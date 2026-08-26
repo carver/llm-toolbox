@@ -1,0 +1,2 @@
+Forked from
+https://github.com/cursor/plugins/blob/bdf7aa355337897f167153e05069aca505dae17c/pstack/skills/unslop/SKILL.md

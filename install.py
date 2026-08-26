@@ -5,9 +5,9 @@ Symlinks rather than copies, so editing a skill here takes effect immediately
 and `git pull` is the whole update story.
 
 Idempotent: safe to re-run. It only ever touches links that point into this
-repo -- a real directory or a link to someone else's skill of the same name is
-reported and left alone. Links into this repo whose source has gone away
-(skill renamed or deleted) are removed.
+repo. A real directory, or a link to someone else's skill of the same name,
+gets reported and left alone. It removes links into this repo whose source
+has gone away (skill renamed or deleted).
 
     python3 install.py
 """

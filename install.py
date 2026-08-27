@@ -7,7 +7,7 @@ and `git pull` is the whole update story.
 Idempotent: safe to re-run. It only ever touches links that point into this
 repo. A real directory, or a link to someone else's skill of the same name,
 gets reported and left alone. It removes links into this repo whose source
-has gone away (skill renamed or deleted).
+is no longer a skill (renamed, deleted, or missing its SKILL.md).
 
     python3 install.py
 """
@@ -24,6 +24,11 @@ def say(msg):
     print(f"  {msg}")
 
 
+def is_skill(path: Path) -> bool:
+    """The one rule for what gets linked and what gets pruned."""
+    return (path / "SKILL.md").is_file()
+
+
 def link_skills() -> int:
     """Returns the number of skills that could not be linked."""
     if not SKILLS_SRC.is_dir():
@@ -35,7 +40,7 @@ def link_skills() -> int:
 
     for skill in sorted(p for p in SKILLS_SRC.iterdir() if p.is_dir()):
         dst = SKILLS_DST / skill.name
-        if not (skill / "SKILL.md").is_file():
+        if not is_skill(skill):
             say(f"skipped {skill.name}: no SKILL.md")
             continue
         if dst.is_symlink():
@@ -56,14 +61,15 @@ def link_skills() -> int:
 
 
 def prune_stale_links():
-    """Remove links into this repo whose skill no longer exists."""
+    """Remove links into this repo whose target is no longer a skill, by
+    the same rule link_skills uses to create them."""
     if not SKILLS_DST.is_dir():
         return
     for dst in sorted(SKILLS_DST.iterdir()):
         if not dst.is_symlink():
             continue
         target = dst.resolve()
-        if target.parent == SKILLS_SRC and not target.exists():
+        if target.parent == SKILLS_SRC and not is_skill(target):
             dst.unlink()
             say(f"removed stale link {dst}")
 

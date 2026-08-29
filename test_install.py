@@ -13,6 +13,7 @@ def dirs(tmp_path, monkeypatch):
     src.mkdir(parents=True)
     monkeypatch.setattr(install, "SKILLS_SRC", src)
     monkeypatch.setattr(install, "SKILLS_DST", dst)
+    monkeypatch.setattr(install, "AGENTS_SKILLS_DST", tmp_path / "home" / ".agents" / "skills")
     return src, dst
 
 
@@ -88,6 +89,14 @@ def test_link_reports_conflicts(dirs, capsys):
     assert install.link_skills() == 1
     assert "CONFLICT" in capsys.readouterr().out
     assert (dst / "taken").is_dir() and not (dst / "taken").is_symlink()
+
+
+def test_skills_are_linked_into_agents_skills_too(dirs, tmp_path):
+    src, dst = dirs
+    make_skill(src, "good")
+    install.link_skills()
+    agents = tmp_path / "home" / ".agents" / "skills" / "good"
+    assert agents.is_symlink() and agents.resolve() == src / "good"
 
 
 def test_guidelines_reach_claude_and_agents_files(guidelines):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Link this repo into the home directory: every skill into ~/.claude/skills as a
-global skill, and GLOBAL_CLAUDE.md to ~/.claude/CLAUDE.md and
+"""Link this repo into the home directory: every skill into ~/.claude/skills and
+~/.agents/skills as a global skill, and GLOBAL_CLAUDE.md to ~/.claude/CLAUDE.md and
 ~/.agents/AGENTS.md, one set of guidelines whichever convention a tool reads.
 
 Symlinks rather than copies, so editing here takes effect immediately and
@@ -22,6 +22,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 SKILLS_SRC = REPO / "skills"
 SKILLS_DST = Path.home() / ".claude" / "skills"
+# The AGENTS.md convention's home for skills. Tools that read ~/.agents/AGENTS.md look here.
+AGENTS_SKILLS_DST = Path.home() / ".agents" / "skills"
 GUIDELINES_SRC = REPO / "GLOBAL_CLAUDE.md"
 GUIDELINES_DSTS = [Path.home() / ".claude" / "CLAUDE.md", Path.home() / ".agents" / "AGENTS.md"]
 
@@ -42,7 +44,7 @@ def link_skills() -> int:
         return 0
 
     conflicts = 0
-    for dst_dir in (SKILLS_DST,):
+    for dst_dir in (SKILLS_DST, AGENTS_SKILLS_DST):
         dst_dir.mkdir(parents=True, exist_ok=True)
         for skill in sorted(p for p in SKILLS_SRC.iterdir() if p.is_dir()):
             if not is_skill(skill):
@@ -94,7 +96,7 @@ def link_guidelines() -> int:
 def prune_stale_links():
     """Remove links into this repo whose target is no longer a skill, by
     the same rule link_skills uses to create them."""
-    for dst_dir in (SKILLS_DST,):
+    for dst_dir in (SKILLS_DST, AGENTS_SKILLS_DST):
         if not dst_dir.is_dir():
             continue
         for dst in sorted(dst_dir.iterdir()):

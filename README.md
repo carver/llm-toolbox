@@ -9,7 +9,8 @@ python3 install.py
 ```
 
 Symlinks every directory under `skills/` into `~/.claude/skills/`, where Claude
-Code picks them up as global skills, and `GLOBAL_CLAUDE.md` to `~/.claude/CLAUDE.md`
+Code picks them up as global skills, and into `~/.agents/skills/`, the AGENTS.md
+convention's home for them, and `GLOBAL_CLAUDE.md` to `~/.claude/CLAUDE.md`
 and `~/.agents/AGENTS.md`, so one file serves whichever convention a tool reads.
 Links, not copies, so an edit here is live straight away and `git pull` is the
 whole update story.

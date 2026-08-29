@@ -16,6 +16,19 @@ def dirs(tmp_path, monkeypatch):
     return src, dst
 
 
+@pytest.fixture
+def guidelines(tmp_path, monkeypatch):
+    """A guidelines file in a temp repo, and a temp HOME for its two links."""
+    src = tmp_path / "repo" / "GLOBAL_CLAUDE.md"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("# Guidelines\n")
+    home = tmp_path / "home"
+    monkeypatch.setattr(install, "GUIDELINES_SRC", src)
+    monkeypatch.setattr(install, "GUIDELINES_DSTS",
+                        [home / ".claude" / "CLAUDE.md", home / ".agents" / "AGENTS.md"])
+    return src, home
+
+
 def make_skill(src, name, with_md=True):
     d = src / name
     d.mkdir()
@@ -75,3 +88,31 @@ def test_link_reports_conflicts(dirs, capsys):
     assert install.link_skills() == 1
     assert "CONFLICT" in capsys.readouterr().out
     assert (dst / "taken").is_dir() and not (dst / "taken").is_symlink()
+
+
+def test_guidelines_reach_claude_and_agents_files(guidelines):
+    src, home = guidelines
+    install.link_guidelines()
+    for dst in (home / ".claude" / "CLAUDE.md", home / ".agents" / "AGENTS.md"):
+        assert dst.is_symlink() and dst.resolve() == src, dst
+
+
+def test_guidelines_link_keeps_a_real_file_as_bak(guidelines, capsys):
+    src, home = guidelines
+    real = home / ".claude" / "CLAUDE.md"
+    real.parent.mkdir(parents=True)
+    real.write_text("mine\n")
+    install.link_guidelines()
+    assert real.is_symlink() and real.resolve() == src
+    assert (home / ".claude" / "CLAUDE.md.bak").read_text() == "mine\n"
+    assert "moved" in capsys.readouterr().out
+
+
+def test_guidelines_link_replaces_a_link_that_points_elsewhere(guidelines):
+    src, home = guidelines
+    dst = home / ".agents" / "AGENTS.md"
+    dst.parent.mkdir(parents=True)
+    dst.symlink_to(home / "somewhere-else.md")
+    install.link_guidelines()
+    assert dst.resolve() == src
+    assert not (home / ".agents" / "AGENTS.md.bak").exists()

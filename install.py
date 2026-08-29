@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Link every skill in this repo into ~/.claude/skills as a global skill.
+"""Link this repo into the home directory: every skill into ~/.claude/skills as a
+global skill, and GLOBAL_CLAUDE.md to ~/.claude/CLAUDE.md and
+~/.agents/AGENTS.md, one set of guidelines whichever convention a tool reads.
 
-Symlinks rather than copies, so editing a skill here takes effect immediately
-and `git pull` is the whole update story.
+Symlinks rather than copies, so editing here takes effect immediately and
+`git pull` is the whole update story.
 
-Idempotent: safe to re-run. It only ever touches links that point into this
-repo. A real directory, or a link to someone else's skill of the same name,
-gets reported and left alone. It removes links into this repo whose source
-is no longer a skill (renamed, deleted, or missing its SKILL.md).
+Idempotent: safe to re-run. Skills: it only ever touches links that point into
+this repo. A real directory, or a link to someone else's skill of the same
+name, gets reported and left alone. It removes links into this repo whose
+source is no longer a skill (renamed, deleted, or missing its SKILL.md).
+Guidelines: a real file moves aside to .bak, a link is replaced wherever it
+points, since a link is cheap to put back.
 
     python3 install.py
 """
@@ -18,6 +22,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 SKILLS_SRC = REPO / "skills"
 SKILLS_DST = Path.home() / ".claude" / "skills"
+GUIDELINES_SRC = REPO / "GLOBAL_CLAUDE.md"
+GUIDELINES_DSTS = [Path.home() / ".claude" / "CLAUDE.md", Path.home() / ".agents" / "AGENTS.md"]
 
 
 def say(msg):
@@ -35,51 +41,77 @@ def link_skills() -> int:
         say(f"no skills directory at {SKILLS_SRC}")
         return 0
 
-    SKILLS_DST.mkdir(parents=True, exist_ok=True)
     conflicts = 0
-
-    for skill in sorted(p for p in SKILLS_SRC.iterdir() if p.is_dir()):
-        dst = SKILLS_DST / skill.name
-        if not is_skill(skill):
-            say(f"skipped {skill.name}: no SKILL.md")
-            continue
-        if dst.is_symlink():
-            # resolve() on a dangling link still gives the intended target.
-            if dst.resolve() == skill:
+    for dst_dir in (SKILLS_DST,):
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for skill in sorted(p for p in SKILLS_SRC.iterdir() if p.is_dir()):
+            if not is_skill(skill):
+                if dst_dir == SKILLS_DST:
+                    say(f"skipped {skill.name}: no SKILL.md")
                 continue
-            say(f"CONFLICT {dst} already links to {dst.resolve()} -- left alone")
-            conflicts += 1
-            continue
-        if dst.exists():
-            say(f"CONFLICT {dst} is a real directory -- left alone")
-            conflicts += 1
-            continue
-        dst.symlink_to(skill)
-        say(f"linked {dst} -> {skill}")
+            conflicts += link_skill(skill, dst_dir / skill.name)
+    return conflicts
 
+
+def link_skill(skill: Path, dst: Path) -> int:
+    """Returns 1 when something else already holds the name."""
+    if dst.is_symlink():
+        # resolve() on a dangling link still gives the intended target.
+        if dst.resolve() == skill:
+            return 0
+        say(f"CONFLICT {dst} already links to {dst.resolve()} -- left alone")
+        return 1
+    if dst.exists():
+        say(f"CONFLICT {dst} is a real directory -- left alone")
+        return 1
+    dst.symlink_to(skill)
+    say(f"linked {dst} -> {skill}")
+    return 0
+
+
+def link_guidelines() -> int:
+    """Returns the number of destinations that could not be linked."""
+    conflicts = 0
+    for dst in GUIDELINES_DSTS:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_symlink():
+            if dst.resolve() == GUIDELINES_SRC:
+                continue
+            dst.unlink()
+        elif dst.exists():
+            bak = dst.with_name(dst.name + ".bak")
+            if bak.exists():
+                say(f"CONFLICT {dst} is a real file and {bak} already exists -- left alone")
+                conflicts += 1
+                continue
+            dst.rename(bak)
+            say(f"moved {dst} to {bak}")
+        dst.symlink_to(GUIDELINES_SRC)
+        say(f"linked {dst} -> {GUIDELINES_SRC}")
     return conflicts
 
 
 def prune_stale_links():
     """Remove links into this repo whose target is no longer a skill, by
     the same rule link_skills uses to create them."""
-    if not SKILLS_DST.is_dir():
-        return
-    for dst in sorted(SKILLS_DST.iterdir()):
-        if not dst.is_symlink():
+    for dst_dir in (SKILLS_DST,):
+        if not dst_dir.is_dir():
             continue
-        target = dst.resolve()
-        if target.parent == SKILLS_SRC and not is_skill(target):
-            dst.unlink()
-            say(f"removed stale link {dst}")
+        for dst in sorted(dst_dir.iterdir()):
+            if not dst.is_symlink():
+                continue
+            target = dst.resolve()
+            if target.parent == SKILLS_SRC and not is_skill(target):
+                dst.unlink()
+                say(f"removed stale link {dst}")
 
 
 def main():
-    print("[llm-toolbox skills]")
+    print("[llm-toolbox]")
     prune_stale_links()
-    conflicts = link_skills()
+    conflicts = link_skills() + link_guidelines()
     if conflicts:
-        say(f"{conflicts} skill(s) not linked -- resolve the conflicts above by hand")
+        say(f"{conflicts} link(s) not made -- resolve the conflicts above by hand")
         return 1
     return 0
 

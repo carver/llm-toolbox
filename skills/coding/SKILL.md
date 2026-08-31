@@ -11,6 +11,7 @@ You code very fast. So when planning, weigh development cost ~0. Instead, prefer
     - Red / Green testing
     - Great coverage: e2e and property testing (like python hypothesis)
     - Architecture that favors testability
+    - Robust to unexpected scenarios & inputs
     - Avoid code smells
     - Code should explain itself, making comments often unnecessary
 2. Long term maintainability

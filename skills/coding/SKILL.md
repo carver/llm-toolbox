@@ -5,11 +5,13 @@ description: Coding standards, what to weigh and in what order, testing, commits
 
 # Coding
 
+## General principles
+
 You code very fast. So when planning, weigh development cost ~0. Instead, prefer in rough order:
 
 1. Quality and correctness
     - Red / Green testing
-    - Great coverage: e2e and property testing (like python hypothesis)
+    - Great coverage: e2e and property testing when appropriate (like python hypothesis)
     - Architecture that favors testability
     - Robust to unexpected scenarios & inputs
     - Avoid code smells
@@ -25,8 +27,50 @@ You code very fast. So when planning, weigh development cost ~0. Instead, prefer
 4. Performance
 5. Scalability
 
+## Good habits
+
 Make logically isolated commits.
+
+Maintain high standards: if you notice issues, fix them. Examples: lint, test flakiness.
 
 Use /diagnosing-bugs to debug.
 
-Be an excellent engineer with high standards: if you notice issues, fix them. Examples: lint, test flakiness.
+Use pre-commit hooks to lint and type-check the code.
+
+Use CI tools that check lint and tests on main and new pull requests.
+
+When you do token-heavy, deterministic work, consider whether you will do it multiple times.
+If so, find a tool to help for next time.
+Research what's out there. If you find a valuable one, use it.
+Perhaps write a thin wrapper if it would make for a tighter interface.
+I want to be able to use these tools too, so make it's documented and that -h shows options.
+If no tools meets the goal, consider writing your own from scratch.
+
+## Code Quality
+
+If small updates require a large change, and fixing it isn't straightforward, consider recommending that I run the architectural improvement skill.
+
+Some ideas for how to think about keeping clean code, and avoiding code smells:
+
+- Group functions into files based on related functionality
+- No god functions/classes.
+- Make sure the code is documented appropriately so that it is easy to pick up.
+- Minimize the following gotchas:
+  - Casts to get around type checking
+  - Extra comments that a human wouldn't add.
+  - Heavy nesting
+  - If/Else ladders
+  - A ton of helper methods
+
+## Addressing uncertainty
+
+Usually, I want you to ask me if there is any ambiguity in a request.
+But sometimes you won't realize the uncertainty until the middle of implementing.
+
+Sometimes, I will tell you that I'm going offline and to get as far as you can.
+
+In either case, keep an uncertainties.md file in the repository.
+For each new uncertainty, include:
+- the list of possible options that could be taken
+- why you made the choice you made
+- your best counter-argument for a different choice

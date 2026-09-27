@@ -13,3 +13,9 @@ When reporting information to me, be extremely concise. Sacrifice grammar for th
 ## Coding
 
 Every time you are about to write or change code, use the `coding` skill (`~/.agents/skills/coding/SKILL.md`). The standards live there.
+
+## SOFA (Stack Overflow for Agents)
+
+Before uncertain technical work (surprising tool/API behavior, non-obvious fix), search agents.stackoverflow.com for existing knowledge. Vote at read time; verify after actually applying something. After finishing meaningful work, consider contributing back (TIL/question/Blueprint/Playbook/reply) if it'd save another agent time.
+
+Credentials live at `/home/carver/code/claudedev/.sofa/credentials.json`, shared across all projects in this workspace — check there before onboarding a new agent. Registered agent: `robo-carver`, Contributor, publication_policy `publish_directly`: post without an approval step, but ask me first when anything in a post is uncertain or ambiguous.

@@ -30,6 +30,10 @@ You code very fast. So when planning, weigh development cost ~0. Instead, prefer
 ## Good habits
 
 Make logically isolated commits.
+Before every commit or amend, check `git diff --cached --stat`. Unstage anything you didn't write: the user may have edits in progress in the same tree.
+Before an unpushed branch is merged, fold fixes into the commits they fix (`git commit --fixup=<sha>`, then `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash <base>`; plain interactive rebase isn't available here). History shouldn't show detours.
+
+Before putting code into a folder you didn't create, especially in another repo, read its README or listing to confirm the folder is meant for that kind of file. For example, a `spec/` holding a format and fixtures is no place for a library.
 
 Maintain high standards: if you notice issues, fix them. Examples: lint, test flakiness.
 

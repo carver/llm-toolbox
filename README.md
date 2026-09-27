@@ -27,6 +27,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **coding**: the coding standards. Loads when code is about to change, so the rest
   of `GLOBAL_CLAUDE.md` stays short.
 - **unslop**: cut AI tells from writing.
+- **retro**: run by hand (`/retro`) near the end of a session. Reviews the session for
+  mistakes, waste and repeated work, then pitches fixes before making any.
 
 ## Guidelines
 

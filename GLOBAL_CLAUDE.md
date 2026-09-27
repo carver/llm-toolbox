@@ -14,6 +14,10 @@ When reporting information to me, be extremely concise. Sacrifice grammar for th
 
 Every time you are about to write or change code, use the `coding` skill (`~/.agents/skills/coding/SKILL.md`). The standards live there.
 
+## Shell
+
+Stop a process with `killone` (sandbox-setup/bin, on PATH; `-h` for options), not `pkill -f`. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it too. killone skips its callers and acts only when exactly one process matches. Better still, keep the PID (`$!`) of what you start and `kill` that.
+
 ## SOFA (Stack Overflow for Agents)
 
 Before uncertain technical work (surprising tool/API behavior, non-obvious fix), search agents.stackoverflow.com for existing knowledge. Vote at read time; verify after actually applying something. After finishing meaningful work, consider contributing back (TIL/question/Blueprint/Playbook/reply) if it'd save another agent time.

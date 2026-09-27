@@ -39,6 +39,10 @@ Use pre-commit hooks to lint and type-check the code.
 
 Use CI tools that check lint and tests on main and new pull requests.
 
+A pre-commit hook must finish in under 5 seconds all-in. Anything slower, like end-to-end tests or a from-scratch dev install, goes in CI; create a CI workflow if the repo has none.
+
+CI builds the dev environment from scratch the documented way (e.g. a fresh venv with `pip install -e '.[dev]'`) before running the checks. When you change packaging, dependencies or dev tooling, run that same from-scratch install yourself before committing. Code that only ever ran from the source tree can hide an uninstallable package.
+
 When you do token-heavy, deterministic work, consider whether you will do it multiple times.
 If so, find a tool to help for next time.
 Research what's out there. If you find a valuable one, use it.

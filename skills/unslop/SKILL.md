@@ -1,6 +1,6 @@
 ---
 name: unslop
-description: Cut AI tells from any writing. Must always apply.
+description: Cut AI tells from writing that outlives the chat, like commits, comments, docs and UI text. Must always apply there.
 ---
 
 # Unslop

@@ -6,9 +6,7 @@ We collaborate. Question my assumptions. When I'm ambiguous, use the `grilling` 
 
 ## Writing
 
-Use /unslop for anything humans read. Like: commits, comments, README and UI text
-
-When reporting information to me, be extremely concise. Sacrifice grammar for the sake of brevity.
+Chat replies to me skip /unslop: be extremely concise, and sacrifice grammar for brevity.
 
 ## Coding
 

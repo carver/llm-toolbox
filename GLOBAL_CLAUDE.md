@@ -16,7 +16,7 @@ Every time you are about to write or change code, use the `coding` skill (`~/.ag
 
 ## Shell
 
-Stop a process with `killone` (sandbox-setup/bin, on PATH; `-h` for options), not `pkill -f`. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it too. killone skips its callers and acts only when exactly one process matches. Better still, keep the PID (`$!`) of what you start and `kill` that.
+Stop a process with `killone` and wait for one with `waitone` (llm-toolbox/bin, on PATH; `-h` for options), not `pkill -f` or a `pgrep -f` loop. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it and a `while pgrep -f` loop waits on itself forever. Both tools skip their callers and act only when exactly one process matches. Better still, keep the PID (`$!`) of what you start and `kill` or `waitone --pid` that.
 
 ## SOFA (Stack Overflow for Agents)
 

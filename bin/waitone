@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Wait for exactly one process to exit, found by name, command line or PID.
+
+The shell-safe replacement for `while pgrep -f PATTERN; do sleep 1; done`,
+which never ends: the pattern is in the waiting shell's own command line, so
+pgrep keeps finding that shell. waitone skips itself and every ancestor,
+picks the one matching process up front and then waits on that PID, so a
+later process with the same command line does not extend the wait. Works for
+processes that are not children of the caller, which the `wait` builtin
+cannot wait for.
+
+Exit status: 0 the process exited (or had already exited, with --pid),
+1 nothing matched, 2 several matched (listed, waited for none),
+4 still running at --timeout. The process's own exit status is not
+available, since it is not our child.
+"""
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from procmatch import command_line, exactly_one, wait_gone  # noqa: E402
+
+TIMED_OUT = 4
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="waitone", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("pattern", nargs="?", help="exact process name, or with -f a regex over the full command line")
+    target.add_argument("-p", "--pid", type=int, help="wait for this PID instead of matching")
+    parser.add_argument("-f", "--full", action="store_true", help="match the full command line, like pgrep -f")
+    parser.add_argument("-t", "--timeout", type=float, metavar="SECONDS", help="give up after SECONDS (exit 4)")
+    parser.add_argument(
+        "-i", "--interval", type=float, default=0.2, metavar="SECONDS", help="poll interval (default %(default)s)"
+    )
+    args = parser.parse_args(argv)
+
+    if args.pid is not None:
+        pid, cmdline = args.pid, command_line(args.pid) or "(not running)"
+    else:
+        found = exactly_one(args.pattern, args.full, "waitone")
+        if isinstance(found, int):
+            return found
+        pid, cmdline = found
+
+    start = time.monotonic()
+    if not wait_gone(pid, args.timeout, args.interval):
+        print(f"waitone: {pid} still running after {args.timeout}s  {cmdline}", file=sys.stderr)
+        return TIMED_OUT
+    print(f"{pid} exited after {time.monotonic() - start:.1f}s  {cmdline}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

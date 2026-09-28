@@ -33,6 +33,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 
 ## Tools
 
+- **killone** and **waitone**: stop, or wait for, exactly one process found
+  by name or command line. Unlike `pkill -f` and `pgrep -f`, they never match
+  the calling shell, whose command line holds the pattern. `waitone --pid`
+  also waits for processes that are not the caller's children.
 - **gui-shot**: runs a GUI app on a headless display (Xvfb, or weston for
   Wayland), clicks and types into it, and saves screenshots. For checking a
   desktop app's UI from a sandbox with no screen. `gui-shot -h` lists the

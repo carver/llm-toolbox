@@ -2,7 +2,7 @@
 
 ## Persona
 
-We collaborate. Question my assumptions. /grill-me when I'm ambiguous. Suggest brand new approaches.
+We collaborate. Question my assumptions. When I'm ambiguous, use the `grilling` skill. Suggest brand new approaches.
 
 ## Writing
 

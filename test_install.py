@@ -14,6 +14,9 @@ def dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(install, "SKILLS_SRC", src)
     monkeypatch.setattr(install, "SKILLS_DST", dst)
     monkeypatch.setattr(install, "AGENTS_SKILLS_DST", tmp_path / "home" / ".agents" / "skills")
+    # Pruning walks every destination, so keep it off the real ~/.local/bin.
+    monkeypatch.setattr(install, "BIN_SRC", tmp_path / "repo" / "bin")
+    monkeypatch.setattr(install, "BIN_DST", tmp_path / "home" / ".local" / "bin")
     return src, dst
 
 
@@ -28,6 +31,52 @@ def guidelines(tmp_path, monkeypatch):
     monkeypatch.setattr(install, "GUIDELINES_DSTS",
                         [home / ".claude" / "CLAUDE.md", home / ".agents" / "AGENTS.md"])
     return src, home
+
+
+@pytest.fixture
+def tools(tmp_path, monkeypatch):
+    src = tmp_path / "repo" / "bin"
+    dst = tmp_path / "home" / ".local" / "bin"
+    src.mkdir(parents=True)
+    monkeypatch.setattr(install, "BIN_SRC", src)
+    monkeypatch.setattr(install, "BIN_DST", dst)
+    return src, dst
+
+
+def make_tool(src, name, executable=True):
+    path = src / name
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755 if executable else 0o644)
+    return path
+
+
+def test_links_executable_tools_only(tools):
+    src, dst = tools
+    make_tool(src, "gui-shot")
+    make_tool(src, "notes.txt", executable=False)
+    assert install.link_tools() == 0
+    assert (dst / "gui-shot").resolve() == src / "gui-shot"
+    assert not (dst / "notes.txt").exists()
+    assert install.link_tools() == 0, "idempotent"
+
+
+def test_tool_name_taken_by_another_file_is_a_conflict(tools, capsys):
+    src, dst = tools
+    make_tool(src, "gui-shot")
+    dst.mkdir(parents=True)
+    (dst / "gui-shot").write_text("someone else's")
+    assert install.link_tools() == 1
+    assert "CONFLICT" in capsys.readouterr().out
+    assert (dst / "gui-shot").read_text() == "someone else's"
+
+
+def test_prune_removes_link_to_deleted_tool(dirs, tools):
+    src, dst = tools
+    make_tool(src, "gone")
+    install.link_tools()
+    (src / "gone").unlink()
+    install.prune_stale_links()
+    assert not (dst / "gone").is_symlink()
 
 
 def make_skill(src, name, with_md=True):

@@ -8,7 +8,8 @@ Skills, and the guidelines every agent session starts from.
 python3 install.py
 ```
 
-Symlinks every directory under `skills/` into `~/.claude/skills/`, where Claude
+Symlinks every executable in `bin/` into `~/.local/bin/`, and every directory
+under `skills/` into `~/.claude/skills/`, where Claude
 Code picks them up as global skills, and into `~/.agents/skills/`, the AGENTS.md
 convention's home for them, and `GLOBAL_CLAUDE.md` to `~/.claude/CLAUDE.md`
 and `~/.agents/AGENTS.md`, so one file serves whichever convention a tool reads.
@@ -29,6 +30,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **unslop**: cut AI tells from writing.
 - **retro**: run by hand (`/retro`) near the end of a session. Reviews the session for
   mistakes, waste and repeated work, then pitches fixes before making any.
+
+## Tools
+
+- **gui-shot**: runs a GUI app on a headless display (Xvfb, or weston for
+  Wayland), clicks and types into it, and saves screenshots. For checking a
+  desktop app's UI from a sandbox with no screen. `gui-shot -h` lists the
+  actions. Prints the apt command if Xvfb, xdotool, ImageMagick or weston is
+  missing.
 
 ## Guidelines
 

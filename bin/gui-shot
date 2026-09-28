@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Run a GUI app on a headless display, drive it, and take screenshots.
+
+    gui-shot [options] [--do ACTION ...] -- COMMAND [ARGS...]
+
+Backends:
+  x11      Xvfb + xdotool + ImageMagick. Supports every action.
+  wayland  headless weston. Screenshots and sleeps only: weston's headless
+           backend takes no synthetic input.
+
+Actions (--do, repeatable, run in order after the window appears).
+Coordinates are relative to the app window's top-left corner.
+  sleep SECONDS          wait, e.g. for an animation or a background job
+  click X Y [BUTTON]     press and release (1 left, 2 middle, 3 right)
+  down X Y [BUTTON]      press and hold
+  up X Y [BUTTON]        release
+  move X Y               move the pointer
+  key KEYS               xdotool key names, e.g. "n", "ctrl+z", "Escape"
+  keydown KEY / keyup KEY
+  type TEXT              type literal text
+  resize W H             resize the window
+  shot NAME              screenshot to OUT/NAME.png
+
+A final screenshot, OUT/final.png, is always taken. The app's output goes
+to OUT/app.log. Paths of the screenshots are printed on stdout.
+
+Examples:
+  gui-shot -- ./target/debug/my-app
+  gui-shot --do "click 390 265" --do "sleep 1" --do "key n" --do "shot dialog" -- ./my-app
+  gui-shot --backend wayland --env MY_APP_DEBUG=1 -- ./my-app
+
+Gotchas it handles for you:
+  - WAYLAND_DISPLAY is unset on x11 (and DISPLAY on wayland), so toolkits
+    don't try a compositor that isn't there.
+  - Xvfb has no window manager, so the window is focused explicitly or it
+    never receives keys.
+  - weston's socket lives in a short /tmp dir: sockets need paths under 108
+    bytes, which deep scratch directories exceed.
+  - weston runs with --debug, which weston-screenshooter needs.
+Apps that only redraw on input (egui, for example) may need a "move" action
+before a screenshot shows a state change.
+"""
+
+import argparse
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+NEEDS = {
+    "x11": {"Xvfb": "xvfb", "xdotool": "xdotool", "import": "imagemagick"},
+    "wayland": {"weston": "weston", "weston-screenshooter": "weston"},
+}
+ARITY = {
+    "sleep": (1, 1),
+    "click": (2, 3),
+    "down": (2, 3),
+    "up": (2, 3),
+    "move": (2, 2),
+    "key": (1, 1),
+    "keydown": (1, 1),
+    "keyup": (1, 1),
+    "type": (1, 1),
+    "resize": (2, 2),
+    "shot": (1, 1),
+}
+# How many leading arguments of each action must be numbers.
+NUMERIC_ARGS = {"sleep": 1, "click": 2, "down": 2, "up": 2, "move": 2, "resize": 2}
+WAYLAND_ACTIONS = {"sleep", "shot"}
+
+
+class UsageError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Action:
+    verb: str
+    args: tuple[str, ...]
+
+
+def parse_action(text: str) -> Action:
+    """`type` and `key` keep the rest of the line as one argument."""
+    verb, _, rest = text.strip().partition(" ")
+    if verb not in ARITY:
+        raise UsageError(f"unknown action {verb!r} in {text!r}")
+    args = (rest,) if verb in ("type", "key") and rest else tuple(rest.split())
+    lo, hi = ARITY[verb]
+    if not lo <= len(args) <= hi:
+        raise UsageError(f"{verb} takes {lo}-{hi} arguments, got {len(args)}: {text!r}")
+    for a in args[: NUMERIC_ARGS.get(verb, 0)]:
+        try:
+            float(a)
+        except ValueError:
+            raise UsageError(f"{verb}: {a!r} is not a number") from None
+    return Action(verb, args)
+
+
+def missing_tools(backend: str) -> dict[str, str]:
+    return {tool: pkg for tool, pkg in NEEDS[backend].items() if shutil.which(tool) is None}
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
+
+
+def wait_for(check, timeout: float, what: str):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = check()
+        if result:
+            return result
+        time.sleep(0.1)
+    raise TimeoutError(f"timed out after {timeout:.0f}s waiting for {what}")
+
+
+class Session:
+    """Owns the display server and the app; `close` stops both."""
+
+    def __init__(self, backend: str, size: tuple[int, int], out: Path):
+        self.backend = backend
+        self.size = size
+        self.out = out
+        self.procs: list[subprocess.Popen] = []
+        self.env = dict(os.environ)
+        self.window = None
+        self.runtime_dir = None
+
+    def start_display(self):
+        w, h = self.size
+        if self.backend == "x11":
+            number = next(n for n in range(90, 200) if not Path(f"/tmp/.X11-unix/X{n}").exists())
+            self.spawn(["Xvfb", f":{number}", "-screen", "0", f"{w}x{h}x24"], self.out / "server.log")
+            wait_for(lambda: Path(f"/tmp/.X11-unix/X{number}").exists(), 10, "Xvfb")
+            self.env["DISPLAY"] = f":{number}"
+            self.env.pop("WAYLAND_DISPLAY", None)
+        else:
+            self.runtime_dir = tempfile.mkdtemp(prefix="gs", dir="/tmp")
+            os.chmod(self.runtime_dir, 0o700)
+            self.env["XDG_RUNTIME_DIR"] = self.runtime_dir
+            socket = Path(self.runtime_dir) / "wl"
+            self.spawn(
+                ["weston", "--debug", "--backend=headless", "--socket=wl", f"--width={w}", f"--height={h}",
+                 "--renderer=pixman"],
+                self.out / "server.log",
+            )
+            wait_for(socket.exists, 10, "weston")
+            self.env["WAYLAND_DISPLAY"] = "wl"
+            self.env.pop("DISPLAY", None)
+
+    def spawn(self, cmd: list[str], log: Path, env=None) -> subprocess.Popen:
+        with open(log, "w") as f:
+            proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env or self.env,
+                                    start_new_session=True)
+        self.procs.append(proc)
+        return proc
+
+    def launch(self, command: list[str], title: str | None, timeout: float):
+        app = self.spawn(command, self.out / "app.log")
+        if self.backend == "wayland":
+            time.sleep(min(timeout, 3))
+        else:
+            self.window = wait_for(lambda: self.find_window(app.pid, title), timeout, "the app window")
+            self.xdo("windowfocus", "--sync", self.window)
+        if app.poll() is not None:
+            raise RuntimeError(f"app exited with code {app.returncode}; see {self.out / 'app.log'}")
+
+    def find_window(self, pid: int, title: str | None):
+        """By title if given, else by process id. Not every app sets its
+        pid on the window (plain X11 apps often don't), so fall back to any
+        visible window: the display is private to this run."""
+        queries = [["--name", title]] if title else [["--pid", str(pid)], ["--class", "."]]
+        for query in queries:
+            result = subprocess.run(["xdotool", "search", "--onlyvisible", *query], capture_output=True,
+                                    text=True, env=self.env)
+            ids = result.stdout.split()
+            if ids:
+                return ids[0]
+        return None
+
+    def xdo(self, *args: str) -> str:
+        return run(["xdotool", *args], env=self.env).stdout
+
+    def act(self, action: Action):
+        v, a = action.verb, action.args
+        if v == "sleep":
+            time.sleep(float(a[0]))
+        elif v == "shot":
+            print(self.shot(a[0]))
+        elif v in ("click", "down", "up", "move"):
+            self.xdo("mousemove", "--window", self.window, a[0], a[1])
+            button = a[2] if len(a) > 2 else "1"
+            verb = {"click": "click", "down": "mousedown", "up": "mouseup"}.get(v)
+            if verb:
+                self.xdo(verb, button)
+        elif v in ("key", "keydown", "keyup"):
+            self.xdo(v, "--window", self.window, *a[0].split())
+        elif v == "type":
+            self.xdo("type", "--window", self.window, a[0])
+        elif v == "resize":
+            self.xdo("windowsize", "--sync", self.window, a[0], a[1])
+        time.sleep(0.2)
+
+    def shot(self, name: str) -> Path:
+        path = self.out / f"{name}.png"
+        if self.backend == "x11":
+            geometry = dict(line.split("=") for line in self.xdo("getwindowgeometry", "--shell", self.window).split())
+            crop = f"{geometry['WIDTH']}x{geometry['HEIGHT']}+{geometry['X']}+{geometry['Y']}"
+            run(["import", "-window", "root", "-crop", crop, "+repage", str(path)], env=self.env)
+        else:
+            with tempfile.TemporaryDirectory() as tmp:
+                run(["weston-screenshooter"], cwd=tmp, env=self.env)
+                taken = next(Path(tmp).glob("*.png"))
+                shutil.move(taken, path)
+        return path
+
+    def close(self):
+        for proc in reversed(self.procs):
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+        if self.runtime_dir:
+            shutil.rmtree(self.runtime_dir, ignore_errors=True)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="gui-shot",
+        description="Run a GUI app headless, drive it and screenshot it.",
+        epilog=__doc__.split("\n\n", 1)[1],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--backend", choices=("x11", "wayland"), default="x11")
+    p.add_argument("--size", default="1280x800", help="screen size WxH (default 1280x800)")
+    p.add_argument("--out", type=Path, help="output directory (default: a new temp dir)")
+    p.add_argument("--title", help="find the window by title instead of by process id")
+    p.add_argument("--timeout", type=float, default=30, help="seconds to wait for the window (default 30)")
+    p.add_argument("--env", action="append", default=[], metavar="K=V", help="extra environment for the app")
+    p.add_argument("--do", action="append", default=[], metavar="ACTION", help="an action; see below")
+    p.add_argument("command", nargs=argparse.REMAINDER, help="the app to run, after --")
+    args = p.parse_args(argv)
+    if args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    if not args.command:
+        p.error("give the app to run after --")
+    try:
+        w, h = (int(n) for n in args.size.lower().split("x"))
+    except ValueError:
+        p.error(f"--size must look like 1280x800, not {args.size!r}")
+    args.size = (w, h)
+    return args
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    try:
+        actions = [parse_action(a) for a in args.do]
+    except UsageError as e:
+        print(f"gui-shot: {e}", file=sys.stderr)
+        return 2
+    if args.backend == "wayland":
+        unsupported = sorted({a.verb for a in actions} - WAYLAND_ACTIONS)
+        if unsupported:
+            print(f"gui-shot: wayland supports only sleep and shot, not {', '.join(unsupported)}", file=sys.stderr)
+            return 2
+    missing = missing_tools(args.backend)
+    if missing:
+        pkgs = " ".join(sorted(set(missing.values())))
+        print(f"gui-shot: missing {', '.join(sorted(missing))}. Install with:\n  sudo apt-get install -y {pkgs}",
+              file=sys.stderr)
+        return 3
+
+    out = args.out or Path(tempfile.mkdtemp(prefix="gui-shot-"))
+    out.mkdir(parents=True, exist_ok=True)
+    session = Session(args.backend, args.size, out)
+    for pair in args.env:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            print(f"gui-shot: --env needs K=V, not {pair!r}", file=sys.stderr)
+            return 2
+        session.env[key] = value
+    try:
+        session.start_display()
+        session.launch(args.command, args.title, args.timeout)
+        for action in actions:
+            session.act(action)
+        print(session.shot("final"))
+        return 0
+    except (TimeoutError, RuntimeError, subprocess.CalledProcessError) as e:
+        detail = getattr(e, "stderr", "") or ""
+        print(f"gui-shot: {e} {detail}".strip(), file=sys.stderr)
+        print(f"gui-shot: logs in {out}", file=sys.stderr)
+        return 1
+    finally:
+        session.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

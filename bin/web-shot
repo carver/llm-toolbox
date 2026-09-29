@@ -1,0 +1,149 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# dependencies = ["playwright"]
+# ///
+"""Open a web page in headless Chromium, drive it, take screenshots and report its JavaScript errors.
+
+    web-shot [options] [--do ACTION ...] PAGE
+
+PAGE is a URL or a local file path.
+
+Actions (--do, repeatable, run in order once the page has loaded):
+  click SELECTOR         click the first element matching a CSS selector
+  wait MS                wait, e.g. for an animation or a fetch
+  eval JS                run JavaScript in the page
+  shot NAME [SELECTOR]   screenshot to OUT/NAME.png: the matching element, else the full page
+
+A final full-page screenshot, OUT/final.png, is always taken. Paths of the
+screenshots go to stdout; the page's uncaught errors and console errors go to
+stderr, and make the exit status 3 once the screenshots are saved.
+
+The browser is Playwright's Chromium. When the cached browser is not the build
+this Playwright wants, the newest cached Chromium is used instead, so no
+download is needed; with none cached it prints the install command.
+
+Examples:
+  web-shot report/page.html
+  web-shot --do "click #legend button[data-series=human]" --do "shot chart #trajectory" report/page.html
+  web-shot --size 390x844 https://example.com
+"""
+import argparse
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+ARITY = {"click": (1, 1), "wait": (1, 1), "eval": (1, 1), "shot": (1, 2)}  # (min, max) arguments
+INSTALL = "uv run --with playwright playwright install chromium"
+
+
+class UsageError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Action:
+    verb: str
+    args: tuple
+
+
+def parse_action(text):
+    """'shot chart #trajectory .card' -> Action('shot', ('chart', '#trajectory .card')). A selector or
+    script is the rest of the line, spaces and all; only shot splits off a name first."""
+    verb, _, rest = text.strip().partition(" ")
+    rest = rest.strip()
+    if verb not in ARITY:
+        raise UsageError(f"unknown action {verb!r}; one of {', '.join(ARITY)}")
+    args = tuple(rest.split(" ", 1)) if verb == "shot" and rest else (rest,) if rest else ()
+    low, high = ARITY[verb]
+    if not low <= len(args) <= high:
+        raise UsageError(f"{verb!r} takes {low}{'' if low == high else f' to {high}'} argument(s): {text!r}")
+    if verb == "wait" and not args[0].isdigit():
+        raise UsageError(f"wait takes milliseconds: {text!r}")
+    return Action(verb, tuple(a.strip() for a in args))
+
+
+def page_url(page):
+    path = Path(page)
+    return path.resolve().as_uri() if "://" not in page and path.exists() else page
+
+
+def cached_chromium():
+    """The newest Chromium in Playwright's cache, or None."""
+    cache = Path.home() / ".cache" / "ms-playwright"
+    found = sorted(cache.glob("chromium-*/chrome-linux*/chrome"), key=lambda p: int(p.parts[-3].split("-")[1]))
+    return found[-1] if found else None
+
+
+def launch(playwright):
+    try:
+        return playwright.chromium.launch()
+    except Exception as error:  # Playwright raises its own Error with no finer type for a missing browser
+        if "Executable doesn't exist" not in str(error):
+            raise
+    fallback = cached_chromium()
+    if not fallback:
+        raise UsageError(f"no Chromium for Playwright; install one with: {INSTALL}")
+    return playwright.chromium.launch(executable_path=str(fallback))
+
+
+def run(page, actions, out, size):
+    from playwright.sync_api import sync_playwright
+
+    width, height = size
+    errors, shots = [], []
+    with sync_playwright() as playwright:
+        browser = launch(playwright)
+        tab = browser.new_page(viewport={"width": width, "height": height})
+        tab.on("pageerror", lambda error: errors.append(f"page error: {error}"))
+        tab.on("console", lambda msg: msg.type == "error" and errors.append(f"console error: {msg.text}"))
+        tab.goto(page_url(page), wait_until="load")
+        for action in actions + [Action("shot", ("final",))]:
+            if action.verb == "click":
+                tab.click(action.args[0])
+            elif action.verb == "wait":
+                tab.wait_for_timeout(int(action.args[0]))
+            elif action.verb == "eval":
+                tab.evaluate(action.args[0])
+            else:
+                path = out / f"{action.args[0]}.png"
+                if len(action.args) == 2:
+                    tab.locator(action.args[1]).first.screenshot(path=str(path))
+                else:
+                    tab.screenshot(path=str(path), full_page=True)
+                shots.append(path)
+        browser.close()
+    return shots, errors
+
+
+def size_arg(text):
+    width, _, height = text.partition("x")
+    if not (width.isdigit() and height.isdigit()):
+        raise argparse.ArgumentTypeError(f"size is WxH, e.g. 1280x900: {text!r}")
+    return int(width), int(height)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], epilog=__doc__.split("\n\n", 1)[1],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("page", help="a URL or a local file")
+    parser.add_argument("--do", action="append", default=[], metavar="ACTION", help="an action; see below")
+    parser.add_argument("--out", type=Path, help="output directory (default: a new temp dir)")
+    parser.add_argument("--size", type=size_arg, default=(1280, 900), help="viewport WxH (default 1280x900)")
+    args = parser.parse_args(argv)
+    try:
+        actions = [parse_action(a) for a in args.do]
+        out = args.out or Path(tempfile.mkdtemp(prefix="web-shot-"))
+        out.mkdir(parents=True, exist_ok=True)
+        shots, errors = run(args.page, actions, out, args.size)
+    except UsageError as error:
+        print(f"web-shot: {error}", file=sys.stderr)
+        return 2
+    print("\n".join(map(str, shots)))
+    for error in errors:
+        print(error, file=sys.stderr)
+    return 3 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

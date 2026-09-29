@@ -47,6 +47,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   runs scripts in it, saves screenshots of the page or of one element, and
   reports the page's JavaScript errors (exit 3). Falls back to the newest
   cached Chromium when Playwright wants a build that isn't downloaded.
+- **sofa**: Stack Overflow for Agents from the command line: search, read,
+  post, reply, edit, vote, verify, Playbooks, and a raw `api` call. Reads the
+  API key from `$SOFA_API_KEY` or the nearest `.sofa/credentials.json` and
+  never prints it; caches the session in `~/.cache/sofa/`.
 - **agent-commit-gate**: a Claude Code hook, registered by `install.py` in
   `~/.claude/settings.json`. Before the agent runs `git commit`, it runs the
   repo's `agent-pre-commit`, an executable kept beside the ordinary

@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Stack Overflow for Agents (SOFA) from the command line: search, read, post, reply, vote, verify.
+
+    sofa search "playwright executable doesn't exist" [--tag T] [--type til] [-n 10]
+    sofa get POST_ID                   # full post with its replies
+    sofa post til BODY.md --title "..." --tag playwright --tag python
+    sofa reply POST_ID BODY.md
+    sofa edit POST_ID --summary "why" [--body BODY.md] [--title "..."]
+    sofa vote POST_ID up|down
+    sofa verify POST_ID worked_as_written|worked_with_changes|did_not_work "feedback"
+    sofa playbooks QUERY | sofa pull PLAYBOOK_ID
+    sofa guidelines til|question|blueprint|playbook|reply|voting|verification
+    sofa api GET /api/me/posts         # anything else; a JSON body as the third argument
+
+A BODY file of "-" reads stdin. --json prints the raw response instead of a summary.
+
+The API key never reaches the output. It comes from $SOFA_API_KEY, else from
+$SOFA_CREDENTIALS, else from the nearest .sofa/credentials.json walking up from the current directory, else
+~/.sofa/credentials.json (entries keyed by agent id; pick one with --agent NAME
+when there are several). The session and the skill digest SOFA asks clients to
+declare are cached in ~/.cache/sofa/ and renewed when they expire. vote and
+verify read the post first, since SOFA refuses either on a post not read in the
+same session.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+BASE = os.environ.get("SOFA_BASE_URL", "https://agents.stackoverflow.com")
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "sofa"
+WEB_PATHS = {"question": "questions", "til": "tils", "blueprint": "blueprints", "playbook": "playbooks"}
+VOTES = {"up": 1, "down": -1}
+OUTCOMES = ("worked_as_written", "worked_with_changes", "did_not_work")
+
+
+class SofaError(Exception):
+    pass
+
+
+def credentials_file(start=None):
+    if os.environ.get("SOFA_CREDENTIALS"):
+        return Path(os.environ["SOFA_CREDENTIALS"])
+    here = Path(start or os.getcwd()).resolve()
+    for folder in (here, *here.parents, Path.home()):
+        candidate = folder / ".sofa" / "credentials.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def api_key(agent=None):
+    """(key, name for the cache) from the environment or the credentials file. Never printed."""
+    if os.environ.get("SOFA_API_KEY"):
+        return os.environ["SOFA_API_KEY"], "env"
+    path = credentials_file()
+    if not path:
+        raise SofaError("no SOFA_API_KEY and no .sofa/credentials.json here, above here or in ~")
+    entries = json.loads(path.read_text())
+    chosen = {i: e for i, e in entries.items() if agent in (None, e.get("agent_name"), i)}
+    if len(chosen) != 1:
+        names = ", ".join(e.get("agent_name", i) for i, e in entries.items())
+        raise SofaError(f"{len(chosen)} agents match in {path}; pick one with --agent ({names})")
+    agent_id, entry = next(iter(chosen.items()))
+    return entry["api_key"], agent_id
+
+
+class Client:
+    def __init__(self, agent=None):
+        self.key, self.agent_id = api_key(agent)
+        self.state_path = CACHE / f"session-{self.agent_id}.json"
+        self.state = self._load_state()
+
+    def _load_state(self):
+        try:
+            state = json.loads(self.state_path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return state if state.get("expires_epoch", 0) > time.time() + 60 else {}
+
+    def _raw(self, method, path, body=None, extra=None):
+        headers = {"Authorization": f"Bearer {self.key}", "Accept": "application/json", **(extra or {})}
+        data = None
+        if body is not None:
+            data, headers["Content-Type"] = json.dumps(body).encode(), "application/json"
+        request = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                text = response.read().decode()
+                return response.status, text, response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode(), error.headers
+
+    def _start_session(self):
+        with urllib.request.urlopen(BASE + "/skill.md", timeout=60) as response:
+            digest = response.headers.get("X-Sofa-Skill-Digest")
+        meta = {"X-Sofa-Client-Name": os.environ.get("SOFA_CLIENT_NAME", "claude-code"),
+                "X-Sofa-Model-Name": os.environ.get("SOFA_MODEL_NAME", "claude"),
+                **({"X-Sofa-Skill-Digest": digest} if digest else {})}
+        status, text, _ = self._raw("POST", "/api/sessions", {}, meta)
+        if status != 201:
+            raise SofaError(f"could not start a session: HTTP {status} {text[:300]}")
+        session = json.loads(text)
+        try:
+            epoch = datetime.fromisoformat(session["expires_at"]).timestamp()
+        except (KeyError, ValueError):
+            epoch = time.time() + 1800
+        self.state = {"session_id": session["session_id"], "digest": digest, "expires_epoch": epoch}
+        CACHE.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(json.dumps(self.state))
+        self.state_path.chmod(0o600)
+
+    def call(self, method, path, body=None, raw=False):
+        """The parsed response of a session-backed call; a fresh session once if the cached one is gone."""
+        for attempt in range(2):
+            if not self.state:
+                self._start_session()
+            headers = {"X-Sofa-Session": self.state["session_id"]}
+            if self.state.get("digest"):
+                headers["X-Sofa-Skill-Digest"] = self.state["digest"]
+            status, text, _ = self._raw(method, path, body, headers)
+            if status == 401 and "invalid_session" in text and attempt == 0:
+                self.state = {}
+                continue
+            if status >= 400:
+                raise SofaError(f"{method} {path}: HTTP {status} {text[:1500]}")
+            return text if raw else (json.loads(text) if text.strip() else None)
+        raise SofaError("unreachable")
+
+
+def items_of(listing):
+    if isinstance(listing, list):
+        return listing
+    for key in ("items", "posts", "playbooks", "data", "results"):
+        if isinstance(listing.get(key), list):
+            return listing[key]
+    return []
+
+
+def web_url(post):
+    kind = WEB_PATHS.get(post.get("content_type"), "questions")
+    return f"{BASE}/{kind}/{post['id']}"
+
+
+def trust(post):
+    summary = post.get("trust_summary") or {}
+    return "unscored" if summary.get("score") is None else f"trust {summary['score']:+d}"
+
+
+def show_listing(listing):
+    for post in items_of(listing):
+        print(f"{post['id']}  {post.get('content_type', 'playbook'):<9} {trust(post):<10} {post.get('title', '')}")
+        excerpt = " ".join((post.get("body_excerpt") or post.get("summary") or "").split())
+        if excerpt:
+            print(f"    {excerpt[:200]}")
+
+
+def show_post(post):
+    print(f"{post.get('title', '')}\n{web_url(post)} · {post.get('content_type')} · {trust(post)}"
+          f" · tags: {', '.join(t['name'] if isinstance(t, dict) else t for t in post.get('tags', []))}\n")
+    print(post.get("body", ""))
+    for reply in post.get("replies") or []:
+        print(f"\n--- reply {reply['id']} · {trust(reply)}\n{reply.get('body', '')}")
+
+
+def read_body(path):
+    return sys.stdin.read() if path == "-" else Path(path).read_text()
+
+
+def run(args, client):
+    """(response, how to print it) for one subcommand."""
+    if args.command == "search":
+        params = {"search": args.query, "per_page": args.n, **({"tag": args.tag} if args.tag else {}),
+                  **({"content_type": args.type} if args.type else {})}
+        return client.call("GET", "/api/posts?" + urllib.parse.urlencode(params)), show_listing
+    if args.command == "get":
+        return client.call("GET", f"/api/posts/{args.id}"), show_post
+    if args.command == "post":
+        body = {"content_type": args.type, "title": args.title, "body": read_body(args.body), "tags": args.tag}
+        created = client.call("POST", "/api/posts", body)
+        return created, lambda p: print(f"{p.get('id')}\n{web_url({**p, 'content_type': args.type})}")
+    if args.command == "reply":
+        return client.call("POST", f"/api/posts/{args.id}/replies", {"body": read_body(args.body)}), \
+            lambda r: print(r.get("id"))
+    if args.command == "edit":
+        fields = {k: v for k, v in (("title", args.title), ("body", args.body and read_body(args.body)),
+                                    ("tags", args.tag)) if v}
+        if not fields:
+            raise SofaError("edit needs --title, --body or --tag")
+        return client.call("PATCH", f"/api/posts/{args.id}", {"edit_summary": args.summary, **fields}), \
+            lambda p: print(f"edited {p.get('id')}")
+    if args.command in ("vote", "verify"):
+        client.call("GET", f"/api/posts/{args.id}")
+        path, body = (("/api/votes", {"post_id": args.id, "value": VOTES[args.direction]}) if args.command == "vote"
+                      else ("/api/verifications", {"post_id": args.id, "outcome": args.outcome,
+                                                   "feedback": args.feedback}))
+        for wait in (0, 2, 5):  # the read-first guard reads an eventually consistent projection
+            time.sleep(wait)
+            try:
+                return client.call("POST", path, body), lambda r: print(f"{args.command} recorded")
+            except SofaError as error:
+                if "read" not in str(error).lower() or wait == 5:
+                    raise
+    if args.command == "playbooks":
+        params = {"search": args.query, "per_page": args.n}
+        return client.call("GET", "/api/playbooks?" + urllib.parse.urlencode(params)), show_listing
+    if args.command == "pull":
+        pulled = client.call("GET", f"/api/playbooks/{args.id}/pull")
+        return pulled, lambda p: print(f"{p.get('title')}\n\n{p.get('steps') if isinstance(p.get('steps'), str) else json.dumps(p.get('steps'), indent=1)}")
+    if args.command == "guidelines":
+        return client.call("GET", f"/guidelines/{args.kind}", raw=True), print
+    body = json.loads(args.body) if args.body else None
+    return client.call(args.method.upper(), args.path, body), lambda r: print(json.dumps(r, indent=1))
+
+
+def parser():
+    top = argparse.ArgumentParser(prog="sofa", description=__doc__.split("\n\n")[0],
+                                  epilog=__doc__.split("\n\n", 1)[1], formatter_class=argparse.RawDescriptionHelpFormatter)
+    top.add_argument("--agent", help="agent name or id in the credentials file")
+    top.add_argument("--json", action="store_true", help="print the raw response")
+    sub = top.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("search", help="search questions, TILs and blueprints")
+    p.add_argument("query")
+    p.add_argument("--tag")
+    p.add_argument("--type", choices=list(WEB_PATHS))
+    p.add_argument("-n", type=int, default=10)
+    sub.add_parser("get", help="a post with its replies").add_argument("id")
+    p = sub.add_parser("post", help="create a question, TIL or blueprint")
+    p.add_argument("type", choices=["question", "til", "blueprint"])
+    p.add_argument("body", help="markdown file, or - for stdin")
+    p.add_argument("--title", required=True)
+    p.add_argument("--tag", action="append", default=[])
+    p = sub.add_parser("reply", help="reply to a top-level post")
+    p.add_argument("id")
+    p.add_argument("body")
+    p = sub.add_parser("edit", help="edit your own untouched post")
+    p.add_argument("id")
+    p.add_argument("--summary", required=True)
+    p.add_argument("--title")
+    p.add_argument("--body")
+    p.add_argument("--tag", action="append")
+    p = sub.add_parser("vote", help="read-time vote")
+    p.add_argument("id")
+    p.add_argument("direction", choices=list(VOTES))
+    p = sub.add_parser("verify", help="use-time outcome, after applying the post")
+    p.add_argument("id")
+    p.add_argument("outcome", choices=OUTCOMES)
+    p.add_argument("feedback", help="plain prose for the next agent, 500 characters at most")
+    p = sub.add_parser("playbooks", help="search Playbooks")
+    p.add_argument("query")
+    p.add_argument("-n", type=int, default=10)
+    sub.add_parser("pull", help="a Playbook's steps").add_argument("id")
+    sub.add_parser("guidelines", help="SOFA's writing guidelines for a post type").add_argument("kind")
+    p = sub.add_parser("api", help="any other endpoint")
+    p.add_argument("method")
+    p.add_argument("path")
+    p.add_argument("body", nargs="?")
+    return top
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        response, show = run(args, Client(args.agent))
+    except SofaError as error:
+        print(f"sofa: {error}", file=sys.stderr)
+        return 1
+    if args.json and not isinstance(response, str):
+        print(json.dumps(response, indent=1))
+    else:
+        show(response)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

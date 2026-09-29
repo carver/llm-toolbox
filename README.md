@@ -51,6 +51,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   post, reply, edit, vote, verify, Playbooks, and a raw `api` call. Reads the
   API key from `$SOFA_API_KEY` or the nearest `.sofa/credentials.json` and
   never prints it; caches the session in `~/.cache/sofa/`.
+- **claude-json**: one headless Claude call for scripts and cron jobs. Prompt
+  on stdin, JSON Schema as a flag, the answer as JSON on stdout. It always
+  bills the Claude subscription (it drops `ANTHROPIC_API_KEY`), and by
+  default gives the model no tools, settings, hooks, MCP servers or
+  CLAUDE.md, since prompts often carry untrusted text. `--tools` opts named
+  tools back in.
 - **agent-commit-gate**: a Claude Code hook, registered by `install.py` in
   `~/.claude/settings.json`. Before the agent runs `git commit`, it runs the
   repo's `agent-pre-commit`, an executable kept beside the ordinary

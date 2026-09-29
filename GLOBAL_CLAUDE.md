@@ -22,6 +22,10 @@ Stop a process with `killone` and wait for one with `waitone` (llm-toolbox/bin, 
 
 To see a web page or HTML report you changed, or check it for JavaScript errors, use `web-shot` (`-h` for its click, wait and shot actions), not a one-off Playwright script.
 
+## Claude from code
+
+Claude runs on my subscription; there is no `ANTHROPIC_API_KEY`, so don't reach for the Anthropic SDK. When a script or cron job needs typed data from Claude, pipe the prompt to `claude-json --schema SCHEMA` (llm-toolbox/bin, on PATH; `-h` for options), which prints the answer as JSON and locks the call down for untrusted text.
+
 ## Secrets
 
 Never print a secret, not even through a filter meant to redact it: a filter that misses one shape of the data (a key nested one level deeper, a field named differently) prints the value. To learn a credentials file's structure, print its key paths only: `jq -r '[paths(scalars)|map(tostring)|join(".")]|.[]' FILE`. Read the secret inside the script that uses it, and print only its length or a hash prefix if you must show something.

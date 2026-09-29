@@ -45,6 +45,8 @@ Use CI tools that check lint and tests on main and new pull requests.
 
 A pre-commit hook must finish in under 5 seconds all-in. Anything slower, like end-to-end tests or a from-scratch dev install, goes in CI; create a CI workflow if the repo has none.
 
+Your commits get a slower gate too: `agent-commit-gate` runs the repo's `agent-pre-commit`, an executable beside the pre-commit hook (same hooks directory), before every `git commit` you run, and blocks the commit when it fails. Put the checks CI runs in it, the test suite first, so CI failures show up at your commit instead of after the push. Add one to a repo that has CI and no `agent-pre-commit`.
+
 CI builds the dev environment from scratch the documented way (e.g. a fresh venv with `pip install -e '.[dev]'`) before running the checks. When you change packaging, dependencies or dev tooling, run that same from-scratch install yourself before committing. Code that only ever ran from the source tree can hide an uninstallable package.
 
 When you do token-heavy, deterministic work, consider whether you will do it multiple times.

@@ -12,9 +12,15 @@ Chat replies to me skip /unslop: be extremely concise, and sacrifice grammar for
 
 Every time you are about to write or change code, use the `coding` skill (`~/.agents/skills/coding/SKILL.md`). The standards live there.
 
+## Claims
+
+Before saying a source lacks something ("the paper has no human verbosity figure", "nothing calls this"), search the source itself. What cites it, or what you remember of it, is not enough. The same goes for superlatives: first, only, never, all.
+
 ## Shell
 
 Stop a process with `killone` and wait for one with `waitone` (llm-toolbox/bin, on PATH; `-h` for options), not `pkill -f` or a `pgrep -f` loop. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it and a `while pgrep -f` loop waits on itself forever. Both tools skip their callers and act only when exactly one process matches. Better still, keep the PID (`$!`) of what you start and `kill` or `waitone --pid` that.
+
+To see a web page or HTML report you changed, or check it for JavaScript errors, use `web-shot` (`-h` for its click, wait and shot actions), not a one-off Playwright script.
 
 ## SOFA (Stack Overflow for Agents)
 

@@ -43,6 +43,17 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   actions. Prints the apt command if Xvfb, xdotool, ImageMagick or weston is
   missing.
 
+- **web-shot**: opens a URL or HTML file in headless Chromium, clicks and
+  runs scripts in it, saves screenshots of the page or of one element, and
+  reports the page's JavaScript errors (exit 3). Falls back to the newest
+  cached Chromium when Playwright wants a build that isn't downloaded.
+- **agent-commit-gate**: a Claude Code hook, registered by `install.py` in
+  `~/.claude/settings.json`. Before the agent runs `git commit`, it runs the
+  repo's `agent-pre-commit`, an executable kept beside the ordinary
+  pre-commit hook, and blocks the commit if it fails. People keep the quick
+  hook; the agent also gets the slow checks, such as the whole test suite.
+  `agent-commit-gate --run` runs a repo's check by hand.
+
 ## Guidelines
 
 `GLOBAL_CLAUDE.md` is named that way, rather than `CLAUDE.md`, so an agent working in

@@ -2,7 +2,8 @@
 """Link this repo into the home directory: every skill into ~/.claude/skills and
 ~/.agents/skills as a global skill, every tool in bin/ into ~/.local/bin, and
 GLOBAL_CLAUDE.md to ~/.claude/CLAUDE.md and ~/.agents/AGENTS.md, one set of
-guidelines whichever convention a tool reads.
+guidelines whichever convention a tool reads. Registers the Claude Code hooks in
+HOOKS in ~/.claude/settings.json.
 
 Symlinks rather than copies, so editing here takes effect immediately and
 `git pull` is the whole update story.
@@ -12,11 +13,13 @@ this repo. A real directory, or a link to someone else's skill of the same
 name, gets reported and left alone. It removes links into this repo whose
 source is no longer a skill (renamed, deleted, or missing its SKILL.md).
 Guidelines: a real file moves aside to .bak, a link is replaced wherever it
-points, since a link is cheap to put back.
+points, since a link is cheap to put back. Hooks: added once, beside whatever
+else the settings hold; a settings file that is not valid JSON is left alone.
 
     python3 install.py
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -30,6 +33,12 @@ BIN_SRC = REPO / "bin"
 BIN_DST = Path.home() / ".local" / "bin"
 GUIDELINES_SRC = REPO / "GLOBAL_CLAUDE.md"
 GUIDELINES_DSTS = [Path.home() / ".claude" / "CLAUDE.md", Path.home() / ".agents" / "AGENTS.md"]
+SETTINGS = Path.home() / ".claude" / "settings.json"
+# (event, matcher, tool in bin/, hook fields beyond the command)
+HOOKS = [
+    ("PreToolUse", "Bash", "agent-commit-gate",
+     {"timeout": 900, "statusMessage": "Running the repo's agent pre-commit check"}),
+]
 
 
 def say(msg):
@@ -109,6 +118,28 @@ def link_guidelines() -> int:
     return conflicts
 
 
+def register_hooks() -> int:
+    """Returns 1 when the settings file cannot be read as JSON."""
+    try:
+        settings = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+    except json.JSONDecodeError:
+        say(f"CONFLICT {SETTINGS} is not valid JSON -- hooks not registered")
+        return 1
+    changed = False
+    for event, matcher, tool, fields in HOOKS:
+        command = str(BIN_DST / tool)
+        groups = settings.setdefault("hooks", {}).setdefault(event, [])
+        if any(h.get("command") == command for g in groups if g.get("matcher") == matcher for h in g.get("hooks", [])):
+            continue
+        groups.append({"matcher": matcher, "hooks": [{"type": "command", "command": command, **fields}]})
+        say(f"registered {tool} as a {event} hook on {matcher}")
+        changed = True
+    if changed:
+        SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+    return 0
+
+
 def prune_stale_links():
     """Remove links into this repo whose target is no longer a skill or a
     tool, by the same rules link_skills and link_tools use to create them."""
@@ -128,7 +159,7 @@ def prune_stale_links():
 def main():
     print("[llm-toolbox]")
     prune_stale_links()
-    conflicts = link_skills() + link_tools() + link_guidelines()
+    conflicts = link_skills() + link_tools() + link_guidelines() + register_hooks()
     if conflicts:
         say(f"{conflicts} link(s) not made -- resolve the conflicts above by hand")
         return 1

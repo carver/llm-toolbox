@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Claude Code PreToolUse hook: before the agent commits, run the repo's agent-only check.
+
+A repo keeps its fast checks in the ordinary git pre-commit hook, which every
+committer runs. Checks too slow for that (the full test suite, say) go in an
+executable named `agent-pre-commit` beside it, in whatever directory git takes
+hooks from (`core.hooksPath`, else .git/hooks). Git never runs that file; this
+gate does, for each `git commit` in a Bash command the agent is about to run.
+
+A failing check blocks the command (exit 2) and shows the agent the tail of its
+output. A repo without the file, and every command that is not a commit, pass
+through untouched. install.py registers the gate in ~/.claude/settings.json.
+
+    agent-commit-gate < hook-input.json    # as Claude Code calls it
+    agent-commit-gate --run [DIR]          # run DIR's check by hand (default: .)
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+HOOK_NAME = "agent-pre-commit"
+TAIL_LINES = 40
+SEPARATORS = re.compile(r"&&|\|\||[;|\n]")
+
+
+def commit_dirs(command, cwd):
+    """The directories each `git commit` in a shell command runs in, following `cd DIR` and `git -C DIR`.
+    A heredoc body splits into harmless segments; at worst a line of it that reads like a commit adds a check."""
+    here, found = Path(cwd), []
+    for segment in SEPARATORS.split(command):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        if len(words) >= 2 and words[0] == "cd":
+            here = here / os.path.expanduser(words[1])
+            continue
+        if not words or Path(words[0]).name != "git":
+            continue
+        rest, where = words[1:], here
+        while rest and rest[0].startswith("-"):
+            flag = rest.pop(0)
+            if flag == "-C" and rest:
+                where = where / os.path.expanduser(rest.pop(0))
+            elif flag == "-c" and rest:
+                rest.pop(0)
+        if rest and rest[0] == "commit" and not {"-h", "--help"} & set(rest):
+            found.append(where)
+    return list(dict.fromkeys(found))
+
+
+def agent_hook(repo):
+    """The repo's agent-pre-commit if it exists and is executable, else None."""
+    run = subprocess.run(["git", "-C", str(repo), "rev-parse", "--show-toplevel", "--git-path", "hooks"],
+                         capture_output=True, text=True, check=False)
+    if run.returncode:
+        return None
+    top, hooks = run.stdout.splitlines()
+    hook = Path(repo, hooks) / HOOK_NAME
+    return (Path(top), hook) if hook.is_file() and os.access(hook, os.X_OK) else None
+
+
+def check(repo):
+    """Run the repo's check; returns (passed, message for the agent)."""
+    found = agent_hook(repo)
+    if not found:
+        return True, ""
+    top, hook = found
+    run = subprocess.run([str(hook)], cwd=top, capture_output=True, text=True, check=False)
+    if run.returncode == 0:
+        return True, ""
+    tail = "\n".join((run.stdout + run.stderr).splitlines()[-TAIL_LINES:])
+    return False, (f"Commit blocked: {hook} exited {run.returncode}. Fix what it reports, then commit again.\n"
+                   f"{tail}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--run", nargs="?", const=".", metavar="DIR", help="run DIR's check now, outside a hook")
+    args = parser.parse_args(argv)
+    if args.run:
+        passed, message = check(Path(args.run))
+        print(message or f"{args.run}: passed, or has no {HOOK_NAME}", file=sys.stderr if message else sys.stdout)
+        return 0 if passed else 1
+    event = json.load(sys.stdin)
+    if event.get("tool_name") != "Bash":
+        return 0
+    for repo in commit_dirs(event.get("tool_input", {}).get("command", ""), event.get("cwd") or os.getcwd()):
+        passed, message = check(repo)
+        if not passed:
+            print(message, file=sys.stderr)
+            return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,6 +1,8 @@
 """install.py against a temp copy of the repo layout and a temp
 ~/.claude/skills. Never touches the real one."""
 
+import json
+
 import pytest
 
 import install
@@ -174,3 +176,36 @@ def test_guidelines_link_replaces_a_link_that_points_elsewhere(guidelines):
     install.link_guidelines()
     assert dst.resolve() == src
     assert not (home / ".agents" / "AGENTS.md.bak").exists()
+
+
+@pytest.fixture
+def settings(tmp_path, monkeypatch):
+    path = tmp_path / "home" / ".claude" / "settings.json"
+    monkeypatch.setattr(install, "SETTINGS", path)
+    monkeypatch.setattr(install, "BIN_DST", tmp_path / "home" / ".local" / "bin")
+    return path
+
+
+def test_hooks_register_once_beside_existing_settings(settings):
+    settings.parent.mkdir(parents=True)
+    other = {"matcher": "Bash", "hooks": [{"type": "command", "command": "log-it"}]}
+    settings.write_text(json.dumps({"model": "opus", "hooks": {"PreToolUse": [other]}}))
+    assert install.register_hooks() == 0
+    assert install.register_hooks() == 0
+    data = json.loads(settings.read_text())
+    assert data["model"] == "opus"
+    groups = data["hooks"]["PreToolUse"]
+    assert groups[0] == other and len(groups) == 2
+    assert groups[1]["hooks"][0]["command"] == str(install.BIN_DST / "agent-commit-gate")
+
+
+def test_hooks_create_a_missing_settings_file(settings):
+    assert install.register_hooks() == 0
+    assert "agent-commit-gate" in settings.read_text()
+
+
+def test_hooks_leave_a_broken_settings_file_alone(settings, capsys):
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{not json")
+    assert install.register_hooks() == 1
+    assert settings.read_text() == "{not json" and "CONFLICT" in capsys.readouterr().out

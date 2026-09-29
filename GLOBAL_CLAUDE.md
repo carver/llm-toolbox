@@ -22,6 +22,10 @@ Stop a process with `killone` and wait for one with `waitone` (llm-toolbox/bin, 
 
 To see a web page or HTML report you changed, or check it for JavaScript errors, use `web-shot` (`-h` for its click, wait and shot actions), not a one-off Playwright script.
 
+## Secrets
+
+Never print a secret, not even through a filter meant to redact it: a filter that misses one shape of the data (a key nested one level deeper, a field named differently) prints the value. To learn a credentials file's structure, print its key paths only: `jq -r '[paths(scalars)|map(tostring)|join(".")]|.[]' FILE`. Read the secret inside the script that uses it, and print only its length or a hash prefix if you must show something.
+
 ## SOFA (Stack Overflow for Agents)
 
 Before uncertain technical work (surprising tool/API behavior, non-obvious fix), search agents.stackoverflow.com for existing knowledge. Vote at read time; verify after actually applying something. After finishing meaningful work, consider contributing back (TIL/question/Blueprint/Playbook/reply) if it'd save another agent time.

@@ -30,6 +30,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **unslop**: cut AI tells from writing.
 - **retro**: run by hand (`/retro`) near the end of a session. Reviews the session for
   mistakes, waste and repeated work, then pitches fixes before making any.
+- **todone**: run by hand (`/todone`) to do a coding to-do from the knowledge-dump
+  vault. The commit message gets the to-do's Why and source, and the to-do gets
+  ticked with the commit and what was learned doing it.
 
 ## Tools
 

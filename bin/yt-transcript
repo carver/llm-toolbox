@@ -18,8 +18,13 @@ TIME is seconds (1238), YouTube's form (20m38s) or a clock (20:38, 1:02:03).
 The default window leans back, since the argument that led to a moment
 usually comes before it.
 
-Exit status: 0 success, 1 no transcript could be fetched (reason on stderr),
-2 usage error.
+Transcripts are cached in $XDG_CACHE_HOME/yt-transcript (default
+~/.cache/yt-transcript), one file per video, so asking again, or for another
+moment, doesn't touch YouTube. --refresh fetches anew.
+
+Exit status: 0 success, 1 the video has no transcript to fetch (reason on
+stderr), 2 usage error, 3 YouTube refused or failed the request, e.g. it is
+blocking this IP: try again later.
 
 Examples:
     yt-transcript 'https://m.youtube.com/watch?v=LlgiOCmFG_w&t=1238'
@@ -27,11 +32,26 @@ Examples:
 """
 
 import argparse
+import json
+import os
 import re
 import sys
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-FAILED, USAGE = 1, 2
+FAILED, USAGE, LATER = 1, 2, 3
+# The library's errors that mean the video itself has no transcript to give.
+# Any other failure (a block, a network error, a page it can't parse) may pass.
+NO_TRANSCRIPT = {
+    "AgeRestricted",
+    "InvalidVideoId",
+    "NoTranscriptFound",
+    "NotTranslatable",
+    "TranscriptsDisabled",
+    "TranslationLanguageNotAvailable",
+    "VideoUnavailable",
+    "VideoUnplayable",
+}
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
 PATH_PREFIXES = ("/shorts/", "/live/", "/embed/")
@@ -45,7 +65,11 @@ class UsageError(Exception):
 
 
 class FetchFailed(Exception):
-    pass
+    """The video has no transcript to fetch."""
+
+
+class TryLater(Exception):
+    """YouTube refused or failed the request; it may work later."""
 
 
 def parse_time(text: str) -> int:
@@ -103,14 +127,33 @@ def format_segment(segment: Segment) -> str:
     return f"[{clock(start)}] {' '.join(text.split())}"
 
 
-def fetch(video_id: str) -> list[Segment]:
+def download(video_id: str) -> list[Segment]:
     from youtube_transcript_api import YouTubeTranscriptApi
 
     try:
         transcript = YouTubeTranscriptApi().fetch(video_id)
-    except Exception as e:  # the library raises many types, all meaning "no transcript for you"
-        raise FetchFailed(f"{type(e).__name__}: {str(e).strip().splitlines()[0] if str(e).strip() else ''}") from e
+    except Exception as e:  # the library's own errors, and requests' network errors
+        lines = str(e).strip().splitlines()
+        reason = f"{type(e).__name__}: {lines[0] if lines else ''}"
+        raise (FetchFailed if type(e).__name__ in NO_TRANSCRIPT else TryLater)(reason) from e
     return [(s.start, s.text) for s in transcript]
+
+
+def cache_dir() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "yt-transcript"
+
+
+def fetch(video_id: str, refresh: bool = False) -> list[Segment]:
+    """The video's transcript, from the cache when it's there."""
+    path = cache_dir() / f"{video_id}.json"
+    if not refresh and path.exists():
+        return [(start, text) for start, text in json.loads(path.read_text(encoding="utf-8"))]
+    segments = download(video_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(segments, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+    return segments
 
 
 def seconds_arg(text: str) -> int:
@@ -131,16 +174,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--at", type=seconds_arg, help="the moment to center on; overrides the URL's timestamp")
     parser.add_argument("--before", type=seconds_arg, default=90, help="seconds before the moment (default 90)")
     parser.add_argument("--after", type=seconds_arg, default=60, help="seconds after the moment (default 60)")
+    parser.add_argument("--refresh", action="store_true", help="fetch from YouTube even when the transcript is cached")
     args = parser.parse_args(argv)
     try:
         video_id, stamp = parse_video(args.video)
-        segments = fetch(video_id)
+        segments = fetch(video_id, args.refresh)
     except UsageError as e:
         print(f"yt-transcript: {e}", file=sys.stderr)
         return USAGE
     except FetchFailed as e:
         print(f"yt-transcript: no transcript for {args.video}: {e}", file=sys.stderr)
         return FAILED
+    except TryLater as e:
+        print(f"yt-transcript: YouTube failed the request for {args.video}, try later: {e}", file=sys.stderr)
+        return LATER
     at = args.at if args.at is not None else stamp
     for segment in window(segments, at, args.before, args.after):
         print(format_segment(segment))

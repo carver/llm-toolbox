@@ -72,7 +72,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **yt-transcript**: prints a YouTube video's captions, or the ones around
   the URL's timestamp (90 seconds before, 60 after, by default), each line
   prefixed with its clock time. For finding what a video said at a moment
-  someone bookmarked.
+  someone bookmarked. Caches each transcript, and exits 3 when YouTube
+  refuses the request (it blocks IPs that fetch a lot), so callers can retry later.
 
 ## Guidelines
 

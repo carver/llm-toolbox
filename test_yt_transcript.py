@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -70,10 +71,10 @@ def test_formats_a_segment_with_its_clock_time():
 
 
 def run_main(monkeypatch, capsys, argv, segments=SEGMENTS, error=None):
-    def fake_fetch(video_id):
+    def fake_fetch(video_id, refresh=False):
         assert video_id == ID
         if error:
-            raise yt.FetchFailed(error)
+            raise error
         return segments
 
     monkeypatch.setattr(yt, "fetch", fake_fetch)
@@ -94,7 +95,7 @@ def test_at_flag_overrides_the_url_timestamp(monkeypatch, capsys):
 
 
 def test_fetch_failure_exits_1_with_the_reason(monkeypatch, capsys):
-    code, out, err = run_main(monkeypatch, capsys, [ID], error="no transcript for this video")
+    code, out, err = run_main(monkeypatch, capsys, [ID], error=yt.FetchFailed("no transcript for this video"))
     assert (code, out) == (1, "")
     assert "no transcript for this video" in err
 
@@ -103,3 +104,66 @@ def test_bad_input_exits_2(monkeypatch, capsys):
     code, _, err = run_main(monkeypatch, capsys, ["https://example.com/x"])
     assert code == 2
     assert "not a YouTube video" in err
+
+
+def test_a_refused_request_exits_3(monkeypatch, capsys):
+    code, _, err = run_main(monkeypatch, capsys, [ID], error=yt.TryLater("IpBlocked: blocked"))
+    assert code == 3
+    assert "try later" in err and "IpBlocked" in err
+
+
+class Downloads:
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    def __call__(self, video_id):
+        self.calls += 1
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def test_a_fetched_transcript_is_cached(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    downloads = Downloads([(1.5, "hi")])
+    monkeypatch.setattr(yt, "download", downloads)
+    assert yt.fetch(ID) == [(1.5, "hi")]
+    assert yt.fetch(ID) == [(1.5, "hi")]
+    assert downloads.calls == 1
+    assert (tmp_path / "yt-transcript" / f"{ID}.json").exists()
+
+
+def test_refresh_skips_the_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    downloads = Downloads([(1.5, "hi")])
+    monkeypatch.setattr(yt, "download", downloads)
+    yt.fetch(ID)
+    yt.fetch(ID, refresh=True)
+    assert downloads.calls == 2
+
+
+def test_a_failed_fetch_caches_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(yt, "download", Downloads(yt.TryLater("blocked")))
+    with pytest.raises(yt.TryLater):
+        yt.fetch(ID)
+    assert not (tmp_path / "yt-transcript").exists()
+
+
+@pytest.mark.parametrize("name, expected", [("IpBlocked", "TryLater"), ("TranscriptsDisabled", "FetchFailed"),
+                                            ("ConnectionError", "TryLater")])
+def test_download_sorts_errors_into_no_transcript_and_try_later(monkeypatch, name, expected):
+    import types
+
+    error = type(name, (Exception,), {})
+    fake = types.ModuleType("youtube_transcript_api")
+
+    class Api:
+        def fetch(self, video_id):
+            raise error("first line\nmore")
+
+    fake.YouTubeTranscriptApi = Api
+    monkeypatch.setitem(sys.modules, "youtube_transcript_api", fake)
+    with pytest.raises(getattr(yt, expected), match=f"{name}: first line$"):
+        yt.download(ID)

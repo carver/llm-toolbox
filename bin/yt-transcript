@@ -1,0 +1,151 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# dependencies = ["youtube-transcript-api"]
+# ///
+"""Print a YouTube video's transcript, or the part around one moment.
+
+    yt-transcript [--at TIME] [--before SECONDS] [--after SECONDS] VIDEO
+
+VIDEO is a video URL (watch, youtu.be, shorts, live, embed) or an 11-character
+video id. When the URL carries a timestamp (t= or start=), or --at gives one,
+only the segments from --before seconds earlier to --after seconds later are
+printed. Otherwise the whole transcript is. Each line is one caption segment,
+prefixed with its clock time: "[20:38] you never want to write the same
+comment twice".
+
+TIME is seconds (1238), YouTube's form (20m38s) or a clock (20:38, 1:02:03).
+
+The default window leans back, since the argument that led to a moment
+usually comes before it.
+
+Exit status: 0 success, 1 no transcript could be fetched (reason on stderr),
+2 usage error.
+
+Examples:
+    yt-transcript 'https://m.youtube.com/watch?v=LlgiOCmFG_w&t=1238'
+    yt-transcript --at 16:46 --before 180 LlgiOCmFG_w
+"""
+
+import argparse
+import re
+import sys
+from urllib.parse import parse_qs, urlparse
+
+FAILED, USAGE = 1, 2
+VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+PATH_PREFIXES = ("/shorts/", "/live/", "/embed/")
+UNIT_TIME = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?")
+
+Segment = tuple[float, str]
+
+
+class UsageError(Exception):
+    pass
+
+
+class FetchFailed(Exception):
+    pass
+
+
+def parse_time(text: str) -> int:
+    """Seconds from "1238", "20m38s" or "20:38"."""
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) > 3 or not all(p.isdigit() for p in parts) or any(int(p) > 59 for p in parts[1:]):
+            raise UsageError(f"not a time: {text!r}")
+        seconds = 0
+        for part in parts:
+            seconds = seconds * 60 + int(part)
+        return seconds
+    match = UNIT_TIME.fullmatch(text)
+    if not text or not match or not any(match.groups()):
+        raise UsageError(f"not a time: {text!r}")
+    hours, minutes, seconds = (int(g or 0) for g in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def parse_video(text: str) -> tuple[str, int | None]:
+    """The video id and the timestamp in seconds, if the URL has one."""
+    if VIDEO_ID.fullmatch(text):
+        return text, None
+    url = urlparse(text)
+    if url.hostname not in YOUTUBE_HOSTS:
+        raise UsageError(f"not a YouTube video: {text!r}")
+    query = parse_qs(url.query)
+    if url.hostname == "youtu.be":
+        candidate = url.path.strip("/")
+    elif url.path.startswith(PATH_PREFIXES):
+        candidate = url.path.split("/")[2]
+    else:
+        candidate = query.get("v", [""])[0]
+    if not VIDEO_ID.fullmatch(candidate):
+        raise UsageError(f"not a YouTube video: {text!r}")
+    stamp = (query.get("t") or query.get("start") or [None])[0]
+    return candidate, parse_time(stamp) if stamp else None
+
+
+def window(segments: list[Segment], at: int | None, before: int, after: int) -> list[Segment]:
+    if at is None:
+        return segments
+    return [s for s in segments if at - before <= s[0] <= at + after]
+
+
+def clock(seconds: float) -> str:
+    whole = int(seconds)
+    hours, rest = divmod(whole, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02}:{secs:02}" if hours else f"{minutes}:{secs:02}"
+
+
+def format_segment(segment: Segment) -> str:
+    start, text = segment
+    return f"[{clock(start)}] {' '.join(text.split())}"
+
+
+def fetch(video_id: str) -> list[Segment]:
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    try:
+        transcript = YouTubeTranscriptApi().fetch(video_id)
+    except Exception as e:  # the library raises many types, all meaning "no transcript for you"
+        raise FetchFailed(f"{type(e).__name__}: {str(e).strip().splitlines()[0] if str(e).strip() else ''}") from e
+    return [(s.start, s.text) for s in transcript]
+
+
+def seconds_arg(text: str) -> int:
+    try:
+        return parse_time(text)
+    except UsageError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="yt-transcript",
+        description=__doc__.split("\n\n")[0],
+        epilog=__doc__.split("\n\n", 2)[2],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("video", metavar="VIDEO", help="video URL or id")
+    parser.add_argument("--at", type=seconds_arg, help="the moment to center on; overrides the URL's timestamp")
+    parser.add_argument("--before", type=seconds_arg, default=90, help="seconds before the moment (default 90)")
+    parser.add_argument("--after", type=seconds_arg, default=60, help="seconds after the moment (default 60)")
+    args = parser.parse_args(argv)
+    try:
+        video_id, stamp = parse_video(args.video)
+        segments = fetch(video_id)
+    except UsageError as e:
+        print(f"yt-transcript: {e}", file=sys.stderr)
+        return USAGE
+    except FetchFailed as e:
+        print(f"yt-transcript: no transcript for {args.video}: {e}", file=sys.stderr)
+        return FAILED
+    at = args.at if args.at is not None else stamp
+    for segment in window(segments, at, args.before, args.after):
+        print(format_segment(segment))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

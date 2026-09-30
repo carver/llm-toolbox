@@ -66,6 +66,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   hook; the agent also gets the slow checks, such as the whole test suite.
   `agent-commit-gate --run` runs a repo's check by hand.
 
+- **yt-transcript**: prints a YouTube video's captions, or the ones around
+  the URL's timestamp (90 seconds before, 60 after, by default), each line
+  prefixed with its clock time. For finding what a video said at a moment
+  someone bookmarked.
+
 ## Guidelines
 
 `GLOBAL_CLAUDE.md` is named that way, rather than `CLAUDE.md`, so an agent working in

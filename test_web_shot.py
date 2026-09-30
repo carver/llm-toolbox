@@ -21,9 +21,13 @@ def test_parses_actions():
     assert web_shot.parse_action("shot whole").args == ("whole",)
     assert web_shot.parse_action("  wait 500 ").args == ("500",)
     assert web_shot.parse_action("eval document.body.remove()").args == ("document.body.remove()",)
+    assert web_shot.parse_action("text").args == ()
+    assert web_shot.parse_action("text main .form").args == ("main .form",)
+    assert web_shot.parse_action("links apply|airtable").args == ("apply|airtable",)
+    assert web_shot.parse_action("scroll-all").args == ()
 
 
-@pytest.mark.parametrize("bad", ["jump #x", "click", "wait", "wait soon", "shot", "eval"])
+@pytest.mark.parametrize("bad", ["jump #x", "click", "wait", "wait soon", "shot", "eval", "scroll-all now"])
 def test_rejects_bad_actions(bad):
     with pytest.raises(web_shot.UsageError):
         web_shot.parse_action(bad)
@@ -48,3 +52,32 @@ def test_clicks_shoots_and_reports_page_errors(tmp_path):
     shots = run.stdout.split()
     assert [Path(s).name for s in shots] == ["text.png", "final.png"]
     assert all(Path(s).stat().st_size > 0 for s in shots)
+
+
+def test_repeated_errors_collapse_to_one_line_with_a_count():
+    assert web_shot.collapse(["a", "b", "a", "a"]) == ["a (x3)", "b"]
+
+
+@pytest.mark.skipif(not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache")
+def test_prints_text_and_links_after_loading_an_endless_page(tmp_path):
+    page = tmp_path / "p.html"
+    page.write_text(
+        '<main><h1>Form</h1><a href="https://airtable.com/f">Apply now</a><a href="/about">About</a></main>'
+        '<div id="feed"></div><script>'
+        'let n = 0; function more() { if (n >= 30) return; const d = document.createElement("p");'
+        ' d.style.height = "400px"; d.textContent = "item " + (++n); feed.appendChild(d); }'
+        'for (let i = 0; i < 3; i++) more();'
+        'addEventListener("scroll", () => setTimeout(() => { more(); more(); }, 50));'
+        'for (let i = 0; i < 5; i++) console.error("same noise");'
+        '</script>')
+    run = subprocess.run([str(SCRIPT), "--out", str(tmp_path / "out"), "--do", "scroll-all", "--do", "text main",
+                          "--do", "links airtable", "--do", "text #feed", str(page)],
+                         capture_output=True, text=True, timeout=300)
+    assert run.returncode == 3, run.stderr
+    lines = run.stdout.splitlines()
+    assert lines[0] == "Form"
+    assert "Apply now -> https://airtable.com/f" in lines
+    assert "About -> " not in run.stdout
+    assert "item 30" in run.stdout
+    assert run.stderr.strip().splitlines() == ["console error: same noise (x5)"]
+    assert lines[-1].endswith("final.png")

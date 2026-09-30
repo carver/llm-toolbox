@@ -13,10 +13,15 @@ Actions (--do, repeatable, run in order once the page has loaded):
   wait MS                wait, e.g. for an animation or a fetch
   eval JS                run JavaScript in the page
   shot NAME [SELECTOR]   screenshot to OUT/NAME.png: the matching element, else the full page
+  text [SELECTOR]        print the visible text of the matching element, else the whole page
+  links [REGEX]          print "text -> url" for each link whose text or url matches REGEX
+  scroll-all             scroll to the bottom until the page stops growing (endless feeds)
 
-A final full-page screenshot, OUT/final.png, is always taken. Paths of the
-screenshots go to stdout; the page's uncaught errors and console errors go to
-stderr, and make the exit status 3 once the screenshots are saved.
+A final full-page screenshot, OUT/final.png, is always taken. Printed text and
+links go to stdout as their actions run, then the paths of the screenshots.
+The page's uncaught errors and console errors go to stderr, repeats collapsed
+to one line with a count, and make the exit status 3 once the screenshots are
+saved.
 
 The browser is Playwright's Chromium. When the cached browser is not the build
 this Playwright wants, the newest cached Chromium is used instead, so no
@@ -26,6 +31,8 @@ Examples:
   web-shot report/page.html
   web-shot --do "click #legend button[data-series=human]" --do "shot chart #trajectory" report/page.html
   web-shot --size 390x844 https://example.com
+  web-shot --do "wait 5000" --do text https://airtable.com/app.../form     # read a JS-rendered form
+  web-shot --do scroll-all --do "links /event/" https://example.com/calendar
 """
 import argparse
 import sys
@@ -33,8 +40,15 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-ARITY = {"click": (1, 1), "wait": (1, 1), "eval": (1, 1), "shot": (1, 2)}  # (min, max) arguments
+ARITY = {"click": (1, 1), "wait": (1, 1), "eval": (1, 1), "shot": (1, 2), "text": (0, 1), "links": (0, 1),
+         "scroll-all": (0, 0)}  # (min, max) arguments
 INSTALL = "uv run --with playwright playwright install chromium"
+SCROLL_PAUSE_MS = 700
+SCROLL_STABLE_ROUNDS = 5  # page height unchanged this many times in a row means the feed is done
+SCROLL_MAX_ROUNDS = 400
+LINKS_JS = """pattern => [...document.querySelectorAll('a[href]')]
+  .map(a => [a.innerText.trim().replace(/\\s+/g, ' '), a.href])
+  .filter(([text, href]) => !pattern || new RegExp(pattern, 'i').test(text + ' ' + href))"""
 
 
 class UsageError(Exception):
@@ -61,6 +75,31 @@ def parse_action(text):
     if verb == "wait" and not args[0].isdigit():
         raise UsageError(f"wait takes milliseconds: {text!r}")
     return Action(verb, tuple(a.strip() for a in args))
+
+
+def collapse(lines):
+    """Repeated lines once each, in first-seen order, with a count when there was more than one."""
+    counts = {}
+    for line in lines:
+        counts[line] = counts.get(line, 0) + 1
+    return [line if n == 1 else f"{line} (x{n})" for line, n in counts.items()]
+
+
+def scroll_all(tab):
+    height, stable = -1, 0
+    for _ in range(SCROLL_MAX_ROUNDS):
+        tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        tab.wait_for_timeout(SCROLL_PAUSE_MS)
+        new_height = tab.evaluate("document.body.scrollHeight")
+        stable = stable + 1 if new_height == height else 0
+        if stable >= SCROLL_STABLE_ROUNDS:
+            return
+        height = new_height
+
+
+def visible_text(tab, selector):
+    text = tab.locator(selector).first.inner_text() if selector else tab.inner_text("body")
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
 
 
 def page_url(page):
@@ -105,6 +144,13 @@ def run(page, actions, out, size):
                 tab.wait_for_timeout(int(action.args[0]))
             elif action.verb == "eval":
                 tab.evaluate(action.args[0])
+            elif action.verb == "text":
+                print(visible_text(tab, action.args[0] if action.args else None), flush=True)
+            elif action.verb == "links":
+                for text, href in tab.evaluate(LINKS_JS, action.args[0] if action.args else ""):
+                    print(f"{text} -> {href}", flush=True)
+            elif action.verb == "scroll-all":
+                scroll_all(tab)
             else:
                 path = out / f"{action.args[0]}.png"
                 if len(action.args) == 2:
@@ -140,7 +186,7 @@ def main(argv=None):
         print(f"web-shot: {error}", file=sys.stderr)
         return 2
     print("\n".join(map(str, shots)))
-    for error in errors:
+    for error in collapse(errors):
         print(error, file=sys.stderr)
     return 3 if errors else 0
 

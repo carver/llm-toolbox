@@ -44,8 +44,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   missing.
 
 - **web-shot**: opens a URL or HTML file in headless Chromium, clicks and
-  runs scripts in it, saves screenshots of the page or of one element, and
-  reports the page's JavaScript errors (exit 3). Falls back to the newest
+  runs scripts in it, saves screenshots of the page or of one element, prints
+  a page's text or links (for JS-rendered forms and calendars; `scroll-all`
+  loads endless feeds first), and reports the page's JavaScript errors
+  (exit 3), repeats collapsed. Falls back to the newest
   cached Chromium when Playwright wants a build that isn't downloaded.
 - **sofa**: Stack Overflow for Agents from the command line: search, read,
   post, reply, edit, vote, verify, Playbooks, and a raw `api` call. Reads the

@@ -10,7 +10,7 @@ A to-do in the knowledge-dump vault is kept because its reason matters later. Th
 
 ## The vault
 
-Clone it into your scratchpad: `git clone -q git://host.docker.internal/notes <scratchpad>/v`. The sandbox reaches it only this way, never through the mount. To change it, commit in the clone and run `git push --force origin HEAD:refs/heads/agent`. The host merges that branch and prints "merged into main". `knowledge-dump/docs/silverbullet.md` has the task and attribute syntax.
+knowledge-dump's `kd` lists the to-dos and records one as done. Run it from `/home/carver/code/claudedev/knowledge-dump` as `python3 -m kd todos` and `python3 -m kd done`; each fetches its own copy of the vault. For any other change, such as a Cue page, clone it into your scratchpad: `git clone -q git://host.docker.internal/notes <scratchpad>/v`. The sandbox reaches it only this way, never through the mount. Commit in the clone and run `git push --force origin HEAD:refs/heads/agent`; the host merges that branch and prints "merged into main". `knowledge-dump/docs/silverbullet.md` has the task and attribute syntax.
 
 A to-do is an open task on a topic page, with its context on indented lines under it:
 
@@ -24,9 +24,9 @@ The `Why:` line may be missing.
 
 ## 1. Pick the to-do
 
-If the user named one, find its task line. Otherwise list the open tasks on every page except `Triage`, `Queue` and `Inbox/`, keep the ones that are coding work (a change to code, a skill, a config or a guideline file), and offer the 3 to 5 most actionable with AskUserQuestion, each labeled with its page and a short summary.
+Run `python3 -m kd todos`, which prints each open task with its id, page and nested lines. If the user named one, find it there. Otherwise keep the ones that are coding work (a change to code, a skill, a config or a guideline file), and offer the 3 to 5 most actionable with AskUserQuestion, each labeled with its page and a short summary.
 
-Done when one task line is chosen and you know which repository the work happens in. Ask if the task doesn't make that clear.
+Done when one task's id is chosen and you know which repository the work happens in. Ask if the task doesn't make that clear.
 
 ## 2. Settle the Why
 
@@ -64,12 +64,13 @@ Done when the work is committed and the repository's checks pass.
 
 ## 4. Record it in the vault
 
-Refresh the clone (`git fetch && git reset --hard origin/main`), then edit the task:
+If there were findings, show them to the user as proposed `Learned:` lines; they'll keep a few. Then run:
 
-- Tick it and add a `[done: YYYY-MM-DD]` attribute.
-- Add a `Why:` line if it had none.
-- Add `Done in: <repo>@<short sha>`, or `<repo>@<first>..<last>` for several commits.
-- If there were findings, show them to the user as proposed `Learned:` lines and add only the ones they approve.
+```bash
+python3 -m kd done <id> --done-in <repo>@<short sha> [--why "<confirmed Why>"] [--learned "<approved line>"]...
+```
+
+`--done-in` takes `<repo>@<first>..<last>` for several commits. Pass `--why` only when the task had no `Why:` line. The task ends up like this:
 
 ```markdown
 - [x] Install retro skill, run it regularly #queue [added: 2026-09-30] [done: 2026-10-02]
@@ -82,4 +83,4 @@ Refresh the clone (`git fetch && git reset --hard origin/main`), then edit the t
 
 If an approved finding is a lesson beyond this to-do ("when I face X, consider Y"), offer to file it as a Cue page under `Cues/` too.
 
-Commit and push. Done when the push prints "merged into main".
+Done when `kd done` prints "merged into main".

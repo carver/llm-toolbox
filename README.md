@@ -22,8 +22,12 @@ skill, it reports the conflict and leaves it alone.
 
 It also installs other authors' skills, listed in `THIRD_PARTY_SKILLS` in
 `install.py`, with `npx skills add -g`. It installs only the missing ones and
-never updates them; `npx skills update -g` does that. To add one, install it,
-then add its name to the list.
+never updates them; `npx skills update -g` does that. To add one, add its name
+under its source and re-run `install.py`, which passes the flags that put the
+skill in `~/.agents/skills` with a link from `~/.claude/skills`; `-a claude-code`
+alone copies it into `~/.claude/skills` instead. When only some requested names
+exist in the source, the `skills` CLI installs those, skips the rest without a
+word and exits 0, so `install.py` checks for each skill afterwards.
 
 The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 `PROJECT_INSTALLERS`, so a sandbox recreate restores the links.

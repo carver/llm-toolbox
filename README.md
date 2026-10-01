@@ -2,6 +2,15 @@
 
 Skills, and the guidelines every agent session starts from.
 
+## Developer setup
+
+Add linting tools:
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements-dev.txt
+```
+
 ## Install
 
 ```bash

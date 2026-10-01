@@ -5,6 +5,7 @@ GLOBAL_CLAUDE.md to ~/.claude/CLAUDE.md and ~/.agents/AGENTS.md, one set of
 guidelines whichever convention a tool reads. Registers the Claude Code hooks in
 HOOKS in ~/.claude/settings.json. Installs the other authors' skills in
 THIRD_PARTY_SKILLS with the `skills` CLI (npx), so a recreated sandbox gets them back.
+Points this repo's git at the hooks in .githooks.
 
 Symlinks rather than copies, so editing here takes effect immediately and
 `git pull` is the whole update story.
@@ -244,6 +245,15 @@ def install_third_party_skills() -> int:
     return failures
 
 
+def enable_git_hooks() -> int:
+    """Returns 1 when git refuses the setting."""
+    cmd = ["git", "-C", str(REPO), "config", "core.hooksPath", ".githooks"]
+    if subprocess.run(cmd, check=False).returncode != 0:
+        say("FAILED to point git at .githooks")
+        return 1
+    return 0
+
+
 def prune_stale_links():
     """Remove links into this repo whose target is no longer a skill or a
     tool, by the same rules link_skills and link_tools use to create them."""
@@ -268,7 +278,7 @@ def main():
     print("[llm-toolbox]")
     prune_stale_links()
     conflicts = link_skills() + link_tools() + link_guidelines() + register_hooks()
-    failures = install_third_party_skills()
+    failures = install_third_party_skills() + enable_git_hooks()
     if conflicts:
         say(f"{conflicts} link(s) not made -- resolve the conflicts above by hand")
     return 1 if conflicts or failures else 0

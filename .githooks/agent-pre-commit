@@ -1,0 +1,11 @@
+#!/bin/sh
+# The agent's commit check (see bin/agent-commit-gate): the pre-commit hook, then
+# every test, on what's staged. Also the repo's whole check, run by hand:
+# `agent-commit-gate --run`.
+set -e
+"$(dirname "$0")/pre-commit"
+tree=$(mktemp -d)
+trap 'rm -rf "$tree"' EXIT
+git checkout-index -a --prefix="$tree/"
+cd "$tree"
+python3 -m pytest -q -p no:cacheprovider

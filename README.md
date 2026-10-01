@@ -81,6 +81,18 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   someone bookmarked. Caches each transcript, and exits 3 when YouTube
   refuses the request (it blocks IPs that fetch a lot), so callers can retry later.
 
+## Checks
+
+```bash
+python3 -m ruff check . && python3 -m ruff format --check . && python3 -m pytest
+```
+
+`install.py` points git at `.githooks`. Its `pre-commit` runs the two ruff checks on
+what's staged; `agent-pre-commit` adds the tests (about 35 seconds), and
+`agent-commit-gate` runs it before an agent's commits. Both need ruff for
+whichever `python3` is on `PATH` (`pip install ruff`). `ruff.toml` brings the
+extensionless scripts in `bin/` into both ruff checks.
+
 ## Guidelines
 
 `GLOBAL_CLAUDE.md` is named that way, rather than `CLAUDE.md`, so an agent working in

@@ -290,3 +290,16 @@ def test_third_party_reports_missing_npx(third_party, monkeypatch, capsys):
     monkeypatch.setattr(install.subprocess, "run", no_npx)
     assert install.install_third_party_skills() == 2
     assert "npx" in capsys.readouterr().out
+
+
+def test_git_hooks_point_at_githooks(tmp_path, monkeypatch):
+    install.subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    monkeypatch.setattr(install, "REPO", tmp_path)
+    assert install.enable_git_hooks() == 0
+    hooks = install.subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "--git-path", "hooks"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert hooks == ".githooks"

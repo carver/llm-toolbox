@@ -3,6 +3,7 @@
 A fake `claude` on PATH records the argv, environment, working directory and
 stdin it was given, then replies the way the real CLI does.
 """
+
 import json
 import os
 import subprocess
@@ -11,7 +12,11 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "claude-json"
-SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+SCHEMA = {
+    "type": "object",
+    "properties": {"name": {"type": "string"}},
+    "required": ["name"],
+}
 
 FAKE_CLAUDE = """#!/usr/bin/env python3
 import json, os, sys, time
@@ -26,7 +31,9 @@ sys.exit(int(os.environ.get("FAKE_EXIT", "0")))
 
 
 def reply(**fields) -> str:
-    return json.dumps({"type": "result", "subtype": "success", "is_error": False, **fields})
+    return json.dumps(
+        {"type": "result", "subtype": "success", "is_error": False, **fields}
+    )
 
 
 OK_REPLY = reply(structured_output={"name": "x"})
@@ -42,13 +49,26 @@ def run(tmp_path):
     record = tmp_path / "record.json"
 
     def run(*args, prompt="the prompt", fake_stdout=OK_REPLY, **fake_env):
-        env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "FAKE_RECORD": str(record),
-               "FAKE_STDOUT": fake_stdout, "ANTHROPIC_API_KEY": "sk-ant-api-fake",
-               **{f"FAKE_{k.upper()}": str(v) for k, v in fake_env.items()}}
-        proc = subprocess.run([str(SCRIPT), "--schema", json.dumps(SCHEMA), *args], input=prompt,
-                              text=True, capture_output=True, env=env, timeout=30, check=False)
+        env = {
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "FAKE_RECORD": str(record),
+            "FAKE_STDOUT": fake_stdout,
+            "ANTHROPIC_API_KEY": "sk-ant-api-fake",
+            **{f"FAKE_{k.upper()}": str(v) for k, v in fake_env.items()},
+        }
+        proc = subprocess.run(
+            [str(SCRIPT), "--schema", json.dumps(SCHEMA), *args],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=30,
+            check=False,
+        )
         sent = json.loads(record.read_text()) if record.exists() else None
         return proc, sent
+
     return run
 
 
@@ -57,7 +77,9 @@ def flag(argv: list[str], name: str) -> str:
 
 
 def test_prints_the_structured_output(run):
-    proc, _ = run(fake_stdout=reply(structured_output={"name": "Ada"}, result='{"name":"Ada"}'))
+    proc, _ = run(
+        fake_stdout=reply(structured_output={"name": "Ada"}, result='{"name":"Ada"}')
+    )
     assert proc.returncode == 0
     assert json.loads(proc.stdout) == {"name": "Ada"}
 
@@ -106,19 +128,24 @@ def test_named_tools_are_enabled_and_preapproved(run):
 
 
 def test_passes_model_system_prompt_and_budget(run):
-    _, sent = run("--model", "haiku", "--system-prompt", "Be terse.", "--max-budget-usd", "3")
+    _, sent = run(
+        "--model", "haiku", "--system-prompt", "Be terse.", "--max-budget-usd", "3"
+    )
     assert flag(sent["argv"], "--model") == "haiku"
     assert flag(sent["argv"], "--system-prompt") == "Be terse."
     assert flag(sent["argv"], "--max-budget-usd") == "3"
 
 
-@pytest.mark.parametrize("fake", [
-    {"exit": 1, "stderr": "Invalid API key"},
-    {"fake_stdout": "not json"},
-    {"fake_stdout": reply(is_error=True, subtype="error_max_budget_usd")},
-    {"fake_stdout": reply(result="plain text, no structured output")},
-    {"fake_stdout": reply(structured_output="a string, not an object")},
-])
+@pytest.mark.parametrize(
+    "fake",
+    [
+        {"exit": 1, "stderr": "Invalid API key"},
+        {"fake_stdout": "not json"},
+        {"fake_stdout": reply(is_error=True, subtype="error_max_budget_usd")},
+        {"fake_stdout": reply(result="plain text, no structured output")},
+        {"fake_stdout": reply(structured_output="a string, not an object")},
+    ],
+)
 def test_a_failed_call_exits_1_with_the_reason_on_stderr(run, fake):
     proc, _ = run(**fake)
     assert proc.returncode == 1
@@ -139,6 +166,12 @@ def test_an_empty_prompt_is_a_usage_error(run):
 
 
 def test_a_bad_schema_is_a_usage_error(run):
-    proc = subprocess.run([str(SCRIPT), "--schema", "{not json"], input="p", text=True,
-                          capture_output=True, timeout=30, check=False)
+    proc = subprocess.run(
+        [str(SCRIPT), "--schema", "{not json"],
+        input="p",
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
     assert proc.returncode == 2

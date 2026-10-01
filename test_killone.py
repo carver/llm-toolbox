@@ -1,4 +1,5 @@
 """killone signals exactly one matching process and never its own caller."""
+
 import subprocess
 import sys
 import time
@@ -15,8 +16,15 @@ def killone(*args: str, shell: bool = False) -> subprocess.CompletedProcess[str]
     if shell:
         # The pattern sits in the calling shell's own command line, which is what trips pkill -f.
         command = " ".join([str(SCRIPT), *args])
-        return subprocess.run(["bash", "-c", command + "; echo shell-survived"], text=True, capture_output=True, check=False)
-    return subprocess.run([str(SCRIPT), *args], text=True, capture_output=True, check=False)
+        return subprocess.run(
+            ["bash", "-c", command + "; echo shell-survived"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    return subprocess.run(
+        [str(SCRIPT), *args], text=True, capture_output=True, check=False
+    )
 
 
 @pytest.fixture
@@ -28,8 +36,12 @@ def sleepers() -> Iterator[list[subprocess.Popen[bytes]]]:
         proc.wait()
 
 
-def start(sleepers: list[subprocess.Popen[bytes]], marker: str) -> subprocess.Popen[bytes]:
-    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)", marker])
+def start(
+    sleepers: list[subprocess.Popen[bytes]], marker: str
+) -> subprocess.Popen[bytes]:
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)", marker]
+    )
     sleepers.append(proc)
     time.sleep(0.05)
     return proc
@@ -56,7 +68,9 @@ def test_no_match(sleepers: list[subprocess.Popen[bytes]]) -> None:
     assert killone("-f", uuid.uuid4().hex).returncode == 1
 
 
-def test_the_calling_shell_is_never_a_match(sleepers: list[subprocess.Popen[bytes]]) -> None:
+def test_the_calling_shell_is_never_a_match(
+    sleepers: list[subprocess.Popen[bytes]],
+) -> None:
     marker = uuid.uuid4().hex
     proc = start(sleepers, marker)
     result = killone("-f", f"'{marker}'", "--wait", "5", shell=True)
@@ -73,7 +87,9 @@ def test_dry_run_signals_nothing(sleepers: list[subprocess.Popen[bytes]]) -> Non
     marker = uuid.uuid4().hex
     proc = start(sleepers, marker)
     result = killone("-f", marker, "--dry-run")
-    assert result.returncode == 0 and f"would send SIGTERM to {proc.pid}" in result.stdout
+    assert (
+        result.returncode == 0 and f"would send SIGTERM to {proc.pid}" in result.stdout
+    )
     assert proc.poll() is None
 
 

@@ -53,7 +53,9 @@ def processes() -> dict[int, tuple[str, str]]:
         if comm is None or cmdline is None:
             continue
         name = comm.decode(errors="replace").strip()
-        full = cmdline.replace(b"\0", b" ").decode(errors="replace").strip() or f"[{name}]"
+        full = (
+            cmdline.replace(b"\0", b" ").decode(errors="replace").strip() or f"[{name}]"
+        )
         found[int(entry.name)] = (name, full)
     return found
 
@@ -78,7 +80,10 @@ def exactly_one(pattern: str, full: bool, prog: str) -> tuple[int, str] | int:
         print(f"{prog}: no process matches {pattern!r}", file=sys.stderr)
         return NONE_MATCHED
     if len(found) > 1:
-        print(f"{prog}: {len(found)} processes match {pattern!r}; acted on none:", file=sys.stderr)
+        print(
+            f"{prog}: {len(found)} processes match {pattern!r}; acted on none:",
+            file=sys.stderr,
+        )
         for pid, cmdline in sorted(found.items()):
             print(f"  {pid}  {cmdline}", file=sys.stderr)
         return SEVERAL_MATCHED

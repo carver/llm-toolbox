@@ -36,23 +36,53 @@ AGENTS_SKILLS_DST = Path.home() / ".agents" / "skills"
 BIN_SRC = REPO / "bin"
 BIN_DST = Path.home() / ".local" / "bin"
 GUIDELINES_SRC = REPO / "GLOBAL_CLAUDE.md"
-GUIDELINES_DSTS = [Path.home() / ".claude" / "CLAUDE.md", Path.home() / ".agents" / "AGENTS.md"]
+GUIDELINES_DSTS = [
+    Path.home() / ".claude" / "CLAUDE.md",
+    Path.home() / ".agents" / "AGENTS.md",
+]
 SETTINGS = Path.home() / ".claude" / "settings.json"
 # (event, matcher, tool in bin/, hook fields beyond the command)
 HOOKS = [
-    ("PreToolUse", "Bash", "agent-commit-gate",
-     {"timeout": 900, "statusMessage": "Running the repo's agent pre-commit check"}),
+    (
+        "PreToolUse",
+        "Bash",
+        "agent-commit-gate",
+        {"timeout": 900, "statusMessage": "Running the repo's agent pre-commit check"},
+    ),
 ]
 # Other authors' skills, by GitHub source. Installed into ~/.agents/skills with a
 # link from ~/.claude/skills, the layout `npx skills add -g` gives Claude Code and Codex.
 THIRD_PARTY_SKILLS = {
     "mattpocock/skills": [
-        "ask-matt", "claude-handoff", "code-review", "codebase-design", "diagnosing-bugs",
-        "domain-modeling", "grill-me", "grill-with-docs", "grilling", "handoff", "implement",
-        "improve-codebase-architecture", "prototype", "research",
-        "retro", "setup-matt-pocock-skills", "tdd", "teach", "to-questionnaire", "to-spec",
-        "to-tickets", "triage", "wait-what", "wayfinder", "wizard", "writing-beats",
-        "writing-for-agents", "writing-fragments", "writing-shape",
+        "ask-matt",
+        "claude-handoff",
+        "code-review",
+        "codebase-design",
+        "diagnosing-bugs",
+        "domain-modeling",
+        "grill-me",
+        "grill-with-docs",
+        "grilling",
+        "handoff",
+        "implement",
+        "improve-codebase-architecture",
+        "prototype",
+        "research",
+        "retro",
+        "setup-matt-pocock-skills",
+        "tdd",
+        "teach",
+        "to-questionnaire",
+        "to-spec",
+        "to-tickets",
+        "triage",
+        "wait-what",
+        "wayfinder",
+        "wizard",
+        "writing-beats",
+        "writing-for-agents",
+        "writing-fragments",
+        "writing-shape",
     ],
     "vercel-labs/skills": ["find-skills"],
 }
@@ -94,7 +124,11 @@ def link_tools() -> int:
     if not BIN_SRC.is_dir():
         return 0
     BIN_DST.mkdir(parents=True, exist_ok=True)
-    return sum(link_one(tool, BIN_DST / tool.name) for tool in sorted(BIN_SRC.iterdir()) if is_tool(tool))
+    return sum(
+        link_one(tool, BIN_DST / tool.name)
+        for tool in sorted(BIN_SRC.iterdir())
+        if is_tool(tool)
+    )
 
 
 def link_one(src: Path, dst: Path) -> int:
@@ -125,7 +159,9 @@ def link_guidelines() -> int:
         elif dst.exists():
             bak = dst.with_name(dst.name + ".bak")
             if bak.exists():
-                say(f"CONFLICT {dst} is a real file and {bak} already exists -- left alone")
+                say(
+                    f"CONFLICT {dst} is a real file and {bak} already exists -- left alone"
+                )
                 conflicts += 1
                 continue
             dst.rename(bak)
@@ -146,9 +182,19 @@ def register_hooks() -> int:
     for event, matcher, tool, fields in HOOKS:
         command = str(BIN_DST / tool)
         groups = settings.setdefault("hooks", {}).setdefault(event, [])
-        if any(h.get("command") == command for g in groups if g.get("matcher") == matcher for h in g.get("hooks", [])):
+        if any(
+            h.get("command") == command
+            for g in groups
+            if g.get("matcher") == matcher
+            for h in g.get("hooks", [])
+        ):
             continue
-        groups.append({"matcher": matcher, "hooks": [{"type": "command", "command": command, **fields}]})
+        groups.append(
+            {
+                "matcher": matcher,
+                "hooks": [{"type": "command", "command": command, **fields}],
+            }
+        )
         say(f"registered {tool} as a {event} hook on {matcher}")
         changed = True
     if changed:
@@ -164,9 +210,24 @@ def install_third_party_skills() -> int:
         missing = [n for n in names if not (AGENTS_SKILLS_DST / n).exists()]
         if not missing:
             continue
-        cmd = ["npx", "-y", "skills", "add", source, "-g", "-y", "-s", *missing, "-a", "claude-code", "codex"]
+        cmd = [
+            "npx",
+            "-y",
+            "skills",
+            "add",
+            source,
+            "-g",
+            "-y",
+            "-s",
+            *missing,
+            "-a",
+            "claude-code",
+            "codex",
+        ]
         try:
-            exited = subprocess.run(cmd, cwd=Path.home(), stdout=subprocess.DEVNULL, check=False).returncode
+            exited = subprocess.run(
+                cmd, cwd=Path.home(), stdout=subprocess.DEVNULL, check=False
+            ).returncode
         except FileNotFoundError:
             say(f"FAILED {source}: npx not found -- install Node, then re-run")
             failures += 1
@@ -174,7 +235,9 @@ def install_third_party_skills() -> int:
         # The CLI exits 0 even when the source no longer has a skill, so look for each one.
         still_missing = [n for n in missing if not (AGENTS_SKILLS_DST / n).exists()]
         if exited or still_missing:
-            say(f"FAILED {source}: `{' '.join(cmd)}` exited {exited}, still missing: {', '.join(still_missing)}")
+            say(
+                f"FAILED {source}: `{' '.join(cmd)}` exited {exited}, still missing: {', '.join(still_missing)}"
+            )
             failures += 1
         else:
             say(f"installed {', '.join(missing)} from {source}")
@@ -184,7 +247,11 @@ def install_third_party_skills() -> int:
 def prune_stale_links():
     """Remove links into this repo whose target is no longer a skill or a
     tool, by the same rules link_skills and link_tools use to create them."""
-    rules = [(SKILLS_DST, SKILLS_SRC, is_skill), (AGENTS_SKILLS_DST, SKILLS_SRC, is_skill), (BIN_DST, BIN_SRC, is_tool)]
+    rules = [
+        (SKILLS_DST, SKILLS_SRC, is_skill),
+        (AGENTS_SKILLS_DST, SKILLS_SRC, is_skill),
+        (BIN_DST, BIN_SRC, is_tool),
+    ]
     for dst_dir, src_dir, still_valid in rules:
         if not dst_dir.is_dir():
             continue

@@ -15,7 +15,9 @@ def dirs(tmp_path, monkeypatch):
     src.mkdir(parents=True)
     monkeypatch.setattr(install, "SKILLS_SRC", src)
     monkeypatch.setattr(install, "SKILLS_DST", dst)
-    monkeypatch.setattr(install, "AGENTS_SKILLS_DST", tmp_path / "home" / ".agents" / "skills")
+    monkeypatch.setattr(
+        install, "AGENTS_SKILLS_DST", tmp_path / "home" / ".agents" / "skills"
+    )
     # Pruning walks every destination, so keep it off the real ~/.local/bin.
     monkeypatch.setattr(install, "BIN_SRC", tmp_path / "repo" / "bin")
     monkeypatch.setattr(install, "BIN_DST", tmp_path / "home" / ".local" / "bin")
@@ -30,8 +32,11 @@ def guidelines(tmp_path, monkeypatch):
     src.write_text("# Guidelines\n")
     home = tmp_path / "home"
     monkeypatch.setattr(install, "GUIDELINES_SRC", src)
-    monkeypatch.setattr(install, "GUIDELINES_DSTS",
-                        [home / ".claude" / "CLAUDE.md", home / ".agents" / "AGENTS.md"])
+    monkeypatch.setattr(
+        install,
+        "GUIDELINES_DSTS",
+        [home / ".claude" / "CLAUDE.md", home / ".agents" / "AGENTS.md"],
+    )
     return src, home
 
 
@@ -196,7 +201,9 @@ def test_hooks_register_once_beside_existing_settings(settings):
     assert data["model"] == "opus"
     groups = data["hooks"]["PreToolUse"]
     assert groups[0] == other and len(groups) == 2
-    assert groups[1]["hooks"][0]["command"] == str(install.BIN_DST / "agent-commit-gate")
+    assert groups[1]["hooks"][0]["command"] == str(
+        install.BIN_DST / "agent-commit-gate"
+    )
 
 
 def test_hooks_create_a_missing_settings_file(settings):
@@ -218,12 +225,16 @@ def third_party(tmp_path, monkeypatch):
     dst = tmp_path / "home" / ".agents" / "skills"
     dst.mkdir(parents=True)
     monkeypatch.setattr(install, "AGENTS_SKILLS_DST", dst)
-    monkeypatch.setattr(install, "THIRD_PARTY_SKILLS", {"someone/skills": ["tdd", "retro"], "other/skills": ["find"]})
+    monkeypatch.setattr(
+        install,
+        "THIRD_PARTY_SKILLS",
+        {"someone/skills": ["tdd", "retro"], "other/skills": ["find"]},
+    )
     calls = []
 
     def fake_run(cmd, **kw):
         calls.append(cmd)
-        for name in cmd[cmd.index("-s") + 1:cmd.index("-a")]:
+        for name in cmd[cmd.index("-s") + 1 : cmd.index("-a")]:
             (dst / name).mkdir()
         return install.subprocess.CompletedProcess(cmd, 0)
 
@@ -239,7 +250,7 @@ def test_third_party_installs_only_missing_skills(third_party):
     assert len(calls) == 1
     cmd = calls[0]
     assert "someone/skills" in cmd and "-g" in cmd
-    assert cmd[cmd.index("-s") + 1:cmd.index("-a")] == ["retro"]
+    assert cmd[cmd.index("-s") + 1 : cmd.index("-a")] == ["retro"]
 
 
 def test_third_party_runs_nothing_when_all_present(third_party):
@@ -259,7 +270,9 @@ def test_third_party_reports_a_failed_install(third_party, monkeypatch, capsys):
     assert "FAILED" in capsys.readouterr().out
 
 
-def test_third_party_reports_a_skill_the_source_no_longer_has(third_party, monkeypatch, capsys):
+def test_third_party_reports_a_skill_the_source_no_longer_has(
+    third_party, monkeypatch, capsys
+):
     # The real CLI exits 0 when a requested skill isn't in the source.
     def skips_everything(cmd, **kw):
         return install.subprocess.CompletedProcess(cmd, 0)

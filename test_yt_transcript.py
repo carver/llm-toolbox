@@ -16,30 +16,49 @@ loader.exec_module(yt)
 ID = "LlgiOCmFG_w"
 
 
-@pytest.mark.parametrize("text, expected", [
-    (ID, (ID, None)),
-    (f"https://www.youtube.com/watch?v={ID}", (ID, None)),
-    (f"https://m.youtube.com/watch?v={ID}&t=1238", (ID, 1238)),
-    (f"https://youtube.com/watch?t=1238s&v={ID}", (ID, 1238)),
-    (f"https://youtu.be/{ID}?t=20m38s", (ID, 1238)),
-    (f"https://www.youtube.com/shorts/{ID}", (ID, None)),
-    (f"https://www.youtube.com/live/{ID}?t=1h2m3s", (ID, 3723)),
-    (f"https://www.youtube.com/embed/{ID}?start=90", (ID, 90)),
-])
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (ID, (ID, None)),
+        (f"https://www.youtube.com/watch?v={ID}", (ID, None)),
+        (f"https://m.youtube.com/watch?v={ID}&t=1238", (ID, 1238)),
+        (f"https://youtube.com/watch?t=1238s&v={ID}", (ID, 1238)),
+        (f"https://youtu.be/{ID}?t=20m38s", (ID, 1238)),
+        (f"https://www.youtube.com/shorts/{ID}", (ID, None)),
+        (f"https://www.youtube.com/live/{ID}?t=1h2m3s", (ID, 3723)),
+        (f"https://www.youtube.com/embed/{ID}?start=90", (ID, 90)),
+    ],
+)
 def test_parses_video_and_timestamp(text, expected):
     assert yt.parse_video(text) == expected
 
 
-@pytest.mark.parametrize("bad", ["", "notanid", "https://example.com/watch?v=" + ID, "https://www.youtube.com/watch"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "notanid",
+        "https://example.com/watch?v=" + ID,
+        "https://www.youtube.com/watch",
+    ],
+)
 def test_rejects_what_is_not_a_video(bad):
     with pytest.raises(yt.UsageError):
         yt.parse_video(bad)
 
 
-@pytest.mark.parametrize("text, seconds", [
-    ("1238", 1238), ("1238s", 1238), ("20m38s", 1238), ("1h", 3600),
-    ("20:38", 1238), ("1:02:03", 3723), ("0:05", 5),
-])
+@pytest.mark.parametrize(
+    "text, seconds",
+    [
+        ("1238", 1238),
+        ("1238s", 1238),
+        ("20m38s", 1238),
+        ("1h", 3600),
+        ("20:38", 1238),
+        ("1:02:03", 3723),
+        ("0:05", 5),
+    ],
+)
 def test_parses_times(text, seconds):
     assert yt.parse_time(text) == seconds
 
@@ -50,11 +69,22 @@ def test_rejects_bad_times(bad):
         yt.parse_time(bad)
 
 
-SEGMENTS = [(0.0, "intro"), (100.0, "setup"), (1150.0, "before"), (1238.5, "at"), (1290.0, "after"), (1400.0, "late")]
+SEGMENTS = [
+    (0.0, "intro"),
+    (100.0, "setup"),
+    (1150.0, "before"),
+    (1238.5, "at"),
+    (1290.0, "after"),
+    (1400.0, "late"),
+]
 
 
 def test_window_keeps_segments_around_the_moment():
-    assert [t for _, t in yt.window(SEGMENTS, at=1238, before=90, after=60)] == ["before", "at", "after"]
+    assert [t for _, t in yt.window(SEGMENTS, at=1238, before=90, after=60)] == [
+        "before",
+        "at",
+        "after",
+    ]
 
 
 def test_window_without_a_moment_keeps_everything():
@@ -62,11 +92,17 @@ def test_window_without_a_moment_keeps_everything():
 
 
 def test_window_clamps_at_the_start():
-    assert [t for _, t in yt.window(SEGMENTS, at=30, before=90, after=100)] == ["intro", "setup"]
+    assert [t for _, t in yt.window(SEGMENTS, at=30, before=90, after=100)] == [
+        "intro",
+        "setup",
+    ]
 
 
 def test_formats_a_segment_with_its_clock_time():
-    assert yt.format_segment((1238.5, "you never want\nto write it twice")) == "[20:38] you never want to write it twice"
+    assert (
+        yt.format_segment((1238.5, "you never want\nto write it twice"))
+        == "[20:38] you never want to write it twice"
+    )
     assert yt.format_segment((3723.0, "x")) == "[1:02:03] x"
 
 
@@ -90,12 +126,26 @@ def test_prints_the_window_from_the_url_timestamp(monkeypatch, capsys):
 
 
 def test_at_flag_overrides_the_url_timestamp(monkeypatch, capsys):
-    _, out, _ = run_main(monkeypatch, capsys, ["--at", "1:40", "--before", "0", "--after", "0", f"https://youtu.be/{ID}?t=1238"])
+    _, out, _ = run_main(
+        monkeypatch,
+        capsys,
+        [
+            "--at",
+            "1:40",
+            "--before",
+            "0",
+            "--after",
+            "0",
+            f"https://youtu.be/{ID}?t=1238",
+        ],
+    )
     assert out.splitlines() == ["[1:40] setup"]
 
 
 def test_fetch_failure_exits_1_with_the_reason(monkeypatch, capsys):
-    code, out, err = run_main(monkeypatch, capsys, [ID], error=yt.FetchFailed("no transcript for this video"))
+    code, out, err = run_main(
+        monkeypatch, capsys, [ID], error=yt.FetchFailed("no transcript for this video")
+    )
     assert (code, out) == (1, "")
     assert "no transcript for this video" in err
 
@@ -107,7 +157,9 @@ def test_bad_input_exits_2(monkeypatch, capsys):
 
 
 def test_a_refused_request_exits_3(monkeypatch, capsys):
-    code, _, err = run_main(monkeypatch, capsys, [ID], error=yt.TryLater("IpBlocked: blocked"))
+    code, _, err = run_main(
+        monkeypatch, capsys, [ID], error=yt.TryLater("IpBlocked: blocked")
+    )
     assert code == 3
     assert "try later" in err and "IpBlocked" in err
 
@@ -151,9 +203,17 @@ def test_a_failed_fetch_caches_nothing(monkeypatch, tmp_path):
     assert not (tmp_path / "yt-transcript").exists()
 
 
-@pytest.mark.parametrize("name, expected", [("IpBlocked", "TryLater"), ("TranscriptsDisabled", "FetchFailed"),
-                                            ("ConnectionError", "TryLater")])
-def test_download_sorts_errors_into_no_transcript_and_try_later(monkeypatch, name, expected):
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("IpBlocked", "TryLater"),
+        ("TranscriptsDisabled", "FetchFailed"),
+        ("ConnectionError", "TryLater"),
+    ],
+)
+def test_download_sorts_errors_into_no_transcript_and_try_later(
+    monkeypatch, name, expected
+):
     import types
 
     error = type(name, (Exception,), {})

@@ -16,16 +16,19 @@ gate = importlib.util.module_from_spec(spec)
 loader.exec_module(gate)
 
 
-@pytest.mark.parametrize("command, dirs", [
-    ("git commit -m x", ["/r"]),
-    ("git add a && git commit -q -F - <<'EOF'\nfix: it's done\nEOF", ["/r"]),
-    ("cd sub && git commit -m x", ["/r/sub"]),
-    ("git -C /elsewhere -c user.name=a commit --amend", ["/elsewhere"]),
-    ("/usr/bin/git commit -m x; git commit -m y", ["/r"]),
-    ("git status && git log --oneline -1", []),
-    ("git commit --help", []),
-    ("echo git commit", []),
-])
+@pytest.mark.parametrize(
+    "command, dirs",
+    [
+        ("git commit -m x", ["/r"]),
+        ("git add a && git commit -q -F - <<'EOF'\nfix: it's done\nEOF", ["/r"]),
+        ("cd sub && git commit -m x", ["/r/sub"]),
+        ("git -C /elsewhere -c user.name=a commit --amend", ["/elsewhere"]),
+        ("/usr/bin/git commit -m x; git commit -m y", ["/r"]),
+        ("git status && git log --oneline -1", []),
+        ("git commit --help", []),
+        ("echo git commit", []),
+    ],
+)
 def test_finds_each_commit_and_where_it_runs(command, dirs):
     assert gate.commit_dirs(command, "/r") == [Path(d) for d in dirs]
 
@@ -33,7 +36,10 @@ def test_finds_each_commit_and_where_it_runs(command, dirs):
 @pytest.fixture
 def repo(tmp_path):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "config", "core.hooksPath", ".githooks"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "core.hooksPath", ".githooks"],
+        check=True,
+    )
     (tmp_path / ".githooks").mkdir()
     return tmp_path
 
@@ -51,7 +57,9 @@ def run_hook(monkeypatch, capsys, command, cwd, tool="Bash"):
     return code, capsys.readouterr().err
 
 
-def test_a_failing_check_blocks_the_commit_and_shows_its_output(repo, monkeypatch, capsys):
+def test_a_failing_check_blocks_the_commit_and_shows_its_output(
+    repo, monkeypatch, capsys
+):
     agent_check(repo, "echo '1 failed, 3 passed'; exit 1")
     code, err = run_hook(monkeypatch, capsys, "git commit -m x", repo)
     assert code == 2 and "1 failed, 3 passed" in err and "Commit blocked" in err
@@ -66,7 +74,10 @@ def test_no_check_and_no_commit_pass_untouched(repo, monkeypatch, capsys):
     assert run_hook(monkeypatch, capsys, "git commit -m x", repo) == (0, "")
     agent_check(repo, "exit 1")
     assert run_hook(monkeypatch, capsys, "git status", repo) == (0, "")
-    assert run_hook(monkeypatch, capsys, "git commit -m x", repo, tool="Edit") == (0, "")
+    assert run_hook(monkeypatch, capsys, "git commit -m x", repo, tool="Edit") == (
+        0,
+        "",
+    )
 
 
 def test_a_commit_outside_any_repo_passes(tmp_path, monkeypatch, capsys):

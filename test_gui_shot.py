@@ -17,14 +17,18 @@ loader.exec_module(gui_shot)
 
 
 def test_parses_actions():
-    assert gui_shot.parse_action("click 10 20") == gui_shot.Action("click", ("10", "20"))
+    assert gui_shot.parse_action("click 10 20") == gui_shot.Action(
+        "click", ("10", "20")
+    )
     assert gui_shot.parse_action("click 10 20 3").args == ("10", "20", "3")
     assert gui_shot.parse_action("type hello world").args == ("hello world",)
     assert gui_shot.parse_action("key ctrl+z").args == ("ctrl+z",)
     assert gui_shot.parse_action("  sleep 0.5 ").args == ("0.5",)
 
 
-@pytest.mark.parametrize("bad", ["jump 1 2", "click 10", "click a b", "sleep", "shot", "resize 10"])
+@pytest.mark.parametrize(
+    "bad", ["jump 1 2", "click 10", "click a b", "sleep", "shot", "resize 10"]
+)
 def test_rejects_bad_actions(bad):
     with pytest.raises(gui_shot.UsageError):
         gui_shot.parse_action(bad)
@@ -41,21 +45,54 @@ def have(*tools):
 
 
 def run_tool(*args, tmp_path):
-    return subprocess.run([str(SCRIPT), "--out", str(tmp_path), *args], capture_output=True, text=True, timeout=120, check=False)
+    return subprocess.run(
+        [str(SCRIPT), "--out", str(tmp_path), *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
 
 
-@pytest.mark.skipif(not have("Xvfb", "xdotool", "import", "xeyes"), reason="x11 tools missing")
+@pytest.mark.skipif(
+    not have("Xvfb", "xdotool", "import", "xeyes"), reason="x11 tools missing"
+)
 def test_x11_run_takes_named_and_final_shots(tmp_path):
-    result = run_tool("--size", "640x480", "--do", "click 20 20", "--do", "key Escape", "--do", "shot mid",
-                      "--", "xeyes", tmp_path=tmp_path)
+    result = run_tool(
+        "--size",
+        "640x480",
+        "--do",
+        "click 20 20",
+        "--do",
+        "key Escape",
+        "--do",
+        "shot mid",
+        "--",
+        "xeyes",
+        tmp_path=tmp_path,
+    )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.split() == [str(tmp_path / "mid.png"), str(tmp_path / "final.png")]
+    assert result.stdout.split() == [
+        str(tmp_path / "mid.png"),
+        str(tmp_path / "final.png"),
+    ]
     assert (tmp_path / "final.png").stat().st_size > 0
 
 
-@pytest.mark.skipif(not have("weston", "weston-screenshooter", "weston-simple-shm"), reason="weston missing")
+@pytest.mark.skipif(
+    not have("weston", "weston-screenshooter", "weston-simple-shm"),
+    reason="weston missing",
+)
 def test_wayland_run_takes_a_shot(tmp_path):
-    result = run_tool("--backend", "wayland", "--do", "sleep 0.5", "--", "weston-simple-shm", tmp_path=tmp_path)
+    result = run_tool(
+        "--backend",
+        "wayland",
+        "--do",
+        "sleep 0.5",
+        "--",
+        "weston-simple-shm",
+        tmp_path=tmp_path,
+    )
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "final.png").stat().st_size > 0
 

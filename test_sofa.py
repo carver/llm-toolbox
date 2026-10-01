@@ -25,6 +25,7 @@ def load(monkeypatch, base, cache):
 
 class Stub(http.server.BaseHTTPRequestHandler):
     """Sessions, a post, votes that need a read first, and a way to expire every session."""
+
     sessions, reads, calls, expired = set(), set(), [], False
 
     def log_message(self, *args):
@@ -49,22 +50,46 @@ class Stub(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/sessions":
             sid = f"s{len(Stub.sessions)}"
             Stub.sessions.add(sid)
-            return self.reply(201, {"session_id": sid, "expires_at": "2099-01-01T00:00:00+00:00"})
+            return self.reply(
+                201, {"session_id": sid, "expires_at": "2099-01-01T00:00:00+00:00"}
+            )
         sid = self.headers.get("X-Sofa-Session")
         if Stub.expired or sid not in Stub.sessions:
             Stub.expired = False
             return self.reply(401, {"error": "invalid_session"})
         if self.path.startswith("/api/posts/"):
             Stub.reads.add((sid, self.path.rsplit("/", 1)[1]))
-            return self.reply(200, {"id": "p1", "content_type": "til", "title": "T", "body": "B", "tags": [],
-                                    "replies": [], "trust_summary": {"score": 42}})
+            return self.reply(
+                200,
+                {
+                    "id": "p1",
+                    "content_type": "til",
+                    "title": "T",
+                    "body": "B",
+                    "tags": [],
+                    "replies": [],
+                    "trust_summary": {"score": 42},
+                },
+            )
         if self.path == "/api/votes":
             if (sid, body["post_id"]) not in Stub.reads:
                 return self.reply(403, {"error": "read the post first"})
             return self.reply(201, {"ok": True})
         if self.path.startswith("/api/posts?"):
-            return self.reply(200, {"items": [{"id": "p1", "content_type": "til", "title": "T",
-                                               "body_excerpt": "x", "trust_summary": {"score": None}}]})
+            return self.reply(
+                200,
+                {
+                    "items": [
+                        {
+                            "id": "p1",
+                            "content_type": "til",
+                            "title": "T",
+                            "body_excerpt": "x",
+                            "trust_summary": {"score": None},
+                        }
+                    ]
+                },
+            )
         return self.reply(404, {"error": "no such stub route"})
 
     def do_GET(self):
@@ -85,7 +110,9 @@ def sofa(monkeypatch, tmp_path):
     monkeypatch.chdir(creds.parent.parent)
     monkeypatch.delenv("SOFA_API_KEY", raising=False)
     monkeypatch.delenv("SOFA_CREDENTIALS", raising=False)
-    yield load(monkeypatch, f"http://127.0.0.1:{server.server_port}", tmp_path / "cache")
+    yield load(
+        monkeypatch, f"http://127.0.0.1:{server.server_port}", tmp_path / "cache"
+    )
     server.shutdown()
 
 
@@ -106,7 +133,9 @@ def test_search_and_get_print_summaries_and_links(sofa, capsys):
 def test_the_session_is_cached_across_calls(sofa, capsys):
     run(sofa, capsys, "search", "x")
     run(sofa, capsys, "search", "y")
-    assert [c for c in Stub.calls if c[1] == "/api/sessions"] == [("POST", "/api/sessions")]
+    assert [c for c in Stub.calls if c[1] == "/api/sessions"] == [
+        ("POST", "/api/sessions")
+    ]
 
 
 def test_an_expired_session_is_replaced_once(sofa, capsys):
@@ -121,9 +150,18 @@ def test_vote_reads_the_post_first(sofa, capsys):
     assert code == 0 and "vote recorded" in out
 
 
-def test_several_agents_need_a_choice_and_the_error_never_shows_a_key(sofa, capsys, tmp_path):
+def test_several_agents_need_a_choice_and_the_error_never_shows_a_key(
+    sofa, capsys, tmp_path
+):
     creds = Path(".sofa/credentials.json")
-    creds.write_text(json.dumps({"a1": {"agent_name": "one", "api_key": KEY}, "a2": {"agent_name": "two", "api_key": KEY}}))
+    creds.write_text(
+        json.dumps(
+            {
+                "a1": {"agent_name": "one", "api_key": KEY},
+                "a2": {"agent_name": "two", "api_key": KEY},
+            }
+        )
+    )
     code, out = run(sofa, capsys, "search", "x")
     assert code == 1 and "--agent" in out and "one, two" in out
     assert run(sofa, capsys, "--agent", "two", "search", "x")[0] == 0

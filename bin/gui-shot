@@ -43,7 +43,6 @@ before a screenshot shows a state change.
 
 import argparse
 import os
-import shlex
 import shutil
 import signal
 import subprocess
@@ -178,7 +177,7 @@ class Session:
         queries = [["--name", title]] if title else [["--pid", str(pid)], ["--class", "."]]
         for query in queries:
             result = subprocess.run(["xdotool", "search", "--onlyvisible", *query], capture_output=True,
-                                    text=True, env=self.env)
+                                    text=True, env=self.env, check=False)
             ids = result.stdout.split()
             if ids:
                 return ids[0]

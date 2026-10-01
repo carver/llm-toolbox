@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from procmatch import exactly_one, wait_gone  # noqa: E402
+from procmatch import exactly_one, wait_gone
 
 
 def main(argv: list[str] | None = None) -> int:

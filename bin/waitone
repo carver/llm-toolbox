@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from procmatch import command_line, exactly_one, wait_gone  # noqa: E402
+from procmatch import command_line, exactly_one, wait_gone
 
 TIMED_OUT = 4
 

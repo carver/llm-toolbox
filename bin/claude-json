@@ -71,7 +71,7 @@ def call(cmd: list[str], prompt: str, timeout: float) -> dict:
     with tempfile.TemporaryDirectory(prefix="claude-json-") as empty_dir:
         try:
             proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                                  env=env, cwd=empty_dir, timeout=timeout)
+                                  env=env, cwd=empty_dir, timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
             raise CallFailed(f"claude timed out after {timeout:g}s")
         except OSError as err:

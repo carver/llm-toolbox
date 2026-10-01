@@ -3,7 +3,8 @@
 ~/.agents/skills as a global skill, every tool in bin/ into ~/.local/bin, and
 GLOBAL_CLAUDE.md to ~/.claude/CLAUDE.md and ~/.agents/AGENTS.md, one set of
 guidelines whichever convention a tool reads. Registers the Claude Code hooks in
-HOOKS in ~/.claude/settings.json.
+HOOKS in ~/.claude/settings.json. Installs the other authors' skills in
+THIRD_PARTY_SKILLS with the `skills` CLI (npx), so a recreated sandbox gets them back.
 
 Symlinks rather than copies, so editing here takes effect immediately and
 `git pull` is the whole update story.
@@ -15,12 +16,15 @@ source is no longer a skill (renamed, deleted, or missing its SKILL.md).
 Guidelines: a real file moves aside to .bak, a link is replaced wherever it
 points, since a link is cheap to put back. Hooks: added once, beside whatever
 else the settings hold; a settings file that is not valid JSON is left alone.
+Third-party skills: only missing ones are installed; it never updates or
+removes one (`npx skills update -g` does that).
 
     python3 install.py
 """
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -39,6 +43,19 @@ HOOKS = [
     ("PreToolUse", "Bash", "agent-commit-gate",
      {"timeout": 900, "statusMessage": "Running the repo's agent pre-commit check"}),
 ]
+# Other authors' skills, by GitHub source. Installed into ~/.agents/skills with a
+# link from ~/.claude/skills, the layout `npx skills add -g` gives Claude Code and Codex.
+THIRD_PARTY_SKILLS = {
+    "mattpocock/skills": [
+        "ask-matt", "claude-handoff", "code-review", "codebase-design", "diagnosing-bugs",
+        "domain-modeling", "grill-me", "grill-with-docs", "grilling", "handoff", "implement",
+        "improve-codebase-architecture", "prototype", "research",
+        "retro", "setup-matt-pocock-skills", "tdd", "teach", "to-questionnaire", "to-spec",
+        "to-tickets", "triage", "wait-what", "wayfinder", "wizard", "writing-beats",
+        "writing-for-agents", "writing-fragments", "writing-shape",
+    ],
+    "vercel-labs/skills": ["find-skills"],
+}
 
 
 def say(msg):
@@ -140,6 +157,30 @@ def register_hooks() -> int:
     return 0
 
 
+def install_third_party_skills() -> int:
+    """Returns the number of sources whose missing skills could not be installed."""
+    failures = 0
+    for source, names in THIRD_PARTY_SKILLS.items():
+        missing = [n for n in names if not (AGENTS_SKILLS_DST / n).exists()]
+        if not missing:
+            continue
+        cmd = ["npx", "-y", "skills", "add", source, "-g", "-y", "-s", *missing, "-a", "claude-code", "codex"]
+        try:
+            exited = subprocess.run(cmd, cwd=Path.home(), stdout=subprocess.DEVNULL, check=False).returncode
+        except FileNotFoundError:
+            say(f"FAILED {source}: npx not found -- install Node, then re-run")
+            failures += 1
+            continue
+        # The CLI exits 0 even when the source no longer has a skill, so look for each one.
+        still_missing = [n for n in missing if not (AGENTS_SKILLS_DST / n).exists()]
+        if exited or still_missing:
+            say(f"FAILED {source}: `{' '.join(cmd)}` exited {exited}, still missing: {', '.join(still_missing)}")
+            failures += 1
+        else:
+            say(f"installed {', '.join(missing)} from {source}")
+    return failures
+
+
 def prune_stale_links():
     """Remove links into this repo whose target is no longer a skill or a
     tool, by the same rules link_skills and link_tools use to create them."""
@@ -160,10 +201,10 @@ def main():
     print("[llm-toolbox]")
     prune_stale_links()
     conflicts = link_skills() + link_tools() + link_guidelines() + register_hooks()
+    failures = install_third_party_skills()
     if conflicts:
         say(f"{conflicts} link(s) not made -- resolve the conflicts above by hand")
-        return 1
-    return 0
+    return 1 if conflicts or failures else 0
 
 
 if __name__ == "__main__":

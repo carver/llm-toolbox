@@ -209,3 +209,71 @@ def test_hooks_leave_a_broken_settings_file_alone(settings, capsys):
     settings.write_text("{not json")
     assert install.register_hooks() == 1
     assert settings.read_text() == "{not json" and "CONFLICT" in capsys.readouterr().out
+
+
+@pytest.fixture
+def third_party(tmp_path, monkeypatch):
+    """A temp ~/.agents/skills, and a record of the installer commands run.
+    The fake installer creates every skill it is asked for, as the real one does."""
+    dst = tmp_path / "home" / ".agents" / "skills"
+    dst.mkdir(parents=True)
+    monkeypatch.setattr(install, "AGENTS_SKILLS_DST", dst)
+    monkeypatch.setattr(install, "THIRD_PARTY_SKILLS", {"someone/skills": ["tdd", "retro"], "other/skills": ["find"]})
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        for name in cmd[cmd.index("-s") + 1:cmd.index("-a")]:
+            (dst / name).mkdir()
+        return install.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(install.subprocess, "run", fake_run)
+    return dst, calls
+
+
+def test_third_party_installs_only_missing_skills(third_party):
+    dst, calls = third_party
+    (dst / "tdd").mkdir()
+    (dst / "find").mkdir()
+    assert install.install_third_party_skills() == 0
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert "someone/skills" in cmd and "-g" in cmd
+    assert cmd[cmd.index("-s") + 1:cmd.index("-a")] == ["retro"]
+
+
+def test_third_party_runs_nothing_when_all_present(third_party):
+    dst, calls = third_party
+    for name in ("tdd", "retro", "find"):
+        (dst / name).mkdir()
+    assert install.install_third_party_skills() == 0
+    assert calls == []
+
+
+def test_third_party_reports_a_failed_install(third_party, monkeypatch, capsys):
+    def failing_run(cmd, **kw):
+        return install.subprocess.CompletedProcess(cmd, 1)
+
+    monkeypatch.setattr(install.subprocess, "run", failing_run)
+    assert install.install_third_party_skills() == 2
+    assert "FAILED" in capsys.readouterr().out
+
+
+def test_third_party_reports_a_skill_the_source_no_longer_has(third_party, monkeypatch, capsys):
+    # The real CLI exits 0 when a requested skill isn't in the source.
+    def skips_everything(cmd, **kw):
+        return install.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(install.subprocess, "run", skips_everything)
+    assert install.install_third_party_skills() == 2
+    out = capsys.readouterr().out
+    assert "FAILED someone/skills" in out and "tdd, retro" in out
+
+
+def test_third_party_reports_missing_npx(third_party, monkeypatch, capsys):
+    def no_npx(cmd, **kw):
+        raise FileNotFoundError(cmd[0])
+
+    monkeypatch.setattr(install.subprocess, "run", no_npx)
+    assert install.install_third_party_skills() == 2
+    assert "npx" in capsys.readouterr().out

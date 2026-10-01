@@ -20,6 +20,11 @@ Re-run it after adding or renaming a skill. It is idempotent and only touches
 links that point into this repo. If a name already belongs to some other
 skill, it reports the conflict and leaves it alone.
 
+It also installs other authors' skills, listed in `THIRD_PARTY_SKILLS` in
+`install.py`, with `npx skills add -g`. It installs only the missing ones and
+never updates them; `npx skills update -g` does that. To add one, install it,
+then add its name to the list.
+
 The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 `PROJECT_INSTALLERS`, so a sandbox recreate restores the links.
 

@@ -15,8 +15,8 @@ def killone(*args: str, shell: bool = False) -> subprocess.CompletedProcess[str]
     if shell:
         # The pattern sits in the calling shell's own command line, which is what trips pkill -f.
         command = " ".join([str(SCRIPT), *args])
-        return subprocess.run(["bash", "-c", command + "; echo shell-survived"], text=True, capture_output=True)
-    return subprocess.run([str(SCRIPT), *args], text=True, capture_output=True)
+        return subprocess.run(["bash", "-c", command + "; echo shell-survived"], text=True, capture_output=True, check=False)
+    return subprocess.run([str(SCRIPT), *args], text=True, capture_output=True, check=False)
 
 
 @pytest.fixture

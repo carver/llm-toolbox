@@ -29,6 +29,9 @@ def reply(**fields) -> str:
     return json.dumps({"type": "result", "subtype": "success", "is_error": False, **fields})
 
 
+OK_REPLY = reply(structured_output={"name": "x"})
+
+
 @pytest.fixture
 def run(tmp_path):
     bindir = tmp_path / "bin"
@@ -38,12 +41,12 @@ def run(tmp_path):
     fake.chmod(0o755)
     record = tmp_path / "record.json"
 
-    def run(*args, prompt="the prompt", fake_stdout=reply(structured_output={"name": "x"}), **fake_env):
+    def run(*args, prompt="the prompt", fake_stdout=OK_REPLY, **fake_env):
         env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "FAKE_RECORD": str(record),
                "FAKE_STDOUT": fake_stdout, "ANTHROPIC_API_KEY": "sk-ant-api-fake",
                **{f"FAKE_{k.upper()}": str(v) for k, v in fake_env.items()}}
         proc = subprocess.run([str(SCRIPT), "--schema", json.dumps(SCHEMA), *args], input=prompt,
-                              text=True, capture_output=True, env=env, timeout=30)
+                              text=True, capture_output=True, env=env, timeout=30, check=False)
         sent = json.loads(record.read_text()) if record.exists() else None
         return proc, sent
     return run
@@ -137,5 +140,5 @@ def test_an_empty_prompt_is_a_usage_error(run):
 
 def test_a_bad_schema_is_a_usage_error(run):
     proc = subprocess.run([str(SCRIPT), "--schema", "{not json"], input="p", text=True,
-                          capture_output=True, timeout=30)
+                          capture_output=True, timeout=30, check=False)
     assert proc.returncode == 2

@@ -46,7 +46,7 @@ def test_clicks_shoots_and_reports_page_errors(tmp_path):
     page.write_text('<button id="b" onclick="document.getElementById(\'t\').textContent=\'on\'">x</button>'
                     '<p id="t">off</p><script>setTimeout(() => { throw new Error("boom") }, 0)</script>')
     run = subprocess.run([str(SCRIPT), "--out", str(tmp_path / "out"), "--do", "click #b", "--do", "wait 50",
-                          "--do", "shot text #t", str(page)], capture_output=True, text=True, timeout=180)
+                          "--do", "shot text #t", str(page)], capture_output=True, text=True, timeout=180, check=False)
     assert run.returncode == 3, run.stderr
     assert "boom" in run.stderr
     shots = run.stdout.split()
@@ -72,7 +72,7 @@ def test_prints_text_and_links_after_loading_an_endless_page(tmp_path):
         '</script>')
     run = subprocess.run([str(SCRIPT), "--out", str(tmp_path / "out"), "--do", "scroll-all", "--do", "text main",
                           "--do", "links airtable", "--do", "text #feed", str(page)],
-                         capture_output=True, text=True, timeout=300)
+                         capture_output=True, text=True, timeout=300, check=False)
     assert run.returncode == 3, run.stderr
     lines = run.stdout.splitlines()
     assert lines[0] == "Form"

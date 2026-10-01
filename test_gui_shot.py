@@ -41,7 +41,7 @@ def have(*tools):
 
 
 def run_tool(*args, tmp_path):
-    return subprocess.run([str(SCRIPT), "--out", str(tmp_path), *args], capture_output=True, text=True, timeout=120)
+    return subprocess.run([str(SCRIPT), "--out", str(tmp_path), *args], capture_output=True, text=True, timeout=120, check=False)
 
 
 @pytest.mark.skipif(not have("Xvfb", "xdotool", "import", "xeyes"), reason="x11 tools missing")

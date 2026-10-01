@@ -122,7 +122,7 @@ def test_prune_removes_link_to_skill_that_lost_its_skill_md(dirs):
 
 
 def test_prune_leaves_links_into_other_repos_alone(dirs, tmp_path):
-    src, dst = dirs
+    _src, dst = dirs
     dst.mkdir(parents=True)
     other = tmp_path / "elsewhere" / "theirs"
     other.mkdir(parents=True)
@@ -143,7 +143,7 @@ def test_link_reports_conflicts(dirs, capsys):
 
 
 def test_skills_are_linked_into_agents_skills_too(dirs, tmp_path):
-    src, dst = dirs
+    src, _dst = dirs
     make_skill(src, "good")
     install.link_skills()
     agents = tmp_path / "home" / ".agents" / "skills" / "good"

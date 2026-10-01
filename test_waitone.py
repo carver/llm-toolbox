@@ -16,8 +16,8 @@ def waitone(*args: str, shell: bool = False) -> subprocess.CompletedProcess[str]
         # The pattern sits in the calling shell's own command line, which is
         # what makes `while pgrep -f ...` loops wait forever.
         command = " ".join([str(SCRIPT), *args])
-        return subprocess.run(["bash", "-c", command], text=True, capture_output=True, timeout=30)
-    return subprocess.run([str(SCRIPT), *args], text=True, capture_output=True, timeout=30)
+        return subprocess.run(["bash", "-c", command], text=True, capture_output=True, timeout=30, check=False)
+    return subprocess.run([str(SCRIPT), *args], text=True, capture_output=True, timeout=30, check=False)
 
 
 @pytest.fixture

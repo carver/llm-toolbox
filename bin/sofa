@@ -22,6 +22,7 @@ declare are cached in ~/.cache/sofa/ and renewed when they expire. vote and
 verify read the post first, since SOFA refuses either on a post not read in the
 same session.
 """
+
 import argparse
 import json
 import os
@@ -35,7 +36,12 @@ from pathlib import Path
 
 BASE = os.environ.get("SOFA_BASE_URL", "https://agents.stackoverflow.com")
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "sofa"
-WEB_PATHS = {"question": "questions", "til": "tils", "blueprint": "blueprints", "playbook": "playbooks"}
+WEB_PATHS = {
+    "question": "questions",
+    "til": "tils",
+    "blueprint": "blueprints",
+    "playbook": "playbooks",
+}
 VOTES = {"up": 1, "down": -1}
 OUTCOMES = ("worked_as_written", "worked_with_changes", "did_not_work")
 
@@ -61,12 +67,18 @@ def api_key(agent=None):
         return os.environ["SOFA_API_KEY"], "env"
     path = credentials_file()
     if not path:
-        raise SofaError("no SOFA_API_KEY and no .sofa/credentials.json here, above here or in ~")
+        raise SofaError(
+            "no SOFA_API_KEY and no .sofa/credentials.json here, above here or in ~"
+        )
     entries = json.loads(path.read_text())
-    chosen = {i: e for i, e in entries.items() if agent in (None, e.get("agent_name"), i)}
+    chosen = {
+        i: e for i, e in entries.items() if agent in (None, e.get("agent_name"), i)
+    }
     if len(chosen) != 1:
         names = ", ".join(e.get("agent_name", i) for i, e in entries.items())
-        raise SofaError(f"{len(chosen)} agents match in {path}; pick one with --agent ({names})")
+        raise SofaError(
+            f"{len(chosen)} agents match in {path}; pick one with --agent ({names})"
+        )
     agent_id, entry = next(iter(chosen.items()))
     return entry["api_key"], agent_id
 
@@ -85,11 +97,20 @@ class Client:
         return state if state.get("expires_epoch", 0) > time.time() + 60 else {}
 
     def _raw(self, method, path, body=None, extra=None):
-        headers = {"Authorization": f"Bearer {self.key}", "Accept": "application/json", **(extra or {})}
+        headers = {
+            "Authorization": f"Bearer {self.key}",
+            "Accept": "application/json",
+            **(extra or {}),
+        }
         data = None
         if body is not None:
-            data, headers["Content-Type"] = json.dumps(body).encode(), "application/json"
-        request = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
+            data, headers["Content-Type"] = (
+                json.dumps(body).encode(),
+                "application/json",
+            )
+        request = urllib.request.Request(
+            BASE + path, data=data, headers=headers, method=method
+        )
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 text = response.read().decode()
@@ -100,9 +121,11 @@ class Client:
     def _start_session(self):
         with urllib.request.urlopen(BASE + "/skill.md", timeout=60) as response:
             digest = response.headers.get("X-Sofa-Skill-Digest")
-        meta = {"X-Sofa-Client-Name": os.environ.get("SOFA_CLIENT_NAME", "claude-code"),
-                "X-Sofa-Model-Name": os.environ.get("SOFA_MODEL_NAME", "claude"),
-                **({"X-Sofa-Skill-Digest": digest} if digest else {})}
+        meta = {
+            "X-Sofa-Client-Name": os.environ.get("SOFA_CLIENT_NAME", "claude-code"),
+            "X-Sofa-Model-Name": os.environ.get("SOFA_MODEL_NAME", "claude"),
+            **({"X-Sofa-Skill-Digest": digest} if digest else {}),
+        }
         status, text, _ = self._raw("POST", "/api/sessions", {}, meta)
         if status != 201:
             raise SofaError(f"could not start a session: HTTP {status} {text[:300]}")
@@ -111,7 +134,11 @@ class Client:
             epoch = datetime.fromisoformat(session["expires_at"]).timestamp()
         except (KeyError, ValueError):
             epoch = time.time() + 1800
-        self.state = {"session_id": session["session_id"], "digest": digest, "expires_epoch": epoch}
+        self.state = {
+            "session_id": session["session_id"],
+            "digest": digest,
+            "expires_epoch": epoch,
+        }
         CACHE.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(json.dumps(self.state))
         self.state_path.chmod(0o600)
@@ -150,20 +177,28 @@ def web_url(post):
 
 def trust(post):
     summary = post.get("trust_summary") or {}
-    return "unscored" if summary.get("score") is None else f"trust {summary['score']:+d}"
+    return (
+        "unscored" if summary.get("score") is None else f"trust {summary['score']:+d}"
+    )
 
 
 def show_listing(listing):
     for post in items_of(listing):
-        print(f"{post['id']}  {post.get('content_type', 'playbook'):<9} {trust(post):<10} {post.get('title', '')}")
-        excerpt = " ".join((post.get("body_excerpt") or post.get("summary") or "").split())
+        print(
+            f"{post['id']}  {post.get('content_type', 'playbook'):<9} {trust(post):<10} {post.get('title', '')}"
+        )
+        excerpt = " ".join(
+            (post.get("body_excerpt") or post.get("summary") or "").split()
+        )
         if excerpt:
             print(f"    {excerpt[:200]}")
 
 
 def show_post(post):
-    print(f"{post.get('title', '')}\n{web_url(post)} · {post.get('content_type')} · {trust(post)}"
-          f" · tags: {', '.join(t['name'] if isinstance(t, dict) else t for t in post.get('tags', []))}\n")
+    print(
+        f"{post.get('title', '')}\n{web_url(post)} · {post.get('content_type')} · {trust(post)}"
+        f" · tags: {', '.join(t['name'] if isinstance(t, dict) else t for t in post.get('tags', []))}\n"
+    )
     print(post.get("body", ""))
     for reply in post.get("replies") or []:
         print(f"\n--- reply {reply['id']} · {trust(reply)}\n{reply.get('body', '')}")
@@ -176,52 +211,99 @@ def read_body(path):
 def run(args, client):
     """(response, how to print it) for one subcommand."""
     if args.command == "search":
-        params = {"search": args.query, "per_page": args.n, **({"tag": args.tag} if args.tag else {}),
-                  **({"content_type": args.type} if args.type else {})}
-        return client.call("GET", "/api/posts?" + urllib.parse.urlencode(params)), show_listing
+        params = {
+            "search": args.query,
+            "per_page": args.n,
+            **({"tag": args.tag} if args.tag else {}),
+            **({"content_type": args.type} if args.type else {}),
+        }
+        return client.call(
+            "GET", "/api/posts?" + urllib.parse.urlencode(params)
+        ), show_listing
     if args.command == "get":
         return client.call("GET", f"/api/posts/{args.id}"), show_post
     if args.command == "post":
-        body = {"content_type": args.type, "title": args.title, "body": read_body(args.body), "tags": args.tag}
+        body = {
+            "content_type": args.type,
+            "title": args.title,
+            "body": read_body(args.body),
+            "tags": args.tag,
+        }
         created = client.call("POST", "/api/posts", body)
-        return created, lambda p: print(f"{p.get('id')}\n{web_url({**p, 'content_type': args.type})}")
+        return created, lambda p: print(
+            f"{p.get('id')}\n{web_url({**p, 'content_type': args.type})}"
+        )
     if args.command == "reply":
-        return client.call("POST", f"/api/posts/{args.id}/replies", {"body": read_body(args.body)}), \
-            lambda r: print(r.get("id"))
+        return client.call(
+            "POST", f"/api/posts/{args.id}/replies", {"body": read_body(args.body)}
+        ), lambda r: print(r.get("id"))
     if args.command == "edit":
-        fields = {k: v for k, v in (("title", args.title), ("body", args.body and read_body(args.body)),
-                                    ("tags", args.tag)) if v}
+        fields = {
+            k: v
+            for k, v in (
+                ("title", args.title),
+                ("body", args.body and read_body(args.body)),
+                ("tags", args.tag),
+            )
+            if v
+        }
         if not fields:
             raise SofaError("edit needs --title, --body or --tag")
-        return client.call("PATCH", f"/api/posts/{args.id}", {"edit_summary": args.summary, **fields}), \
-            lambda p: print(f"edited {p.get('id')}")
+        return client.call(
+            "PATCH", f"/api/posts/{args.id}", {"edit_summary": args.summary, **fields}
+        ), lambda p: print(f"edited {p.get('id')}")
     if args.command in ("vote", "verify"):
         client.call("GET", f"/api/posts/{args.id}")
-        path, body = (("/api/votes", {"post_id": args.id, "value": VOTES[args.direction]}) if args.command == "vote"
-                      else ("/api/verifications", {"post_id": args.id, "outcome": args.outcome,
-                                                   "feedback": args.feedback}))
-        for wait in (0, 2, 5):  # the read-first guard reads an eventually consistent projection
+        path, body = (
+            ("/api/votes", {"post_id": args.id, "value": VOTES[args.direction]})
+            if args.command == "vote"
+            else (
+                "/api/verifications",
+                {
+                    "post_id": args.id,
+                    "outcome": args.outcome,
+                    "feedback": args.feedback,
+                },
+            )
+        )
+        for wait in (
+            0,
+            2,
+            5,
+        ):  # the read-first guard reads an eventually consistent projection
             time.sleep(wait)
             try:
-                return client.call("POST", path, body), lambda r: print(f"{args.command} recorded")
+                return client.call("POST", path, body), lambda r: print(
+                    f"{args.command} recorded"
+                )
             except SofaError as error:
                 if "read" not in str(error).lower() or wait == 5:
                     raise
     if args.command == "playbooks":
         params = {"search": args.query, "per_page": args.n}
-        return client.call("GET", "/api/playbooks?" + urllib.parse.urlencode(params)), show_listing
+        return client.call(
+            "GET", "/api/playbooks?" + urllib.parse.urlencode(params)
+        ), show_listing
     if args.command == "pull":
         pulled = client.call("GET", f"/api/playbooks/{args.id}/pull")
-        return pulled, lambda p: print(f"{p.get('title')}\n\n{p.get('steps') if isinstance(p.get('steps'), str) else json.dumps(p.get('steps'), indent=1)}")
+        return pulled, lambda p: print(
+            f"{p.get('title')}\n\n{p.get('steps') if isinstance(p.get('steps'), str) else json.dumps(p.get('steps'), indent=1)}"
+        )
     if args.command == "guidelines":
         return client.call("GET", f"/guidelines/{args.kind}", raw=True), print
     body = json.loads(args.body) if args.body else None
-    return client.call(args.method.upper(), args.path, body), lambda r: print(json.dumps(r, indent=1))
+    return client.call(args.method.upper(), args.path, body), lambda r: print(
+        json.dumps(r, indent=1)
+    )
 
 
 def parser():
-    top = argparse.ArgumentParser(prog="sofa", description=__doc__.split("\n\n")[0],
-                                  epilog=__doc__.split("\n\n", 1)[1], formatter_class=argparse.RawDescriptionHelpFormatter)
+    top = argparse.ArgumentParser(
+        prog="sofa",
+        description=__doc__.split("\n\n")[0],
+        epilog=__doc__.split("\n\n", 1)[1],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     top.add_argument("--agent", help="agent name or id in the credentials file")
     top.add_argument("--json", action="store_true", help="print the raw response")
     sub = top.add_subparsers(dest="command", required=True)
@@ -251,12 +333,16 @@ def parser():
     p = sub.add_parser("verify", help="use-time outcome, after applying the post")
     p.add_argument("id")
     p.add_argument("outcome", choices=OUTCOMES)
-    p.add_argument("feedback", help="plain prose for the next agent, 500 characters at most")
+    p.add_argument(
+        "feedback", help="plain prose for the next agent, 500 characters at most"
+    )
     p = sub.add_parser("playbooks", help="search Playbooks")
     p.add_argument("query")
     p.add_argument("-n", type=int, default=10)
     sub.add_parser("pull", help="a Playbook's steps").add_argument("id")
-    sub.add_parser("guidelines", help="SOFA's writing guidelines for a post type").add_argument("kind")
+    sub.add_parser(
+        "guidelines", help="SOFA's writing guidelines for a post type"
+    ).add_argument("kind")
     p = sub.add_parser("api", help="any other endpoint")
     p.add_argument("method")
     p.add_argument("path")

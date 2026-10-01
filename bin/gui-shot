@@ -102,7 +102,9 @@ def parse_action(text: str) -> Action:
 
 
 def missing_tools(backend: str) -> dict[str, str]:
-    return {tool: pkg for tool, pkg in NEEDS[backend].items() if shutil.which(tool) is None}
+    return {
+        tool: pkg for tool, pkg in NEEDS[backend].items() if shutil.which(tool) is None
+    }
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -134,8 +136,13 @@ class Session:
     def start_display(self):
         w, h = self.size
         if self.backend == "x11":
-            number = next(n for n in range(90, 200) if not Path(f"/tmp/.X11-unix/X{n}").exists())
-            self.spawn(["Xvfb", f":{number}", "-screen", "0", f"{w}x{h}x24"], self.out / "server.log")
+            number = next(
+                n for n in range(90, 200) if not Path(f"/tmp/.X11-unix/X{n}").exists()
+            )
+            self.spawn(
+                ["Xvfb", f":{number}", "-screen", "0", f"{w}x{h}x24"],
+                self.out / "server.log",
+            )
             wait_for(lambda: Path(f"/tmp/.X11-unix/X{number}").exists(), 10, "Xvfb")
             self.env["DISPLAY"] = f":{number}"
             self.env.pop("WAYLAND_DISPLAY", None)
@@ -145,8 +152,15 @@ class Session:
             self.env["XDG_RUNTIME_DIR"] = self.runtime_dir
             socket = Path(self.runtime_dir) / "wl"
             self.spawn(
-                ["weston", "--debug", "--backend=headless", "--socket=wl", f"--width={w}", f"--height={h}",
-                 "--renderer=pixman"],
+                [
+                    "weston",
+                    "--debug",
+                    "--backend=headless",
+                    "--socket=wl",
+                    f"--width={w}",
+                    f"--height={h}",
+                    "--renderer=pixman",
+                ],
                 self.out / "server.log",
             )
             wait_for(socket.exists, 10, "weston")
@@ -155,8 +169,13 @@ class Session:
 
     def spawn(self, cmd: list[str], log: Path, env=None) -> subprocess.Popen:
         with open(log, "w") as f:
-            proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env or self.env,
-                                    start_new_session=True)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                env=env or self.env,
+                start_new_session=True,
+            )
         self.procs.append(proc)
         return proc
 
@@ -165,19 +184,30 @@ class Session:
         if self.backend == "wayland":
             time.sleep(min(timeout, 3))
         else:
-            self.window = wait_for(lambda: self.find_window(app.pid, title), timeout, "the app window")
+            self.window = wait_for(
+                lambda: self.find_window(app.pid, title), timeout, "the app window"
+            )
             self.xdo("windowfocus", "--sync", self.window)
         if app.poll() is not None:
-            raise RuntimeError(f"app exited with code {app.returncode}; see {self.out / 'app.log'}")
+            raise RuntimeError(
+                f"app exited with code {app.returncode}; see {self.out / 'app.log'}"
+            )
 
     def find_window(self, pid: int, title: str | None):
         """By title if given, else by process id. Not every app sets its
         pid on the window (plain X11 apps often don't), so fall back to any
         visible window: the display is private to this run."""
-        queries = [["--name", title]] if title else [["--pid", str(pid)], ["--class", "."]]
+        queries = (
+            [["--name", title]] if title else [["--pid", str(pid)], ["--class", "."]]
+        )
         for query in queries:
-            result = subprocess.run(["xdotool", "search", "--onlyvisible", *query], capture_output=True,
-                                    text=True, env=self.env, check=False)
+            result = subprocess.run(
+                ["xdotool", "search", "--onlyvisible", *query],
+                capture_output=True,
+                text=True,
+                env=self.env,
+                check=False,
+            )
             ids = result.stdout.split()
             if ids:
                 return ids[0]
@@ -209,9 +239,17 @@ class Session:
     def shot(self, name: str) -> Path:
         path = self.out / f"{name}.png"
         if self.backend == "x11":
-            geometry = dict(line.split("=") for line in self.xdo("getwindowgeometry", "--shell", self.window).split())
+            geometry = dict(
+                line.split("=")
+                for line in self.xdo(
+                    "getwindowgeometry", "--shell", self.window
+                ).split()
+            )
             crop = f"{geometry['WIDTH']}x{geometry['HEIGHT']}+{geometry['X']}+{geometry['Y']}"
-            run(["import", "-window", "root", "-crop", crop, "+repage", str(path)], env=self.env)
+            run(
+                ["import", "-window", "root", "-crop", crop, "+repage", str(path)],
+                env=self.env,
+            )
         else:
             with tempfile.TemporaryDirectory() as tmp:
                 run(["weston-screenshooter"], cwd=tmp, env=self.env)
@@ -239,12 +277,33 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--backend", choices=("x11", "wayland"), default="x11")
-    p.add_argument("--size", default="1280x800", help="screen size WxH (default 1280x800)")
-    p.add_argument("--out", type=Path, help="output directory (default: a new temp dir)")
+    p.add_argument(
+        "--size", default="1280x800", help="screen size WxH (default 1280x800)"
+    )
+    p.add_argument(
+        "--out", type=Path, help="output directory (default: a new temp dir)"
+    )
     p.add_argument("--title", help="find the window by title instead of by process id")
-    p.add_argument("--timeout", type=float, default=30, help="seconds to wait for the window (default 30)")
-    p.add_argument("--env", action="append", default=[], metavar="K=V", help="extra environment for the app")
-    p.add_argument("--do", action="append", default=[], metavar="ACTION", help="an action; see below")
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=30,
+        help="seconds to wait for the window (default 30)",
+    )
+    p.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="extra environment for the app",
+    )
+    p.add_argument(
+        "--do",
+        action="append",
+        default=[],
+        metavar="ACTION",
+        help="an action; see below",
+    )
     p.add_argument("command", nargs=argparse.REMAINDER, help="the app to run, after --")
     args = p.parse_args(argv)
     if args.command[:1] == ["--"]:
@@ -269,13 +328,18 @@ def main(argv: list[str]) -> int:
     if args.backend == "wayland":
         unsupported = sorted({a.verb for a in actions} - WAYLAND_ACTIONS)
         if unsupported:
-            print(f"gui-shot: wayland supports only sleep and shot, not {', '.join(unsupported)}", file=sys.stderr)
+            print(
+                f"gui-shot: wayland supports only sleep and shot, not {', '.join(unsupported)}",
+                file=sys.stderr,
+            )
             return 2
     missing = missing_tools(args.backend)
     if missing:
         pkgs = " ".join(sorted(set(missing.values())))
-        print(f"gui-shot: missing {', '.join(sorted(missing))}. Install with:\n  sudo apt-get install -y {pkgs}",
-              file=sys.stderr)
+        print(
+            f"gui-shot: missing {', '.join(sorted(missing))}. Install with:\n  sudo apt-get install -y {pkgs}",
+            file=sys.stderr,
+        )
         return 3
 
     out = args.out or Path(tempfile.mkdtemp(prefix="gui-shot-"))

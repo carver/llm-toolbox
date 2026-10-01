@@ -14,6 +14,7 @@ through untouched. install.py registers the gate in ~/.claude/settings.json.
     agent-commit-gate < hook-input.json    # as Claude Code calls it
     agent-commit-gate --run [DIR]          # run DIR's check by hand (default: .)
 """
+
 import argparse
 import json
 import os
@@ -56,8 +57,12 @@ def commit_dirs(command, cwd):
 
 def agent_hook(repo):
     """The repo's agent-pre-commit if it exists and is executable, else None."""
-    run = subprocess.run(["git", "-C", str(repo), "rev-parse", "--show-toplevel", "--git-path", "hooks"],
-                         capture_output=True, text=True, check=False)
+    run = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--show-toplevel", "--git-path", "hooks"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     if run.returncode:
         return None
     top, hooks = run.stdout.splitlines()
@@ -71,26 +76,43 @@ def check(repo):
     if not found:
         return True, ""
     top, hook = found
-    run = subprocess.run([str(hook)], cwd=top, capture_output=True, text=True, check=False)
+    run = subprocess.run(
+        [str(hook)], cwd=top, capture_output=True, text=True, check=False
+    )
     if run.returncode == 0:
         return True, ""
     tail = "\n".join((run.stdout + run.stderr).splitlines()[-TAIL_LINES:])
-    return False, (f"Commit blocked: {hook} exited {run.returncode}. Fix what it reports, then commit again.\n"
-                   f"{tail}")
+    return False, (
+        f"Commit blocked: {hook} exited {run.returncode}. Fix what it reports, then commit again.\n"
+        f"{tail}"
+    )
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--run", nargs="?", const=".", metavar="DIR", help="run DIR's check now, outside a hook")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--run",
+        nargs="?",
+        const=".",
+        metavar="DIR",
+        help="run DIR's check now, outside a hook",
+    )
     args = parser.parse_args(argv)
     if args.run:
         passed, message = check(Path(args.run))
-        print(message or f"{args.run}: passed, or has no {HOOK_NAME}", file=sys.stderr if message else sys.stdout)
+        print(
+            message or f"{args.run}: passed, or has no {HOOK_NAME}",
+            file=sys.stderr if message else sys.stdout,
+        )
         return 0 if passed else 1
     event = json.load(sys.stdin)
     if event.get("tool_name") != "Bash":
         return 0
-    for repo in commit_dirs(event.get("tool_input", {}).get("command", ""), event.get("cwd") or os.getcwd()):
+    for repo in commit_dirs(
+        event.get("tool_input", {}).get("command", ""), event.get("cwd") or os.getcwd()
+    ):
         passed, message = check(repo)
         if not passed:
             print(message, file=sys.stderr)

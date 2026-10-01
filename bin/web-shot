@@ -34,17 +34,27 @@ Examples:
   web-shot --do "wait 5000" --do text https://airtable.com/app.../form     # read a JS-rendered form
   web-shot --do scroll-all --do "links /event/" https://example.com/calendar
 """
+
 import argparse
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-ARITY = {"click": (1, 1), "wait": (1, 1), "eval": (1, 1), "shot": (1, 2), "text": (0, 1), "links": (0, 1),
-         "scroll-all": (0, 0)}  # (min, max) arguments
+ARITY = {
+    "click": (1, 1),
+    "wait": (1, 1),
+    "eval": (1, 1),
+    "shot": (1, 2),
+    "text": (0, 1),
+    "links": (0, 1),
+    "scroll-all": (0, 0),
+}  # (min, max) arguments
 INSTALL = "uv run --with playwright playwright install chromium"
 SCROLL_PAUSE_MS = 700
-SCROLL_STABLE_ROUNDS = 5  # page height unchanged this many times in a row means the feed is done
+SCROLL_STABLE_ROUNDS = (
+    5  # page height unchanged this many times in a row means the feed is done
+)
 SCROLL_MAX_ROUNDS = 400
 LINKS_JS = """pattern => [...document.querySelectorAll('a[href]')]
   .map(a => [a.innerText.trim().replace(/\\s+/g, ' '), a.href])
@@ -68,10 +78,18 @@ def parse_action(text):
     rest = rest.strip()
     if verb not in ARITY:
         raise UsageError(f"unknown action {verb!r}; one of {', '.join(ARITY)}")
-    args = tuple(rest.split(" ", 1)) if verb == "shot" and rest else (rest,) if rest else ()
+    args = (
+        tuple(rest.split(" ", 1))
+        if verb == "shot" and rest
+        else (rest,)
+        if rest
+        else ()
+    )
     low, high = ARITY[verb]
     if not low <= len(args) <= high:
-        raise UsageError(f"{verb!r} takes {low}{'' if low == high else f' to {high}'} argument(s): {text!r}")
+        raise UsageError(
+            f"{verb!r} takes {low}{'' if low == high else f' to {high}'} argument(s): {text!r}"
+        )
     if verb == "wait" and not args[0].isdigit():
         raise UsageError(f"wait takes milliseconds: {text!r}")
     return Action(verb, tuple(a.strip() for a in args))
@@ -98,7 +116,9 @@ def scroll_all(tab):
 
 
 def visible_text(tab, selector):
-    text = tab.locator(selector).first.inner_text() if selector else tab.inner_text("body")
+    text = (
+        tab.locator(selector).first.inner_text() if selector else tab.inner_text("body")
+    )
     return "\n".join(line.strip() for line in text.splitlines() if line.strip())
 
 
@@ -110,7 +130,10 @@ def page_url(page):
 def cached_chromium():
     """The newest Chromium in Playwright's cache, or None."""
     cache = Path.home() / ".cache" / "ms-playwright"
-    found = sorted(cache.glob("chromium-*/chrome-linux*/chrome"), key=lambda p: int(p.parts[-3].split("-")[1]))
+    found = sorted(
+        cache.glob("chromium-*/chrome-linux*/chrome"),
+        key=lambda p: int(p.parts[-3].split("-")[1]),
+    )
     return found[-1] if found else None
 
 
@@ -135,7 +158,12 @@ def run(page, actions, out, size):
         browser = launch(playwright)
         tab = browser.new_page(viewport={"width": width, "height": height})
         tab.on("pageerror", lambda error: errors.append(f"page error: {error}"))
-        tab.on("console", lambda msg: msg.type == "error" and errors.append(f"console error: {msg.text}"))
+        tab.on(
+            "console",
+            lambda msg: (
+                msg.type == "error" and errors.append(f"console error: {msg.text}")
+            ),
+        )
         tab.goto(page_url(page), wait_until="load")
         for action in actions + [Action("shot", ("final",))]:
             if action.verb == "click":
@@ -145,9 +173,14 @@ def run(page, actions, out, size):
             elif action.verb == "eval":
                 tab.evaluate(action.args[0])
             elif action.verb == "text":
-                print(visible_text(tab, action.args[0] if action.args else None), flush=True)
+                print(
+                    visible_text(tab, action.args[0] if action.args else None),
+                    flush=True,
+                )
             elif action.verb == "links":
-                for text, href in tab.evaluate(LINKS_JS, action.args[0] if action.args else ""):
+                for text, href in tab.evaluate(
+                    LINKS_JS, action.args[0] if action.args else ""
+                ):
                     print(f"{text} -> {href}", flush=True)
             elif action.verb == "scroll-all":
                 scroll_all(tab)
@@ -170,12 +203,28 @@ def size_arg(text):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], epilog=__doc__.split("\n\n", 1)[1],
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        epilog=__doc__.split("\n\n", 1)[1],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("page", help="a URL or a local file")
-    parser.add_argument("--do", action="append", default=[], metavar="ACTION", help="an action; see below")
-    parser.add_argument("--out", type=Path, help="output directory (default: a new temp dir)")
-    parser.add_argument("--size", type=size_arg, default=(1280, 900), help="viewport WxH (default 1280x900)")
+    parser.add_argument(
+        "--do",
+        action="append",
+        default=[],
+        metavar="ACTION",
+        help="an action; see below",
+    )
+    parser.add_argument(
+        "--out", type=Path, help="output directory (default: a new temp dir)"
+    )
+    parser.add_argument(
+        "--size",
+        type=size_arg,
+        default=(1280, 900),
+        help="viewport WxH (default 1280x900)",
+    )
     args = parser.parse_args(argv)
     try:
         actions = [parse_action(a) for a in args.do]

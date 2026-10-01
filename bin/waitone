@@ -28,15 +28,39 @@ TIMED_OUT = 4
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="waitone", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        prog="waitone",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("pattern", nargs="?", help="exact process name, or with -f a regex over the full command line")
-    target.add_argument("-p", "--pid", type=int, help="wait for this PID instead of matching")
-    parser.add_argument("-f", "--full", action="store_true", help="match the full command line, like pgrep -f")
-    parser.add_argument("-t", "--timeout", type=float, metavar="SECONDS", help="give up after SECONDS (exit 4)")
+    target.add_argument(
+        "pattern",
+        nargs="?",
+        help="exact process name, or with -f a regex over the full command line",
+    )
+    target.add_argument(
+        "-p", "--pid", type=int, help="wait for this PID instead of matching"
+    )
     parser.add_argument(
-        "-i", "--interval", type=float, default=0.2, metavar="SECONDS", help="poll interval (default %(default)s)"
+        "-f",
+        "--full",
+        action="store_true",
+        help="match the full command line, like pgrep -f",
+    )
+    parser.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="give up after SECONDS (exit 4)",
+    )
+    parser.add_argument(
+        "-i",
+        "--interval",
+        type=float,
+        default=0.2,
+        metavar="SECONDS",
+        help="poll interval (default %(default)s)",
     )
     args = parser.parse_args(argv)
 
@@ -50,7 +74,10 @@ def main(argv: list[str] | None = None) -> int:
 
     start = time.monotonic()
     if not wait_gone(pid, args.timeout, args.interval):
-        print(f"waitone: {pid} still running after {args.timeout}s  {cmdline}", file=sys.stderr)
+        print(
+            f"waitone: {pid} still running after {args.timeout}s  {cmdline}",
+            file=sys.stderr,
+        )
         return TIMED_OUT
     print(f"{pid} exited after {time.monotonic() - start:.1f}s  {cmdline}")
     return 0

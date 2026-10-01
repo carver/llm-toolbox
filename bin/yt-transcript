@@ -53,7 +53,13 @@ NO_TRANSCRIPT = {
     "VideoUnplayable",
 }
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
-YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+}
 PATH_PREFIXES = ("/shorts/", "/live/", "/embed/")
 UNIT_TIME = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?")
 
@@ -76,7 +82,11 @@ def parse_time(text: str) -> int:
     """Seconds from "1238", "20m38s" or "20:38"."""
     if ":" in text:
         parts = text.split(":")
-        if len(parts) > 3 or not all(p.isdigit() for p in parts) or any(int(p) > 59 for p in parts[1:]):
+        if (
+            len(parts) > 3
+            or not all(p.isdigit() for p in parts)
+            or any(int(p) > 59 for p in parts[1:])
+        ):
             raise UsageError(f"not a time: {text!r}")
         seconds = 0
         for part in parts:
@@ -109,7 +119,9 @@ def parse_video(text: str) -> tuple[str, int | None]:
     return candidate, parse_time(stamp) if stamp else None
 
 
-def window(segments: list[Segment], at: int | None, before: int, after: int) -> list[Segment]:
+def window(
+    segments: list[Segment], at: int | None, before: int, after: int
+) -> list[Segment]:
     if at is None:
         return segments
     return [s for s in segments if at - before <= s[0] <= at + after]
@@ -135,19 +147,27 @@ def download(video_id: str) -> list[Segment]:
     except Exception as e:  # the library's own errors, and requests' network errors
         lines = str(e).strip().splitlines()
         reason = f"{type(e).__name__}: {lines[0] if lines else ''}"
-        raise (FetchFailed if type(e).__name__ in NO_TRANSCRIPT else TryLater)(reason) from e
+        raise (FetchFailed if type(e).__name__ in NO_TRANSCRIPT else TryLater)(
+            reason
+        ) from e
     return [(s.start, s.text) for s in transcript]
 
 
 def cache_dir() -> Path:
-    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "yt-transcript"
+    return (
+        Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+        / "yt-transcript"
+    )
 
 
 def fetch(video_id: str, refresh: bool = False) -> list[Segment]:
     """The video's transcript, from the cache when it's there."""
     path = cache_dir() / f"{video_id}.json"
     if not refresh and path.exists():
-        return [(start, text) for start, text in json.loads(path.read_text(encoding="utf-8"))]
+        return [
+            (start, text)
+            for start, text in json.loads(path.read_text(encoding="utf-8"))
+        ]
     segments = download(video_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -171,10 +191,28 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("video", metavar="VIDEO", help="video URL or id")
-    parser.add_argument("--at", type=seconds_arg, help="the moment to center on; overrides the URL's timestamp")
-    parser.add_argument("--before", type=seconds_arg, default=90, help="seconds before the moment (default 90)")
-    parser.add_argument("--after", type=seconds_arg, default=60, help="seconds after the moment (default 60)")
-    parser.add_argument("--refresh", action="store_true", help="fetch from YouTube even when the transcript is cached")
+    parser.add_argument(
+        "--at",
+        type=seconds_arg,
+        help="the moment to center on; overrides the URL's timestamp",
+    )
+    parser.add_argument(
+        "--before",
+        type=seconds_arg,
+        default=90,
+        help="seconds before the moment (default 90)",
+    )
+    parser.add_argument(
+        "--after",
+        type=seconds_arg,
+        default=60,
+        help="seconds after the moment (default 60)",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="fetch from YouTube even when the transcript is cached",
+    )
     args = parser.parse_args(argv)
     try:
         video_id, stamp = parse_video(args.video)
@@ -186,7 +224,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"yt-transcript: no transcript for {args.video}: {e}", file=sys.stderr)
         return FAILED
     except TryLater as e:
-        print(f"yt-transcript: YouTube failed the request for {args.video}, try later: {e}", file=sys.stderr)
+        print(
+            f"yt-transcript: YouTube failed the request for {args.video}, try later: {e}",
+            file=sys.stderr,
+        )
         return LATER
     at = args.at if args.at is not None else stamp
     for segment in window(segments, at, args.before, args.after):

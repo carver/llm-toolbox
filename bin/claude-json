@@ -48,12 +48,18 @@ def load_schema(text: str) -> dict:
 
 def claude_command(args: argparse.Namespace, schema: dict) -> list[str]:
     cmd = [
-        "claude", "-p",
-        "--model", args.model,
-        "--output-format", "json",
-        "--json-schema", json.dumps(schema),
-        "--tools", args.tools,
-        "--setting-sources", "",
+        "claude",
+        "-p",
+        "--model",
+        args.model,
+        "--output-format",
+        "json",
+        "--json-schema",
+        json.dumps(schema),
+        "--tools",
+        args.tools,
+        "--setting-sources",
+        "",
         "--strict-mcp-config",
         "--no-session-persistence",
     ]
@@ -70,39 +76,80 @@ def call(cmd: list[str], prompt: str, timeout: float) -> dict:
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     with tempfile.TemporaryDirectory(prefix="claude-json-") as empty_dir:
         try:
-            proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                                  env=env, cwd=empty_dir, timeout=timeout, check=False)
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=empty_dir,
+                timeout=timeout,
+                check=False,
+            )
         except subprocess.TimeoutExpired:
             raise CallFailed(f"claude timed out after {timeout:g}s")
         except OSError as err:
             raise CallFailed(f"claude did not start: {err}")
     if proc.returncode != 0:
-        raise CallFailed(f"claude exited {proc.returncode}: {proc.stderr.strip()[:500]}")
+        raise CallFailed(
+            f"claude exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+        )
     try:
         reply = json.loads(proc.stdout)
     except json.JSONDecodeError:
         raise CallFailed(f"claude printed non-JSON: {proc.stdout[:200]!r}")
     output = reply.get("structured_output")
     if reply.get("is_error") or not isinstance(output, dict):
-        detail = reply.get("subtype") if reply.get("is_error") else str(reply.get("result"))[:300]
+        detail = (
+            reply.get("subtype")
+            if reply.get("is_error")
+            else str(reply.get("result"))[:300]
+        )
         raise CallFailed(f"claude returned no structured output: {detail}")
     return output
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="claude-json", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        prog="claude-json",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-s", "--schema", required=True, help="JSON Schema, as JSON text or a path to a .json file")
-    parser.add_argument("-m", "--model", default="sonnet", help="model alias or id (default %(default)s)")
-    parser.add_argument("--tools", default="", metavar="LIST",
-                        help="comma-separated built-in tools to enable and pre-approve, e.g. WebFetch,WebSearch "
-                             "(default: none)")
-    parser.add_argument("--system-prompt", metavar="TEXT",
-                        help="replace Claude Code's system prompt; cuts about 6k input tokens per call")
-    parser.add_argument("--max-budget-usd", metavar="USD", help="stop the call past this spend")
-    parser.add_argument("-t", "--timeout", type=float, default=600, metavar="SECONDS",
-                        help="kill the call after this long (default %(default)g)")
+    parser.add_argument(
+        "-s",
+        "--schema",
+        required=True,
+        help="JSON Schema, as JSON text or a path to a .json file",
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        default="sonnet",
+        help="model alias or id (default %(default)s)",
+    )
+    parser.add_argument(
+        "--tools",
+        default="",
+        metavar="LIST",
+        help="comma-separated built-in tools to enable and pre-approve, e.g. WebFetch,WebSearch "
+        "(default: none)",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        metavar="TEXT",
+        help="replace Claude Code's system prompt; cuts about 6k input tokens per call",
+    )
+    parser.add_argument(
+        "--max-budget-usd", metavar="USD", help="stop the call past this spend"
+    )
+    parser.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=600,
+        metavar="SECONDS",
+        help="kill the call after this long (default %(default)g)",
+    )
     args = parser.parse_args(argv)
 
     try:

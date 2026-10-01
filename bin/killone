@@ -21,20 +21,45 @@ from procmatch import exactly_one, wait_gone
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="killone", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        prog="killone",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("pattern", help="exact process name, or with -f a regex over the full command line")
-    parser.add_argument("-f", "--full", action="store_true", help="match the full command line, like pkill -f")
-    parser.add_argument("-s", "--signal", default="TERM", help="signal name or number (default %(default)s)")
-    parser.add_argument("-n", "--dry-run", action="store_true", help="show what would be signalled")
     parser.add_argument(
-        "-w", "--wait", type=float, default=0, metavar="SECONDS",
+        "pattern",
+        help="exact process name, or with -f a regex over the full command line",
+    )
+    parser.add_argument(
+        "-f",
+        "--full",
+        action="store_true",
+        help="match the full command line, like pkill -f",
+    )
+    parser.add_argument(
+        "-s",
+        "--signal",
+        default="TERM",
+        help="signal name or number (default %(default)s)",
+    )
+    parser.add_argument(
+        "-n", "--dry-run", action="store_true", help="show what would be signalled"
+    )
+    parser.add_argument(
+        "-w",
+        "--wait",
+        type=float,
+        default=0,
+        metavar="SECONDS",
         help="wait up to SECONDS for the process to exit; exit 3 if it doesn't",
     )
     args = parser.parse_args(argv)
 
     sig_name = args.signal.upper().removeprefix("SIG")
-    sig = signal.Signals(int(sig_name)) if sig_name.isdigit() else signal.Signals["SIG" + sig_name]
+    sig = (
+        signal.Signals(int(sig_name))
+        if sig_name.isdigit()
+        else signal.Signals["SIG" + sig_name]
+    )
     found = exactly_one(args.pattern, args.full, "killone")
     if isinstance(found, int):
         return found

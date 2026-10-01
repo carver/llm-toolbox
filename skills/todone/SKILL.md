@@ -77,7 +77,7 @@ Refresh the clone (`git fetch && git reset --hard origin/main`), then edit the t
   Source: ...
   Done in: llm-toolbox@4c1e2a9
   Learned:
-    - Renamed it from /retro to /retro-session: Matt Pocock's skill already has that name.
+    - Renamed it from /retro to /upskill: Matt Pocock's skill already has that name.
 ```
 
 If an approved finding is a lesson beyond this to-do ("when I face X, consider Y"), offer to file it as a Cue page under `Cues/` too.

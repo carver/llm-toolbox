@@ -1,10 +1,10 @@
 ---
-name: retro
+name: upskill
 description: End-of-session retrospective. Mines the session for mistakes, waste and repetition, then pitches automation, skills and doc fixes.
 disable-model-invocation: true
 ---
 
-# Retro
+# Upskill
 
 This session is about to end. Run a retrospective on it: find what cost time or tokens, and pitch changes that make the next session cheaper.
 

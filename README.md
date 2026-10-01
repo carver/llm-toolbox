@@ -28,7 +28,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **coding**: the coding standards. Loads when code is about to change, so the rest
   of `GLOBAL_CLAUDE.md` stays short.
 - **unslop**: cut AI tells from writing.
-- **retro**: run by hand (`/retro`) near the end of a session. Reviews the session for
+- **upskill**: run by hand (`/upskill`) near the end of a session. Reviews the session for
   mistakes, waste and repeated work, then pitches fixes before making any.
 - **todone**: run by hand (`/todone`) to do a coding to-do from the knowledge-dump
   vault. The commit message gets the to-do's Why and source, and the to-do gets

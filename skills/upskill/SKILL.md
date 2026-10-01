@@ -32,3 +32,5 @@ Drop one-offs with no cheaper path next time.
 ## 3. Pitch
 
 Make no changes yet. Present a numbered list, biggest payoff first. Each item: the finding with its evidence from the transcript, the proposed fix, and its size. Ask questions wherever you're unsure. Then stop: the user picks which ones to follow through on now.
+
+Close by suggesting `/retro`, Matt Pocock's skill, for a second pass over the same session. It looks for guardrails rather than waste: automated checks, rules for the reviewer agent, and steering files to trim.

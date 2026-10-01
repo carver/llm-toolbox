@@ -34,7 +34,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   of `GLOBAL_CLAUDE.md` stays short.
 - **unslop**: cut AI tells from writing.
 - **upskill**: run by hand (`/upskill`) near the end of a session. Reviews the session for
-  mistakes, waste and repeated work, then pitches fixes before making any.
+  mistakes, waste and repeated work, then pitches fixes before making any. It ends
+  by suggesting Matt Pocock's `/retro`, which looks at the same session for guardrails.
 - **todone**: run by hand (`/todone`) to do a coding to-do from the knowledge-dump
   vault. The commit message gets the to-do's Why and source, and the to-do gets
   ticked with the commit and what was learned doing it.

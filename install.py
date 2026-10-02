@@ -72,7 +72,6 @@ THIRD_PARTY_SKILLS = {
         "grill-with-docs",
         "grilling",
         "handoff",
-        "implement",
         "improve-codebase-architecture",
         "pr",
         "prototype",

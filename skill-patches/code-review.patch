@@ -1,0 +1,28 @@
+# Why: Hold diffs to the global standards in coding/standards.md too, and take /build's brief as the spec.
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -10,7 +10,7 @@
+ 
+ Both axes run as **parallel sub-agents** so they don't pollute each other's context, then this skill aggregates their findings.
+ 
+-The issue tracker should have been provided to you. If `docs/agents/issue-tracker.md` is missing, tell the user to run `/setup-matt-pocock-skills`.
++The issue tracker should have been provided to you. If `docs/agents/issue-tracker.md` is missing and the spec wasn't passed in, tell the user to run `/setup-matt-pocock-skills`.
+ 
+ ## Process
+ 
+@@ -27,13 +27,13 @@
+ Look for the originating spec, in this order:
+ 
+ 1. Issue references in the commit messages (`#123`, `Closes #45`, GitLab `!67`, etc.), fetched via the workflow in `docs/agents/issue-tracker.md`.
+-2. A path the user passed as an argument.
++2. A path or text passed in as an argument, such as `/build`'s brief.
+ 3. A spec file under `docs/`, `specs/`, or `.scratch/` matching the branch name or feature.
+ 4. If nothing is found, ask the user where the spec is. If they say there isn't one, the **Spec** sub-agent will skip and report "no spec available".
+ 
+ ### 3. Identify the standards sources
+ 
+-Anything in the repo that documents how code should be written, such as `CODING_STANDARDS.md` or `CONTRIBUTING.md`.
++Anything in the repo that documents how code should be written, such as `CODING_STANDARDS.md` or `CONTRIBUTING.md`, plus the user's global standards in `~/.agents/skills/coding/standards.md`. A repo's own standards win where the two conflict.
+ 
+ On top of whatever the repo documents, the Standards axis always carries the **smell baseline** below: a fixed set of Fowler code smells (_Refactoring_, ch.3) that applies even when a repo documents nothing. Two rules bind it:
+ 

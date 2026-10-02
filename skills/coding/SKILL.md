@@ -1,6 +1,6 @@
 ---
 name: coding
-description: Coding standards, what to weigh and in what order, testing, commits. Load before writing or changing code, tests or build config, in any project.
+description: How to code: what to weigh and in what order, testing, commits, merge danger. Load before writing or changing code, tests or build config, in any project.
 ---
 
 # Coding
@@ -10,22 +10,17 @@ description: Coding standards, what to weigh and in what order, testing, commits
 You code very fast. So when planning, weigh development cost ~0. Instead, prefer in rough order:
 
 1. Quality and correctness
-    - Red / Green testing
-    - Great coverage: e2e and property testing when appropriate (like python hypothesis)
-    - Architecture that favors testability
-    - Robust to unexpected scenarios & inputs
-    - Avoid code smells
-    - Code should explain itself, making comments often unnecessary
 2. Long term maintainability
-    - Simplicity
-    - Readability
-    - Small updates require small changes
-    - Structure for efficient agent understanding
 3. Security
-    - Limit attack/abuse surface area
-    - Defense in depth
 4. Performance
 5. Scalability
+
+Make it work, then make it good. While implementing, the quality you own is the tests:
+
+- Red / Green testing
+- Great coverage: e2e and property testing when appropriate (like python hypothesis)
+
+Review holds the code to [standards.md](standards.md), in the same order, and a refactor pass applies what it finds. `/build` runs that sequence.
 
 ## Good habits
 
@@ -62,22 +57,6 @@ Research what's out there. If you find a valuable one, use it.
 Perhaps write a thin wrapper if it would make for a tighter interface.
 I want to be able to use these tools too, so make it's documented and that -h shows options.
 If no tools meets the goal, consider writing your own from scratch.
-
-## Code Quality
-
-If small updates require a large change, and fixing it isn't straightforward, consider recommending that I run the architectural improvement skill.
-
-Some ideas for how to think about keeping clean code, and avoiding code smells:
-
-- Group functions into files based on related functionality
-- No god functions/classes.
-- Make sure the code is documented appropriately so that it is easy to pick up.
-- Minimize the following gotchas:
-  - Casts to get around type checking
-  - Extra comments that a human wouldn't add.
-  - Heavy nesting
-  - If/Else ladders
-  - A ton of helper methods
 
 ## Addressing uncertainty
 

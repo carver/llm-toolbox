@@ -51,8 +51,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 
 ## Skills
 
-- **coding**: the coding standards. Loads when code is about to change, so the rest
-  of `GLOBAL_CLAUDE.md` stays short.
+- **coding**: how to code: priorities, tests, commits, merge danger. Loads when
+  code is about to change, so the rest of `GLOBAL_CLAUDE.md` stays short. Its
+  `standards.md` holds the quality rules, which apply at review, not while
+  implementing.
+- **build**: the orchestrator for a code change. An implementer subagent makes it
+  work, `/code-review` checks it against `coding/standards.md`, the orchestrator
+  triages the findings, and a refactor subagent makes it good.
 - **unslop**: cut AI tells from writing.
 - **upskill**: run by hand (`/upskill`) near the end of a session. Reviews the session for
   mistakes, waste and repeated work, then pitches fixes before making any. It ends

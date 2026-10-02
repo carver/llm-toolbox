@@ -10,7 +10,7 @@ Chat replies to me skip /unslop: be extremely concise, and sacrifice grammar for
 
 ## Coding
 
-Every time you are about to write or change code, use the `coding` skill (`~/.agents/skills/coding/SKILL.md`). The standards live there.
+To write or change code, run `/build`: subagents implement, review and refactor while you orchestrate. A trivial edit, such as a one-file change with no behaviour worth a test, you make yourself with the `coding` skill (`~/.agents/skills/coding/SKILL.md`).
 
 ## Claims
 

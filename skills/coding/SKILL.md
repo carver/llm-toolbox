@@ -33,6 +33,13 @@ Make logically isolated commits.
 Before every commit or amend, check `git diff --cached --stat`. Unstage anything you didn't write: the user may have edits in progress in the same tree.
 Before an unpushed branch is merged, fold fixes into the commits they fix (`git commit --fixup=<sha>`, then `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash <base>`; plain interactive rebase isn't available here). History shouldn't show detours.
 
+Before you start a change, and again on the finished diff, judge its merge danger:
+
+- Door: a revert walks back a two-way door. Data loss, destructive migrations, messages sent to people, published releases and rewritten shared history are one-way doors.
+- Blast radius: what breaks if it's wrong. It's local when only my own use of this repo suffers; wide when it reaches other people, published packages, production systems or shared data.
+
+A two-way door with a local blast radius stays fast: commit on the current branch as usual. Anything else gets my review first. Say so before starting, work on a branch, open the PR with `/pr`, and stop there instead of merging. If the finished diff turns out riskier than you judged, move the unpushed commits onto a branch. A repo with no GitHub remote keeps the branch local, and the `/pr` body goes in chat.
+
 Before putting code into a folder you didn't create, especially in another repo, read its README or listing to confirm the folder is meant for that kind of file. For example, a `spec/` holding a format and fixtures is no place for a library.
 
 Maintain high standards: if you notice issues, fix them. Examples: lint, test flakiness.

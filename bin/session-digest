@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 TEXT_LIMIT = 400
+BIGGEST = 5
 INPUT_LIMIT = 200
 CHARS_PER_TOKEN = 4
 IMAGE_TOKENS = 1600
@@ -46,6 +47,7 @@ class Agent:
     lines: list[str] = field(default_factory=list)
     totals: ToolStats = field(default_factory=ToolStats)
     tools: dict[str, ToolStats] = field(default_factory=dict)
+    outputs: list[tuple[int, str]] = field(default_factory=list)
     context_in: int = 0
     output: int = 0
 
@@ -90,7 +92,7 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
-    pending: dict[str, str] = {}
+    pending: dict[str, tuple[str, str]] = {}
     requests: set[str] = set()
     for record in records:
         message = record.get("message") or {}
@@ -110,8 +112,9 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
                 if block.get("type") == "text":
                     agent.lines.append(f"  {short(block['text'], TEXT_LIMIT)}")
                 elif block.get("type") == "tool_use":
-                    pending[block["id"]] = block["name"]
-                    line = f"  > {block['name']}: {describe_input(block['name'], block.get('input', {}))}"
+                    call = f"{block['name']}: {describe_input(block['name'], block.get('input', {}))}"
+                    pending[block["id"]] = (block["name"], call)
+                    line = f"  > {call}"
                     if block["id"] in spawned:
                         line += f" -> {spawned[block['id']]}"
                     agent.lines.append(line)
@@ -126,11 +129,12 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
                 if block.get("type") == "text" and not record.get("isMeta"):
                     agent.lines.append(f"USER {short(block['text'], TEXT_LIMIT * 5)}")
                 elif block.get("type") == "tool_result":
-                    tool = pending.pop(block.get("tool_use_id"), "?")
+                    tool, call = pending.pop(block.get("tool_use_id"), ("?", "?"))
                     text, tokens, images = result_size(block.get("content") or "")
                     error = bool(block.get("is_error"))
                     agent.totals.add(error, tokens)
                     agent.tools.setdefault(tool, ToolStats()).add(error, tokens)
+                    agent.outputs.append((tokens, call))
                     if error:
                         agent.lines.append(f"    ERROR {short(text, TEXT_LIMIT)}")
                     else:
@@ -199,7 +203,12 @@ def summary(agents: list[Agent]) -> list[str]:
         "",
         "out~tok: tool output the agent read, estimated. api-in: context sent per",
         "request, summed (cache reads included). api-out: tokens generated.",
+        "",
+        "biggest outputs",
     ]
+    outputs = [(tokens, a.name, call) for a in agents for tokens, call in a.outputs]
+    for tokens, name, call in sorted(outputs, key=lambda o: -o[0])[:BIGGEST]:
+        lines.append(f"{human(tokens):>7}  {name:<24} {short(call, 100)}")
     return lines
 
 

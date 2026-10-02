@@ -119,7 +119,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 
 - **session-digest**: condenses a Claude Code session log, and each of its
   subagents' logs, for a retrospective. Prints what each agent and tool cost
-  (calls, errors, estimated tokens of tool output, API tokens in and out),
+  (calls, errors, estimated tokens of tool output, API tokens in and out)
+  and its five biggest tool outputs,
   then each agent's timeline: user turns, the assistant's text, one line per
   tool call with its output's size, and every error in full. Defaults to the
   newest session for the current directory.

@@ -173,3 +173,10 @@ def test_unknown_session_fails(config: Path) -> None:
     )
     assert proc.returncode == 1
     assert "nope" in proc.stderr
+
+
+def test_summary_lists_biggest_outputs(config: Path) -> None:
+    summary = digest(config).split("\n== main")[0]
+    biggest = summary.split("biggest outputs")[1].strip().splitlines()
+    assert biggest[0].split() == ["1.0k", "main", "Bash:", "cat", "big.log"]
+    assert len(biggest) == 5

@@ -59,9 +59,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   work, `/code-review` checks it against `coding/standards.md`, the orchestrator
   triages the findings, and a refactor subagent makes it good.
 - **unslop**: cut AI tells from writing.
-- **upskill**: run by hand (`/upskill`) near the end of a session. Reviews the session for
-  mistakes, waste and repeated work, then pitches fixes before making any. It ends
-  by suggesting Matt Pocock's `/retro`, which looks at the same session for guardrails.
+- **upskill**: run by hand (`/upskill`) near the end of a session, or on an
+  earlier one. Reviews it for mistakes, waste, repeated work and missing
+  guardrails, subagents included, then pitches fixes before making any.
 - **todone**: run by hand (`/todone`) to do a coding to-do from the knowledge-dump
   vault. The commit message gets the to-do's Why and source, and the to-do gets
   ticked with the commit and what was learned doing it.

@@ -76,7 +76,6 @@ THIRD_PARTY_SKILLS = {
         "pr",
         "prototype",
         "research",
-        "retro",
         "setup-matt-pocock-skills",
         "tdd",
         "teach",

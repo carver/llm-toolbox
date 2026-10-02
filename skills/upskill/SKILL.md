@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # Upskill
 
-This session is about to end. Run a retrospective on it: find what cost time or tokens, and pitch changes that make the next session cheaper.
+Run a retrospective on this session, or on the one the user names (`session-digest SESSION` reads a past one, such as the session before a `/clear`): find what cost time or tokens, and pitch changes that make the next session cheaper.
 
 Also look for important conventions in the repositories that might be ill-formed.
 
@@ -17,7 +17,8 @@ Walk the whole transcript, first turn to last. Your context holds only a subagen
 - **Mistakes**: wrong assumptions, retracted answers, reverted edits, user corrections.
 - **Waste**: dead ends, oversized reads or outputs, searches that took several tries to land.
 - **Repetition**: the same command sequence, lookup or explanation done more than once.
-- **Missing context**: anything you learned by trial, by asking the user, or by digging through code, that a doc could have told you.
+- **Missing context**: anything you learned by trial, by asking the user, or by digging through code, that a doc could have told you. That includes hidden dependencies: files that must change together with nothing pointing from one to the other.
+- **Hungry tools**: a CLI, MCP server or script of ours whose output costs more tokens than the agent used. `session-digest`'s biggest outputs are the place to start.
 
 Done when every failed tool call, in the main session and in each subagent, and every user correction is accounted for, either as a finding or dismissed with a reason.
 
@@ -25,7 +26,8 @@ Done when every failed tool call, in the main session and in each subagent, and 
 
 - **Deterministic task**: automate it. Research existing libraries and tools first. Prefer, in order: one that solves it out of the box; a thin layer around one; an extension of a binary or script the project already has; a new Python script in the project's `bin/`. If the tool would pay off across projects, say so: it could live in `llm-toolbox` instead.
 - **Repeated task needing judgment**: a project-local skill (`.claude/skills/<name>/SKILL.md`), written with `writing-for-agents`.
-- **Missing context**: docs. If the context was written but you missed it, sharpen the pointer to it (a `CLAUDE.md`/`AGENTS.md` line). If a doc was wrong, fix it. If nothing was written, add a doc.
+- **Missing context**: docs. If the context was written but you missed it, sharpen the pointer to it. If a doc was wrong, fix it. If nothing was written, add a doc. `CLAUDE.md`/`AGENTS.md` load into every session, so they hold pointers, not the material itself.
+- **Hungry tool**: trim its default output, or add a flag for the short form.
 - **Mistake from a habit**: a guideline, skill or memory edit that changes the habit.
 - **Hard-won knowledge**: something another agent would also have to dig for may be worth a SOFA post.
 
@@ -45,5 +47,3 @@ Look for candidates for improvement in these categories.
 ## 4. Pitch
 
 Make no changes yet. Present a numbered list, biggest payoff first. Each item: the finding with its evidence from the transcript, the proposed fix, and its size. Ask questions wherever you're unsure. Then stop: the user picks which ones to follow through on now.
-
-Close by suggesting `/retro`, Matt Pocock's skill, for a second pass over the same session. It looks for guardrails rather than waste: automated checks, rules for the reviewer agent, and steering files to trim.

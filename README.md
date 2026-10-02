@@ -112,6 +112,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   new skills. The weekly cron job from `install.py` runs it; its log is
   `~/.cache/skills-news/cron.log`.
 
+- **session-digest**: condenses a Claude Code session log, and each of its
+  subagents' logs, for a retrospective. Prints what each agent and tool cost
+  (calls, errors, estimated tokens of tool output, API tokens in and out),
+  then each agent's timeline: user turns, the assistant's text, one line per
+  tool call with its output's size, and every error in full. Defaults to the
+  newest session for the current directory.
+
 - **yt-transcript**: prints a YouTube video's captions, or the ones around
   the URL's timestamp (90 seconds before, 60 after, by default), each line
   prefixed with its clock time. For finding what a video said at a moment

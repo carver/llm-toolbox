@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Condense a Claude Code session, subagents included, for a retrospective.
+
+A session log and each of its subagents' logs run to a megabyte of JSONL, mostly
+tool output. This prints a summary of what each agent and each tool cost, then
+every agent's timeline: user turns, the assistant's text, one line per tool call
+with the size of its output, and the text of every error. Output bodies are
+left out; their size is given in characters and estimated tokens (chars / 4).
+
+The session defaults to the newest one for the current directory's project.
+Logs live under $CLAUDE_CONFIG_DIR (default ~/.claude) in
+projects/<project>/<session>.jsonl, with subagents in
+projects/<project>/<session>/subagents/agent-<id>.jsonl.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+TEXT_LIMIT = 400
+INPUT_LIMIT = 200
+CHARS_PER_TOKEN = 4
+IMAGE_TOKENS = 1600
+
+
+@dataclass
+class ToolStats:
+    calls: int = 0
+    errors: int = 0
+    tokens: int = 0
+
+    def add(self, error: bool, tokens: int) -> None:
+        self.calls += 1
+        self.errors += error
+        self.tokens += tokens
+
+
+@dataclass
+class Agent:
+    name: str
+    label: str
+    lines: list[str] = field(default_factory=list)
+    totals: ToolStats = field(default_factory=ToolStats)
+    tools: dict[str, ToolStats] = field(default_factory=dict)
+    context_in: int = 0
+    output: int = 0
+
+
+def short(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…[+{len(text) - limit} chars]"
+
+
+def human(n: int) -> str:
+    return str(n) if n < 1000 else f"{n / 1000:.1f}k"
+
+
+def describe_input(name: str, tool_input: dict) -> str:
+    for key in ("command", "file_path", "pattern", "url", "query", "skill"):
+        if key in tool_input:
+            return short(str(tool_input[key]), INPUT_LIMIT)
+    if name == "Agent" and "description" in tool_input:
+        return str(tool_input["description"])
+    return short(json.dumps(tool_input), INPUT_LIMIT)
+
+
+def result_size(content: str | list) -> tuple[str, int, int]:
+    """The result's text, its estimated tokens, and how many images it held."""
+    if isinstance(content, str):
+        return content, len(content) // CHARS_PER_TOKEN, 0
+    text = "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
+    images = sum(b.get("type") == "image" for b in content)
+    return text, len(text) // CHARS_PER_TOKEN + images * IMAGE_TOKENS, images
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    records = []
+    for line in path.read_text().splitlines():
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
+def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
+    pending: dict[str, str] = {}
+    requests: set[str] = set()
+    for record in records:
+        message = record.get("message") or {}
+        content = message.get("content")
+        if record.get("type") == "assistant":
+            request = record.get("requestId") or message.get("id")
+            usage = message.get("usage")
+            if usage and request not in requests:
+                requests.add(request)
+                agent.context_in += (
+                    usage.get("input_tokens", 0)
+                    + usage.get("cache_creation_input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0)
+                )
+                agent.output += usage.get("output_tokens", 0)
+            for block in content or []:
+                if block.get("type") == "text":
+                    agent.lines.append(f"  {short(block['text'], TEXT_LIMIT)}")
+                elif block.get("type") == "tool_use":
+                    pending[block["id"]] = block["name"]
+                    line = f"  > {block['name']}: {describe_input(block['name'], block.get('input', {}))}"
+                    if block["id"] in spawned:
+                        line += f" -> {spawned[block['id']]}"
+                    agent.lines.append(line)
+        elif record.get("type") == "user":
+            if isinstance(content, str):
+                if record.get("isMeta"):
+                    agent.lines.append(f"USER (injected, {len(content)} chars)")
+                else:
+                    agent.lines.append(f"USER {short(content, TEXT_LIMIT * 5)}")
+                continue
+            for block in content or []:
+                if block.get("type") == "text" and not record.get("isMeta"):
+                    agent.lines.append(f"USER {short(block['text'], TEXT_LIMIT * 5)}")
+                elif block.get("type") == "tool_result":
+                    tool = pending.pop(block.get("tool_use_id"), "?")
+                    text, tokens, images = result_size(block.get("content") or "")
+                    error = bool(block.get("is_error"))
+                    agent.totals.add(error, tokens)
+                    agent.tools.setdefault(tool, ToolStats()).add(error, tokens)
+                    if error:
+                        agent.lines.append(f"    ERROR {short(text, TEXT_LIMIT)}")
+                    else:
+                        size = f"{len(text)} chars ~{tokens} tok"
+                        if images:
+                            size += f" ({images} images)"
+                        agent.lines.append(f"    = {size}")
+    return agent
+
+
+def project_dir(config: Path, cwd: str) -> Path:
+    return config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def find_session(config: Path, cwd: str, session: str | None) -> Path | None:
+    if session and Path(session).is_file():
+        return Path(session)
+    project = project_dir(config, cwd)
+    if session:
+        path = project / f"{session}.jsonl"
+        if path.is_file():
+            return path
+        matches = list((config / "projects").glob(f"*/{session}.jsonl"))
+        return matches[0] if len(matches) == 1 else None
+    logs = sorted(project.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    return logs[-1] if logs else None
+
+
+def load_subagents(session: Path) -> list[tuple[str, dict, list[dict]]]:
+    folder = session.with_suffix("") / "subagents"
+    found = []
+    for log in sorted(folder.glob("agent-*.jsonl"), key=lambda p: p.stat().st_mtime):
+        meta_path = log.with_suffix(".meta.json")
+        meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+        found.append((log.stem, meta, read_jsonl(log)))
+    return found
+
+
+def summary(agents: list[Agent]) -> list[str]:
+    row = "{:<24} {:>6} {:>6} {:>9} {:>10} {:>8}"
+    lines = [row.format("agent", "calls", "errors", "out~tok", "api-in", "api-out")]
+    for a in agents:
+        t = a.totals
+        lines.append(
+            row.format(
+                a.name,
+                t.calls,
+                t.errors,
+                human(t.tokens),
+                human(a.context_in),
+                human(a.output),
+            )
+        )
+    tools: dict[str, ToolStats] = {}
+    for a in agents:
+        for name, s in a.tools.items():
+            total = tools.setdefault(name, ToolStats())
+            total.calls += s.calls
+            total.errors += s.errors
+            total.tokens += s.tokens
+    trow = "{:<24} {:>6} {:>6} {:>9}"
+    lines += ["", trow.format("tool", "calls", "errors", "out~tok")]
+    for name, s in sorted(tools.items(), key=lambda kv: -kv[1].tokens):
+        lines.append(trow.format(name, s.calls, s.errors, human(s.tokens)))
+    lines += [
+        "",
+        "out~tok: tool output the agent read, estimated. api-in: context sent per",
+        "request, summed (cache reads included). api-out: tokens generated.",
+    ]
+    return lines
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="session-digest",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "session",
+        nargs="?",
+        help="session id or path to its .jsonl (default: newest for --cwd)",
+    )
+    parser.add_argument(
+        "--cwd",
+        default=os.getcwd(),
+        help="project directory whose sessions to search (default: current)",
+    )
+    args = parser.parse_args(argv)
+
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+    session = find_session(config, args.cwd, args.session)
+    if session is None:
+        print(
+            f"session-digest: no session {args.session or ''} for {args.cwd} under {config}",
+            file=sys.stderr,
+        )
+        return 1
+
+    subagents = load_subagents(session)
+    spawned = {
+        meta["toolUseId"]: name for name, meta, _ in subagents if "toolUseId" in meta
+    }
+    agents = [digest(Agent("main", "main"), read_jsonl(session), spawned)]
+    for name, meta, records in subagents:
+        label = f"{meta.get('agentType', '?')}: {meta.get('description', '')}"
+        agents.append(digest(Agent(name, label), records, spawned))
+
+    print(f"session {session.stem}  ({session})")
+    print("\n".join(summary(agents)))
+    for agent in agents:
+        header = "main" if agent.name == "main" else f"{agent.name} ({agent.label})"
+        print(f"\n== {header}")
+        print("\n".join(agent.lines))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

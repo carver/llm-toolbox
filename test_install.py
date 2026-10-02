@@ -344,3 +344,21 @@ def test_update_reports_failure(third_party, monkeypatch, capsys):
     )
     assert install.update_third_party_skills() == 1
     assert "FAILED update" in capsys.readouterr().out
+
+
+def test_skill_patches_go_back_on_and_conflicts_count(tmp_path, monkeypatch, capsys):
+    from skill_testing import make_skill
+
+    tp = install.thirdparty
+    monkeypatch.setattr(tp, "INSTALLED", tmp_path / "installed")
+    monkeypatch.setattr(tp, "PATCHES", tmp_path / "skill-patches")
+    upstream = make_skill(tmp_path, "upstream/pr")
+    edited = make_skill(tmp_path, "edited/pr", body="do the thing\nmine\n")
+    make_skill(tmp_path, "installed/pr")
+    tp.write_patch("pr", "w", tp.diff(upstream, edited)[1])
+    tp.write_patch("absent", "w", "")
+    assert install.apply_skill_patches() == 0
+    assert "mine" in (tmp_path / "installed/pr/SKILL.md").read_text()
+    (tmp_path / "installed/pr/SKILL.md").write_text("rewritten\n")
+    assert install.apply_skill_patches() == 1
+    assert "CONFLICT pr" in capsys.readouterr().out

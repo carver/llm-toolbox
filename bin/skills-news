@@ -11,15 +11,17 @@ what each source has.
 
 A difference is "upstream" when the source's folder hash no longer matches
 the one `npx skills` recorded at install (~/.agents/.skill-lock.json), and a
-hand edit here when it still does. Claude (through claude-json) summarizes each
-upstream diff. The report keeps each diff's file stats beside the summary, so
-the summary can be checked against them. Hand edits are listed, unsummarized,
-because the next update after an upstream change would replace them.
+hand edit here when it still does. A skill's patch in skill-patches/ is taken
+off before comparing, so a patched skill only shows up when upstream moved
+(with whether its patch still applies) or when it was edited outside the patch.
+
+Claude (through claude-json) summarizes each upstream diff. The report keeps
+each diff's file stats beside the summary, so the summary can be checked
+against them.
 
 With --email it sends only when there are upstream changes or new skills, so
 hand edits alone don't mail every week. With nothing to report it prints
-"no news". It never installs
-anything: `python3 install.py --update` does that.
+"no news". It never installs anything: `python3 install.py --update` does that.
 
 Exit status: 0 success, news or not; 1 a fetch, summary or send failed.
 
@@ -29,21 +31,18 @@ Examples:
 """
 
 import argparse
-import difflib
-import importlib.util
 import json
-import os
 import re
 import subprocess
 import sys
 import tempfile
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-INSTALLED = Path.home() / ".agents" / "skills"
-LOCK = Path.home() / ".agents" / ".skill-lock.json"
-CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "skills-news"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import thirdparty as tp
+
 SEND_EMAIL = Path.home() / ".claude" / "skills" / "email" / "scripts" / "send_email.py"
 # A diff past this is cut before Claude reads it; the stats still cover all of it.
 MAX_PATCH_CHARS = 30_000
@@ -67,22 +66,16 @@ SUMMARY_SCHEMA = {
 
 
 @dataclass
-class FileStat:
-    added: int
-    removed: int
-    path: str
-
-
-@dataclass
 class Change:
     name: str
     source: str
-    stats: list[FileStat]
+    stats: list[tp.FileStat]
     patch: str
     # "upstream": the source moved past the installed version.
     # "local": the source didn't move; the installed copy was edited by hand.
     # "untracked": not in the skills lock file, so `npx skills update` skips it.
     kind: str = "upstream"
+    note: str = ""
 
 
 @dataclass
@@ -92,73 +85,6 @@ class NewSkill:
     description: str
 
 
-def third_party_skills() -> dict[str, list[str]]:
-    spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.THIRD_PARTY_SKILLS
-
-
-def fetch(source: str, cache: Path) -> Path:
-    clone = cache / source.replace("/", "--")
-    git = ["git", "-c", "advice.detachedHead=false"]
-    if (clone / ".git").is_dir():
-        subprocess.run(
-            [*git, "-C", str(clone), "fetch", "-q", "--depth", "1", "origin", "HEAD"],
-            check=True,
-        )
-        subprocess.run(
-            [*git, "-C", str(clone), "reset", "-q", "--hard", "FETCH_HEAD"], check=True
-        )
-    else:
-        clone.parent.mkdir(parents=True, exist_ok=True)
-        url = f"https://github.com/{source}.git"
-        subprocess.run(
-            [*git, "clone", "-q", "--depth", "1", url, str(clone)], check=True
-        )
-    return clone
-
-
-def upstream_skills(clone: Path) -> dict[str, Path]:
-    """Every folder with a SKILL.md, by folder name, as `npx skills` names them."""
-    return {
-        skill_md.parent.name: skill_md.parent
-        for skill_md in sorted(clone.rglob("SKILL.md"))
-        if ".git" not in skill_md.relative_to(clone).parts
-    }
-
-
-def files(root: Path) -> dict[str, Path]:
-    return {str(f.relative_to(root)): f for f in sorted(root.rglob("*")) if f.is_file()}
-
-
-def diff(installed: Path, upstream: Path) -> tuple[list[FileStat], str]:
-    """Per-file stats and a unified patch from the installed copy to upstream."""
-    old, new = files(installed), files(upstream)
-    stats, patch = [], []
-    for rel in sorted(old.keys() | new.keys()):
-        before = (
-            old[rel].read_text(errors="replace").splitlines(keepends=True)
-            if rel in old
-            else []
-        )
-        after = (
-            new[rel].read_text(errors="replace").splitlines(keepends=True)
-            if rel in new
-            else []
-        )
-        hunk = list(difflib.unified_diff(before, after, f"a/{rel}", f"b/{rel}"))
-        if not hunk:
-            continue
-        body = hunk[2:]
-        added = sum(line.startswith("+") for line in body)
-        removed = sum(line.startswith("-") for line in body)
-        stats.append(FileStat(added, removed, rel))
-        patch += hunk
-    return stats, "".join(patch)
-
-
 def description(skill_dir: Path) -> str:
     match = re.search(
         r"^description:\s*(.+)$", (skill_dir / "SKILL.md").read_text(), re.MULTILINE
@@ -166,21 +92,11 @@ def description(skill_dir: Path) -> str:
     return match.group(1).strip().strip("\"'") if match else ""
 
 
-def tree_hash(clone: Path, folder: Path) -> str:
-    rel = folder.relative_to(clone)
-    return subprocess.run(
-        ["git", "-C", str(clone), "rev-parse", f"HEAD:{rel}"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-
-
 def kind_of(lock_entry: dict | None, clone: Path, folder: Path) -> str:
     """Whose change a difference is, by the folder hash `npx skills` recorded at install."""
     if not lock_entry or not lock_entry.get("skillFolderHash"):
         return "untracked"
-    same = lock_entry["skillFolderHash"] == tree_hash(clone, folder)
+    same = lock_entry["skillFolderHash"] == tp.tree_hash(clone, folder)
     return "local" if same else "upstream"
 
 
@@ -190,21 +106,20 @@ def find_news(
     seen: dict[str, list[str]],
     lock: dict[str, dict],
 ) -> tuple[list[Change], list[NewSkill], dict[str, list[str]]]:
-    """Installed skills that differ from upstream, skills new since `seen`, and the next `seen`."""
+    """Installed skills that differ from upstream plus their patches, skills new
+    since `seen`, and the next `seen`."""
     changes, new = [], []
     next_seen = dict(seen)
     for source, names in sources.items():
-        upstream = upstream_skills(clones[source])
+        upstream = tp.upstream_skills(clones[source])
         for name in names:
             if name not in upstream:
                 changes.append(Change(name, source, [], "(no longer in the source)"))
                 continue
-            if not (INSTALLED / name).is_dir():
-                continue
-            stats, patch = diff(INSTALLED / name, upstream[name])
-            if patch:
-                kind = kind_of(lock.get(name), clones[source], upstream[name])
-                changes.append(Change(name, source, stats, patch, kind))
+            if (tp.INSTALLED / name).is_dir():
+                change = _compare(name, source, clones[source], upstream[name], lock)
+                if change:
+                    changes.append(change)
         if source in seen:
             new += [
                 NewSkill(name, source, description(path))
@@ -213,6 +128,40 @@ def find_news(
             ]
         next_seen[source] = sorted(upstream)
     return changes, new, next_seen
+
+
+def _compare(
+    name: str, source: str, clone: Path, upstream: Path, lock: dict[str, dict]
+) -> Change | None:
+    """The installed skill, minus its patch, against upstream."""
+    installed = tp.INSTALLED / name
+    patch = tp.patch_file(name)
+    with ExitStack() as stack:
+        base = installed
+        if patch:
+            unpatched = stack.enter_context(
+                tp.copy_with(installed, patch, reverse=True)
+            )
+            if unpatched is None:
+                stats, text = tp.diff(installed, upstream)
+                note = f"doesn't hold {patch.name}: run install.py, or skill-patch save {name}"
+                return Change(name, source, stats, text, "local", note)
+            base = unpatched
+        stats, text = tp.diff(base, upstream)
+    if not text:
+        return None
+    kind = kind_of(lock.get(name), clone, upstream)
+    note = ""
+    if kind == "upstream" and patch:
+        with tp.copy_with(upstream, patch) as patched:
+            note = (
+                f"{patch.name} applies to the new version"
+                if patched
+                else f"{patch.name} needs a rebase after the update"
+            )
+    elif kind == "local":
+        note = f"save it: skill-patch save {name} --why '...'"
+    return Change(name, source, stats, text, kind, note)
 
 
 def summarize(changes: list[Change], run=subprocess.run) -> dict[str, str]:
@@ -252,7 +201,7 @@ def render(
         ("upstream", "Changed upstream since you installed them:"),
         (
             "local",
-            "Edited by hand here (the next --update after an upstream change replaces these):",
+            "Edited by hand outside a patch (the next update after an upstream change loses these):",
         ),
         ("untracked", "Not in the skills lock file, so --update leaves them alone:"),
     ]
@@ -264,6 +213,8 @@ def render(
         lines.append(heading + "\n")
         for c in group:
             lines.append(f"## {c.name} ({c.source})")
+            if c.note:
+                lines.append(f"({c.note})")
             if c.name in summaries:
                 lines.append(summaries[c.name])
             if c.stats:
@@ -273,7 +224,9 @@ def render(
                 lines.append(c.patch)
             lines.append("")
         if kind == "upstream":
-            lines.append(f"To install them: python3 {REPO / 'install.py'} --update\n")
+            lines.append(
+                f"To install them: python3 {tp.REPO / 'install.py'} --update\n"
+            )
     if new:
         lines.append(
             "New skills in your sources (add one to THIRD_PARTY_SKILLS to install it):\n"
@@ -314,12 +267,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    state_file = CACHE / "seen.json"
+    state_file = tp.CACHE / "seen.json"
     seen = json.loads(state_file.read_text()) if state_file.is_file() else {}
-    sources = third_party_skills()
+    sources = tp.third_party_skills()
     try:
-        clones = {source: fetch(source, CACHE) for source in sources}
-        lock = json.loads(LOCK.read_text())["skills"] if LOCK.is_file() else {}
+        clones = {source: tp.fetch(source, tp.CACHE) for source in sources}
+        lock = json.loads(tp.LOCK.read_text())["skills"] if tp.LOCK.is_file() else {}
         changes, new, next_seen = find_news(sources, clones, seen, lock)
         updated = [c for c in changes if c.kind == "upstream"]
         summaries = {} if args.no_summary or not updated else summarize(updated)

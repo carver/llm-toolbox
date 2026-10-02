@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Keep hand edits to other authors' skills as patches that survive updates.
+
+    skill-patch save NAME [--why TEXT]
+    skill-patch apply [NAME ...]
+
+save writes skill-patches/NAME.patch in llm-toolbox: the diff from the
+upstream version the skill was installed from to the installed copy in
+~/.agents/skills/NAME, headed by a `# Why:` line. Edit the installed copy
+first, then save. --why is required for a new patch and replaces the old one
+when given. A skill back to its upstream state loses its patch.
+
+apply puts each patch (or the named ones) on its installed skill, skipping
+those already on. install.py runs it after installing or updating. A patch
+that no longer fits leaves the skill as upstream ships it: redo the change on
+the installed copy, using the patch file as the guide, then save again.
+
+Exit status: 0 success; 1 a patch didn't apply, or save found nothing to
+compare against; 2 usage error.
+
+Examples:
+    skill-patch save show-me --why "Publish HTML views as Artifacts; open does nothing here."
+    skill-patch apply
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import thirdparty as tp
+
+
+class PatchError(Exception):
+    pass
+
+
+def source_of(name: str) -> str:
+    for source, names in tp.third_party_skills().items():
+        if name in names:
+            return source
+    raise PatchError(f"{name} isn't in install.py's THIRD_PARTY_SKILLS")
+
+
+def installed_from(name: str) -> Path:
+    """The upstream folder at the version installed, from the skills-news cache."""
+    clone = tp.fetch(source_of(name), tp.CACHE)
+    folder = tp.upstream_skills(clone).get(name)
+    if folder is None:
+        raise PatchError(f"{name} is no longer in its source")
+    lock = json.loads(tp.LOCK.read_text())["skills"] if tp.LOCK.is_file() else {}
+    recorded = lock.get(name, {}).get("skillFolderHash")
+    if recorded != tp.tree_hash(clone, folder):
+        raise PatchError(
+            f"{name} changed upstream since it was installed, so its old version isn't "
+            "at hand: run install.py --update, redo the edit, then save"
+        )
+    return folder
+
+
+def save(name: str, why_text: str | None) -> str:
+    installed = tp.INSTALLED / name
+    if not installed.is_dir():
+        raise PatchError(f"{name} isn't installed in {tp.INSTALLED}")
+    _, patch = tp.diff(installed_from(name), installed)
+    existing = tp.patch_file(name)
+    if not patch:
+        if existing:
+            existing.unlink()
+            return f"{name} matches upstream; removed {existing.name}"
+        return f"{name} matches upstream; no patch"
+    why_text = why_text or (tp.why(existing) if existing else "")
+    if not why_text:
+        raise PatchError("a new patch needs --why")
+    return f"saved {tp.write_patch(name, why_text, patch)}"
+
+
+def apply(names: list[str]) -> int:
+    patches = [tp.PATCHES / f"{n}.patch" for n in names] or sorted(
+        tp.PATCHES.glob("*.patch")
+    )
+    conflicts = 0
+    for patch in patches:
+        name = patch.stem
+        skill = tp.INSTALLED / name
+        if not patch.is_file() or not skill.is_dir():
+            print(f"  skipped {name}: no patch or no installed skill")
+            continue
+        status = tp.apply(skill, patch)
+        if status == "conflict":
+            conflicts += 1
+            print(
+                f"  CONFLICT {name}: {patch.name} no longer fits; redo it on {skill}, "
+                f"then skill-patch save {name}"
+            )
+        elif status == "applied":
+            print(f"  patched {name}")
+    return 1 if conflicts else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n\n", 2)[2],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    save_cmd = commands.add_parser(
+        "save", help="write the installed skill's edits to its patch"
+    )
+    save_cmd.add_argument("name")
+    save_cmd.add_argument(
+        "--why", help="the reason for the edit; required for a new patch"
+    )
+    apply_cmd = commands.add_parser(
+        "apply", help="put patches on their installed skills"
+    )
+    apply_cmd.add_argument("names", nargs="*", metavar="NAME")
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "save":
+            print(save(args.name, args.why))
+            return 0
+        return apply(args.names)
+    except PatchError as e:
+        print(f"skill-patch: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

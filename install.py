@@ -33,6 +33,9 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO / "lib"))
+import thirdparty
+
 SKILLS_SRC = REPO / "skills"
 SKILLS_DST = Path.home() / ".claude" / "skills"
 # The AGENTS.md convention's home for skills. Tools that read ~/.agents/AGENTS.md look here.
@@ -303,6 +306,26 @@ def install_cron() -> int:
     return 0
 
 
+def apply_skill_patches() -> int:
+    """Put skill-patches/ back on the skills they patch, after an install or
+    update replaced them. Returns the number that no longer fit."""
+    conflicts = 0
+    for patch in sorted(thirdparty.PATCHES.glob("*.patch")):
+        skill = thirdparty.INSTALLED / patch.stem
+        if not skill.is_dir():
+            continue
+        status = thirdparty.apply(skill, patch)
+        if status == "applied":
+            say(f"patched {patch.stem}")
+        elif status == "conflict":
+            say(
+                f"CONFLICT {patch.stem}: {patch.name} no longer fits the new version; "
+                f"redo the edit on {skill}, then `skill-patch save {patch.stem}`"
+            )
+            conflicts += 1
+    return conflicts
+
+
 def enable_git_hooks() -> int:
     """Returns 1 when git refuses the setting."""
     cmd = ["git", "-C", str(REPO), "config", "core.hooksPath", ".githooks"]
@@ -348,6 +371,7 @@ def main():
     failures = install_third_party_skills() + enable_git_hooks() + install_cron()
     if args.update:
         failures += update_third_party_skills()
+    failures += apply_skill_patches()
     if conflicts:
         say(f"{conflicts} link(s) not made -- resolve the conflicts above by hand")
     return 1 if conflicts or failures else 0

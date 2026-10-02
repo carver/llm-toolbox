@@ -36,7 +36,10 @@ It also installs other authors' skills, listed in `THIRD_PARTY_SKILLS` in
 updates them only with `--update`. It also installs a weekly cron job (Mondays
 08:17) that runs `skills-news`, which emails what changed upstream; read that,
 then run `python3 install.py --update`. An update replaces a skill whose
-upstream changed, along with any hand edits to it. To add one, add its name
+upstream changed, along with any hand edits to it, so keep those edits as
+patches in `skill-patches/` (see `skill-patch`): `install.py` puts each one
+back on after installing or updating, and reports one that no longer fits.
+To add one, add its name
 under its source and re-run `install.py`, which passes the flags that put the
 skill in `~/.agents/skills` with a link from `~/.claude/skills`; `-a claude-code`
 alone copies it into `~/.claude/skills` instead. When only some requested names
@@ -93,11 +96,19 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   hook; the agent also gets the slow checks, such as the whole test suite.
   `agent-commit-gate --run` runs a repo's check by hand.
 
+- **skill-patch**: keeps hand edits to other authors' skills. Edit the
+  installed copy in `~/.agents/skills/NAME`, then `skill-patch save NAME
+  --why "..."` writes `skill-patches/NAME.patch`, headed by its Why.
+  `skill-patch apply` puts the patches back on; `install.py` runs it. When an
+  upstream change makes a patch no longer fit, redo the edit on the new
+  version and save again.
+
 - **skills-news**: fetches the sources in `install.py`'s `THIRD_PARTY_SKILLS`,
   diffs each installed skill against upstream, and reports which changed
   upstream (summarized by Claude, with file stats beside each summary), which
   were edited by hand here, and which skills a source added since the last
-  run. `--email TO` sends the report only when there are upstream changes or
+  run. A skill's patch is taken off before comparing, and the report says
+  whether it still fits a new upstream version. `--email TO` sends the report only when there are upstream changes or
   new skills. The weekly cron job from `install.py` runs it; its log is
   `~/.cache/skills-news/cron.log`.
 

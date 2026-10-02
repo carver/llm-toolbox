@@ -4,12 +4,14 @@ Skills, and the guidelines every agent session starts from.
 
 ## Developer setup
 
-Add linting tools:
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements-dev.txt
+python3 install_dev.py
 ```
+
+Creates `.venv` with the tools in `requirements-dev.txt`, and points git at the
+hooks in `.githooks`, which use `.venv`'s Python. It links no skills or tools
+into your home directory; `install.py` below does that, and enables the hooks too.
+Run `. .venv/bin/activate` to use the tools by hand.
 
 ## Install
 
@@ -102,8 +104,9 @@ python3 -m ruff check . && python3 -m ruff format --check . && python3 -m pytest
 
 `install.py` points git at `.githooks`. Its `pre-commit` runs the two ruff checks on
 what's staged; `agent-pre-commit` adds the tests (about 35 seconds), and
-`agent-commit-gate` runs it before an agent's commits. Both need ruff for
-whichever `python3` is on `PATH` (`pip install ruff`). `ruff.toml` brings the
+`agent-commit-gate` runs it before an agent's commits. Both use `.venv`'s Python
+when it exists, else whichever `python3` is on `PATH`, which then needs ruff and
+pytest. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.
 
 ## Guidelines

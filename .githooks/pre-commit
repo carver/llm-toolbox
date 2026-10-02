@@ -1,11 +1,14 @@
 #!/bin/sh
-# Lint and format-check what's staged, in about a second. Enabled by install.py (core.hooksPath).
+# Lint and format-check what's staged, in about a second. Enabled by install.py or install_dev.py (core.hooksPath).
 # The test suite is too slow for this; agent-pre-commit runs it.
 set -e
+# A dev clone runs its .venv's tools (install_dev.py); otherwise whatever python3 is on PATH.
+python=python3
+[ -x .venv/bin/python3 ] && python="$PWD/.venv/bin/python3"
 tree=$(mktemp -d)
 trap 'rm -rf "$tree"' EXIT
 # Check the staged snapshot, not the working tree, without touching either.
 git checkout-index -a --prefix="$tree/"
 cd "$tree"
-python3 -m ruff check --quiet .
-python3 -m ruff format --check --quiet .
+"$python" -m ruff check --quiet .
+"$python" -m ruff format --check --quiet .

@@ -3,9 +3,12 @@
 # every test, on what's staged. Also the repo's whole check, run by hand:
 # `agent-commit-gate --run`.
 set -e
+# A dev clone runs its .venv's tools (install_dev.py); otherwise whatever python3 is on PATH.
+python=python3
+[ -x .venv/bin/python3 ] && python="$PWD/.venv/bin/python3"
 "$(dirname "$0")/pre-commit"
 tree=$(mktemp -d)
 trap 'rm -rf "$tree"' EXIT
 git checkout-index -a --prefix="$tree/"
 cd "$tree"
-python3 -m pytest -q -p no:cacheprovider
+"$python" -m pytest -q -p no:cacheprovider

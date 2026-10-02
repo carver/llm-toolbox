@@ -32,8 +32,11 @@ links that point into this repo. If a name already belongs to some other
 skill, it reports the conflict and leaves it alone.
 
 It also installs other authors' skills, listed in `THIRD_PARTY_SKILLS` in
-`install.py`, with `npx skills add -g`. It installs only the missing ones and
-never updates them; `npx skills update -g` does that. To add one, add its name
+`install.py`, with `npx skills add -g`. It installs only the missing ones, and
+updates them only with `--update`. It also installs a weekly cron job (Mondays
+08:17) that runs `skills-news`, which emails what changed upstream; read that,
+then run `python3 install.py --update`. An update replaces a skill whose
+upstream changed, along with any hand edits to it. To add one, add its name
 under its source and re-run `install.py`, which passes the flags that put the
 skill in `~/.agents/skills` with a link from `~/.claude/skills`; `-a claude-code`
 alone copies it into `~/.claude/skills` instead. When only some requested names
@@ -89,6 +92,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   pre-commit hook, and blocks the commit if it fails. People keep the quick
   hook; the agent also gets the slow checks, such as the whole test suite.
   `agent-commit-gate --run` runs a repo's check by hand.
+
+- **skills-news**: fetches the sources in `install.py`'s `THIRD_PARTY_SKILLS`,
+  diffs each installed skill against upstream, and reports which changed
+  upstream (summarized by Claude, with file stats beside each summary), which
+  were edited by hand here, and which skills a source added since the last
+  run. `--email TO` sends the report only when there are upstream changes or
+  new skills. The weekly cron job from `install.py` runs it; its log is
+  `~/.cache/skills-news/cron.log`.
 
 - **yt-transcript**: prints a YouTube video's captions, or the ones around
   the URL's timestamp (90 seconds before, 60 after, by default), each line

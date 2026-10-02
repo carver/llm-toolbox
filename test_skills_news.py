@@ -1,0 +1,244 @@
+"""bin/skills-news against temp skill folders, with Claude faked."""
+
+import importlib.machinery
+import importlib.util
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+SCRIPT = Path(__file__).resolve().parent / "bin" / "skills-news"
+loader = importlib.machinery.SourceFileLoader("skills_news", str(SCRIPT))
+spec = importlib.util.spec_from_loader("skills_news", loader)
+news = importlib.util.module_from_spec(spec)
+loader.exec_module(news)
+
+
+def make_skill(
+    root: Path, rel: str, body: str = "do the thing\n", desc: str = "Does a thing."
+) -> Path:
+    path = root / rel
+    path.mkdir(parents=True)
+    (path / "SKILL.md").write_text(
+        f"---\nname: {path.name}\ndescription: {desc}\n---\n{body}"
+    )
+    return path
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    installed = tmp_path / "installed"
+    clone = tmp_path / "clone"
+    installed.mkdir()
+    monkeypatch.setattr(news, "INSTALLED", installed)
+    return installed, clone
+
+
+def test_upstream_skills_finds_nested_folders_and_skips_git(tmp_path):
+    make_skill(tmp_path, "skills/engineering/pr")
+    make_skill(tmp_path, "plugins/show-me/skills/show-me")
+    make_skill(tmp_path, ".git/skills/ghost")
+    assert set(news.upstream_skills(tmp_path)) == {"pr", "show-me"}
+
+
+def test_unchanged_skill_is_no_news(world):
+    installed, clone = world
+    make_skill(installed, "pr")
+    make_skill(clone, "skills/pr")
+    changes, new, _ = news.find_news(
+        {"a/s": ["pr"]}, {"a/s": clone}, {"a/s": ["pr"]}, {}
+    )
+    assert changes == [] and new == []
+
+
+def test_changed_skill_reports_stat_and_patch_with_short_paths(world):
+    installed, clone = world
+    make_skill(installed, "pr")
+    make_skill(clone, "skills/pr", body="do the new thing\n")
+    (clone / "skills/pr/extra.md").write_text("more\n")
+    [change], _, _ = news.find_news({"a/s": ["pr"]}, {"a/s": clone}, {}, {})
+    assert change.name == "pr"
+    assert "+do the new thing" in change.patch
+    assert str(installed) not in change.patch and str(clone) not in change.patch
+    assert change.stats == [
+        news.FileStat(1, 1, "SKILL.md"),
+        news.FileStat(1, 0, "extra.md"),
+    ]
+    assert "--- a/SKILL.md\n+++ b/SKILL.md" in change.patch
+
+
+def test_skill_gone_from_source_is_reported(world):
+    installed, clone = world
+    make_skill(installed, "pr")
+    clone.mkdir()
+    [change], _, _ = news.find_news({"a/s": ["pr"]}, {"a/s": clone}, {}, {})
+    assert "no longer" in change.patch
+
+
+def test_first_run_records_skills_without_calling_them_new(world):
+    _, clone = world
+    make_skill(clone, "skills/teach")
+    _, new, seen = news.find_news({"a/s": []}, {"a/s": clone}, {}, {})
+    assert new == [] and seen == {"a/s": ["teach"]}
+
+
+def test_skill_added_since_last_run_is_new_with_its_description(world):
+    _, clone = world
+    make_skill(clone, "skills/teach")
+    make_skill(clone, "skills/pr", desc='"Use when writing a PR body."')
+    _, [added], seen = news.find_news(
+        {"a/s": []}, {"a/s": clone}, {"a/s": ["teach"]}, {}
+    )
+    assert (added.name, added.description) == ("pr", "Use when writing a PR body.")
+    assert seen == {"a/s": ["pr", "teach"]}
+
+
+def test_skill_already_listed_to_install_is_not_new(world):
+    _, clone = world
+    make_skill(clone, "skills/pr")
+    _, new, _ = news.find_news({"a/s": ["pr"]}, {"a/s": clone}, {"a/s": []}, {})
+    assert new == []
+
+
+def fake_claude(reply: dict, seen_prompts: list):
+    def run(cmd, input, **kw):
+        seen_prompts.append(input)
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(reply), stderr="")
+
+    return run
+
+
+def test_summarize_keeps_only_names_it_asked_about():
+    change = news.Change("pr", "a/s", [news.FileStat(1, 0, "SKILL.md")], "+x")
+    reply = {
+        "skills": [
+            {"name": "pr", "summary": "Adds x."},
+            {"name": "ghost", "summary": "?"},
+        ]
+    }
+    prompts = []
+    assert news.summarize([change], run=fake_claude(reply, prompts)) == {
+        "pr": "Adds x."
+    }
+    assert '<skill name="pr">' in prompts[0]
+
+
+def test_summarize_cuts_a_huge_patch():
+    change = news.Change("pr", "a/s", [], "+" * (news.MAX_PATCH_CHARS + 10))
+    prompts = []
+    news.summarize([change], run=fake_claude({"skills": []}, prompts))
+    assert "(diff cut here)" in prompts[0]
+
+
+def test_summarize_raises_when_claude_fails():
+    def failing(cmd, **kw):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        news.summarize([news.Change("pr", "a/s", [], "+x")], run=failing)
+
+
+def test_render_puts_summary_beside_stats_and_points_at_update():
+    change = news.Change("pr", "a/s", [news.FileStat(3, 1, "SKILL.md")], "patch")
+    added = news.NewSkill("teach", "a/s", "Teaches.")
+    body = news.render([change], [added], {"pr": "Adds evidence."})
+    assert (
+        "## pr (a/s)\nAdds evidence.\nFiles (+added -removed):\n  +3 -1  SKILL.md"
+        in body
+    )
+    assert "install.py --update" in body
+    assert "- teach (a/s): Teaches." in body
+
+
+def test_render_new_skills_only_has_no_update_hint():
+    body = news.render([], [news.NewSkill("teach", "a/s", "Teaches.")], {})
+    assert "--update" not in body
+
+
+def commit(repo: Path) -> None:
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+    if not (repo / ".git").exists():
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "c"], check=True)
+
+
+def lock_for(clone: Path, rel: str) -> dict:
+    return {"skillFolderHash": news.tree_hash(clone, clone / rel)}
+
+
+def test_difference_after_upstream_moved_is_upstream(world):
+    installed, clone = world
+    make_skill(installed, "pr")
+    make_skill(clone, "skills/pr")
+    commit(clone)
+    lock = {"pr": lock_for(clone, "skills/pr")}
+    (clone / "skills/pr/SKILL.md").write_text("new upstream\n")
+    commit(clone)
+    [change], _, _ = news.find_news({"a/s": ["pr"]}, {"a/s": clone}, {}, lock)
+    assert change.kind == "upstream"
+
+
+def test_difference_while_upstream_stood_still_is_a_hand_edit(world):
+    installed, clone = world
+    make_skill(installed, "pr", body="my tweak\n")
+    make_skill(clone, "skills/pr")
+    commit(clone)
+    lock = {"pr": lock_for(clone, "skills/pr")}
+    [change], _, _ = news.find_news({"a/s": ["pr"]}, {"a/s": clone}, {}, lock)
+    assert change.kind == "local"
+
+
+def test_difference_without_a_lock_entry_is_untracked(world):
+    installed, clone = world
+    make_skill(installed, "pr", body="my tweak\n")
+    make_skill(clone, "skills/pr")
+    [change], _, _ = news.find_news({"a/s": ["pr"]}, {"a/s": clone}, {}, {})
+    assert change.kind == "untracked"
+
+
+def test_render_groups_hand_edits_apart_from_upstream():
+    up = news.Change("pr", "a/s", [news.FileStat(1, 0, "SKILL.md")], "p", "upstream")
+    mine = news.Change(
+        "implement", "a/s", [news.FileStat(1, 1, "SKILL.md")], "p", "local"
+    )
+    body = news.render([up, mine], [], {})
+    assert body.index("Changed upstream") < body.index("## pr") < body.index("--update")
+    assert body.index("Edited by hand") < body.index("## implement")
+
+
+@pytest.fixture
+def run_main(world, tmp_path, monkeypatch):
+    installed, clone = world
+    monkeypatch.setattr(news, "CACHE", tmp_path / "cache")
+    (tmp_path / "cache").mkdir()
+    monkeypatch.setattr(news, "LOCK", tmp_path / "lock.json")
+    monkeypatch.setattr(news, "third_party_skills", lambda: {"a/s": ["pr"]})
+    monkeypatch.setattr(news, "fetch", lambda source, cache: clone)
+    sent = []
+    monkeypatch.setattr(news, "send", lambda to, subject, body: sent.append(subject))
+    monkeypatch.setattr(news, "summarize", lambda changes: {})
+    return installed, clone, sent
+
+
+def test_email_skips_hand_edits_alone(run_main, capsys):
+    installed, clone, sent = run_main
+    make_skill(installed, "pr", body="my tweak\n")
+    make_skill(clone, "skills/pr")
+    commit(clone)
+    news.LOCK.write_text(json.dumps({"skills": {"pr": lock_for(clone, "skills/pr")}}))
+    assert news.main(["--email", "me@example.com"]) == 0
+    assert sent == [] and "no news" in capsys.readouterr().out
+
+
+def test_email_sends_upstream_change(run_main):
+    installed, clone, sent = run_main
+    make_skill(installed, "pr")
+    make_skill(clone, "skills/pr")
+    commit(clone)
+    news.LOCK.write_text(json.dumps({"skills": {"pr": lock_for(clone, "skills/pr")}}))
+    (clone / "skills/pr/SKILL.md").write_text("new upstream\n")
+    commit(clone)
+    assert news.main(["--email", "me@example.com"]) == 0
+    assert sent == ["Skill updates: 1 changed, 0 new"]

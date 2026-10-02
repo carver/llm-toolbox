@@ -303,3 +303,44 @@ def test_git_hooks_point_at_githooks(tmp_path, monkeypatch):
         check=True,
     ).stdout.strip()
     assert hooks == ".githooks"
+
+
+def test_crontab_keeps_other_jobs_and_replaces_ours():
+    current = (
+        "7 * * * * other-job # rental-finder scan\n"
+        "1 1 * * 1 old skills-news # llm-toolbox weekly skills-news\n"
+    )
+    merged = install.merged_crontab(current)
+    assert merged.splitlines() == [
+        "7 * * * * other-job # rental-finder scan",
+        *install.CRON_LINES,
+    ]
+    assert install.merged_crontab(merged) == merged
+
+
+def test_crontab_from_empty():
+    assert install.merged_crontab("") == "\n".join(install.CRON_LINES) + "\n"
+
+
+def test_update_passes_every_listed_skill(third_party, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return install.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(install.subprocess, "run", fake_run)
+    assert install.update_third_party_skills() == 0
+    cmd = calls[0]
+    assert cmd[:4] == ["npx", "-y", "skills", "update"] and "-g" in cmd
+    assert cmd[-3:] == ["tdd", "retro", "find"]
+
+
+def test_update_reports_failure(third_party, monkeypatch, capsys):
+    monkeypatch.setattr(
+        install.subprocess,
+        "run",
+        lambda cmd, **kw: install.subprocess.CompletedProcess(cmd, 1),
+    )
+    assert install.update_third_party_skills() == 1
+    assert "FAILED update" in capsys.readouterr().out

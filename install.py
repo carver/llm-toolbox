@@ -17,12 +17,15 @@ source is no longer a skill (renamed, deleted, or missing its SKILL.md).
 Guidelines: a real file moves aside to .bak, a link is replaced wherever it
 points, since a link is cheap to put back. Hooks: added once, beside whatever
 else the settings hold; a settings file that is not valid JSON is left alone.
-Third-party skills: only missing ones are installed; it never updates or
-removes one (`npx skills update -g` does that).
+Third-party skills: only missing ones are installed; it never removes one,
+and updates them only with --update. Installs a weekly cron job that runs
+bin/skills-news, which emails what changed upstream, so you know when an
+--update is worth running.
 
-    python3 install.py
+    python3 install.py [--update]
 """
 
+import argparse
 import json
 import os
 import subprocess
@@ -89,6 +92,14 @@ THIRD_PARTY_SKILLS = {
     ],
     "vercel-labs/skills": ["find-skills"],
 }
+CRON_MARKER = "# llm-toolbox"
+CRON_LINES = [
+    (
+        "17 8 * * 1 bash -lc 'mkdir -p ~/.cache/skills-news && skills-news"
+        " --email ADDRESS-REMOVED >> ~/.cache/skills-news/cron.log 2>&1'"
+        f" {CRON_MARKER} weekly skills-news"
+    ),
+]
 
 
 def say(msg):
@@ -247,6 +258,51 @@ def install_third_party_skills() -> int:
     return failures
 
 
+def update_third_party_skills() -> int:
+    """Returns 1 when the update fails. `npx skills` replaces a skill only when
+    its upstream folder changed, overwriting any hand edits to it."""
+    names = [n for names in THIRD_PARTY_SKILLS.values() for n in names]
+    cmd = ["npx", "-y", "skills", "update", "-g", "-y", *names]
+    try:
+        exited = subprocess.run(cmd, cwd=Path.home(), check=False).returncode
+    except FileNotFoundError:
+        say("FAILED update: npx not found -- install Node, then re-run")
+        return 1
+    if exited:
+        say(f"FAILED update: `{' '.join(cmd)}` exited {exited}")
+        return 1
+    return 0
+
+
+def merged_crontab(current: str) -> str:
+    """`current` with this repo's lines replaced by CRON_LINES, others kept."""
+    kept = [line for line in current.splitlines() if CRON_MARKER not in line]
+    return "\n".join([*kept, *CRON_LINES]) + "\n"
+
+
+def install_cron() -> int:
+    """Returns 1 when crontab refuses the new table."""
+    try:
+        listed = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError:
+        say("FAILED cron: no crontab command")
+        return 1
+    current = listed.stdout if listed.returncode == 0 else ""
+    wanted = merged_crontab(current)
+    if wanted == current:
+        return 0
+    written = subprocess.run(
+        ["crontab", "-"], input=wanted, text=True, capture_output=True, check=False
+    )
+    if written.returncode:
+        say(f"FAILED cron: {written.stderr.strip()}")
+        return 1
+    say("installed the weekly skills-news cron job")
+    return 0
+
+
 def enable_git_hooks() -> int:
     """Returns 1 when git refuses the setting."""
     cmd = ["git", "-C", str(REPO), "config", "core.hooksPath", ".githooks"]
@@ -277,10 +333,21 @@ def prune_stale_links():
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="also update the third-party skills whose upstream changed",
+    )
+    args = parser.parse_args()
     print("[llm-toolbox]")
     prune_stale_links()
     conflicts = link_skills() + link_tools() + link_guidelines() + register_hooks()
-    failures = install_third_party_skills() + enable_git_hooks()
+    failures = install_third_party_skills() + enable_git_hooks() + install_cron()
+    if args.update:
+        failures += update_third_party_skills()
     if conflicts:
         say(f"{conflicts} link(s) not made -- resolve the conflicts above by hand")
     return 1 if conflicts or failures else 0

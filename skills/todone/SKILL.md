@@ -43,7 +43,7 @@ Done when the user has confirmed the Why.
 
 ## 3. Do the work
 
-Work in the target repository by its own CLAUDE.md or AGENTS.md, with the `coding` skill. Note any **finding**: a surprise you'd want to know the next time you revisit this decision, such as the work going differently from what the to-do said, and why. Most to-dos have none. Skip small lessons from along the way.
+Work in the target repository by its own CLAUDE.md or AGENTS.md, through `/build` (a trivial edit takes the `coding` skill alone). Put the commit-message ending below in `/build`'s brief, so its subagents' commits carry the Why and source. Note any **finding**: a surprise you'd want to know the next time you revisit this decision, such as the work going differently from what the to-do said, and why. Most to-dos have none. Skip small lessons from along the way.
 
 Commit messages for the work end with the Why and the source:
 

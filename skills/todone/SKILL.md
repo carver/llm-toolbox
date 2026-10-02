@@ -70,7 +70,7 @@ If there were findings, show them to the user as proposed `Learned:` lines; they
 python3 -m kd done <id> --done-in <repo>@<short sha> [--why "<confirmed Why>"] [--learned "<approved line>"]...
 ```
 
-`--done-in` takes `<repo>@<first>..<last>` for several commits. Pass `--why` only when the task had no `Why:` line. The task ends up like this:
+`--done-in` takes `<repo>@<first>..<last>` for several commits. Pass `--why` when the task had no `Why:` line or the user changed it; it replaces the old line. The task ends up like this:
 
 ```markdown
 - [x] Install retro skill, run it regularly #queue [added: 2026-09-30] [done: 2026-10-02]

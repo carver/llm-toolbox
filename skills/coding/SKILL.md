@@ -36,7 +36,7 @@ Before an unpushed branch is merged, fold fixes into the commits they fix (`git 
 Before you start a change, and again on the finished diff, judge its merge danger:
 
 - Door: a revert walks back a two-way door. Data loss, destructive migrations, messages sent to people, published releases and rewritten shared history are one-way doors.
-- Blast radius: what breaks if it's wrong. It's local when only my own use of this repo suffers; wide when it reaches other people, published packages, production systems or shared data.
+- Blast radius: what breaks if it's wrong. It's local when only my own use suffers, even across projects, as with my global guidelines and skills; wide when it reaches other people, published packages, production systems or shared data.
 
 A two-way door with a local blast radius stays fast: commit on the current branch as usual. Anything else gets my review first. Say so before starting, work on a branch, open the PR with `/pr`, and stop there instead of merging. If the finished diff turns out riskier than you judged, move the unpushed commits onto a branch. A repo with no GitHub remote keeps the branch local, and the `/pr` body goes in chat.
 

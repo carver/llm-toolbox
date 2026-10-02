@@ -8,6 +8,8 @@ import install
 ROOT = Path(__file__).resolve().parent
 OWN = {p.name for p in (ROOT / "skills").iterdir() if (p / "SKILL.md").is_file()}
 INSTALLED = OWN | {n for names in install.THIRD_PARTY_SKILLS.values() for n in names}
+# Claude Code's own slash commands, which docs may name beside skills.
+BUILTIN = {"clear", "compact", "config", "help", "init", "memory", "resume"}
 
 SLASH = re.compile(r"`/([a-z][a-z0-9-]*)`")
 NAMED = re.compile(r"the `([a-z][a-z0-9-]*)` skill")
@@ -18,7 +20,7 @@ def broken_refs(text: str) -> list[str]:
     broken = [
         f"/{name}"
         for name in SLASH.findall(text) + NAMED.findall(text)
-        if name not in INSTALLED
+        if name not in INSTALLED | BUILTIN
     ]
     for name, rest in PATH.findall(text):
         if name not in INSTALLED:

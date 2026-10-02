@@ -54,6 +54,7 @@ HOOKS = [
 # Other authors' skills, by GitHub source. Installed into ~/.agents/skills with a
 # link from ~/.claude/skills, the layout `npx skills add -g` gives Claude Code and Codex.
 THIRD_PARTY_SKILLS = {
+    "humanlayer/skills": ["show-me", "visual-pr"],
     "mattpocock/skills": [
         "ask-matt",
         "claude-handoff",

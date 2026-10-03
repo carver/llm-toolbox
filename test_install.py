@@ -2,10 +2,12 @@
 ~/.claude/skills. Never touches the real one."""
 
 import json
+import os
 
 import pytest
 
 import install
+from conftest import without_repo_vars
 
 
 @pytest.fixture
@@ -293,7 +295,8 @@ def test_third_party_reports_missing_npx(third_party, monkeypatch, capsys):
 
 
 def test_git_hooks_point_at_githooks(tmp_path, monkeypatch):
-    install.subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    env = without_repo_vars(os.environ)
+    install.subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, env=env)
     monkeypatch.setattr(install, "REPO", tmp_path)
     assert install.enable_git_hooks() == 0
     hooks = install.subprocess.run(
@@ -301,6 +304,7 @@ def test_git_hooks_point_at_githooks(tmp_path, monkeypatch):
         capture_output=True,
         text=True,
         check=True,
+        env=env,
     ).stdout.strip()
     assert hooks == ".githooks"
 

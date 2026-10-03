@@ -4,10 +4,13 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from conftest import without_repo_vars
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "agent-commit-gate"
 loader = importlib.machinery.SourceFileLoader("agent_commit_gate", str(SCRIPT))
@@ -35,10 +38,12 @@ def test_finds_each_commit_and_where_it_runs(command, dirs):
 
 @pytest.fixture
 def repo(tmp_path):
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    env = without_repo_vars(os.environ)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, env=env)
     subprocess.run(
         ["git", "-C", str(tmp_path), "config", "core.hooksPath", ".githooks"],
         check=True,
+        env=env,
     )
     (tmp_path / ".githooks").mkdir()
     return tmp_path

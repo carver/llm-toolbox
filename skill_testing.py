@@ -1,11 +1,14 @@
 """Helpers for the tests of lib/thirdparty.py and the tools built on it."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import thirdparty as tp
+
+from conftest import without_repo_vars
 
 
 def make_skill(
@@ -21,10 +24,11 @@ def make_skill(
 
 def commit(repo: Path) -> None:
     git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+    env = without_repo_vars(os.environ)
     if not (repo / ".git").exists():
-        subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run([*git, "add", "-A"], check=True)
-    subprocess.run([*git, "commit", "-q", "-m", "c"], check=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
+    subprocess.run([*git, "add", "-A"], check=True, env=env)
+    subprocess.run([*git, "commit", "-q", "-m", "c"], check=True, env=env)
 
 
 def lock_for(clone: Path, rel: str) -> dict:

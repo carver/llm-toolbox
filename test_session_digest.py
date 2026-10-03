@@ -9,6 +9,16 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "session-digest"
 BULKY = "x" * 4000
+REPORT = "The fix is in. " * 100
+NOTIFICATION = f"""<task-notification>
+<task-id>abc</task-id>
+<tool-use-id>t3</tool-use-id>
+<output-file>/tmp/tasks/abc.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement fix" finished</summary>
+<note>A task-notification fires each time this agent stops.</note>
+<result>{REPORT}</result>
+</task-notification>"""
 
 
 def assistant(request: str, *blocks: dict, out: int = 10) -> dict:
@@ -66,6 +76,7 @@ MAIN = [
         tool_use("t3", "Agent", description="Implement fix", prompt="Do it"),
     ),
     user([result("t3", [{"type": "text", "text": "Done, tests green."}])]),
+    user(NOTIFICATION, origin={"kind": "task-notification"}),
     user("No, keep the old name", isMeta=False),
     user("<skill body that is long>", isMeta=True),
 ]
@@ -133,6 +144,26 @@ def test_user_turns_shown_and_meta_shortened(config: Path) -> None:
     assert "USER Fix the flaky test" in out
     assert "USER No, keep the old name" in out
     assert "<skill body that is long>" not in out
+
+
+def test_task_notification_is_one_line_without_the_report(config: Path) -> None:
+    out = digest(config)
+    assert 'NOTIFY abc completed: Agent "Implement fix" finished' in out
+    assert "The fix is in." not in out
+    assert "<task-notification>" not in out
+
+
+def test_monitor_event_has_no_status_and_drops_its_event(tmp_path: Path) -> None:
+    event = """<task-notification>
+<task-id>b2</task-id>
+<summary>Monitor event: "build -&gt; deploy"</summary>
+<event>EXTEND: checkpoint_3 165/174</event>
+If this event is something the user would act on now, send a PushNotification.
+</task-notification>"""
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", [user(event)])
+    out = digest(tmp_path)
+    assert 'NOTIFY b2: Monitor event: "build -> deploy"' in out
+    assert "checkpoint_3" not in out
 
 
 def test_subagent_is_linked_and_digested(config: Path) -> None:

@@ -122,7 +122,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   (calls, errors, estimated tokens of tool output, API tokens in and out)
   and its five biggest tool outputs,
   then each agent's timeline: user turns, the assistant's text, one line per
-  tool call with its output's size, and every error in full. Defaults to the
+  tool call with its output's size, one line per background task notification
+  (id, status, summary), and every error in full. Defaults to the
   newest session for the current directory.
 
 - **yt-transcript**: prints a YouTube video's captions, or the ones around

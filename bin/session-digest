@@ -6,6 +6,8 @@ tool output. This prints a summary of what each agent and each tool cost, then
 every agent's timeline: user turns, the assistant's text, one line per tool call
 with the size of its output, and the text of every error. Output bodies are
 left out; their size is given in characters and estimated tokens (chars / 4).
+A background task's notification gets one line, its id, status and summary,
+without the report: a subagent's report shows in that agent's own timeline.
 
 The session defaults to the newest one for the current directory's project.
 Logs live under $CLAUDE_CONFIG_DIR (default ~/.claude) in
@@ -14,6 +16,7 @@ projects/<project>/<session>/subagents/agent-<id>.jsonl.
 """
 
 import argparse
+import html
 import json
 import os
 import re
@@ -81,6 +84,19 @@ def result_size(content: str | list) -> tuple[str, int, int]:
     return text, len(text) // CHARS_PER_TOKEN + images * IMAGE_TOKENS, images
 
 
+def notification(text: str) -> str | None:
+    """One line for a <task-notification> turn, leaving out its report or event body."""
+    if not text.lstrip().startswith("<task-notification>"):
+        return None
+
+    def tag(name: str) -> str:
+        found = re.search(rf"<{name}>(.*?)</{name}>", text, re.DOTALL)
+        return html.unescape(found.group(1).strip()) if found else ""
+
+    head = " ".join(filter(None, [tag("task-id"), tag("status")]))
+    return f"NOTIFY {head}: {short(tag('summary'), TEXT_LIMIT)}"
+
+
 def read_jsonl(path: Path) -> list[dict]:
     records = []
     for line in path.read_text().splitlines():
@@ -122,6 +138,8 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
             if isinstance(content, str):
                 if record.get("isMeta"):
                     agent.lines.append(f"USER (injected, {len(content)} chars)")
+                elif notice := notification(content):
+                    agent.lines.append(notice)
                 else:
                     agent.lines.append(f"USER {short(content, TEXT_LIMIT * 5)}")
                 continue

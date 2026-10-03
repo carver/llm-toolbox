@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # Upskill
 
-Run a retrospective on this session, or on the one the user names (`session-digest SESSION` reads a past one, such as the session before a `/clear`): find what cost time or tokens, and pitch changes that make the next session cheaper.
+Run a retrospective on this session (`session-digest` with no argument reads it), or on the one the user names (`session-digest SESSION` reads a past one, such as the session before a `/clear`; a subagent's output-file path holds a different session's id): find what cost time or tokens, and pitch changes that make the next session cheaper.
 
 Also look for important conventions in the repositories that might be ill-formed.
 

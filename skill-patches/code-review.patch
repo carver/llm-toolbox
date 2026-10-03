@@ -1,4 +1,4 @@
-# Why: Hold diffs to the global standards in coding/standards.md too, and take /build's brief as the spec.
+# Why: Hold diffs to the global standards in coding/standards.md too, and take /build's brief as the spec. Reviewers read the smell baseline from this file by path, so the orchestrator doesn't retype (and abridge) it.
 --- a/SKILL.md
 +++ b/SKILL.md
 @@ -10,7 +10,7 @@
@@ -25,4 +25,22 @@
 +Anything in the repo that documents how code should be written, such as `CODING_STANDARDS.md` or `CONTRIBUTING.md`, plus the user's global standards in `~/.agents/skills/coding/standards.md`. A repo's own standards win where the two conflict.
  
  On top of whatever the repo documents, the Standards axis always carries the **smell baseline** below: a fixed set of Fowler code smells (_Refactoring_, ch.3) that applies even when a repo documents nothing. Two rules bind it:
+ 
+@@ -60,7 +60,7 @@
+ **Standards sub-agent prompt** should include:
+ 
+ - The full diff command and commit list.
+-- The list of standards-source files you found in step 3, **plus the smell baseline from step 3** pasted in full (the sub-agent has no other access to it).
++- The list of standards-source files you found in step 3, **plus the smell baseline**: tell the sub-agent to read `### 3. Identify the standards sources` in `~/.agents/skills/code-review/SKILL.md` itself, so the list reaches it whole and you spend no tokens copying it.
+ - The brief: "Report, per file/hunk where relevant, (a) every place the diff violates a documented standard: cite the standard (file + the rule); and (b) any baseline smell you spot: name it and quote the hunk. Distinguish hard violations from judgement calls: documented-standard breaches can be hard, but baseline smells are always judgement calls, and a documented repo standard overrides the baseline. Skip anything tooling enforces. Under 400 words."
+ 
+ **Spec sub-agent prompt** should include:
+@@ -68,6 +68,8 @@
+ - The diff command and commit list.
+ - The path or fetched contents of the spec.
+ - The brief: "Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words."
++
++Pass each quoted brief verbatim.
+ 
+ If the spec is missing, skip the Spec sub-agent and note this in the final report.
  

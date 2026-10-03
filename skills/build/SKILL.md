@@ -11,6 +11,8 @@ Keep your own context light: read what the subagents report, the commit list and
 
 ## 1. Brief
 
+First find the **design forks**: places where the request leaves a choice open and a reasonable implementer could go either way. Ask the user about each one, leading with your recommendation, before any code exists. Use the `grilling` skill when the request itself is ambiguous.
+
 Write the **brief**, the one message every subagent starts from. A fresh subagent has seen none of this conversation, so the brief carries all of it that matters:
 
 - the repo path, and the goal in the user's words
@@ -18,15 +20,15 @@ Write the **brief**, the one message every subagent starts from. A fresh subagen
 - the **seams**: the public interfaces the tests go through, per `/tdd`. Agree them with the user now. If the user is offline, pick them and record the choice in `uncertainties.md` (see the `coding` skill)
 - the merge danger, judged per the `coding` skill. Create the branch now if it needs one
 
-Record the **base**: `git rev-parse HEAD`.
+Record the **base**: `git rev-parse HEAD`. Also record the **repo fingerprint**: `git config --file "$(git rev-parse --git-common-dir)/config" --list | sha1sum` and `git for-each-ref | grep -v <work branch> | sha1sum`. Worktrees share both, so a subagent can damage them from anywhere.
 
-Done when the user has confirmed the seams (or you've recorded them) and the brief would let someone who never saw this chat do the work.
+Done when every design fork is answered, the user has confirmed the seams (or you've recorded them) and the brief would let someone who never saw this chat do the work.
 
 ## 2. Implement
 
 Spawn a fresh general-purpose subagent with the brief, plus:
 
-> Load the `coding` and `tdd` skills. Make it work: red/green at the seams above, then the code that passes them. Leave code quality to the review that follows. Commit per `coding`. Report: the commits, the check command and its result, and any uncertainty you resolved on your own.
+> Load the `coding` and `tdd` skills. Make it work: red/green at the seams above, then the code that passes them. Leave code quality to the review that follows. Commit per `coding`. When a choice would break a rule in the brief, or widen what a failure stops, report it as a question instead of picking. Report: the commits, the check command and its result, and any uncertainty you resolved on your own.
 
 Keep its agent ID: spec gaps go back to it in step 4.
 
@@ -60,8 +62,9 @@ Record the **refactor base**: `git rev-parse HEAD`. Spawn a fresh general-purpos
 - Run the repo's checks.
 - Read `git diff <refactor base>..HEAD -- <test files>`. A refactor that loosened an assertion or deleted a test to stay green is a failure: send it back or revert it.
 - `git log <base>..HEAD` shows logically isolated commits.
+- The repo fingerprint matches the one from step 1. On a mismatch, find what changed and tell the user before anything else.
 
-Done when checks pass and every test change traces to a finding.
+Done when checks pass, the fingerprint matches, and every test change traces to a finding.
 
 ## 7. Report
 

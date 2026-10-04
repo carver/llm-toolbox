@@ -22,6 +22,8 @@ Stop a process with `killone` and wait for one with `waitone` (llm-toolbox/bin, 
 
 To see a web page or HTML report you changed, check it for JavaScript errors, or read a page that renders with JavaScript (forms, calendars, endless feeds), use `web-shot` (`-h` for its click, wait, shot, text, links and scroll-all actions), not a one-off Playwright script.
 
+To start a new Rust desktop app, run `new-egui-app DIR` (`-h` for options) rather than copying an earlier app's setup.
+
 To read what a YouTube video says, around a timestamp or in full, use `yt-transcript`.
 
 A new user-level skill or tool goes in llm-toolbox (`skills/` or `bin/`), then run its `install.py` to link it. Anything written straight into `~/.claude` or `~/.agents` is lost when the sandbox is recreated. To change another author's skill, edit it in `~/.agents/skills`, then run `skill-patch save NAME --why "..."`; an edit without a patch is lost at the next update.

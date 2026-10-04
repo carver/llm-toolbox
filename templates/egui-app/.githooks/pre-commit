@@ -1,0 +1,5 @@
+#!/bin/sh
+# Formatting only: clippy takes over five seconds here, so it runs in CI
+# along with the tests.
+set -e
+cargo fmt --check

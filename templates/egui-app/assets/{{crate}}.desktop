@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name={{title}}
+Exec={{crate}}
+Icon={{crate}}
+Categories=Utility;
+Terminal=false
+StartupWMClass={{crate}}

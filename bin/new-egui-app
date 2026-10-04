@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Start a Rust egui desktop app for Ubuntu GNOME on Wayland.
+
+Copies templates/egui-app into DIR, filling in the crate name, app id and
+window title. The result builds as is: an eframe window drawn with glow,
+with an icon, a .desktop entry whose StartupWMClass matches the app id, a
+startup timing line on stderr, an egui_kittest test, git hooks (rustfmt
+before each commit, clippy and the tests for agents' commits), a CI
+workflow, a per-user install script, and a CLAUDE.md with the gotchas the
+earlier apps ran into.
+
+DIR must be missing, empty, or hold only .git. It becomes a git repository
+if it is not one, with core.hooksPath set to .githooks.
+"""
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "egui-app"
+PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+# Lowercase, since the name doubles as the app id and the .desktop file's name.
+CRATE_NAME = re.compile(r"[a-z][a-z0-9_-]*")
+# Characters that would break the Rust string literals or the .desktop entry.
+TITLE_FORBIDDEN = re.compile(r'["\\\n\r]')
+BINARY_SUFFIXES = {".png"}
+
+
+def default_title(crate: str) -> str:
+    return " ".join(word.capitalize() for word in re.split(r"[-_]+", crate) if word)
+
+
+def fill(text: str, values: dict[str, str], where: Path) -> str:
+    def substitute(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in values:
+            raise SystemExit(
+                f"new-egui-app: unknown placeholder {{{{{key}}}}} in {where}"
+            )
+        return values[key]
+
+    return PLACEHOLDER.sub(substitute, text)
+
+
+def render(target: Path, values: dict[str, str]) -> None:
+    for source in sorted(TEMPLATE.rglob("*")):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(TEMPLATE)
+        dest = target / fill(str(relative), values, relative)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if source.suffix in BINARY_SUFFIXES:
+            shutil.copyfile(source, dest)
+        else:
+            dest.write_text(fill(source.read_text(), values, relative))
+        shutil.copymode(source, dest)
+
+
+def refusal(target: Path) -> str | None:
+    if not target.exists():
+        return None
+    if not target.is_dir():
+        return f"{target} is not a directory"
+    others = [p.name for p in target.iterdir() if p.name != ".git"]
+    if others:
+        return f"{target} is not empty (holds {', '.join(sorted(others)[:5])})"
+    return None
+
+
+def git(target: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(target), *args], check=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="new-egui-app",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Nothing is committed: build and look at the app first, then\n"
+            "commit it yourself (`cargo build` writes Cargo.lock, which belongs\n"
+            "in the first commit)."
+        ),
+    )
+    parser.add_argument("dir", type=Path, help="where to create the project")
+    parser.add_argument(
+        "--name",
+        help="crate name, also the binary, app id and .desktop file name "
+        "(default: DIR's basename)",
+    )
+    parser.add_argument(
+        "--title",
+        help='window title and launcher name (default: from the name, "my-app" -> "My App")',
+    )
+    args = parser.parse_args(argv)
+
+    target = args.dir.resolve()
+    crate = args.name or target.name
+    if not CRATE_NAME.fullmatch(crate):
+        parser.error(
+            f"name {crate!r}: use lowercase letters, digits, - and _, starting with a letter"
+        )
+    title = args.title or default_title(crate)
+    if TITLE_FORBIDDEN.search(title):
+        parser.error("title: no quotes, backslashes or line breaks")
+    problem = refusal(target)
+    if problem:
+        print(f"new-egui-app: {problem}", file=sys.stderr)
+        return 1
+
+    values = {
+        "crate": crate,
+        "crate_ident": crate.replace("-", "_"),
+        "app_id": crate,
+        "title": title,
+    }
+    target.mkdir(parents=True, exist_ok=True)
+    render(target, values)
+    if not (target / ".git").exists():
+        git(target, "init", "--quiet")
+    git(target, "config", "core.hooksPath", ".githooks")
+    print(f"Created {crate} in {target}. Next: cd there, `cargo run`, then commit.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

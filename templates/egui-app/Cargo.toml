@@ -1,0 +1,28 @@
+[package]
+name = "{{crate}}"
+version = "0.1.0"
+edition = "2024"
+description = "{{title}}"
+
+[dependencies]
+# Add "links" (open URLs) or "persistence" (eframe::Storage) when the app needs them.
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+# Not used directly: its GNOME-style title bar is off unless eframe's default
+# features are on, and Wayland windows otherwise get plain square buttons.
+winit = { version = "0.30.13", default-features = false, features = ["wayland-csd-adwaita"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["eframe"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+
+# Dependencies get optimised and no debug info, which keeps debug builds
+# usable and target/ small on the slow shared mount.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false

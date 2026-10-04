@@ -78,6 +78,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   actions. Prints the apt command if Xvfb, xdotool, ImageMagick or weston is
   missing.
 
+- **new-egui-app**: starts a Rust egui desktop app for GNOME on Wayland
+  from `templates/egui-app`: glow renderer, app id matched to the `.desktop`
+  entry, window icon, startup timing line, an egui_kittest test, git hooks,
+  CI, a per-user install script, and a CLAUDE.md with the known gotchas.
+  `new-egui-app DIR [--name CRATE] [--title TITLE]`; it runs `git init` but
+  leaves the first commit to you.
+
 - **web-shot**: opens a URL or HTML file in headless Chromium, clicks and
   runs scripts in it, saves screenshots of the page or of one element, prints
   a page's text or links (for JS-rendered forms and calendars; `scroll-all`

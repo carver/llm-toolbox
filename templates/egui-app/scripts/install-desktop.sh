@@ -41,6 +41,9 @@ locked=
 cargo install $locked --path "$root" --target-dir "$root/target/install"
 bin=${CARGO_HOME:-$HOME/.cargo}/bin/{{crate}}
 install -Dm644 "$root/assets/icon.svg" "$icon"
+# GNOME Shell rescans icons only when the theme folder itself changes, and
+# adding a file to an existing scalable/apps leaves that folder untouched.
+touch "$data/icons/hicolor"
 mkdir -p "$(dirname "$desktop")"
 # Launchers often run without ~/.cargo/bin on PATH, so use the full path,
 # quoted as the desktop entry spec asks: backslash before " ` $ \, then every

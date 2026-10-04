@@ -35,10 +35,18 @@ esac
 
 # A build directory of its own, so an install never shares artifacts with
 # builds running elsewhere against the same checkout.
-cargo install --locked --path "$root" --target-dir "$root/target/install"
+# --locked once Cargo.lock exists; a project never built yet has none.
+locked=
+[ -f "$root/Cargo.lock" ] && locked=--locked
+cargo install $locked --path "$root" --target-dir "$root/target/install"
 bin=${CARGO_HOME:-$HOME/.cargo}/bin/{{crate}}
 install -Dm644 "$root/assets/icon.svg" "$icon"
 mkdir -p "$(dirname "$desktop")"
-# Launchers often run without ~/.cargo/bin on PATH, so use the full path.
-sed "s|^Exec=.*|Exec=$bin|" "$root/assets/{{crate}}.desktop" > "$desktop"
+# Launchers often run without ~/.cargo/bin on PATH, so use the full path,
+# quoted as the desktop entry spec asks: backslash before " ` $ \, then every
+# backslash doubled for the string-value escaping, and % doubled. awk reads it
+# from the environment, which leaves the value untouched.
+quoted=$(printf '%s' "$bin" | sed -e 's/[\\"`$]/\\&/g' -e 's/\\/\\\\/g' -e 's/%/%%/g')
+EXEC="Exec=\"$quoted\"" awk '/^Exec=/ { print ENVIRON["EXEC"]; next } { print }' \
+    "$root/assets/{{crate}}.desktop" > "$desktop"
 echo "Installed $bin and a launcher entry."

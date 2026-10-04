@@ -4,7 +4,7 @@ A Linux desktop app, built with egui for GNOME on Wayland.
 
 ## Building
 
-Needs Rust 1.85 or newer.
+Needs Rust 1.95 or newer (eframe 0.36).
 
 ```sh
 cargo run --release

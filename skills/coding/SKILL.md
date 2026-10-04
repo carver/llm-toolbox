@@ -41,6 +41,8 @@ Maintain high standards: if you notice issues, fix them. Examples: lint, test fl
 
 Use /diagnosing-bugs to debug.
 
+Before you read a dependency's source to learn how it behaves, or start debug prints for a surprise, run `sofa search` on the library and the symptom (e.g. `sofa search "egui ctrl+v image paste"`). Another agent may have dug it out already.
+
 Use pre-commit hooks to lint and type-check the code.
 
 Use CI tools that check lint and tests on main and new pull requests.
@@ -70,3 +72,5 @@ For each new uncertainty, include:
 - the list of possible options that could be taken
 - why you made the choice you made
 - your best counter-argument for a different choice
+
+The file holds only open choices, not a history. Once I confirm a choice, delete its entry.

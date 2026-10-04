@@ -23,14 +23,94 @@ from pathlib import Path
 TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "egui-app"
 PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 # Lowercase, since the name doubles as the app id and the .desktop file's name.
-CRATE_NAME = re.compile(r"[a-z][a-z0-9_-]*")
+CRATE_NAME = re.compile(r"[a-z](?:[a-z0-9_-]*[a-z0-9])?")
+# The library crate is named after the package with - as _, so it must not be
+# a Rust keyword (2024 edition, reserved ones included).
+RUST_KEYWORDS = {
+    "abstract",
+    "as",
+    "async",
+    "await",
+    "become",
+    "box",
+    "break",
+    "const",
+    "continue",
+    "crate",
+    "do",
+    "dyn",
+    "else",
+    "enum",
+    "extern",
+    "false",
+    "final",
+    "fn",
+    "for",
+    "gen",
+    "if",
+    "impl",
+    "in",
+    "let",
+    "loop",
+    "macro",
+    "match",
+    "mod",
+    "move",
+    "mut",
+    "override",
+    "priv",
+    "pub",
+    "ref",
+    "return",
+    "self",
+    "static",
+    "struct",
+    "super",
+    "trait",
+    "true",
+    "try",
+    "type",
+    "typeof",
+    "unsafe",
+    "unsized",
+    "use",
+    "virtual",
+    "where",
+    "while",
+    "yield",
+}
+# Cargo refuses these: standard library crates, and target/ directory names.
+CARGO_RESERVED = {"alloc", "core", "proc_macro", "std", "test"} | {
+    "build",
+    "deps",
+    "examples",
+    "incremental",
+}
 # Characters that would break the Rust string literals or the .desktop entry.
 TITLE_FORBIDDEN = re.compile(r'["\\\n\r]')
-BINARY_SUFFIXES = {".png"}
+
+
+def name_problem(crate: str) -> str | None:
+    if not CRATE_NAME.fullmatch(crate):
+        return "use lowercase letters, digits, - and _, starting with a letter and ending with a letter or digit"
+    ident = crate.replace("-", "_")
+    if ident in RUST_KEYWORDS:
+        return "a Rust keyword cannot name a crate"
+    if ident in CARGO_RESERVED:
+        return "cargo reserves this name"
+    return None
 
 
 def default_title(crate: str) -> str:
     return " ".join(word.capitalize() for word in re.split(r"[-_]+", crate) if word)
+
+
+def as_text(data: bytes) -> str | None:
+    """The file's text, or None for a binary file, which is copied as is."""
+    try:
+        return data.decode()
+    except UnicodeDecodeError:
+        return None
 
 
 def fill(text: str, values: dict[str, str], where: Path) -> str:
@@ -45,28 +125,42 @@ def fill(text: str, values: dict[str, str], where: Path) -> str:
     return PLACEHOLDER.sub(substitute, text)
 
 
-def render(target: Path, values: dict[str, str]) -> None:
+def render(values: dict[str, str]) -> dict[Path, tuple[bytes, Path]]:
+    """Each output path, relative to the project, with its content and the
+    template file it came from. Exits on an unknown placeholder, before
+    anything is written."""
+    rendered = {}
     for source in sorted(TEMPLATE.rglob("*")):
         if not source.is_file():
             continue
         relative = source.relative_to(TEMPLATE)
-        dest = target / fill(str(relative), values, relative)
+        data = source.read_bytes()
+        text = as_text(data)
+        if text is not None:
+            data = fill(text, values, relative).encode()
+        rendered[Path(fill(str(relative), values, relative))] = (data, source)
+    return rendered
+
+
+def write(target: Path, rendered: dict[Path, tuple[bytes, Path]]) -> None:
+    for relative, (data, source) in rendered.items():
+        dest = target / relative
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if source.suffix in BINARY_SUFFIXES:
-            shutil.copyfile(source, dest)
-        else:
-            dest.write_text(fill(source.read_text(), values, relative))
+        dest.write_bytes(data)
         shutil.copymode(source, dest)
 
 
-def refusal(target: Path) -> str | None:
+def why_unusable(target: Path) -> str | None:
     if not target.exists():
         return None
     if not target.is_dir():
         return f"{target} is not a directory"
     others = [p.name for p in target.iterdir() if p.name != ".git"]
     if others:
-        return f"{target} is not empty (holds {', '.join(sorted(others)[:5])})"
+        shown = ", ".join(sorted(others)[:5])
+        if len(others) > 5:
+            shown += f" and {len(others) - 5} more"
+        return f"{target} is not empty (holds {shown})"
     return None
 
 
@@ -99,14 +193,13 @@ def main(argv: list[str] | None = None) -> int:
 
     target = args.dir.resolve()
     crate = args.name or target.name
-    if not CRATE_NAME.fullmatch(crate):
-        parser.error(
-            f"name {crate!r}: use lowercase letters, digits, - and _, starting with a letter"
-        )
+    problem = name_problem(crate)
+    if problem:
+        parser.error(f"name {crate!r}: {problem}")
     title = args.title or default_title(crate)
     if TITLE_FORBIDDEN.search(title):
         parser.error("title: no quotes, backslashes or line breaks")
-    problem = refusal(target)
+    problem = why_unusable(target)
     if problem:
         print(f"new-egui-app: {problem}", file=sys.stderr)
         return 1
@@ -114,11 +207,11 @@ def main(argv: list[str] | None = None) -> int:
     values = {
         "crate": crate,
         "crate_ident": crate.replace("-", "_"),
-        "app_id": crate,
         "title": title,
     }
+    rendered = render(values)
     target.mkdir(parents=True, exist_ok=True)
-    render(target, values)
+    write(target, rendered)
     if not (target / ".git").exists():
         git(target, "init", "--quiet")
     git(target, "config", "core.hooksPath", ".githooks")

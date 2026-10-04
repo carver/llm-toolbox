@@ -1,5 +1,7 @@
 """new-egui-app writes a ready-to-build Rust egui project from templates/egui-app."""
 
+import importlib.machinery
+import importlib.util
 import os
 import re
 import shutil
@@ -9,6 +11,10 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "new-egui-app"
+loader = importlib.machinery.SourceFileLoader("new_egui_app", str(SCRIPT))
+spec = importlib.util.spec_from_loader("new_egui_app", loader)
+new_egui_app = importlib.util.module_from_spec(spec)
+loader.exec_module(new_egui_app)
 
 
 def run(*args: str | Path, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -32,7 +38,7 @@ def text_files(root: Path) -> list[Path]:
     for path in root.rglob("*"):
         if ".git" in path.relative_to(root).parts or not path.is_file():
             continue
-        if path.suffix == ".png":
+        if new_egui_app.as_text(path.read_bytes()) is None:
             continue
         found.append(path)
     return found
@@ -108,8 +114,29 @@ def test_name_overrides_the_directory(tmp_path: Path) -> None:
     assert (target / "assets/fern.desktop").is_file()
 
 
-def test_rejects_a_name_cargo_would(tmp_path: Path) -> None:
-    result = run(tmp_path / "x", "--name", "Bad Name")
+# Spaces and capitals; Rust keywords, which can't name the library crate;
+# names cargo reserves for the standard library or target/ directories; and
+# a trailing separator.
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Bad Name",
+        "fn",
+        "match",
+        "self",
+        "gen",
+        "try",
+        "test",
+        "std",
+        "core",
+        "build",
+        "deps",
+        "a-",
+        "a_",
+    ],
+)
+def test_rejects_a_name_cargo_would(tmp_path: Path, name: str) -> None:
+    result = run(tmp_path / "x", "--name", name)
     assert result.returncode != 0
     assert "name" in result.stderr
     assert not (tmp_path / "x").exists()
@@ -172,3 +199,7 @@ def test_rust_is_formatted_whatever_the_name(tmp_path: Path, name: str) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_accepts_names_that_only_contain_a_keyword(tmp_path: Path) -> None:
+    assert run(tmp_path / "x", "--name", "fn-keys").returncode == 0

@@ -177,17 +177,17 @@ class Downloads:
 
 
 def test_a_fetched_transcript_is_cached(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("YT_TRANSCRIPT_CACHE", str(tmp_path))
     downloads = Downloads([(1.5, "hi")])
     monkeypatch.setattr(yt, "download", downloads)
     assert yt.fetch(ID) == [(1.5, "hi")]
     assert yt.fetch(ID) == [(1.5, "hi")]
     assert downloads.calls == 1
-    assert (tmp_path / "yt-transcript" / f"{ID}.json").exists()
+    assert (tmp_path / f"{ID}.json").exists()
 
 
 def test_refresh_skips_the_cache(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("YT_TRANSCRIPT_CACHE", str(tmp_path))
     downloads = Downloads([(1.5, "hi")])
     monkeypatch.setattr(yt, "download", downloads)
     yt.fetch(ID)
@@ -196,7 +196,7 @@ def test_refresh_skips_the_cache(monkeypatch, tmp_path):
 
 
 def test_a_failed_fetch_caches_nothing(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("YT_TRANSCRIPT_CACHE", str(tmp_path))
     monkeypatch.setattr(yt, "download", Downloads(yt.TryLater("blocked")))
     with pytest.raises(yt.TryLater):
         yt.fetch(ID)

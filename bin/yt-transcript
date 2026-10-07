@@ -18,8 +18,9 @@ TIME is seconds (1238), YouTube's form (20m38s) or a clock (20:38, 1:02:03).
 The default window leans back, since the argument that led to a moment
 usually comes before it.
 
-Transcripts are cached in $XDG_CACHE_HOME/yt-transcript (default
-~/.cache/yt-transcript), one file per video, so asking again, or for another
+Transcripts are cached in $YT_TRANSCRIPT_CACHE (default
+/home/carver/code/claudedev/cache/yt-transcript, on the host disk so it
+survives a sandbox recreate), one file per video, so asking again, or for another
 moment, doesn't touch YouTube. --refresh fetches anew.
 
 Exit status: 0 success, 1 the video has no transcript to fetch (reason on
@@ -52,6 +53,7 @@ NO_TRANSCRIPT = {
     "VideoUnavailable",
     "VideoUnplayable",
 }
+DEFAULT_CACHE = Path("/home/carver/code/claudedev/cache/yt-transcript")
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 YOUTUBE_HOSTS = {
     "youtube.com",
@@ -154,10 +156,7 @@ def download(video_id: str) -> list[Segment]:
 
 
 def cache_dir() -> Path:
-    return (
-        Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-        / "yt-transcript"
-    )
+    return Path(os.environ.get("YT_TRANSCRIPT_CACHE") or DEFAULT_CACHE)
 
 
 def fetch(video_id: str, refresh: bool = False) -> list[Segment]:

@@ -114,8 +114,10 @@ class FakeHTTP:
         self.routes = [(m, frag, list(rs)) for m, frag, rs in routes]
         self.calls = []
 
-    def __call__(self, method, url, *, params=None):
-        self.calls.append({"method": method, "url": url, "params": params})
+    def __call__(self, method, url, *, params=None, headers=None):
+        self.calls.append(
+            {"method": method, "url": url, "params": params, "headers": headers}
+        )
         for m, frag, responses in self.routes:
             if m == method and frag in url:
                 answer = responses.pop(0) if len(responses) > 1 else responses[0]
@@ -133,6 +135,15 @@ def status(code, body=None, headers=None):
     return paper.Response(
         code, headers or {}, json.dumps(body or {"error": "x"}).encode()
     )
+
+
+@pytest.fixture(autouse=True)
+def key_file(monkeypatch, tmp_path):
+    """No test reads the real API key: env unset, key file under tmp_path."""
+    monkeypatch.delenv("S2_API_KEY", raising=False)
+    path = tmp_path / "api-key"
+    monkeypatch.setattr(paper, "KEY_FILE", path)
+    return path
 
 
 @pytest.fixture
@@ -509,3 +520,120 @@ def test_help_says_how_to_refresh_and_what_search_misses_exit_with(capsys):
     out = " ".join(capsys.readouterr().out.split())
     assert "Delete the s2 folder" in out
     assert "search with no hits exits 1" in out
+
+
+KEY = "s2-secret-key-0123456789"
+
+
+def sent_key(call):
+    return (call["headers"] or {}).get("x-api-key")
+
+
+def test_without_a_key_requests_go_anonymous(cache, capsys):
+    http = FakeHTTP(("GET", "/paper/", [ok(ATTENTION)]))
+    assert run(capsys, ["meta", "1706.03762"], http)[0] == 0
+    assert sent_key(http.calls[0]) is None
+
+
+def test_the_key_file_is_sent_to_semantic_scholar(cache, capsys, key_file):
+    key_file.write_text(KEY + "\n")
+    http = FakeHTTP(("GET", "/paper/", [ok(ATTENTION)]))
+    code, out, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert code == 0
+    assert sent_key(http.calls[0]) == KEY
+    assert KEY not in out + err
+
+
+def test_the_env_var_wins_over_the_key_file(cache, capsys, key_file, monkeypatch):
+    key_file.write_text("from-file")
+    monkeypatch.setenv("S2_API_KEY", " " + KEY + " ")
+    http = FakeHTTP(("GET", "/paper/search", [ok({"total": 1, "data": [COLLUSION]})]))
+    run(capsys, ["search", "collusion"], http)
+    assert sent_key(http.calls[0]) == KEY
+
+
+def test_a_blank_env_var_falls_back_to_the_file(cache, capsys, key_file, monkeypatch):
+    key_file.write_text(KEY)
+    monkeypatch.setenv("S2_API_KEY", "  ")
+    http = FakeHTTP(("GET", "/citations", [ok({"offset": 0, "data": []})]))
+    run(capsys, ["cites", "1706.03762"], http)
+    assert sent_key(http.calls[0]) == KEY
+
+
+def test_a_blank_key_file_means_no_key(cache, capsys, key_file):
+    key_file.write_text("\n")
+    http = FakeHTTP(("GET", "/paper/", [ok(ATTENTION)]))
+    run(capsys, ["meta", "1706.03762"], http)
+    assert sent_key(http.calls[0]) is None
+
+
+def test_pdf_downloads_never_get_the_key(cache, capsys, key_file):
+    key_file.write_text(KEY)
+    url = "https://example.com/paper.pdf"
+    http = FakeHTTP(("GET", url, [pdf_response()]))
+    assert run(capsys, ["text", url], http, extract=fake_extract)[0] == 0
+    assert sent_key(http.calls[0]) is None
+
+
+def test_the_key_stays_out_of_the_cache(cache, capsys, key_file):
+    key_file.write_text(KEY)
+    run(capsys, ["meta", "1706.03762"], FakeHTTP(("GET", "/paper/", [ok(ATTENTION)])))
+    for f in cache.rglob("*"):
+        if f.is_file():
+            assert KEY not in f.read_text() and KEY not in f.name
+    key_file.write_text("another-key")
+    code, _, _, _ = run(capsys, ["meta", "1706.03762"], FakeHTTP())
+    assert code == 0
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_a_rejected_key_says_where_it_came_from(cache, capsys, key_file, code):
+    key_file.write_text(KEY)
+    http = FakeHTTP(("GET", "/paper/", [status(code, {"message": "Forbidden"})]))
+    exit_code, out, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert exit_code == 3
+    assert str(key_file) in err and "may be invalid" in err
+    assert KEY not in out + err
+
+
+def test_a_rejected_env_key_names_the_env_var(cache, capsys, monkeypatch):
+    monkeypatch.setenv("S2_API_KEY", KEY)
+    http = FakeHTTP(("GET", "/paper/", [status(403, {"message": "Forbidden"})]))
+    _, out, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert "S2_API_KEY" in err and "may be invalid" in err
+    assert KEY not in out + err
+
+
+def test_a_403_without_a_key_has_no_key_hint(cache, capsys):
+    http = FakeHTTP(("GET", "/paper/", [status(403, {"message": "Forbidden"})]))
+    code, _, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert code == 3 and "HTTP 403: Forbidden" in err and "key" not in err
+
+
+def test_help_says_where_the_api_key_goes(capsys):
+    with pytest.raises(SystemExit):
+        paper.main(["-h"])
+    out = capsys.readouterr().out
+    assert "S2_API_KEY" in out and ".semantic-scholar/api-key" in out
+
+
+def test_an_unreadable_key_file_exits_2_naming_it(cache, capsys, key_file):
+    key_file.mkdir()
+    http = FakeHTTP(("GET", "/paper/", [ok(ATTENTION)]))
+    code, _, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert code == 2 and str(key_file) in err and not http.calls
+
+
+def test_pdf_downloads_ignore_an_unreadable_key_file(cache, capsys, key_file):
+    key_file.mkdir()
+    url = "https://example.com/paper.pdf"
+    http = FakeHTTP(("GET", url, [pdf_response()]))
+    assert run(capsys, ["text", url], http, extract=fake_extract)[0] == 0
+
+
+def test_a_key_file_that_is_not_utf8_exits_2_without_echoing_it(
+    cache, capsys, key_file
+):
+    key_file.write_bytes(b"\xffsecret")
+    code, out, err, _ = run(capsys, ["meta", "1706.03762"], FakeHTTP())
+    assert code == 2 and "UTF-8" in err and "secret" not in out + err

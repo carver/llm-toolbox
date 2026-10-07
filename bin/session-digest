@@ -9,7 +9,8 @@ left out; their size is given in characters and estimated tokens (chars / 4).
 A background task's notification gets one line, its id, status and summary,
 without the report: a subagent's report shows in that agent's own timeline.
 
-The session defaults to the newest one for the current directory's project.
+The session defaults to the newest one for the current directory's project,
+or its nearest parent directory's.
 Logs live under $CLAUDE_CONFIG_DIR (default ~/.claude) in
 projects/<project>/<session>.jsonl, with subagents in
 projects/<project>/<session>/subagents/agent-<id>.jsonl.
@@ -164,6 +165,15 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
 
 
 def project_dir(config: Path, cwd: str) -> Path:
+    """The project folder for cwd, or for its nearest ancestor that has one.
+
+    The shell often drifts into a subfolder of the project Claude Code was
+    started in, and only that starting folder has a project folder.
+    """
+    for folder in [cwd, *map(str, Path(cwd).parents)]:
+        project = config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", folder)
+        if project.is_dir():
+            return project
     return config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
 
 

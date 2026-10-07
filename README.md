@@ -131,7 +131,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   then each agent's timeline: user turns, the assistant's text, one line per
   tool call with its output's size, one line per background task notification
   (id, status, summary), and every error in full. Defaults to the
-  newest session for the current directory.
+  newest session for the current directory (or its nearest parent with sessions).
 
 - **yt-transcript**: prints a YouTube video's captions, or the ones around
   the URL's timestamp (90 seconds before, 60 after, by default), each line

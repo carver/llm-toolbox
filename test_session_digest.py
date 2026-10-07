@@ -194,6 +194,10 @@ def test_session_by_id(config: Path) -> None:
     assert "USER Fix the flaky test" in digest(config, "sess1")
 
 
+def test_newest_session_found_from_a_subdirectory(config: Path) -> None:
+    assert "USER Fix the flaky test" in digest(config, cwd="/work/repo/research/notes")
+
+
 def test_unknown_session_fails(config: Path) -> None:
     proc = subprocess.run(
         [str(SCRIPT), "--cwd", "/work/repo", "nope"],

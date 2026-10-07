@@ -1,14 +1,14 @@
 #!/bin/sh
-# Lint and format-check what's staged, in about a second. Enabled by install.py or install_dev.py (core.hooksPath).
+# Lint and format-check what's staged, in about a second. Enabled by install.py (core.hooksPath).
 # The test suite is too slow for this; agent-pre-commit runs it.
 set -e
-# A dev clone runs its .venv's tools (install_dev.py); otherwise whatever python3 is on PATH.
-python=python3
-[ -x .venv/bin/python3 ] && python="$PWD/.venv/bin/python3"
+command -v uv >/dev/null || { echo "pre-commit: needs uv on PATH; install uv: https://docs.astral.sh/uv/" >&2; exit 1; }
 tree=$(mktemp -d)
 trap 'rm -rf "$tree"' EXIT
 # Check the staged snapshot, not the working tree, without touching either.
 git checkout-index -a --prefix="$tree/"
 cd "$tree"
-"$python" -m ruff check --quiet .
-"$python" -m ruff format --check --quiet .
+# uv, not a .venv: the repo is shared by machines whose Pythons differ.
+uv_tools="uv run -q --no-project --with-requirements requirements-dev.txt"
+$uv_tools ruff check --quiet .
+$uv_tools ruff format --check --quiet .

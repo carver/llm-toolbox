@@ -4,14 +4,16 @@ Skills, and the guidelines every agent session starts from.
 
 ## Developer setup
 
+Install [uv](https://docs.astral.sh/uv/), then point git at the hooks:
+
 ```bash
-python3 install_dev.py
+git config core.hooksPath .githooks
 ```
 
-Creates `.venv` with the tools in `requirements-dev.txt`, and points git at the
-hooks in `.githooks`, which use `.venv`'s Python. It links no skills or tools
-into your home directory; `install.py` below does that, and enables the hooks too.
-Run `. .venv/bin/activate` to use the tools by hand.
+`install.py` below does this too. The hooks take ruff and pytest at the
+versions in `requirements-dev.txt` from `uv run`, which keeps them in uv's
+cache. There's no `.venv`: this repo is shared between the host and a sandbox,
+and a venv works for only one machine's Python.
 
 ## Install
 
@@ -158,14 +160,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 ## Checks
 
 ```bash
-python3 -m ruff check . && python3 -m ruff format --check . && python3 -m pytest
+.githooks/agent-pre-commit
 ```
 
-`install.py` points git at `.githooks`. Its `pre-commit` runs the two ruff checks on
+It checks what's staged. `install.py` points git at `.githooks`. Its `pre-commit` runs the two ruff checks on
 what's staged; `agent-pre-commit` adds the tests (about 35 seconds), and
-`agent-commit-gate` runs it before an agent's commits. Both use `.venv`'s Python
-when it exists, else whichever `python3` is on `PATH`, which then needs ruff and
-pytest. `ruff.toml` brings the
+`agent-commit-gate` runs it before an agent's commits. Both run the tools
+through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.
 
 ## Guidelines

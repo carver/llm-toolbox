@@ -133,11 +133,11 @@ class Response:
     content: bytes
 
 
-def requests_fetch(method, url, *, params=None, json=None):
+def requests_fetch(method, url, *, params=None):
     import requests
 
     try:
-        r = requests.request(method, url, params=params, json=json, timeout=TIMEOUT)
+        r = requests.request(method, url, params=params, timeout=TIMEOUT)
     except (requests.Timeout, requests.ConnectionError) as e:
         raise TransportError(type(e).__name__) from e
     return Response(r.status_code, dict(r.headers), r.content)
@@ -149,21 +149,18 @@ class Client:
         self.sleep = sleep
         self.cache = Path(os.environ.get("PAPER_CACHE") or DEFAULT_CACHE)
 
-    def s2(self, path, params=None, body=None, require=None):
+    def s2(self, path, params=None, require=None):
         """A Semantic Scholar response's JSON, from the cache when it's there.
 
         The answer must be an object, holding the key `require` if given."""
-        method = "POST" if body is not None else "GET"
         url = S2 + path
-        key = json.dumps([method, url, params, body], sort_keys=True)
+        key = json.dumps([url, params], sort_keys=True)
         cached = (
             self.cache / "s2" / (hashlib.sha256(key.encode()).hexdigest() + ".json")
         )
         if cached.exists():
             return json.loads(cached.read_text(encoding="utf-8"))
-        response = self.request(
-            "Semantic Scholar", method, url, params=params, json=body
-        )
+        response = self.request("Semantic Scholar", "GET", url, params=params)
         if response.status == 404:
             raise NotFound(error_text(response))
         if response.status != 200:

@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import json
 import shutil
 from pathlib import Path
 
@@ -79,7 +80,6 @@ ATTENTION = {
     "year": 2017,
     "venue": "Neural Information Processing Systems",
     "citationCount": 100000,
-    "influentialCitationCount": 9000,
     "externalIds": {
         "ArXiv": "1706.03762",
         "DOI": "10.48550/arXiv.1706.03762",
@@ -96,7 +96,6 @@ COLLUSION = {
     "year": 2022,
     "venue": "UAI",
     "citationCount": 3,
-    "influentialCitationCount": 0,
     "externalIds": {"CorpusId": 1},
     "authors": [{"authorId": "3", "name": "Trevor Bonjour"}],
 }
@@ -112,15 +111,8 @@ class FakeHTTP:
         self.routes = [(m, frag, list(rs)) for m, frag, rs in routes]
         self.calls = []
 
-    def __call__(self, method, url, *, params=None, json=None):
-        self.calls.append(
-            {
-                "method": method,
-                "url": url,
-                "params": params,
-                "json": json,
-            }
-        )
+    def __call__(self, method, url, *, params=None):
+        self.calls.append({"method": method, "url": url, "params": params})
         for m, frag, responses in self.routes:
             if m == method and frag in url:
                 answer = responses.pop(0) if len(responses) > 1 else responses[0]
@@ -131,14 +123,10 @@ class FakeHTTP:
 
 
 def ok(body):
-    import json
-
     return paper.Response(200, {}, json.dumps(body).encode())
 
 
 def status(code, body=None, headers=None):
-    import json
-
     return paper.Response(
         code, headers or {}, json.dumps(body or {"error": "x"}).encode()
     )

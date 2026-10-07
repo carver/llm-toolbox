@@ -140,6 +140,16 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   (`$YT_TRANSCRIPT_CACHE` overrides), and exits 3 when YouTube refuses the
   request (it blocks IPs that fetch a lot), so callers can retry later.
 
+- **paper**: a paper's metadata (`meta`), the papers citing it (`cites`) and
+  keyword search (`search`) from Semantic Scholar, and its full text (`text`:
+  downloads the arXiv or direct-URL PDF, runs `pdftotext -layout` and prints
+  the `.txt` path). Takes arXiv ids and URLs, DOIs and Semantic Scholar
+  paperIds, and prints a few lines per paper. Retries rate limits, 5xx and
+  timeouts with backoff for up to 2 minutes, so callers needn't sleep and
+  retry. Caches everything in `claudedev/cache/paper/` (`$PAPER_CACHE`
+  overrides). Exits 1 when not found or when a URL is not a PDF, 3 when the
+  remote still refuses.
+
 ## Checks
 
 ```bash

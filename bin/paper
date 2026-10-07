@@ -1,0 +1,465 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# dependencies = ["requests"]
+# ///
+"""Fetch a paper's metadata, citations or full text from Semantic Scholar and arXiv.
+
+    paper meta ID...
+    paper cites ID [--limit N]
+    paper search QUERY... [--limit N]
+    paper text ID
+
+meta prints one short block per paper: title, year and venue, authors (with
+affiliations when Semantic Scholar has them), citation count, and its arXiv,
+DOI and Semantic Scholar ids. cites lists papers citing ID (default 20),
+search the top matches for a keyword query (default 10), each with year,
+title, venue, first three authors and ids. text downloads the PDF, extracts
+it with `pdftotext -layout` and prints the path of the .txt file; read that.
+
+ID is an arXiv id (2404.00806, version suffix optional), an arxiv.org abs or
+pdf URL, a DOI (10.1145/... bare or as a doi.org URL), or a 40-character
+Semantic Scholar paperId. text takes only arXiv ids and URLs, or a direct PDF
+URL. For a paper with none of these (PMLR, OpenReview), find its paperId with
+search.
+
+Every answer is cached in $PAPER_CACHE (default
+/home/carver/code/claudedev/cache/paper): Semantic Scholar responses as JSON,
+PDFs with their text. Delete the s2 folder there to refetch Semantic Scholar
+answers (metadata, citations, searches), or a paper's files in pdf/ to fetch
+its text anew.
+
+Rate limits (HTTP 429, including Semantic Scholar's JSON error object), 5xx
+and timeouts are retried with exponential backoff, honouring Retry-After: up
+to 6 attempts and 2 minutes of waiting. Don't sleep and retry yourself.
+
+Exit status: 0 success, 1 not found (or the URL is not a PDF pdftotext can
+read; search with no hits exits 1; cites with no citing papers says so and
+exits 0), 2 usage error, 3 the remote refused or failed the request after
+retries, or sent an unexpected answer: try again later.
+
+Examples:
+    paper meta 2404.00806 10.1145/3442188.3445922
+    paper cites https://arxiv.org/abs/1706.03762 --limit 50
+    paper search detect collusion multi-agent games --limit 5
+    less "$(paper text 2404.00806)"
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import quote, unquote, urlparse, urlsplit
+
+OK, NOT_FOUND, USAGE, REMOTE = 0, 1, 2, 3
+S2 = "https://api.semanticscholar.org/graph/v1"
+DEFAULT_CACHE = "/home/carver/code/claudedev/cache/paper"
+TIMEOUT = 30
+ATTEMPTS = 6
+BUDGET = 120  # seconds of sleeping between attempts, at most
+META_FIELDS = (
+    "title,year,venue,citationCount,externalIds,authors.name,authors.affiliations"
+)
+CITES_FIELDS = "title,year,venue,externalIds,authors"
+SEARCH_FIELDS = CITES_FIELDS + ",citationCount"
+
+
+ARXIV = re.compile(r"\d{4}\.\d{4,5}(?:v\d+)?")
+DOI = re.compile(r"10\.\d{4,9}/\S+")
+S2_HEX = re.compile(r"[0-9a-f]{40}")
+ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org"}
+DOI_HOSTS = {"doi.org", "dx.doi.org", "www.doi.org"}
+
+
+class UsageError(Exception):
+    pass
+
+
+def parse_id(text: str) -> tuple[str, str]:
+    """(kind, value) for an ID: kind is arxiv, doi, s2 or url."""
+    text = text.strip()
+    if ARXIV.fullmatch(text):
+        return "arxiv", text
+    if DOI.fullmatch(text):
+        return "doi", text
+    if S2_HEX.fullmatch(text.lower()):
+        return "s2", text.lower()
+    url = urlsplit(text)
+    if url.scheme in ("http", "https") and url.hostname:
+        if url.hostname in ARXIV_HOSTS:
+            parts = url.path.strip("/").split("/", 1)
+            if len(parts) == 2 and parts[0] in ("abs", "pdf"):
+                candidate = parts[1].removesuffix(".pdf")
+                if ARXIV.fullmatch(candidate):
+                    return "arxiv", candidate
+            raise UsageError(f"not an arXiv paper URL: {text!r}")
+        if url.hostname in DOI_HOSTS:
+            candidate = unquote(url.path.lstrip("/"))
+            if DOI.fullmatch(candidate):
+                return "doi", candidate
+            raise UsageError(f"not a DOI URL: {text!r}")
+        return "url", text
+    raise UsageError(
+        f"not a paper id: {text!r} (arXiv id or URL, DOI, S2 paperId, or a PDF URL)"
+    )
+
+
+class NotFound(Exception):
+    pass
+
+
+class RemoteError(Exception):
+    """The remote refused or failed the request, after retries."""
+
+
+class ExtractFailed(Exception):
+    """The download was not a PDF, or pdftotext could not read it."""
+
+
+class TransportError(Exception):
+    """The request never got an HTTP answer: a timeout or a dropped connection."""
+
+
+@dataclass
+class Response:
+    status: int
+    headers: dict
+    content: bytes
+
+
+def requests_fetch(method, url, *, params=None, json=None):
+    import requests
+
+    try:
+        r = requests.request(method, url, params=params, json=json, timeout=TIMEOUT)
+    except (requests.Timeout, requests.ConnectionError) as e:
+        raise TransportError(type(e).__name__) from e
+    return Response(r.status_code, dict(r.headers), r.content)
+
+
+class Client:
+    def __init__(self, fetch, sleep):
+        self.fetch = fetch
+        self.sleep = sleep
+        self.cache = Path(os.environ.get("PAPER_CACHE") or DEFAULT_CACHE)
+
+    def s2(self, path, params=None, body=None, require=None):
+        """A Semantic Scholar response's JSON, from the cache when it's there.
+
+        The answer must be an object, holding the key `require` if given."""
+        method = "POST" if body is not None else "GET"
+        url = S2 + path
+        key = json.dumps([method, url, params, body], sort_keys=True)
+        cached = (
+            self.cache / "s2" / (hashlib.sha256(key.encode()).hexdigest() + ".json")
+        )
+        if cached.exists():
+            return json.loads(cached.read_text(encoding="utf-8"))
+        response = self.request(
+            "Semantic Scholar", method, url, params=params, json=body
+        )
+        if response.status == 404:
+            raise NotFound(error_text(response))
+        if response.status != 200:
+            raise RemoteError(
+                f"Semantic Scholar: HTTP {response.status}: {error_text(response)}"
+            )
+        try:
+            data = json.loads(response.content)
+        except ValueError:
+            data = None
+        if not isinstance(data, dict) or (require and not data.get(require)):
+            raise RemoteError(
+                "Semantic Scholar sent an unexpected answer: "
+                + response.content[:200].decode(errors="replace")
+            )
+        write_atomic(cached, json.dumps(data).encode())
+        return data
+
+    def request(self, service, method, url, **kwargs):
+        """The response, retrying 429s, 5xx and timeouts with backoff.
+
+        Semantic Scholar's error object, {"message": ..., "code": "429"},
+        counts as that status whatever the HTTP status says."""
+        slept = 0.0
+        for attempt in range(1, ATTEMPTS + 1):
+            retry_after = None
+            try:
+                response = self.fetch(method, url, **kwargs)
+            except TransportError as e:
+                problem = str(e) or "timeout"
+            else:
+                code = s2_error_code(response) or response.status
+                if code != 429 and code < 500:
+                    if code != response.status:
+                        response = Response(code, response.headers, response.content)
+                    return response
+                problem = f"HTTP {code}: {error_text(response)}"
+                retry_after = parse_retry_after(response.headers)
+            if attempt == ATTEMPTS or slept >= BUDGET:
+                break
+            delay = (
+                retry_after
+                if retry_after is not None
+                else (2**attempt * random.uniform(1, 1.5))
+            )
+            delay = min(delay, BUDGET - slept)
+            self.sleep(delay)
+            slept += delay
+        raise RemoteError(
+            f"{service} failed, gave up after {attempt} attempts"
+            f" ({slept:.0f}s of backoff): {problem}"
+        )
+
+
+def s2_error_code(response):
+    """The status in a Semantic Scholar error object, or None if it isn't one."""
+    try:
+        data = json.loads(response.content)
+    except ValueError:
+        return None
+    if (
+        isinstance(data, dict)
+        and {"message", "code"} <= set(data)
+        and str(data["code"]).isdigit()
+    ):
+        return int(data["code"])
+    return None
+
+
+def parse_retry_after(headers):
+    for name, value in headers.items():
+        if name.lower() == "retry-after":
+            try:
+                return max(0.0, float(value))
+            except ValueError:
+                return None
+    return None
+
+
+def error_text(response):
+    try:
+        data = json.loads(response.content)
+    except ValueError:
+        return response.content[:200].decode(errors="replace")
+    if isinstance(data, dict):
+        return str(data.get("message") or data.get("error") or data)
+    return str(data)[:200]
+
+
+def write_atomic(path, content: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(content)
+    tmp.replace(path)
+
+
+def s2_id(kind, value):
+    if kind == "arxiv":
+        return "arXiv:" + re.sub(r"v\d+$", "", value)
+    if kind == "doi":
+        return "DOI:" + value
+    return value
+
+
+def ids_line(p):
+    ext = p.get("externalIds") or {}
+    parts = []
+    if ext.get("ArXiv"):
+        parts.append("arXiv:" + ext["ArXiv"])
+    if ext.get("DOI"):
+        parts.append("DOI:" + ext["DOI"])
+    parts.append("S2:" + p["paperId"])
+    return " ".join(parts)
+
+
+def author_names(p, limit=None):
+    authors = p.get("authors") or []
+    shown = authors if limit is None else authors[:limit]
+    names = []
+    for a in shown:
+        affs = a.get("affiliations") or []
+        names.append(
+            f"{a.get('name')} ({'; '.join(affs)})" if affs else str(a.get("name"))
+        )
+    if len(authors) > len(shown):
+        names.append(f"+{len(authors) - len(shown)} more")
+    return ", ".join(names)
+
+
+def meta_block(p):
+    lines = [p.get("title") or "(untitled)"]
+    where = " · ".join(str(x) for x in (p.get("year"), p.get("venue")) if x)
+    if where:
+        lines.append("  " + where)
+    if p.get("authors"):
+        lines.append("  authors: " + author_names(p, limit=10))
+    lines.append(f"  citations: {p.get('citationCount')}")
+    lines.append("  ids: " + ids_line(p))
+    return "\n".join(lines)
+
+
+def s2_paper_path(text):
+    kind, value = parse_id(text)
+    if kind == "url":
+        raise UsageError(f"a PDF URL works only with `paper text`: {text!r}")
+    return "/paper/" + quote(s2_id(kind, value), safe=":/")
+
+
+def list_block(p, citations=False):
+    """A shorter block, for one paper among many."""
+    head = " · ".join(
+        str(x) for x in (p.get("year"), p.get("title"), p.get("venue")) if x
+    )
+    lines = [head]
+    if p.get("authors"):
+        lines.append("  authors: " + author_names(p, limit=3))
+    tail = ids_line(p)
+    if citations:
+        tail = f"{tail} · citations: {p.get('citationCount')}"
+    lines.append("  ids: " + tail)
+    return "\n".join(lines)
+
+
+def cmd_cites(client, args):
+    path = s2_paper_path(args.id) + "/citations"
+    try:
+        data = client.s2(path, {"fields": CITES_FIELDS, "limit": args.limit})
+    except NotFound:
+        raise NotFound(args.id) from None
+    citing = [
+        row["citingPaper"]
+        for row in data.get("data") or []
+        if (row.get("citingPaper") or {}).get("paperId")
+    ]
+    if not citing:
+        print(f"no papers cite {args.id}")
+    for p in citing:
+        print(list_block(p))
+    return OK
+
+
+def cmd_search(client, args):
+    query = " ".join(args.query)
+    data = client.s2(
+        "/paper/search", {"query": query, "fields": SEARCH_FIELDS, "limit": args.limit}
+    )
+    papers = data.get("data") or []
+    if not papers:
+        print(f"paper: no papers match {query!r}", file=sys.stderr)
+        return NOT_FOUND
+    for p in papers:
+        print(list_block(p, citations=True))
+    return OK
+
+
+def pdftotext(pdf: Path, txt: Path):
+    try:
+        subprocess.run(
+            ["pdftotext", "-layout", str(pdf), str(txt)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:
+        raise ExtractFailed(
+            "pdftotext is not installed (apt install poppler-utils)"
+        ) from e
+    except subprocess.CalledProcessError as e:
+        raise ExtractFailed(f"pdftotext failed: {e.stderr.strip()}") from e
+
+
+def pdf_source(text):
+    """The PDF's URL and the cache file stem for it."""
+    kind, value = parse_id(text)
+    if kind == "arxiv":
+        return f"https://arxiv.org/pdf/{value}", "arxiv-" + value
+    if kind == "url":
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(urlparse(value).path).stem)[:60]
+        digest = hashlib.sha256(value.encode()).hexdigest()[:12]
+        return value, f"url-{digest}-{stem}"
+    raise UsageError(f"`paper text` takes an arXiv id or URL, or a PDF URL: {text!r}")
+
+
+def cmd_text(client, args, extract):
+    url, stem = pdf_source(args.id)
+    folder = client.cache / "pdf"
+    pdf, txt = folder / (stem + ".pdf"), folder / (stem + ".txt")
+    if not txt.exists():
+        response = client.request("PDF download", "GET", url)
+        if response.status == 404:
+            raise NotFound(url)
+        if response.status != 200:
+            raise RemoteError(f"PDF download: HTTP {response.status} for {url}")
+        if not response.content.startswith(b"%PDF"):
+            raise ExtractFailed(f"not a PDF at {url}")
+        write_atomic(pdf, response.content)
+        partial = txt.with_suffix(".txt.tmp")
+        extract(pdf, partial)
+        partial.replace(txt)
+    print(txt)
+    return OK
+
+
+def cmd_meta(client, args):
+    paths = [s2_paper_path(text) for text in args.ids]
+    code = OK
+    for text, path in zip(args.ids, paths):
+        try:
+            p = client.s2(path, {"fields": META_FIELDS}, require="paperId")
+        except NotFound:
+            print(f"paper: not found: {text}", file=sys.stderr)
+            code = NOT_FOUND
+            continue
+        print(meta_block(p))
+    return code
+
+
+def main(argv=None, fetch=None, sleep=time.sleep, extract=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="paper",
+        description=__doc__.split("\n\n")[0],
+        epilog=__doc__.split("\n\n", 2)[2],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    meta = sub.add_parser("meta", help="title, authors, year, venue, citations, ids")
+    meta.add_argument("ids", nargs="+", metavar="ID")
+    cites = sub.add_parser("cites", help="papers citing ID")
+    cites.add_argument("id", metavar="ID")
+    cites.add_argument("--limit", type=int, default=20, help="how many (default 20)")
+    search = sub.add_parser("search", help="keyword search")
+    search.add_argument("query", nargs="+", metavar="QUERY")
+    search.add_argument("--limit", type=int, default=10, help="how many (default 10)")
+    text = sub.add_parser("text", help="full text: prints the cached .txt path")
+    text.add_argument("id", metavar="ID", help="arXiv id or URL, or a PDF URL")
+    args = parser.parse_args(argv)
+    client = Client(fetch or requests_fetch, sleep)
+    try:
+        if args.command == "text":
+            return cmd_text(client, args, extract or pdftotext)
+        return {"meta": cmd_meta, "cites": cmd_cites, "search": cmd_search}[
+            args.command
+        ](client, args)
+    except UsageError as e:
+        print(f"paper: {e}", file=sys.stderr)
+        return USAGE
+    except NotFound as e:
+        print(f"paper: not found: {e}", file=sys.stderr)
+        return NOT_FOUND
+    except ExtractFailed as e:
+        print(f"paper: {e}", file=sys.stderr)
+        return NOT_FOUND
+    except RemoteError as e:
+        print(f"paper: {e}", file=sys.stderr)
+        return REMOTE
+
+
+if __name__ == "__main__":
+    sys.exit(main())

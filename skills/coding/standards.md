@@ -14,6 +14,7 @@ The global standards a reviewer holds a diff to, in priority order. A repo's own
     - Structure for efficient agent understanding
 3. Security
     - Limit attack/abuse surface area
+    - An error about a secret (key file, credential) names its source only: never the exception text, file contents or a repr of the value
     - Defense in depth
 4. Performance
 5. Scalability

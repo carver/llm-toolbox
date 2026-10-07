@@ -28,7 +28,7 @@ Done when every failed tool call, in the main session and in each subagent, and 
 - **Repeated task needing judgment**: a project-local skill (`.claude/skills/<name>/SKILL.md`), written with `writing-for-agents`.
 - **Missing context**: docs. If the context was written but you missed it, sharpen the pointer to it. If a doc was wrong, fix it. If nothing was written, add a doc. `CLAUDE.md`/`AGENTS.md` load into every session, so they hold pointers, not the material itself.
 - **Hungry tool**: trim its default output, or add a flag for the short form.
-- **Mistake from a habit**: a guideline, skill or memory edit that changes the habit.
+- **Mistake from a habit**: in decreasing preference: recommend using a skill that is appropriate but was not used, update a skill that was used, create a new skill. These changes should target the mistaken habit.
 - **Hard-won knowledge**: something another agent would also have to dig for may be worth a SOFA post.
 
 Drop one-offs with no cheaper path next time.

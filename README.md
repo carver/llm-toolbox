@@ -94,7 +94,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   cached Chromium when Playwright wants a build that isn't downloaded.
 - **sofa**: Stack Overflow for Agents from the command line: search, read,
   post, reply, edit, vote, verify, Playbooks, and a raw `api` call. Reads the
-  API key from `$SOFA_API_KEY` or the nearest `.sofa/credentials.json` and
+  API key from `$SOFA_API_KEY`, `$SOFA_CREDENTIALS` or the nearest
+  `.sofa/credentials.json` and
   never prints it; caches the session in `~/.cache/sofa/`.
 - **claude-json**: one headless Claude call for scripts and cron jobs. Prompt
   on stdin, JSON Schema as a flag, the answer as JSON on stdout. It always
@@ -122,8 +123,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   were edited by hand here, and which skills a source added since the last
   run. A skill's patch is taken off before comparing, and the report says
   whether it still fits a new upstream version. `--email TO` sends the report only when there are upstream changes or
-  new skills. The weekly cron job from `install.py` runs it; its log is
-  `~/.cache/skills-news/cron.log`.
+  new skills. Clones go in `$XDG_CACHE_HOME/skills-news` (default
+  `~/.cache/skills-news`). The weekly cron job from `install.py` runs it; its
+  log is `~/.cache/skills-news/cron.log`.
 
 - **session-digest**: condenses a Claude Code session log, and each of its
   subagents' logs, for a retrospective. Prints what each agent and tool cost
@@ -132,7 +134,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   then each agent's timeline: user turns, the assistant's text, one line per
   tool call with its output's size, one line per background task notification
   (id, status, summary), and every error in full. Defaults to the
-  newest session for the current directory (or its nearest parent with sessions).
+  newest session for the current directory (or its nearest parent with sessions),
+  under `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
 
 - **yt-transcript**: prints a YouTube video's captions, or the ones around
   the URL's timestamp (90 seconds before, 60 after, by default), each line

@@ -151,7 +151,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   keyword search (`search`) from Semantic Scholar, and its full text (`text`:
   downloads the arXiv or direct-URL PDF, runs `pdftotext -layout` and prints
   the `.txt` path). Takes arXiv ids and URLs, DOIs and Semantic Scholar
-  paperIds, and prints a few lines per paper. Retries rate limits, 5xx and
+  paperIds, and prints a few lines per paper; `meta` adds an arXiv paper's
+  latest version and its first- and latest-version dates, from one arXiv API
+  request per call (cached for a day). Retries rate limits, 5xx and
   timeouts with backoff for up to 2 minutes, so callers needn't sleep and
   retry. Sends a Semantic Scholar API key from `$S2_API_KEY`, else from
   `claudedev/.semantic-scholar/api-key`, when there is one. Caches everything

@@ -124,7 +124,27 @@ class FakeHTTP:
                 if isinstance(answer, Exception):
                     raise answer
                 return answer
+        if "export.arxiv.org" in url:
+            return arxiv_feed()  # tests that don't route arXiv get no dates
         raise AssertionError(f"unexpected request {method} {url}")
+
+
+def arxiv_feed(*entries: tuple[str, str, str]) -> "paper.Response":
+    """An arXiv API answer with one entry per (id with version, published, updated)."""
+    xml = "".join(
+        f"<entry><id>http://arxiv.org/abs/{vid}</id>"
+        f"<published>{published}T17:57:34Z</published><updated>{updated}T00:41:52Z</updated>"
+        "<title>t</title></entry>"
+        for vid, published, updated in entries
+    )
+    body = (
+        f'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">{xml}</feed>'
+    )
+    return paper.Response(200, {}, body.encode())
+
+
+def s2_calls(http):
+    return [c for c in http.calls if "semanticscholar.org" in c["url"]]
 
 
 def ok(body):
@@ -196,7 +216,7 @@ def test_meta_backs_off_and_retries(cache, capsys, failure):
     code, out, err, sleeps = run(capsys, ["meta", "1706.03762"], http)
     assert code == 0, err
     assert out.startswith("Attention is All you Need\n")
-    assert len(http.calls) == 3
+    assert len(s2_calls(http)) == 3
     assert len(sleeps) == 2
     assert 0 < sleeps[0] < sleeps[1]
 
@@ -269,7 +289,7 @@ def test_meta_answers_a_repeat_from_the_cache(cache, capsys):
     code, again, err, _ = run(capsys, ["meta", "1706.03762v2"], FakeHTTP())
     assert code == 0, err
     assert again == first
-    assert len(http.calls) == 1
+    assert len(s2_calls(http)) == 1
     assert any(cache.rglob("*.json"))
 
 
@@ -637,3 +657,110 @@ def test_a_key_file_that_is_not_utf8_exits_2_without_echoing_it(
     key_file.write_bytes(b"\xffsecret")
     code, out, err, _ = run(capsys, ["meta", "1706.03762"], FakeHTTP())
     assert code == 2 and "UTF-8" in err and "secret" not in out + err
+
+
+ATTENTION_FEED = arxiv_feed(("1706.03762v7", "2017-06-12", "2023-08-02"))
+
+
+def arxiv_calls(http):
+    return [c for c in http.calls if "export.arxiv.org" in c["url"]]
+
+
+def test_meta_adds_arxiv_version_and_dates(cache, capsys):
+    http = FakeHTTP(
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+        ("GET", "export.arxiv.org", [ATTENTION_FEED]),
+    )
+    code, out, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert code == 0, err
+    assert (
+        out.splitlines()[-1] == "  arXiv: v7, submitted 2017-06-12, updated 2023-08-02"
+    )
+    (call,) = arxiv_calls(http)
+    assert call["params"]["id_list"] == "1706.03762"
+
+
+def test_meta_asks_arxiv_once_for_every_paper_in_the_call(cache, capsys):
+    other = dict(ATTENTION, paperId="f" * 40, externalIds={"ArXiv": "2404.00806"})
+    http = FakeHTTP(
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+        ("GET", "/paper/arXiv:2404.00806", [ok(other)]),
+        (
+            "GET",
+            "export.arxiv.org",
+            [
+                arxiv_feed(
+                    ("1706.03762v7", "2017-06-12", "2023-08-02"),
+                    ("2404.00806v6", "2024-03-31", "2026-08-15"),
+                )
+            ],
+        ),
+    )
+    code, out, err, _ = run(capsys, ["meta", "1706.03762", "2404.00806"], http)
+    assert code == 0, err
+    (call,) = arxiv_calls(http)
+    assert set(call["params"]["id_list"].split(",")) == {"1706.03762", "2404.00806"}
+    assert "  arXiv: v6, submitted 2024-03-31, updated 2026-08-15" in out
+
+
+def test_meta_finds_the_arxiv_id_of_a_paper_given_by_doi(cache, capsys):
+    http = FakeHTTP(
+        ("GET", "/paper/DOI:10.48550/arXiv.1706.03762", [ok(ATTENTION)]),
+        ("GET", "export.arxiv.org", [ATTENTION_FEED]),
+    )
+    code, out, _, _ = run(capsys, ["meta", "10.48550/arXiv.1706.03762"], http)
+    assert code == 0
+    assert "  arXiv: v7, submitted 2017-06-12" in out
+
+
+def test_a_paper_without_an_arxiv_id_asks_arxiv_nothing(cache, capsys):
+    http = FakeHTTP(("GET", f"/paper/{S2_ID}", [ok(COLLUSION)]))
+    code, out, _, _ = run(capsys, ["meta", S2_ID], http)
+    assert code == 0
+    assert "arXiv:" not in out.replace("ids: arXiv:", "")
+    assert arxiv_calls(http) == []
+
+
+def test_arxiv_dates_are_cached_for_a_day(cache, capsys):
+    first = FakeHTTP(
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+        ("GET", "export.arxiv.org", [ATTENTION_FEED]),
+    )
+    run(capsys, ["meta", "1706.03762"], first)
+    again = FakeHTTP()
+    code, out, _, _ = run(capsys, ["meta", "1706.03762"], again)
+    assert code == 0
+    assert "  arXiv: v7" in out
+    assert again.calls == []
+
+
+def test_stale_arxiv_dates_are_fetched_again(cache, capsys):
+    import os
+    import time
+
+    first = FakeHTTP(
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+        ("GET", "export.arxiv.org", [ATTENTION_FEED]),
+    )
+    run(capsys, ["meta", "1706.03762"], first)
+    two_days_ago = time.time() - 2 * 86400
+    for f in (cache / "arxiv").iterdir():
+        os.utime(f, (two_days_ago, two_days_ago))
+    newer = arxiv_feed(("1706.03762v8", "2017-06-12", "2026-10-01"))
+    again = FakeHTTP(("GET", "export.arxiv.org", [newer]))
+    code, out, _, _ = run(capsys, ["meta", "1706.03762"], again)
+    assert code == 0
+    assert "  arXiv: v8, submitted 2017-06-12, updated 2026-10-01" in out
+    assert len(arxiv_calls(again)) == 1
+
+
+def test_an_arxiv_failure_leaves_the_rest_and_warns(cache, capsys):
+    http = FakeHTTP(
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+        ("GET", "export.arxiv.org", [status(503)]),
+    )
+    code, out, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert code == 0
+    assert out.startswith("Attention is All you Need\n")
+    assert "arXiv: v" not in out
+    assert "arXiv dates unavailable" in err

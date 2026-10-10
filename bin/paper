@@ -10,8 +10,9 @@
     paper text ID
 
 meta prints one short block per paper: title, year and venue, authors (with
-affiliations when Semantic Scholar has them), citation count, and its arXiv,
-DOI and Semantic Scholar ids. cites lists papers citing ID (default 20),
+affiliations when Semantic Scholar has them), citation count, its arXiv, DOI
+and Semantic Scholar ids, and, for an arXiv paper, its latest version with the
+dates of its first and latest versions (one arXiv API request per call). cites lists papers citing ID (default 20),
 search the top matches for a keyword query (default 10), each with year,
 title, venue, first three authors and ids. text downloads the PDF, extracts
 it with `pdftotext -layout` and prints the path of the .txt file; read that.
@@ -24,9 +25,10 @@ search.
 
 Every answer is cached in $PAPER_CACHE (default
 /home/carver/code/claudedev/cache/paper): Semantic Scholar responses as JSON,
-PDFs with their text. Delete the s2 folder there to refetch Semantic Scholar
-answers (metadata, citations, searches), or a paper's files in pdf/ to fetch
-its text anew.
+arXiv versions and dates for a day (new versions appear), PDFs with their
+text. Delete the s2 folder there to refetch Semantic Scholar answers
+(metadata, citations, searches), or a paper's files in pdf/ to fetch its text
+anew. If arXiv can't be reached, meta prints the rest and warns.
 
 Semantic Scholar answers more requests, and 429s less, with an API key. paper
 sends one when $S2_API_KEY is set, else when the file
@@ -61,17 +63,21 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import cached_property
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlparse, urlsplit
+from xml.etree import ElementTree
 
 OK, NOT_FOUND, USAGE, REMOTE = 0, 1, 2, 3
 S2 = "https://api.semanticscholar.org/graph/v1"
 DEFAULT_CACHE = "/home/carver/code/claudedev/cache/paper"
 KEY_ENV = "S2_API_KEY"
 KEY_FILE = Path("/home/carver/code/claudedev/.semantic-scholar/api-key")
+ARXIV_API = "https://export.arxiv.org/api/query"
+ARXIV_TTL = 24 * 3600  # seconds; arXiv dates are refetched after a day
+ATOM = "{http://www.w3.org/2005/Atom}"
 TIMEOUT = 30
 ATTEMPTS = 6
 BUDGET = 120  # seconds of sleeping between attempts, at most
@@ -323,6 +329,39 @@ class Client:
         write_atomic(cached, json.dumps(data).encode())
         return data
 
+    def arxiv_dates(self, ids: list[str]) -> dict[str, "ArxivDates"]:
+        """Version and dates per arXiv id (without its version suffix), from the cache
+        when under a day old, else from one arXiv API request for all the rest."""
+        found: dict[str, ArxivDates] = {}
+        missing = []
+        for aid in dict.fromkeys(ARXIV_VERSION.sub("", i) for i in ids):
+            cached = self.cache / "arxiv" / f"{aid}.json"
+            if cached.exists() and time.time() - cached.stat().st_mtime < ARXIV_TTL:
+                data = json.loads(cached.read_text(encoding="utf-8"))
+                if data:
+                    found[aid] = ArxivDates(**data)
+            else:
+                missing.append(aid)
+        if not missing:
+            return found
+        response = self.request(
+            "arXiv",
+            "GET",
+            ARXIV_API,
+            params={"id_list": ",".join(missing), "max_results": len(missing)},
+        )
+        if response.status != 200:
+            raise RemoteError(f"arXiv: HTTP {response.status}: {error_text(response)}")
+        fetched = parse_arxiv_feed(response.content)
+        for aid in missing:
+            dates = fetched.get(aid)
+            # An id arXiv doesn't know is cached as {} so it isn't asked again today.
+            body = json.dumps(asdict(dates) if dates else {}).encode()
+            write_atomic(self.cache / "arxiv" / f"{aid}.json", body)
+            if dates:
+                found[aid] = dates
+        return found
+
     def request(
         self,
         service: str,
@@ -428,6 +467,47 @@ def write_atomic(path: Path, content: bytes) -> None:
         tmp.write_bytes(content)
 
 
+# arXiv
+
+
+ARXIV_VERSION = re.compile(r"v\d+$")
+ARXIV_ABS = re.compile(r"https?://arxiv\.org/abs/(\d{4}\.\d{4,5})v(\d+)")
+
+
+@dataclass(frozen=True)
+class ArxivDates:
+    version: int
+    submitted: str  # first version, YYYY-MM-DD
+    updated: str  # latest version
+
+    def line(self) -> str:
+        return f"  arXiv: v{self.version}, submitted {self.submitted}, updated {self.updated}"
+
+
+def parse_arxiv_feed(content: bytes) -> dict[str, ArxivDates]:
+    """Each entry of an arXiv API answer, by id without its version suffix."""
+    try:
+        root = ElementTree.fromstring(content)
+    except ElementTree.ParseError as e:
+        raise RemoteError(f"arXiv sent an unexpected answer: {e}") from e
+    found = {}
+    for entry in root.iter(ATOM + "entry"):
+        m = ARXIV_ABS.fullmatch((entry.findtext(ATOM + "id") or "").strip())
+        if m:
+            found[m.group(1)] = ArxivDates(
+                version=int(m.group(2)),
+                submitted=(entry.findtext(ATOM + "published") or "")[:10],
+                updated=(entry.findtext(ATOM + "updated") or "")[:10],
+            )
+    return found
+
+
+def arxiv_id_of(paper: Paper) -> str | None:
+    """The paper's new-style arXiv id from Semantic Scholar, without a version."""
+    value = (paper.get("externalIds") or {}).get("ArXiv") or ""
+    return ARXIV_VERSION.sub("", value) if ARXIV.fullmatch(value) else None
+
+
 # Formatting
 
 
@@ -455,7 +535,7 @@ def author_names(paper: Paper, limit: int | None = None) -> str:
     return ", ".join(names)
 
 
-def meta_block(paper: Paper) -> str:
+def meta_block(paper: Paper, dates: ArxivDates | None = None) -> str:
     lines = [paper.get("title") or "(untitled)"]
     where = " · ".join(str(x) for x in (paper.get("year"), paper.get("venue")) if x)
     if where:
@@ -464,6 +544,8 @@ def meta_block(paper: Paper) -> str:
         lines.append("  authors: " + author_names(paper, limit=10))
     lines.append(f"  citations: {paper.get('citationCount')}")
     lines.append("  ids: " + ids_line(paper))
+    if dates:
+        lines.append(dates.line())
     return "\n".join(lines)
 
 
@@ -488,14 +570,23 @@ def list_block(paper: Paper, show_citation_count: bool = False) -> str:
 def cmd_meta(client: Client, args: argparse.Namespace) -> int:
     paths = [parse_id(text).s2_path() for text in args.ids]
     code = OK
+    papers = []
     for text, path in zip(args.ids, paths):
         try:
-            paper = client.s2(path, {"fields": META_FIELDS}, require="paperId")
+            papers.append(client.s2(path, {"fields": META_FIELDS}, require="paperId"))
         except NotFound:
             print(f"paper: not found: {text}", file=sys.stderr)
             code = NOT_FOUND
-            continue
-        print(meta_block(paper))
+    arxiv_ids = [aid for p in papers if (aid := arxiv_id_of(p))]
+    dates: dict[str, ArxivDates] = {}
+    if arxiv_ids:
+        try:
+            dates = client.arxiv_dates(arxiv_ids)
+        except RemoteError as e:
+            print(f"paper: arXiv dates unavailable: {e}", file=sys.stderr)
+    for p in papers:
+        aid = arxiv_id_of(p)
+        print(meta_block(p, dates.get(aid) if aid else None))
     return code
 
 

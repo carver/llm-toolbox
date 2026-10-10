@@ -22,7 +22,7 @@ Before saying a source lacks something ("the paper has no human verbosity figure
 
 ## Shell
 
-Stop a process with `killone` and wait for one with `waitone` (llm-toolbox/bin, on PATH; `-h` for options), not `pkill -f` or a `pgrep -f` loop. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it and a `while pgrep -f` loop waits on itself forever. Both tools skip their callers and act only when exactly one process matches. Better still, keep the PID (`$!`) of what you start and `kill` or `waitone --pid` that.
+Stop processes with `safekill --one` (exactly one must match) or `safekill --all` (every match), and wait for one with `waitone` (llm-toolbox/bin, on PATH; `-h` for options), not `pkill -f`, `pgrep -f | xargs kill` or a `pgrep -f` loop. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it and a `while pgrep -f` loop waits on itself forever. Both tools skip their callers. Better still, keep the PID (`$!`) of what you start and `kill` or `waitone --pid` that.
 
 To see a web page or HTML report you changed, check it for JavaScript errors, or read a page that renders with JavaScript (forms, calendars, endless feeds), use `web-shot` (`-h` for its click, wait, shot, text, links and scroll-all actions), not a one-off Playwright script.
 

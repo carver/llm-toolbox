@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Signal processes found by name or command line, and never the caller.
+
+`pkill -f PATTERN` also matches the shell running it, because the pattern is in
+that shell's own command line, and kills it. safekill skips itself and every
+ancestor. Say how many processes you mean:
+
+  safekill --one -f PATTERN   exactly one must match; if several do, list them and
+                              signal none
+  safekill --all -f PATTERN   signal every match
+
+Exit status: 0 signalled (and, with --wait, every signalled process exited),
+1 nothing matched, 2 --one found several (listed, none signalled) or a usage
+error, 3 a signal failed or a process outlived --wait. See also waitone.
+"""
+
+import argparse
+import os
+import signal
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from procmatch import NONE_MATCHED, exactly_one, matches, wait_gone
+
+FAILED = 3
+
+
+def parse_signal(text: str) -> signal.Signals:
+    name = text.upper().removeprefix("SIG")
+    return signal.Signals(int(name)) if name.isdigit() else signal.Signals["SIG" + name]
+
+
+def targets(args: argparse.Namespace) -> dict[int, str] | int:
+    """pid -> command line of the processes to signal, or an exit status."""
+    if args.one:
+        found = exactly_one(args.pattern, args.full, "safekill")
+        if isinstance(found, int):
+            return found
+        pid, cmdline = found
+        return {pid: cmdline}
+    found = matches(args.pattern, args.full)
+    if not found:
+        print(f"safekill: no process matches {args.pattern!r}", file=sys.stderr)
+        return NONE_MATCHED
+    return found
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="safekill",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--one", action="store_true", help="exactly one process must match"
+    )
+    mode.add_argument("--all", action="store_true", help="signal every match")
+    parser.add_argument(
+        "pattern",
+        help="exact process name, or with -f a regex over the full command line",
+    )
+    parser.add_argument(
+        "-f",
+        "--full",
+        action="store_true",
+        help="match the full command line, like pkill -f",
+    )
+    parser.add_argument(
+        "-s",
+        "--signal",
+        default="TERM",
+        help="signal name or number (default %(default)s)",
+    )
+    parser.add_argument(
+        "-n", "--dry-run", action="store_true", help="show what would be signalled"
+    )
+    parser.add_argument(
+        "-w",
+        "--wait",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="wait up to SECONDS for every signalled process to exit; exit 3 if one doesn't",
+    )
+    args = parser.parse_args(argv)
+    sig = parse_signal(args.signal)
+
+    found = targets(args)
+    if isinstance(found, int):
+        return found
+    if args.dry_run:
+        for pid, cmdline in sorted(found.items()):
+            print(f"would send {sig.name} to {pid}  {cmdline}")
+        return 0
+    status = 0
+    signalled = []
+    for pid, cmdline in sorted(found.items()):
+        try:
+            os.kill(pid, sig)
+        except OSError as e:
+            print(f"safekill: {sig.name} to {pid} failed: {e}", file=sys.stderr)
+            status = FAILED
+            continue
+        signalled.append(pid)
+        print(f"sent {sig.name} to {pid}  {cmdline}")
+    if args.wait:
+        for pid in signalled:
+            if not wait_gone(pid, args.wait):
+                print(
+                    f"safekill: {pid} still running after {args.wait}s", file=sys.stderr
+                )
+                status = FAILED
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

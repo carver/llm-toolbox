@@ -14,7 +14,7 @@ To write or change code, run `/build`: you implement and refactor, and subagents
 
 ## Research subagents
 
-A brief that sends a subagent to read papers names the `research` skill. Its `paper text` caches each paper's full text on the host disk, so parallel agents share one download instead of each fetching and converting the same PDF.
+A brief that sends a subagent to read papers tells it to fetch them with `paper` (`paper -h`). Its `paper text` caches each paper's full text on the host disk, so parallel agents share one download instead of each fetching and converting the same PDF.
 
 ## Claims
 

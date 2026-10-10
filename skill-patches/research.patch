@@ -1,6 +1,14 @@
-# Why: Point research agents at the paper CLI instead of hand-written Semantic Scholar and arXiv calls.
+# Why: Point research agents at the paper CLI instead of hand-written Semantic Scholar and arXiv calls; and trigger before launching any paper- or docs-reading agent, not only on user requests (2026-10-09: an agent fanning out paper readers mid-task skipped the skill, so its hand-written briefs lacked paper: 28 curl PDF downloads, one paper fetched 5 times).
 --- a/SKILL.md
 +++ b/SKILL.md
+@@ -1,6 +1,6 @@
+ ---
+ name: research
+-description: Investigate a question against high-trust primary sources and capture the findings as a Markdown file in the repo. Use when the user wants a topic researched, docs or API facts gathered, or reading legwork delegated to a background agent.
++description: Brief research agents to investigate a question in primary sources (papers through the cached `paper` tool, docs, source code) and write cited Markdown notes. Use when the user wants a topic researched or docs and API facts gathered, and before you launch any agent, or a fan-out of agents, to read papers or docs.
+ ---
+ 
+ Spin up a **background agent** to do the research, so you keep working while it reads.
 @@ -8,5 +8,6 @@
  Its job:
  

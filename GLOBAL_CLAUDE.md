@@ -12,6 +12,10 @@ Chat replies to me skip /unslop: be extremely concise, and sacrifice grammar for
 
 To write or change code, run `/build`: you implement and refactor, and subagents review. A trivial edit, such as a one-file change with no behaviour worth a test, you make yourself with the `coding` skill (`~/.agents/skills/coding/SKILL.md`).
 
+## Research subagents
+
+A brief that sends a subagent to read papers names the `research` skill. Its `paper text` caches each paper's full text on the host disk, so parallel agents share one download instead of each fetching and converting the same PDF.
+
 ## Claims
 
 Before saying a source lacks something ("the paper has no human verbosity figure", "nothing calls this"), search the source itself. What cites it, or what you remember of it, is not enough. The same goes for superlatives: first, only, never, all.

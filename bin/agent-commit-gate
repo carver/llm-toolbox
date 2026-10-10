@@ -22,6 +22,7 @@ stage in one command, commit in the next.
 """
 
 import argparse
+import functools
 import json
 import os
 import re
@@ -29,15 +30,36 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 HOOK_NAME = "agent-pre-commit"
 TAIL_LINES = 40
-SEPARATORS = re.compile(r"&&|\|\||[;|\n]")
 REDIRECT = re.compile(r"^\d*[<>]")
-# Subcommands that change the index whatever their arguments.
-STAGING = {"add", "stage", "rm", "mv", "reset", "update-index"}
-# git commit options that take the next word as their value.
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+COMMIT_ALL = "git commit -a"
+COMMIT_PATHS = "git commit PATHS"
+# Subcommands that change the index, unless given one of the listed flags.
+ALWAYS_STAGES = {
+    "add": {"-n", "--dry-run"},
+    "stage": {"-n", "--dry-run"},
+    "rm": {"-n", "--dry-run"},
+    "mv": {"-n", "--dry-run"},
+    "reset": {"--soft"},
+    "update-index": set(),
+}
+# Subcommands that change the index only with one of the listed flags.
+STAGES_WITH = {
+    "restore": {"--staged", "-S"},
+    "apply": {"--cached", "--index"},
+    "merge": {"--squash"},
+    "cherry-pick": {"-n", "--no-commit"},
+    "revert": {"-n", "--no-commit"},
+}
+# git commit options whose value is the next word; u and S take only an attached one.
 COMMIT_SHORT_VALUE = set("mFCct")
+COMMIT_SHORT_ATTACHED = set("uS")
 COMMIT_LONG_VALUE = {
     "--message",
     "--file",
@@ -53,20 +75,66 @@ COMMIT_LONG_VALUE = {
 }
 
 
+class GitCall(NamedTuple):
+    where: Path
+    sub: str
+    args: list[str]
+
+
+def strip_heredocs(command):
+    """The command without heredoc bodies: their lines are data, not commands."""
+    kept, closing = [], []
+    for line in command.split("\n"):
+        if closing:
+            if line.strip() == closing[0]:
+                closing.pop(0)
+            continue
+        kept.append(line)
+        closing += [m.group(2) for m in HEREDOC.finditer(line)]
+    return "\n".join(kept)
+
+
+def segments(command):
+    """The simple commands in a shell command: split on &&, ||, ;, | and newlines
+    outside quotes, so a quoted message never splits."""
+    parts, current, quote, i = [], [], None, 0
+    while i < len(command):
+        char = command[i]
+        if quote:
+            current.append(char)
+            if char == "\\" and quote == '"' and i + 1 < len(command):
+                current.append(command[i + 1])
+                i += 1
+            elif char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+            current.append(char)
+        elif command.startswith(("&&", "||"), i):
+            parts.append("".join(current))
+            current = []
+            i += 1
+        elif char in ";|\n":
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        i += 1
+    parts.append("".join(current))
+    return parts
+
+
 def git_calls(command, cwd):
-    """(directory, subcommand, arguments, quoted) for each git call in a shell command,
-    following `cd DIR` and `git -C DIR`. Arguments stop at the first redirection
-    (`<<'EOF'`, `2>&1`). `quoted` is False when the segment's quoting didn't parse, as
-    when a quoted message runs over several lines; its arguments are then rough.
-    A heredoc body splits into harmless segments; at worst a line of it that reads like a
-    git call is counted."""
+    """Each git call in a shell command, in order, following `cd DIR` and `git -C DIR`.
+    Heredoc bodies are skipped; arguments stop at the first redirection."""
     here = Path(cwd)
-    for segment in SEPARATORS.split(command):
-        quoted = True
+    for segment in segments(strip_heredocs(command)):
         try:
             words = shlex.split(segment)
         except ValueError:
-            words, quoted = segment.split(), False
+            words = segment.split()
+        while words and ASSIGNMENT.match(words[0]):
+            words = words[1:]
         if len(words) >= 2 and words[0] == "cd":
             here = here / os.path.expanduser(words[1])
             continue
@@ -85,71 +153,101 @@ def git_calls(command, cwd):
                 if REDIRECT.match(word):
                     break
                 args.append(word)
-            yield where, rest[0], args, quoted
+            yield GitCall(where, rest[0], args)
+
+
+def is_commit(call):
+    return call.sub == "commit" and not {"-h", "--help"} & set(call.args)
 
 
 def commit_dirs(command, cwd):
     """The directories each `git commit` in a shell command runs in."""
-    found = [
-        where
-        for where, sub, args, _ in git_calls(command, cwd)
-        if sub == "commit" and not {"-h", "--help"} & set(args)
-    ]
-    return list(dict.fromkeys(found))
+    return list(dict.fromkeys(c.where for c in git_calls(command, cwd) if is_commit(c)))
 
 
-def commit_stages(args, quoted=True):
-    """What a `git commit` stages itself: -a/--all, or paths given on the command line.
-    With rough arguments (quoted False), only options before the first quote count, and
-    no paths: a message's words would read as paths."""
-    if not quoted:
-        options = []
-        for word in args:
-            if word[:1] in "\"'" or not word.startswith("-"):
-                break
-            options.append(word.split('"', 1)[0].split("'", 1)[0])
-        return [s for s in commit_stages(options) if s != "git commit PATHS"]
-    staged, i = [], 0
-    while i < len(args):
-        word = args[i]
+def commit_stages(args):
+    """What a `git commit` stages itself: -a/--all, or paths on the command line."""
+    staged, words = [], iter(args)
+    for word in words:
         if word == "--":
-            if args[i + 1 :]:
-                staged.append("git commit PATHS")
+            if next(words, None) is not None:
+                staged.append(COMMIT_PATHS)
             break
         if word.startswith("--"):
             name = word.split("=", 1)[0]
             if name == "--all":
-                staged.append("git commit -a")
+                staged.append(COMMIT_ALL)
             elif name == "--pathspec-from-file":
-                staged.append("git commit PATHS")
-            if "=" not in word and name in COMMIT_LONG_VALUE:
-                i += 1
+                staged.append(COMMIT_PATHS)
+            elif name in COMMIT_LONG_VALUE and "=" not in word:
+                next(words, None)
         elif word.startswith("-") and len(word) > 1:
-            for j, letter in enumerate(word[1:]):
-                if letter == "a":
-                    staged.append("git commit -a")
-                if letter in COMMIT_SHORT_VALUE:
-                    i += j == len(word) - 2  # the value is the next word
-                    break  # or the rest of this one
+            staged += short_flags_stage(word, words)
         else:
-            staged.append("git commit PATHS")
-        i += 1
+            staged.append(COMMIT_PATHS)
+    return list(dict.fromkeys(staged))
+
+
+def short_flags_stage(word, words):
+    """[COMMIT_ALL] if a cluster of short commit flags (-qam) holds -a. A flag that
+    takes a value ends the cluster; with nothing after it, it takes the next word."""
+    staged = []
+    for j, letter in enumerate(word[1:], start=1):
+        if letter == "a":
+            staged.append(COMMIT_ALL)
+        if letter in COMMIT_SHORT_VALUE:
+            if j == len(word) - 1:
+                next(words, None)
+            break
+        if letter in COMMIT_SHORT_ATTACHED:
+            break
     return staged
 
 
-def staging(command):
-    """Each operation in a shell command that changes what is staged, in order."""
-    found = []
-    for _, sub, args, quoted in git_calls(command, "."):
-        if sub in STAGING:
-            found.append(f"git {sub}")
-        elif sub == "restore" and ({"--staged", "-S"} & set(args)):
-            found.append("git restore --staged")
-        elif sub == "apply" and ({"--cached", "--index"} & set(args)):
-            found.append("git apply --cached")
-        elif sub == "commit":
-            found += commit_stages(args, quoted)
+def stages(call):
+    """How this git call changes the index, as labels; [] if it doesn't."""
+    flags = set(call.args)
+    if call.sub in ALWAYS_STAGES and not ALWAYS_STAGES[call.sub] & flags:
+        return [f"git {call.sub}"]
+    if call.sub in STAGES_WITH and STAGES_WITH[call.sub] & flags:
+        return [f"git {call.sub} {min(STAGES_WITH[call.sub] & flags)}"]
+    if call.sub == "checkout" and "--" in call.args:
+        return ["git checkout -- PATHS"]
+    if call.sub == "stash" and call.args[:1] in (["pop"], ["apply"]):
+        return [f"git stash {call.args[0]}"]
+    return []
+
+
+def staged_for_commits(command, cwd):
+    """(directory, label) for each change to the index a commit in the command would
+    record unchecked: staging that comes before a commit, and what a commit stages
+    itself. Staging after the last commit is left out."""
+    found, pending = [], []
+    for call in git_calls(command, cwd):
+        if is_commit(call):
+            found += pending + [
+                (call.where, label) for label in commit_stages(call.args)
+            ]
+            pending = []
+        else:
+            pending += [(call.where, label) for label in stages(call)]
     return list(dict.fromkeys(found))
+
+
+def staging(command):
+    """The labels of staged_for_commits, for a command run in the current directory."""
+    return list(dict.fromkeys(label for _, label in staged_for_commits(command, ".")))
+
+
+@functools.cache
+def toplevel(path):
+    run = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return Path(run.stdout.strip()) if run.returncode == 0 else None
 
 
 def agent_hook(repo):
@@ -170,9 +268,10 @@ def agent_hook(repo):
 def check(repo):
     """Run the repo's check; returns (passed, message for the agent)."""
     found = agent_hook(repo)
-    if not found:
-        return True, ""
-    top, hook = found
+    return run_check(*found) if found else (True, "")
+
+
+def run_check(top, hook):
     run = subprocess.run(
         [str(hook)], cwd=top, capture_output=True, text=True, check=False
     )
@@ -208,18 +307,22 @@ def main(argv=None):
     if event.get("tool_name") != "Bash":
         return 0
     command = event.get("tool_input", {}).get("command", "")
-    repos = commit_dirs(command, event.get("cwd") or os.getcwd())
-    staged = staging(command) if repos else []
-    for repo in repos:
-        if staged and agent_hook(repo):
+    cwd = event.get("cwd") or os.getcwd()
+    staged = staged_for_commits(command, cwd)
+    for repo in commit_dirs(command, cwd):
+        found = agent_hook(repo)
+        if not found:
+            continue
+        mine = [label for where, label in staged if toplevel(where) == found[0]]
+        if mine:
             print(
-                f"Commit blocked: this command also stages ({', '.join(staged)}), but the "
-                "check runs before the command, on what is staged now, so it would not see "
-                "what this commit records. Stage in its own command first, then commit.",
+                f"Commit blocked: this command also stages ({', '.join(dict.fromkeys(mine))}), "
+                "but the check runs before the command, on what is staged now, so it would "
+                "not see what this commit records. Stage in its own command first, then commit.",
                 file=sys.stderr,
             )
             return 2
-        passed, message = check(repo)
+        passed, message = run_check(*found)
         if not passed:
             print(message, file=sys.stderr)
             return 2

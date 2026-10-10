@@ -120,7 +120,25 @@ def test_the_check_runs_from_the_top_of_the_repo(repo, monkeypatch, capsys):
         ("git status && git diff --cached && git commit -m x", []),
         ("git restore a && git commit -m x", []),
         ("git apply p.diff && git commit -m x", []),
-        ("git add a", ["git add"]),
+        ("git add a", []),
+        ("git commit -m x && git add later", []),
+        ('git commit -m "docs: explain staging; git add notes first"', []),
+        (
+            "git commit -q -F - <<'EOF'\ngit add and git rm now block\nran git add && git commit\nEOF",
+            [],
+        ),
+        ("git commit -m \"$(cat <<'EOF'\nbody; git rm was wrong\nEOF\n)\"", []),
+        ('git commit -m "fix\n\nbody" src/a.py', ["git commit PATHS"]),
+        ('git commit -m "fix\n\nbody" -a', ["git commit -a"]),
+        ("git reset --soft HEAD~2 && git commit -m squash", []),
+        ("git add --dry-run . && git commit -m x", []),
+        ("git commit -uall -m x", []),
+        ("git commit -Sabc -m x", []),
+        ("git merge --squash feat && git commit -m x", ["git merge --squash"]),
+        ("git cherry-pick -n abc && git commit -m x", ["git cherry-pick -n"]),
+        ("git checkout main -- a.py && git commit -m x", ["git checkout -- PATHS"]),
+        ("git stash pop && git commit -m x", ["git stash pop"]),
+        ("GIT_INDEX_FILE=i git add a && git commit -m x", ["git add"]),
         ('git commit -q -m "fix: first line\n\nbody words here"', []),
         ('git commit -qam "fix: first line\n\nbody"', ["git commit -a"]),
         ("git commit -q -F - <<'EOF'\nfix: it's done\nEOF", []),
@@ -145,6 +163,21 @@ def test_commit_all_is_blocked_too(repo, monkeypatch, capsys):
     agent_check(repo, "exit 0")
     code, err = run_hook(monkeypatch, capsys, "git commit -am x", repo)
     assert code == 2 and "git commit -a" in err
+
+
+def test_text_that_mentions_git_commands_is_not_a_commit():
+    command = "cat > notes.txt <<'EOF'\ngit add a && git commit -m x\nEOF"
+    assert gate.commit_dirs(command, "/r") == []
+
+
+def test_staging_in_another_repo_does_not_block(repo, monkeypatch, capsys, tmp_path):
+    agent_check(repo, "exit 0")
+    other = tmp_path / "other"
+    subprocess.run(
+        ["git", "init", "-q", str(other)], check=True, env=without_repo_vars(os.environ)
+    )
+    command = f"git -C {other} add a && git commit -m x"
+    assert run_hook(monkeypatch, capsys, command, repo) == (0, "")
 
 
 def test_staging_alone_or_without_an_agent_check_passes(

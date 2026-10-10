@@ -106,15 +106,15 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   default gives the model no tools, settings, hooks, MCP servers or
   CLAUDE.md, since prompts often carry untrusted text. `--tools` opts named
   tools back in.
-- **agent-commit-gate**: a Claude Code hook, registered by `install.py` in
-  `~/.claude/settings.json`. Before the agent runs `git commit`, it runs the
-  repo's `agent-pre-commit`, an executable kept beside the ordinary
-  pre-commit hook, and blocks the commit if it fails. People keep the quick
-  hook; the agent also gets the slow checks, such as the whole test suite.
-  Since the hook runs before the command, a command that both stages and
-  commits (`git add ... && git commit`, `git commit -a`, `git commit PATHS`)
-  is blocked in a repo with a check: stage first, then commit.
-  `agent-commit-gate --run` runs a repo's check by hand.
+- **agent-commit-gate**: gives agents' commits a repo's slow checks.
+  `agent-commit-gate --install REPO...` adds a line to the top of the repo's
+  pre-commit hook: when `$AI_AGENT` is set, as Claude Code sets it, the hook
+  first runs `agent-pre-commit`, an executable kept beside it, and fails the
+  commit if that fails. People keep the quick hook; the agent also gets the
+  slow checks, such as the whole test suite. Git runs the hook after `commit
+  -a` or `commit PATHS` updates the index, so the check sees what is
+  committed. `install.py` also registers it as a Claude Code hook that
+  refuses `git commit --no-verify`.
 
 - **skill-patch**: keeps hand edits to other authors' skills. Edit the
   installed copy in `~/.agents/skills/NAME`, then `skill-patch save NAME
@@ -171,7 +171,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 
 It checks what's staged. `install.py` points git at `.githooks`. Its `pre-commit` runs the two ruff checks on
 what's staged; `agent-pre-commit` adds the tests (about 35 seconds), and
-`agent-commit-gate` runs it before an agent's commits. Both run the tools
+`pre-commit` runs it first when an agent commits. Both run the tools
 through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.
 

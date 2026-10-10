@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
-"""Claude Code PreToolUse hook: before the agent commits, run the repo's agent-only check.
+"""Give agents' commits a repo's slow checks, through git's own pre-commit hook.
 
-A repo keeps its fast checks in the ordinary git pre-commit hook, which every
+A repo keeps its fast checks in the ordinary pre-commit hook, which every
 committer runs. Checks too slow for that (the full test suite, say) go in an
 executable named `agent-pre-commit` beside it, in whatever directory git takes
-hooks from (`core.hooksPath`, else .git/hooks). Git never runs that file; this
-gate does, for each `git commit` in a Bash command the agent is about to run.
+hooks from (`core.hooksPath`, else .git/hooks).
 
-A failing check blocks the command (exit 2) and shows the agent the tail of its
-output. A repo without the file, and every command that is not a commit, pass
-through untouched. install.py registers the gate in ~/.claude/settings.json.
+`--install REPO...` adds one line to the top of each repo's pre-commit hook
+(creating the hook if needed). When `$AI_AGENT` is set, as Claude Code sets it
+in its shells, that line runs agent-pre-commit first and fails the commit if it
+fails. Git runs the hook after `commit -a` or `commit PATHS` has updated the
+index, so the check sees exactly what is being committed. AGENT_PRE_COMMIT
+stops the loop when agent-pre-commit runs pre-commit itself.
 
-The gate runs before the command, so it checks what is staged then. A command
-that also stages (`git add ... && git commit`, `git commit -a`, `git commit
-PATHS`) would commit changes the check never saw, or be blocked for a state it
-was about to fix. In a repo with a check, such a command is blocked up front:
-stage in one command, commit in the next.
+Without arguments it is a Claude Code PreToolUse hook (install.py registers it
+in ~/.claude/settings.json) that refuses `git commit --no-verify` (or `-n`),
+which would skip the check. It catches a mistake, not an agent set on getting
+around the check (`AI_AGENT= git commit`, `git -c core.hooksPath=...`).
 
+    agent-commit-gate --install REPO...    # add the line to each repo's pre-commit
     agent-commit-gate < hook-input.json    # as Claude Code calls it
-    agent-commit-gate --run [DIR]          # run DIR's check by hand (default: .)
 """
 
 import argparse
-import functools
 import json
 import os
 import re
@@ -30,33 +30,23 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import NamedTuple
 
 HOOK_NAME = "agent-pre-commit"
-TAIL_LINES = 40
+COMMENT = f"# Agents' commits also run the slower {HOOK_NAME} (llm-toolbox agent-commit-gate)."
+LINE = (
+    'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
+    f'AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}" || exit; fi'
+)
 REDIRECT = re.compile(r"^\d*[<>]")
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+SHELLS = {"sh", "bash", "dash", "ksh", "zsh"}
 
-COMMIT_ALL = "git commit -a"
-COMMIT_PATHS = "git commit PATHS"
-# Subcommands that change the index, unless given one of the listed flags.
-ALWAYS_STAGES = {
-    "add": {"-n", "--dry-run"},
-    "stage": {"-n", "--dry-run"},
-    "rm": {"-n", "--dry-run"},
-    "mv": {"-n", "--dry-run"},
-    "reset": {"--soft"},
-    "update-index": set(),
-}
-# Subcommands that change the index only with one of the listed flags.
-STAGES_WITH = {
-    "restore": {"--staged", "-S"},
-    "apply": {"--cached", "--index"},
-    "merge": {"--squash"},
-    "cherry-pick": {"-n", "--no-commit"},
-    "revert": {"-n", "--no-commit"},
-}
+# git's own options (before the subcommand) whose value is the next word.
+GIT_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
+# git accepts any unambiguous prefix of a long option; shorter ones clash with --no-verbose.
+NO_VERIFY = "--no-verify"
+NO_VERIFY_SHORTEST = len("--no-veri")
 # git commit options whose value is the next word; u and S take only an attached one.
 COMMIT_SHORT_VALUE = set("mFCct")
 COMMIT_SHORT_ATTACHED = set("uS")
@@ -73,12 +63,6 @@ COMMIT_LONG_VALUE = {
     "--template",
     "--trailer",
 }
-
-
-class GitCall(NamedTuple):
-    where: Path
-    sub: str
-    args: list[str]
 
 
 def strip_heredocs(command):
@@ -124,10 +108,9 @@ def segments(command):
     return parts
 
 
-def git_calls(command, cwd):
-    """Each git call in a shell command, in order, following `cd DIR` and `git -C DIR`.
-    Heredoc bodies are skipped; arguments stop at the first redirection."""
-    here = Path(cwd)
+def commit_args(command):
+    """The arguments of each `git commit` in a shell command. Heredoc bodies are
+    skipped; arguments stop at the first redirection."""
     for segment in segments(strip_heredocs(command)):
         try:
             words = shlex.split(segment)
@@ -135,153 +118,84 @@ def git_calls(command, cwd):
             words = segment.split()
         while words and ASSIGNMENT.match(words[0]):
             words = words[1:]
-        if len(words) >= 2 and words[0] == "cd":
-            here = here / os.path.expanduser(words[1])
-            continue
         if not words or Path(words[0]).name != "git":
             continue
-        rest, where = words[1:], here
+        rest = words[1:]
         while rest and rest[0].startswith("-"):
-            flag = rest.pop(0)
-            if flag == "-C" and rest:
-                where = where / os.path.expanduser(rest.pop(0))
-            elif flag == "-c" and rest:
+            if rest.pop(0) in GIT_VALUE and rest:
                 rest.pop(0)
-        if rest:
-            args = []
-            for word in rest[1:]:
-                if REDIRECT.match(word):
-                    break
-                args.append(word)
-            yield GitCall(where, rest[0], args)
+        if rest[:1] != ["commit"]:
+            continue
+        args = []
+        for word in rest[1:]:
+            if REDIRECT.match(word):
+                break
+            args.append(word)
+        yield args
 
 
-def is_commit(call):
-    return call.sub == "commit" and not {"-h", "--help"} & set(call.args)
-
-
-def commit_dirs(command, cwd):
-    """The directories each `git commit` in a shell command runs in."""
-    return list(dict.fromkeys(c.where for c in git_calls(command, cwd) if is_commit(c)))
-
-
-def commit_stages(args):
-    """What a `git commit` stages itself: -a/--all, or paths on the command line."""
-    staged, words = [], iter(args)
+def skips_hooks(args):
+    """Whether a `git commit` with these arguments skips the pre-commit hook."""
+    words = iter(args)
     for word in words:
         if word == "--":
-            if next(words, None) is not None:
-                staged.append(COMMIT_PATHS)
-            break
+            return False
         if word.startswith("--"):
             name = word.split("=", 1)[0]
-            if name == "--all":
-                staged.append(COMMIT_ALL)
-            elif name == "--pathspec-from-file":
-                staged.append(COMMIT_PATHS)
-            elif name in COMMIT_LONG_VALUE and "=" not in word:
+            if len(name) >= NO_VERIFY_SHORTEST and NO_VERIFY.startswith(name):
+                return True
+            if word in COMMIT_LONG_VALUE:
                 next(words, None)
         elif word.startswith("-") and len(word) > 1:
-            staged += short_flags_stage(word, words)
-        else:
-            staged.append(COMMIT_PATHS)
-    return list(dict.fromkeys(staged))
+            for j, letter in enumerate(word[1:], start=1):
+                if letter == "n":
+                    return True
+                if letter in COMMIT_SHORT_VALUE:
+                    if j == len(word) - 1:
+                        next(words, None)
+                    break
+                if letter in COMMIT_SHORT_ATTACHED:
+                    break
+    return False
 
 
-def short_flags_stage(word, words):
-    """[COMMIT_ALL] if a cluster of short commit flags (-qam) holds -a. A flag that
-    takes a value ends the cluster; with nothing after it, it takes the next word."""
-    staged = []
-    for j, letter in enumerate(word[1:], start=1):
-        if letter == "a":
-            staged.append(COMMIT_ALL)
-        if letter in COMMIT_SHORT_VALUE:
-            if j == len(word) - 1:
-                next(words, None)
-            break
-        if letter in COMMIT_SHORT_ATTACHED:
-            break
-    return staged
-
-
-def stages(call):
-    """How this git call changes the index, as labels; [] if it doesn't."""
-    flags = set(call.args)
-    if call.sub in ALWAYS_STAGES and not ALWAYS_STAGES[call.sub] & flags:
-        return [f"git {call.sub}"]
-    if call.sub in STAGES_WITH and STAGES_WITH[call.sub] & flags:
-        return [f"git {call.sub} {min(STAGES_WITH[call.sub] & flags)}"]
-    if call.sub == "checkout" and "--" in call.args:
-        return ["git checkout -- PATHS"]
-    if call.sub == "stash" and call.args[:1] in (["pop"], ["apply"]):
-        return [f"git stash {call.args[0]}"]
-    return []
-
-
-def staged_for_commits(command, cwd):
-    """(directory, label) for each change to the index a commit in the command would
-    record unchecked: staging that comes before a commit, and what a commit stages
-    itself. Staging after the last commit is left out."""
-    found, pending = [], []
-    for call in git_calls(command, cwd):
-        if is_commit(call):
-            found += pending + [
-                (call.where, label) for label in commit_stages(call.args)
-            ]
-            pending = []
-        else:
-            pending += [(call.where, label) for label in stages(call)]
-    return list(dict.fromkeys(found))
-
-
-def staging(command):
-    """The labels of staged_for_commits, for a command run in the current directory."""
-    return list(dict.fromkeys(label for _, label in staged_for_commits(command, ".")))
-
-
-@functools.cache
-def toplevel(path):
+def hooks_dir(repo):
     run = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        ["git", "-C", str(repo), "rev-parse", "--git-path", "hooks"],
         capture_output=True,
         text=True,
         check=False,
     )
-    return Path(run.stdout.strip()) if run.returncode == 0 else None
+    return Path(repo, run.stdout.strip()) if run.returncode == 0 else None
 
 
-def agent_hook(repo):
-    """The repo's agent-pre-commit if it exists and is executable, else None."""
-    run = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--show-toplevel", "--git-path", "hooks"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if run.returncode:
+def install(repo):
+    """Add LINE to the repo's pre-commit hook; returns an error message or None."""
+    hooks = hooks_dir(repo)
+    if hooks is None:
+        return f"{repo}: not a git repository"
+    agent = hooks / HOOK_NAME
+    if not (agent.is_file() and os.access(agent, os.X_OK)):
+        return f"{repo}: no executable {agent}"
+    pre = hooks / "pre-commit"
+    exists = pre.exists()
+    text = pre.read_text() if exists else "#!/bin/sh\n"
+    if LINE in text:
+        print(f"{pre}: already installed")
         return None
-    top, hooks = run.stdout.splitlines()
-    hook = Path(repo, hooks) / HOOK_NAME
-    return (Path(top), hook) if hook.is_file() and os.access(hook, os.X_OK) else None
-
-
-def check(repo):
-    """Run the repo's check; returns (passed, message for the agent)."""
-    found = agent_hook(repo)
-    return run_check(*found) if found else (True, "")
-
-
-def run_check(top, hook):
-    run = subprocess.run(
-        [str(hook)], cwd=top, capture_output=True, text=True, check=False
-    )
-    if run.returncode == 0:
-        return True, ""
-    tail = "\n".join((run.stdout + run.stderr).splitlines()[-TAIL_LINES:])
-    return False, (
-        f"Commit blocked: {hook} exited {run.returncode}. Fix what it reports, then commit again.\n"
-        f"{tail}"
-    )
+    lines = text.splitlines()
+    shebang = lines[0][2:].split() if lines and lines[0].startswith("#!") else []
+    if shebang and Path(shebang[0]).name == "env":
+        shebang = shebang[1:]
+    if shebang and Path(shebang[0]).name not in SHELLS:
+        return f"{pre}: not a shell script, so add the agent check by hand"
+    at = 1 if shebang else 0
+    lines[at:at] = [COMMENT, LINE]
+    pre.write_text("\n".join(lines) + "\n")
+    if not exists:
+        pre.chmod(0o755)
+    print(f"{pre}: installed")
+    return None
 
 
 def main(argv=None):
@@ -289,43 +203,29 @@ def main(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--run",
-        nargs="?",
-        const=".",
-        metavar="DIR",
-        help="run DIR's check now, outside a hook",
+        "--install",
+        nargs="+",
+        metavar="REPO",
+        help="add the agent check line to each repo's pre-commit hook",
     )
     args = parser.parse_args(argv)
-    if args.run:
-        passed, message = check(Path(args.run))
-        print(
-            message or f"{args.run}: passed, or has no {HOOK_NAME}",
-            file=sys.stderr if message else sys.stdout,
-        )
-        return 0 if passed else 1
+    if args.install:
+        errors = [e for e in map(install, args.install) if e]
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1 if errors else 0
     event = json.load(sys.stdin)
     if event.get("tool_name") != "Bash":
         return 0
     command = event.get("tool_input", {}).get("command", "")
-    cwd = event.get("cwd") or os.getcwd()
-    staged = staged_for_commits(command, cwd)
-    for repo in commit_dirs(command, cwd):
-        found = agent_hook(repo)
-        if not found:
-            continue
-        mine = [label for where, label in staged if toplevel(where) == found[0]]
-        if mine:
-            print(
-                f"Commit blocked: this command also stages ({', '.join(dict.fromkeys(mine))}), "
-                "but the check runs before the command, on what is staged now, so it would "
-                "not see what this commit records. Stage in its own command first, then commit.",
-                file=sys.stderr,
-            )
-            return 2
-        passed, message = run_check(*found)
-        if not passed:
-            print(message, file=sys.stderr)
-            return 2
+    if any(skips_hooks(args) for args in commit_args(command)):
+        print(
+            "Commit blocked: --no-verify (-n) skips the pre-commit hook, which runs "
+            f"this repo's checks, {HOOK_NAME} included. Fix what they report and "
+            "commit without it.",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

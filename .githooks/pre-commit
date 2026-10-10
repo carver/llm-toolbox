@@ -1,4 +1,6 @@
 #!/bin/sh
+# Agents' commits also run the slower agent-pre-commit (llm-toolbox agent-commit-gate).
+if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then AGENT_PRE_COMMIT=1 "$(dirname "$0")/agent-pre-commit" || exit; fi
 # Lint and format-check what's staged, in about a second. Enabled by install.py (core.hooksPath).
 # The test suite is too slow for this; agent-pre-commit runs it.
 set -e

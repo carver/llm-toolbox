@@ -53,8 +53,14 @@ def without_repo_vars(env):
     return {k: v for k, v in env.items() if not redirects_git(k)}
 
 
+# Set when an agent commits; a test's pre-commit hook would rerun the suite.
+AGENT_VARS = ("AI_AGENT", "AGENT_PRE_COMMIT")
+
+
 @pytest.fixture(autouse=True)
 def no_inherited_repo(monkeypatch):
     for name in list(os.environ):
         if redirects_git(name):
             monkeypatch.delenv(name)
+    for name in AGENT_VARS:
+        monkeypatch.delenv(name, raising=False)

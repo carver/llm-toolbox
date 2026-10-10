@@ -54,7 +54,7 @@ HOOKS = [
         "PreToolUse",
         "Bash",
         "agent-commit-gate",
-        {"timeout": 900, "statusMessage": "Running the repo's agent pre-commit check"},
+        {"timeout": 10},
     ),
 ]
 # Other authors' skills, by GitHub source. Installed into ~/.agents/skills with a

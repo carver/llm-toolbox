@@ -1,8 +1,10 @@
 #!/bin/sh
-# The agent's commit check (see bin/agent-commit-gate): the pre-commit hook, then
-# every test, on what's staged. Also the repo's whole check, run by hand:
-# `agent-commit-gate --run`.
+# The agent's commit check, which pre-commit runs when $AI_AGENT is set (see
+# bin/agent-commit-gate): the pre-commit hook, then every test, on what's staged.
+# Also the repo's whole check, run by hand.
 set -e
+# So the pre-commit hook does not run this script again.
+export AGENT_PRE_COMMIT=1
 "$(dirname "$0")/pre-commit"
 tree=$(mktemp -d)
 trap 'rm -rf "$tree"' EXIT

@@ -1,4 +1,4 @@
-"""bin/agent-commit-gate: which commands commit where, and a real repo whose agent check passes or fails."""
+"""bin/agent-commit-gate: the --no-verify refusal, the installer, and real commits through the hook line."""
 
 import importlib.machinery
 import importlib.util
@@ -19,177 +19,225 @@ gate = importlib.util.module_from_spec(spec)
 loader.exec_module(gate)
 
 
-@pytest.mark.parametrize(
-    "command, dirs",
-    [
-        ("git commit -m x", ["/r"]),
-        ("git add a && git commit -q -F - <<'EOF'\nfix: it's done\nEOF", ["/r"]),
-        ("cd sub && git commit -m x", ["/r/sub"]),
-        ("git -C /elsewhere -c user.name=a commit --amend", ["/elsewhere"]),
-        ("/usr/bin/git commit -m x; git commit -m y", ["/r"]),
-        ("git status && git log --oneline -1", []),
-        ("git commit --help", []),
-        ("echo git commit", []),
-    ],
-)
-def test_finds_each_commit_and_where_it_runs(command, dirs):
-    assert gate.commit_dirs(command, "/r") == [Path(d) for d in dirs]
-
-
-@pytest.fixture
-def repo(tmp_path):
-    env = without_repo_vars(os.environ)
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, env=env)
-    subprocess.run(
-        ["git", "-C", str(tmp_path), "config", "core.hooksPath", ".githooks"],
-        check=True,
-        env=env,
-    )
-    (tmp_path / ".githooks").mkdir()
-    return tmp_path
-
-
-def agent_check(repo, body):
-    hook = repo / ".githooks" / gate.HOOK_NAME
-    hook.write_text(f"#!/bin/sh\n{body}\n")
-    hook.chmod(0o755)
-
-
-def run_hook(monkeypatch, capsys, command, cwd, tool="Bash"):
-    event = {"tool_name": tool, "tool_input": {"command": command}, "cwd": str(cwd)}
+def run_hook(monkeypatch, capsys, command, tool="Bash"):
+    event = {"tool_name": tool, "tool_input": {"command": command}, "cwd": "/r"}
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
     code = gate.main([])
     return code, capsys.readouterr().err
 
 
-def test_a_failing_check_blocks_the_commit_and_shows_its_output(
-    repo, monkeypatch, capsys
-):
-    agent_check(repo, "echo '1 failed, 3 passed'; exit 1")
-    code, err = run_hook(monkeypatch, capsys, "git commit -m x", repo)
-    assert code == 2 and "1 failed, 3 passed" in err and "Commit blocked" in err
-
-
-def test_a_passing_check_lets_the_commit_through(repo, monkeypatch, capsys):
-    agent_check(repo, "exit 0")
-    assert run_hook(monkeypatch, capsys, "git commit -m x", repo) == (0, "")
-
-
-def test_no_check_and_no_commit_pass_untouched(repo, monkeypatch, capsys):
-    assert run_hook(monkeypatch, capsys, "git commit -m x", repo) == (0, "")
-    agent_check(repo, "exit 1")
-    assert run_hook(monkeypatch, capsys, "git status", repo) == (0, "")
-    assert run_hook(monkeypatch, capsys, "git commit -m x", repo, tool="Edit") == (
-        0,
-        "",
-    )
-
-
-def test_a_commit_outside_any_repo_passes(tmp_path, monkeypatch, capsys):
-    assert run_hook(monkeypatch, capsys, "git commit -m x", tmp_path) == (0, "")
-
-
-def test_the_check_runs_from_the_top_of_the_repo(repo, monkeypatch, capsys):
-    (repo / "sub").mkdir()
-    agent_check(repo, "test -d .githooks || { echo 'not at the top'; exit 1; }")
-    assert run_hook(monkeypatch, capsys, "cd sub && git commit -m x", repo) == (0, "")
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit --no-verify -m x",
+        "git commit -n -m x",
+        "git commit -nm x",
+        "git commit -anm x",
+        "git -C sub commit -q --no-verify",
+        "git add a && git commit -m x --no-verify",
+        "cd sub; /usr/bin/git commit -n",
+        "git commit --no-verif -m x",
+        "git --git-dir .git commit -n",
+    ],
+)
+def test_skipping_the_hook_is_refused(monkeypatch, capsys, command):
+    code, err = run_hook(monkeypatch, capsys, command)
+    assert code == 2 and "--no-verify" in err
 
 
 @pytest.mark.parametrize(
-    "command, staged",
+    "command",
     [
-        ("git add a && git commit -m x", ["git add"]),
-        ("git add a; git commit -m x", ["git add"]),
-        ("git -C sub stage . && git commit -m x", ["git stage"]),
-        ("git rm old && git mv a b && git commit -m x", ["git rm", "git mv"]),
-        ("git restore --staged a && git commit -m x", ["git restore --staged"]),
-        ("git reset -q a && git commit -m x", ["git reset"]),
-        ("git apply --cached p.diff && git commit -m x", ["git apply --cached"]),
-        ("git commit -am x", ["git commit -a"]),
-        ("git commit -a -m x", ["git commit -a"]),
-        ("git commit --all -m x", ["git commit -a"]),
-        ("git commit -m x src/a.py", ["git commit PATHS"]),
-        ("git commit -q -m x -- a.py", ["git commit PATHS"]),
-        ("git commit -o -m x a.py", ["git commit PATHS"]),
-        ("git commit -m x", []),
-        ("git commit -qm 'add a thing'", []),
-        ("git commit --author 'A <a@b.c>' --date now -m x", []),
-        ("git commit --fixup=abc123", []),
-        ("git commit --amend --no-edit", []),
-        ("git commit -q -F - <<'EOF'\nfix: done\nEOF", []),
-        ("git status && git diff --cached && git commit -m x", []),
-        ("git restore a && git commit -m x", []),
-        ("git apply p.diff && git commit -m x", []),
-        ("git add a", []),
-        ("git commit -m x && git add later", []),
-        ('git commit -m "docs: explain staging; git add notes first"', []),
-        (
-            "git commit -q -F - <<'EOF'\ngit add and git rm now block\nran git add && git commit\nEOF",
-            [],
-        ),
-        ("git commit -m \"$(cat <<'EOF'\nbody; git rm was wrong\nEOF\n)\"", []),
-        ('git commit -m "fix\n\nbody" src/a.py', ["git commit PATHS"]),
-        ('git commit -m "fix\n\nbody" -a', ["git commit -a"]),
-        ("git reset --soft HEAD~2 && git commit -m squash", []),
-        ("git add --dry-run . && git commit -m x", []),
-        ("git commit -uall -m x", []),
-        ("git commit -Sabc -m x", []),
-        ("git merge --squash feat && git commit -m x", ["git merge --squash"]),
-        ("git cherry-pick -n abc && git commit -m x", ["git cherry-pick -n"]),
-        ("git checkout main -- a.py && git commit -m x", ["git checkout -- PATHS"]),
-        ("git stash pop && git commit -m x", ["git stash pop"]),
-        ("GIT_INDEX_FILE=i git add a && git commit -m x", ["git add"]),
-        ('git commit -q -m "fix: first line\n\nbody words here"', []),
-        ('git commit -qam "fix: first line\n\nbody"', ["git commit -a"]),
-        ("git commit -q -F - <<'EOF'\nfix: it's done\nEOF", []),
-        ('git commit -m "don\'t stop"', []),
+        "git commit -m x",
+        "git commit -m -n",
+        "git commit -m 'skip with --no-verify'",
+        "git commit -F - <<'EOF'\ngit commit --no-verify\nEOF",
+        "git commit -Snkey -m x",
+        "git add -n . && git clean -n",
+        "git push --no-verify",
+        "echo git commit -n",
+        "git commit --help",
     ],
 )
-def test_finds_what_a_command_stages(command, staged):
-    assert gate.staging(command) == staged
+def test_other_commands_pass(monkeypatch, capsys, command):
+    assert run_hook(monkeypatch, capsys, command) == (0, "")
 
 
-def test_staging_and_committing_in_one_command_is_blocked_before_the_check(
-    repo, monkeypatch, capsys
-):
-    agent_check(repo, "echo ran > ran.txt")
-    code, err = run_hook(monkeypatch, capsys, "git add a && git commit -m x", repo)
-    assert code == 2
-    assert "git add" in err and "own command" in err
-    assert not (repo / "ran.txt").exists()
+def test_other_tools_pass(monkeypatch, capsys):
+    assert run_hook(monkeypatch, capsys, "git commit -n", tool="Edit") == (0, "")
 
 
-def test_commit_all_is_blocked_too(repo, monkeypatch, capsys):
-    agent_check(repo, "exit 0")
-    code, err = run_hook(monkeypatch, capsys, "git commit -am x", repo)
-    assert code == 2 and "git commit -a" in err
-
-
-def test_text_that_mentions_git_commands_is_not_a_commit():
-    command = "cat > notes.txt <<'EOF'\ngit add a && git commit -m x\nEOF"
-    assert gate.commit_dirs(command, "/r") == []
-
-
-def test_staging_in_another_repo_does_not_block(repo, monkeypatch, capsys, tmp_path):
-    agent_check(repo, "exit 0")
-    other = tmp_path / "other"
-    subprocess.run(
-        ["git", "init", "-q", str(other)], check=True, env=without_repo_vars(os.environ)
+def git(repo, *args, env=None, check=True):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=check,
+        env=env or without_repo_vars(os.environ),
     )
-    command = f"git -C {other} add a && git commit -m x"
-    assert run_hook(monkeypatch, capsys, command, repo) == (0, "")
 
 
-def test_staging_alone_or_without_an_agent_check_passes(
-    repo, monkeypatch, capsys, tmp_path
-):
-    agent_check(repo, "exit 0")
-    assert run_hook(monkeypatch, capsys, "git add a", repo) == (0, "")
-    plain = tmp_path / "plain"
-    subprocess.run(
-        ["git", "init", "-q", str(plain)], check=True, env=without_repo_vars(os.environ)
+@pytest.fixture
+def repo(tmp_path):
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "config", "core.hooksPath", ".githooks")
+    git(tmp_path, "config", "user.name", "t")
+    git(tmp_path, "config", "user.email", "t@t")
+    (tmp_path / ".githooks").mkdir()
+    return tmp_path
+
+
+def hook(repo, name, body):
+    path = repo / ".githooks" / name
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    path.chmod(0o755)
+    return path
+
+
+def install(*repos):
+    return subprocess.run(
+        [str(SCRIPT), "--install", *map(str, repos)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=without_repo_vars(os.environ),
     )
-    assert run_hook(monkeypatch, capsys, "git add a && git commit -m x", plain) == (
-        0,
-        "",
+
+
+def commit(repo, *args, agent=True):
+    env = without_repo_vars(os.environ)
+    if agent:
+        env["AI_AGENT"] = "test-agent"
+    return git(repo, "commit", "-q", "-m", "x", *args, env=env, check=False)
+
+
+def test_install_puts_the_line_after_the_shebang_once(repo):
+    hook(repo, "agent-pre-commit", "exit 0")
+    pre = hook(repo, "pre-commit", "set -e\necho fast")
+    assert install(repo).returncode == 0
+    assert install(repo).returncode == 0
+    lines = pre.read_text().splitlines()
+    assert lines[0] == "#!/bin/sh"
+    assert lines[-2:] == ["set -e", "echo fast"]
+    assert pre.read_text().count("AI_AGENT") == 1
+
+
+def test_install_keeps_a_disabled_pre_commit_disabled(repo):
+    hook(repo, "agent-pre-commit", "exit 0")
+    pre = hook(repo, "pre-commit", "exit 1")
+    pre.chmod(0o644)
+    assert install(repo).returncode == 0
+    assert not os.access(pre, os.X_OK)
+
+
+def test_install_handles_a_shebang_without_a_newline(repo):
+    hook(repo, "agent-pre-commit", "exit 0")
+    pre = repo / ".githooks" / "pre-commit"
+    pre.write_text("#!/bin/sh")
+    pre.chmod(0o755)
+    assert install(repo).returncode == 0
+    assert pre.read_text().splitlines()[0] == "#!/bin/sh"
+
+
+def test_install_refuses_a_pre_commit_that_is_not_a_shell_script(repo):
+    hook(repo, "agent-pre-commit", "exit 0")
+    pre = repo / ".githooks" / "pre-commit"
+    pre.write_text("#!/usr/bin/env python3\nprint('hi')\n")
+    run = install(repo)
+    assert run.returncode == 1 and "shell" in run.stderr
+    assert "AI_AGENT" not in pre.read_text()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [".githooks/pre-commit", "templates/egui-app/.githooks/pre-commit"],
+)
+def test_checked_in_hooks_carry_the_current_line(path):
+    assert gate.LINE in (SCRIPT.parent.parent / path).read_text()
+
+
+def test_install_creates_a_missing_pre_commit(repo):
+    hook(repo, "agent-pre-commit", "exit 0")
+    assert install(repo).returncode == 0
+    pre = repo / ".githooks" / "pre-commit"
+    assert os.access(pre, os.X_OK) and "agent-pre-commit" in pre.read_text()
+
+
+def test_install_uses_git_hooks_dir_without_hooks_path(tmp_path):
+    git(tmp_path, "init", "-q")
+    agent = tmp_path / ".git" / "hooks" / "agent-pre-commit"
+    agent.write_text("#!/bin/sh\nexit 0\n")
+    agent.chmod(0o755)
+    assert install(tmp_path).returncode == 0
+    assert "agent-pre-commit" in (tmp_path / ".git/hooks/pre-commit").read_text()
+
+
+def test_install_refuses_a_repo_without_an_agent_check(repo):
+    run = install(repo)
+    assert run.returncode == 1 and "agent-pre-commit" in run.stderr
+    assert not (repo / ".githooks" / "pre-commit").exists()
+
+
+@pytest.fixture
+def installed(repo):
+    """A repo whose agent check fails when the committed `a` says `bad`."""
+    hook(
+        repo,
+        "agent-pre-commit",
+        'echo agent >> "$(git rev-parse --git-dir)/ran"\n'
+        "git show :a | grep -q bad && { echo 'agent check: a is bad'; exit 1; }\n"
+        "exit 0",
     )
+    hook(repo, "pre-commit", 'echo fast >> "$(git rev-parse --git-dir)/ran"')
+    install(repo)
+    (repo / "a").write_text("good\n")
+    git(repo, "add", "a")
+    return repo
+
+
+def ran(repo):
+    path = repo / ".git" / "ran"
+    return path.read_text().split() if path.exists() else []
+
+
+def test_an_agent_commit_runs_the_agent_check_then_the_fast_one(installed):
+    assert commit(installed).returncode == 0
+    assert ran(installed) == ["agent", "fast"]
+
+
+def test_a_failing_agent_check_blocks_the_commit_and_shows_why(installed):
+    (installed / "a").write_text("bad\n")
+    git(installed, "add", "a")
+    run = commit(installed)
+    assert run.returncode != 0 and "a is bad" in run.stderr
+    assert git(installed, "rev-parse", "HEAD", check=False).returncode != 0
+
+
+def test_commit_all_checks_what_it_commits(installed):
+    assert commit(installed).returncode == 0
+    (installed / "a").write_text("bad\n")
+    run = commit(installed, "-a")
+    assert run.returncode != 0 and "a is bad" in run.stderr
+
+
+def test_a_human_commit_skips_the_agent_check(installed):
+    assert commit(installed, agent=False).returncode == 0
+    assert ran(installed) == ["fast"]
+
+
+def test_a_nounset_pre_commit_still_works_for_humans(installed):
+    pre = installed / ".githooks" / "pre-commit"
+    pre.write_text(pre.read_text().replace("#!/bin/sh", "#!/bin/sh -u", 1))
+    assert commit(installed, agent=False).returncode == 0
+
+
+def test_an_agent_check_that_runs_pre_commit_does_not_loop(repo):
+    hook(
+        repo,
+        "agent-pre-commit",
+        'echo agent >> "$(git rev-parse --git-dir)/ran"\n"$(dirname "$0")/pre-commit"',
+    )
+    hook(repo, "pre-commit", 'echo fast >> "$(git rev-parse --git-dir)/ran"')
+    install(repo)
+    assert commit(repo, "--allow-empty").returncode == 0
+    assert ran(repo) == ["agent", "fast", "fast"]

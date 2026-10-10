@@ -1,6 +1,6 @@
 #!/bin/sh
-# The same steps as .github/workflows/ci.yml, for agents' commits (see
-# agent-commit-gate). Slower than the pre-commit hook: clippy and the tests
+# The same steps as .github/workflows/ci.yml, for agents' commits (pre-commit
+# runs it when $AI_AGENT is set). Slower than the pre-commit hook: clippy and the tests
 # rebuild on the shared mount.
 set -e
 cargo fmt --check

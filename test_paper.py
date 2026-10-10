@@ -3,7 +3,9 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -141,10 +143,6 @@ def arxiv_feed(*entries: tuple[str, str, str]) -> "paper.Response":
         f'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">{xml}</feed>'
     )
     return paper.Response(200, {}, body.encode())
-
-
-def s2_calls(http):
-    return [c for c in http.calls if "semanticscholar.org" in c["url"]]
 
 
 def ok(body):
@@ -662,8 +660,16 @@ def test_a_key_file_that_is_not_utf8_exits_2_without_echoing_it(
 ATTENTION_FEED = arxiv_feed(("1706.03762v7", "2017-06-12", "2023-08-02"))
 
 
+def calls_to(http, host):
+    return [c for c in http.calls if host in c["url"]]
+
+
+def s2_calls(http):
+    return calls_to(http, "semanticscholar.org")
+
+
 def arxiv_calls(http):
-    return [c for c in http.calls if "export.arxiv.org" in c["url"]]
+    return calls_to(http, "export.arxiv.org")
 
 
 def test_meta_adds_arxiv_version_and_dates(cache, capsys):
@@ -735,9 +741,6 @@ def test_arxiv_dates_are_cached_for_a_day(cache, capsys):
 
 
 def test_stale_arxiv_dates_are_fetched_again(cache, capsys):
-    import os
-    import time
-
     first = FakeHTTP(
         ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
         ("GET", "export.arxiv.org", [ATTENTION_FEED]),
@@ -764,3 +767,54 @@ def test_an_arxiv_failure_leaves_the_rest_and_warns(cache, capsys):
     assert out.startswith("Attention is All you Need\n")
     assert "arXiv: v" not in out
     assert "arXiv dates unavailable" in err
+
+
+def test_a_later_semantic_scholar_failure_keeps_the_blocks_already_fetched(
+    cache, capsys
+):
+    http = FakeHTTP(
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+        ("GET", "/paper/arXiv:2404.00806", [status(403, {"error": "forbidden"})]),
+        ("GET", "export.arxiv.org", [ATTENTION_FEED]),
+    )
+    code, out, err, _ = run(capsys, ["meta", "1706.03762", "2404.00806"], http)
+    assert code == 3
+    assert out.startswith("Attention is All you Need\n")
+    assert "  arXiv: v7" in out
+    assert "forbidden" in err
+
+
+def test_an_id_missing_from_the_arxiv_answer_warns_and_is_asked_again(cache, capsys):
+    http = FakeHTTP(
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+        ("GET", "export.arxiv.org", [arxiv_feed()]),
+    )
+    code, out, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert code == 0
+    assert "arXiv: v" not in out
+    assert "arXiv has no entry for 1706.03762" in err
+    again = FakeHTTP(("GET", "export.arxiv.org", [ATTENTION_FEED]))
+    _, out, _, _ = run(capsys, ["meta", "1706.03762"], again)
+    assert "  arXiv: v7" in out
+    assert len(arxiv_calls(again)) == 1
+
+
+def test_old_style_arxiv_ids_get_dates_too(cache, capsys):
+    teleport = dict(
+        ATTENTION,
+        paperId="e" * 40,
+        title="Experimental quantum teleportation",
+        externalIds={"ArXiv": "quant-ph/9801069", "DOI": "10.1038/37539"},
+    )
+    http = FakeHTTP(
+        ("GET", "/paper/DOI:10.1038/37539", [ok(teleport)]),
+        (
+            "GET",
+            "export.arxiv.org",
+            [arxiv_feed(("quant-ph/9801069v2", "1998-01-30", "1998-02-04"))],
+        ),
+    )
+    code, out, err, _ = run(capsys, ["meta", "10.1038/37539"], http)
+    assert code == 0, err
+    assert "  arXiv: v2, submitted 1998-01-30, updated 1998-02-04" in out
+    assert all(f.is_file() for f in (cache / "arxiv").iterdir())

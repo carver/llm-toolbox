@@ -36,14 +36,16 @@ def sleepers() -> Iterator[list[subprocess.Popen[bytes]]]:
         proc.wait()
 
 
+SLEEP = "import time; time.sleep(300)"
+IGNORE_TERM = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)"
+
+
 def start(
-    sleepers: list[subprocess.Popen[bytes]], marker: str
+    sleepers: list[subprocess.Popen[bytes]], marker: str, code: str = SLEEP
 ) -> subprocess.Popen[bytes]:
-    proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(300)", marker]
-    )
+    proc = subprocess.Popen([sys.executable, "-c", code, marker])
     sleepers.append(proc)
-    time.sleep(0.05)
+    time.sleep(0.2 if code is IGNORE_TERM else 0.05)
     return proc
 
 
@@ -137,16 +139,31 @@ def test_all_reports_a_process_that_outlives_the_wait(
     sleepers: list[subprocess.Popen[bytes]],
 ) -> None:
     marker = uuid.uuid4().hex
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)",
-            marker,
-        ]
-    )
-    sleepers.append(proc)
-    time.sleep(0.2)
+    proc = start(sleepers, marker, IGNORE_TERM)
     result = safekill("--all", "-f", marker, "--wait", "0.5")
     assert result.returncode == 3
     assert f"{proc.pid} still running" in result.stderr
+
+
+def test_all_waits_once_for_every_process_not_once_each(
+    sleepers: list[subprocess.Popen[bytes]],
+) -> None:
+    marker = uuid.uuid4().hex
+    for _ in range(3):
+        start(sleepers, marker, IGNORE_TERM)
+    began = time.monotonic()
+    result = safekill("--all", "-f", marker, "--wait", "1")
+    assert result.returncode == 3
+    assert time.monotonic() - began < 2.5
+
+
+@pytest.mark.parametrize(
+    "args, problem",
+    [(["-s", "BOGUS"], "signal"), (["-f", "("], "pattern")],
+    ids=["unknown-signal", "bad-regex"],
+)
+def test_bad_input_is_a_usage_error(args: list[str], problem: str) -> None:
+    result = safekill("--one", *args, *([] if "-f" in args else ["x"]))
+    assert result.returncode == 2
+    assert problem in result.stderr
+    assert "Traceback" not in result.stderr

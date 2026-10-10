@@ -11,42 +11,25 @@ ancestor. Say how many processes you mean:
 
 Exit status: 0 signalled (and, with --wait, every signalled process exited),
 1 nothing matched, 2 --one found several (listed, none signalled) or a usage
-error, 3 a signal failed or a process outlived --wait. See also waitone.
+error (unknown signal, bad pattern), 3 a signal failed or a process outlived
+--wait. See also waitone.
 """
 
 import argparse
 import os
+import re
 import signal
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from procmatch import NONE_MATCHED, exactly_one, matches, wait_gone
+from procmatch import exactly_one, matches, none_matched, wait_gone
 
 FAILED = 3
 
 
-def parse_signal(text: str) -> signal.Signals:
-    name = text.upper().removeprefix("SIG")
-    return signal.Signals(int(name)) if name.isdigit() else signal.Signals["SIG" + name]
-
-
-def targets(args: argparse.Namespace) -> dict[int, str] | int:
-    """pid -> command line of the processes to signal, or an exit status."""
-    if args.one:
-        found = exactly_one(args.pattern, args.full, "safekill")
-        if isinstance(found, int):
-            return found
-        pid, cmdline = found
-        return {pid: cmdline}
-    found = matches(args.pattern, args.full)
-    if not found:
-        print(f"safekill: no process matches {args.pattern!r}", file=sys.stderr)
-        return NONE_MATCHED
-    return found
-
-
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="safekill",
         description=__doc__,
@@ -82,18 +65,37 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0,
         metavar="SECONDS",
-        help="wait up to SECONDS for every signalled process to exit; exit 3 if one doesn't",
+        help="wait up to SECONDS in all for the signalled processes to exit; "
+        "exit 3 if one doesn't",
     )
-    args = parser.parse_args(argv)
-    sig = parse_signal(args.signal)
+    return parser
 
-    found = targets(args)
-    if isinstance(found, int):
-        return found
-    if args.dry_run:
-        for pid, cmdline in sorted(found.items()):
-            print(f"would send {sig.name} to {pid}  {cmdline}")
-        return 0
+
+def parse_signal(text: str) -> signal.Signals | None:
+    name = text.upper().removeprefix("SIG")
+    try:
+        return (
+            signal.Signals(int(name))
+            if name.isdigit()
+            else signal.Signals["SIG" + name]
+        )
+    except (KeyError, ValueError):
+        return None
+
+
+def targets(args: argparse.Namespace) -> dict[int, str] | int:
+    """pid -> command line of the processes to signal, or an exit status."""
+    if args.one:
+        found = exactly_one(args.pattern, args.full, "safekill")
+        if isinstance(found, int):
+            return found
+        pid, cmdline = found
+        return {pid: cmdline}
+    return matches(args.pattern, args.full) or none_matched(args.pattern, "safekill")
+
+
+def signal_and_wait(found: dict[int, str], sig: signal.Signals, wait: float) -> int:
+    """Signal each process, then wait up to `wait` seconds in all for them to exit."""
     status = 0
     signalled = []
     for pid, cmdline in sorted(found.items()):
@@ -105,14 +107,34 @@ def main(argv: list[str] | None = None) -> int:
             continue
         signalled.append(pid)
         print(f"sent {sig.name} to {pid}  {cmdline}")
-    if args.wait:
+    if wait:
+        deadline = time.monotonic() + wait
         for pid in signalled:
-            if not wait_gone(pid, args.wait):
-                print(
-                    f"safekill: {pid} still running after {args.wait}s", file=sys.stderr
-                )
+            if not wait_gone(pid, max(0.0, deadline - time.monotonic())):
+                print(f"safekill: {pid} still running after {wait}s", file=sys.stderr)
                 status = FAILED
     return status
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    sig = parse_signal(args.signal)
+    if sig is None:
+        parser.error(f"unknown signal {args.signal!r}")
+    if args.full:
+        try:
+            re.compile(args.pattern)
+        except re.error as e:
+            parser.error(f"bad pattern {args.pattern!r}: {e}")
+    found = targets(args)
+    if isinstance(found, int):
+        return found
+    if args.dry_run:
+        for pid, cmdline in sorted(found.items()):
+            print(f"would send {sig.name} to {pid}  {cmdline}")
+        return 0
+    return signal_and_wait(found, sig, args.wait)
 
 
 if __name__ == "__main__":

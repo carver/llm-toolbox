@@ -72,13 +72,18 @@ def matches(pattern: str, full: bool) -> dict[int, str]:
     }
 
 
+def none_matched(pattern: str, prog: str) -> int:
+    """Says nothing matched, on stderr, and returns the exit status for it."""
+    print(f"{prog}: no process matches {pattern!r}", file=sys.stderr)
+    return NONE_MATCHED
+
+
 def exactly_one(pattern: str, full: bool, prog: str) -> tuple[int, str] | int:
     """The single match as (pid, command line), or, after explaining on
     stderr, the exit status for none (NONE_MATCHED) or several (SEVERAL_MATCHED)."""
     found = matches(pattern, full)
     if not found:
-        print(f"{prog}: no process matches {pattern!r}", file=sys.stderr)
-        return NONE_MATCHED
+        return none_matched(pattern, prog)
     if len(found) > 1:
         print(
             f"{prog}: {len(found)} processes match {pattern!r}; acted on none:",

@@ -93,3 +93,70 @@ def test_the_check_runs_from_the_top_of_the_repo(repo, monkeypatch, capsys):
     (repo / "sub").mkdir()
     agent_check(repo, "test -d .githooks || { echo 'not at the top'; exit 1; }")
     assert run_hook(monkeypatch, capsys, "cd sub && git commit -m x", repo) == (0, "")
+
+
+@pytest.mark.parametrize(
+    "command, staged",
+    [
+        ("git add a && git commit -m x", ["git add"]),
+        ("git add a; git commit -m x", ["git add"]),
+        ("git -C sub stage . && git commit -m x", ["git stage"]),
+        ("git rm old && git mv a b && git commit -m x", ["git rm", "git mv"]),
+        ("git restore --staged a && git commit -m x", ["git restore --staged"]),
+        ("git reset -q a && git commit -m x", ["git reset"]),
+        ("git apply --cached p.diff && git commit -m x", ["git apply --cached"]),
+        ("git commit -am x", ["git commit -a"]),
+        ("git commit -a -m x", ["git commit -a"]),
+        ("git commit --all -m x", ["git commit -a"]),
+        ("git commit -m x src/a.py", ["git commit PATHS"]),
+        ("git commit -q -m x -- a.py", ["git commit PATHS"]),
+        ("git commit -o -m x a.py", ["git commit PATHS"]),
+        ("git commit -m x", []),
+        ("git commit -qm 'add a thing'", []),
+        ("git commit --author 'A <a@b.c>' --date now -m x", []),
+        ("git commit --fixup=abc123", []),
+        ("git commit --amend --no-edit", []),
+        ("git commit -q -F - <<'EOF'\nfix: done\nEOF", []),
+        ("git status && git diff --cached && git commit -m x", []),
+        ("git restore a && git commit -m x", []),
+        ("git apply p.diff && git commit -m x", []),
+        ("git add a", ["git add"]),
+        ('git commit -q -m "fix: first line\n\nbody words here"', []),
+        ('git commit -qam "fix: first line\n\nbody"', ["git commit -a"]),
+        ("git commit -q -F - <<'EOF'\nfix: it's done\nEOF", []),
+        ('git commit -m "don\'t stop"', []),
+    ],
+)
+def test_finds_what_a_command_stages(command, staged):
+    assert gate.staging(command) == staged
+
+
+def test_staging_and_committing_in_one_command_is_blocked_before_the_check(
+    repo, monkeypatch, capsys
+):
+    agent_check(repo, "echo ran > ran.txt")
+    code, err = run_hook(monkeypatch, capsys, "git add a && git commit -m x", repo)
+    assert code == 2
+    assert "git add" in err and "own command" in err
+    assert not (repo / "ran.txt").exists()
+
+
+def test_commit_all_is_blocked_too(repo, monkeypatch, capsys):
+    agent_check(repo, "exit 0")
+    code, err = run_hook(monkeypatch, capsys, "git commit -am x", repo)
+    assert code == 2 and "git commit -a" in err
+
+
+def test_staging_alone_or_without_an_agent_check_passes(
+    repo, monkeypatch, capsys, tmp_path
+):
+    agent_check(repo, "exit 0")
+    assert run_hook(monkeypatch, capsys, "git add a", repo) == (0, "")
+    plain = tmp_path / "plain"
+    subprocess.run(
+        ["git", "init", "-q", str(plain)], check=True, env=without_repo_vars(os.environ)
+    )
+    assert run_hook(monkeypatch, capsys, "git add a && git commit -m x", plain) == (
+        0,
+        "",
+    )

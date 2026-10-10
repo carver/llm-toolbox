@@ -111,6 +111,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   repo's `agent-pre-commit`, an executable kept beside the ordinary
   pre-commit hook, and blocks the commit if it fails. People keep the quick
   hook; the agent also gets the slow checks, such as the whole test suite.
+  Since the hook runs before the command, a command that both stages and
+  commits (`git add ... && git commit`, `git commit -a`, `git commit PATHS`)
+  is blocked in a repo with a check: stage first, then commit.
   `agent-commit-gate --run` runs a repo's check by hand.
 
 - **skill-patch**: keeps hand edits to other authors' skills. Edit the

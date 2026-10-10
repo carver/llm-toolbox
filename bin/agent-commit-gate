@@ -11,6 +11,12 @@ A failing check blocks the command (exit 2) and shows the agent the tail of its
 output. A repo without the file, and every command that is not a commit, pass
 through untouched. install.py registers the gate in ~/.claude/settings.json.
 
+The gate runs before the command, so it checks what is staged then. A command
+that also stages (`git add ... && git commit`, `git commit -a`, `git commit
+PATHS`) would commit changes the check never saw, or be blocked for a state it
+was about to fix. In a repo with a check, such a command is blocked up front:
+stage in one command, commit in the next.
+
     agent-commit-gate < hook-input.json    # as Claude Code calls it
     agent-commit-gate --run [DIR]          # run DIR's check by hand (default: .)
 """
@@ -27,17 +33,40 @@ from pathlib import Path
 HOOK_NAME = "agent-pre-commit"
 TAIL_LINES = 40
 SEPARATORS = re.compile(r"&&|\|\||[;|\n]")
+REDIRECT = re.compile(r"^\d*[<>]")
+# Subcommands that change the index whatever their arguments.
+STAGING = {"add", "stage", "rm", "mv", "reset", "update-index"}
+# git commit options that take the next word as their value.
+COMMIT_SHORT_VALUE = set("mFCct")
+COMMIT_LONG_VALUE = {
+    "--message",
+    "--file",
+    "--author",
+    "--date",
+    "--reuse-message",
+    "--reedit-message",
+    "--fixup",
+    "--squash",
+    "--cleanup",
+    "--template",
+    "--trailer",
+}
 
 
-def commit_dirs(command, cwd):
-    """The directories each `git commit` in a shell command runs in, following `cd DIR` and `git -C DIR`.
-    A heredoc body splits into harmless segments; at worst a line of it that reads like a commit adds a check."""
-    here, found = Path(cwd), []
+def git_calls(command, cwd):
+    """(directory, subcommand, arguments, quoted) for each git call in a shell command,
+    following `cd DIR` and `git -C DIR`. Arguments stop at the first redirection
+    (`<<'EOF'`, `2>&1`). `quoted` is False when the segment's quoting didn't parse, as
+    when a quoted message runs over several lines; its arguments are then rough.
+    A heredoc body splits into harmless segments; at worst a line of it that reads like a
+    git call is counted."""
+    here = Path(cwd)
     for segment in SEPARATORS.split(command):
+        quoted = True
         try:
             words = shlex.split(segment)
         except ValueError:
-            words = segment.split()
+            words, quoted = segment.split(), False
         if len(words) >= 2 and words[0] == "cd":
             here = here / os.path.expanduser(words[1])
             continue
@@ -50,8 +79,76 @@ def commit_dirs(command, cwd):
                 where = where / os.path.expanduser(rest.pop(0))
             elif flag == "-c" and rest:
                 rest.pop(0)
-        if rest and rest[0] == "commit" and not {"-h", "--help"} & set(rest):
-            found.append(where)
+        if rest:
+            args = []
+            for word in rest[1:]:
+                if REDIRECT.match(word):
+                    break
+                args.append(word)
+            yield where, rest[0], args, quoted
+
+
+def commit_dirs(command, cwd):
+    """The directories each `git commit` in a shell command runs in."""
+    found = [
+        where
+        for where, sub, args, _ in git_calls(command, cwd)
+        if sub == "commit" and not {"-h", "--help"} & set(args)
+    ]
+    return list(dict.fromkeys(found))
+
+
+def commit_stages(args, quoted=True):
+    """What a `git commit` stages itself: -a/--all, or paths given on the command line.
+    With rough arguments (quoted False), only options before the first quote count, and
+    no paths: a message's words would read as paths."""
+    if not quoted:
+        options = []
+        for word in args:
+            if word[:1] in "\"'" or not word.startswith("-"):
+                break
+            options.append(word.split('"', 1)[0].split("'", 1)[0])
+        return [s for s in commit_stages(options) if s != "git commit PATHS"]
+    staged, i = [], 0
+    while i < len(args):
+        word = args[i]
+        if word == "--":
+            if args[i + 1 :]:
+                staged.append("git commit PATHS")
+            break
+        if word.startswith("--"):
+            name = word.split("=", 1)[0]
+            if name == "--all":
+                staged.append("git commit -a")
+            elif name == "--pathspec-from-file":
+                staged.append("git commit PATHS")
+            if "=" not in word and name in COMMIT_LONG_VALUE:
+                i += 1
+        elif word.startswith("-") and len(word) > 1:
+            for j, letter in enumerate(word[1:]):
+                if letter == "a":
+                    staged.append("git commit -a")
+                if letter in COMMIT_SHORT_VALUE:
+                    i += j == len(word) - 2  # the value is the next word
+                    break  # or the rest of this one
+        else:
+            staged.append("git commit PATHS")
+        i += 1
+    return staged
+
+
+def staging(command):
+    """Each operation in a shell command that changes what is staged, in order."""
+    found = []
+    for _, sub, args, quoted in git_calls(command, "."):
+        if sub in STAGING:
+            found.append(f"git {sub}")
+        elif sub == "restore" and ({"--staged", "-S"} & set(args)):
+            found.append("git restore --staged")
+        elif sub == "apply" and ({"--cached", "--index"} & set(args)):
+            found.append("git apply --cached")
+        elif sub == "commit":
+            found += commit_stages(args, quoted)
     return list(dict.fromkeys(found))
 
 
@@ -110,9 +207,18 @@ def main(argv=None):
     event = json.load(sys.stdin)
     if event.get("tool_name") != "Bash":
         return 0
-    for repo in commit_dirs(
-        event.get("tool_input", {}).get("command", ""), event.get("cwd") or os.getcwd()
-    ):
+    command = event.get("tool_input", {}).get("command", "")
+    repos = commit_dirs(command, event.get("cwd") or os.getcwd())
+    staged = staging(command) if repos else []
+    for repo in repos:
+        if staged and agent_hook(repo):
+            print(
+                f"Commit blocked: this command also stages ({', '.join(staged)}), but the "
+                "check runs before the command, on what is staged now, so it would not see "
+                "what this commit records. Stage in its own command first, then commit.",
+                file=sys.stderr,
+            )
+            return 2
         passed, message = check(repo)
         if not passed:
             print(message, file=sys.stderr)

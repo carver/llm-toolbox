@@ -10,7 +10,7 @@ Chat replies to me skip /unslop: be extremely concise, and sacrifice grammar for
 
 ## Coding
 
-To write or change code, run `/build`: you implement and refactor, and subagents review. A trivial edit, such as a one-file change with no behaviour worth a test, you make yourself with the `coding` skill (`~/.agents/skills/coding/SKILL.md`).
+To write or change code, run `/build`: you implement and refactor, and subagents review. A trivial edit, such as a one-file change with no behaviour worth a test, you make yourself with the `coding` skill (`~/.agents/skills/coding/SKILL.md`). If you wrote or changed a test, it isn't trivial: run `/build` with its reviews, small follow-ups late in a session included.
 
 ## Research subagents
 
@@ -22,7 +22,7 @@ Before saying a source lacks something ("the paper has no human verbosity figure
 
 ## Shell
 
-Stop processes with `safekill --one` (exactly one must match) or `safekill --all` (every match), and wait for one with `waitone` (llm-toolbox/bin, on PATH; `-h` for options), not `pkill -f`, `pgrep -f | xargs kill` or a `pgrep -f` loop. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it and a `while pgrep -f` loop waits on itself forever. Both tools skip their callers. Better still, keep the PID (`$!`) of what you start and `kill` or `waitone --pid` that.
+Stop processes with `safekill --one -f PATTERN` (exactly one must match) or `safekill --all -f PATTERN` (every match); without `-f` the pattern is the exact process name (`uv`, `python3`), not the command line, and wait for one with `waitone` (llm-toolbox/bin, on PATH; `-h` for options), not `pkill -f`, `pgrep -f | xargs kill` or a `pgrep -f` loop. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it and a `while pgrep -f` loop waits on itself forever. Both tools skip their callers. Better still, keep the PID (`$!`) of what you start and `kill` or `waitone --pid` that.
 
 To see a web page or HTML report you changed, check it for JavaScript errors, or read a page that renders with JavaScript (forms, calendars, endless feeds), use `web-shot` (`-h` for its click, wait, shot, text, links and scroll-all actions), not a one-off Playwright script.
 

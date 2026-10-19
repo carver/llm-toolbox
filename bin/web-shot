@@ -149,7 +149,7 @@ def launch(playwright):
     return playwright.chromium.launch(executable_path=str(fallback))
 
 
-def run(page, actions, out, size, cookies=()):
+def run(page, actions, out, size, cookies):
     from playwright.sync_api import sync_playwright
 
     width, height = size
@@ -158,8 +158,6 @@ def run(page, actions, out, size, cookies=()):
         browser = launch(playwright)
         context = browser.new_context(viewport={"width": width, "height": height})
         url = page_url(page)
-        if cookies and not url.startswith(("http://", "https://")):
-            raise UsageError("--cookie needs an http(s) page, not a file")
         context.add_cookies([{"name": n, "value": v, "url": url} for n, v in cookies])
         tab = context.new_page()
         tab.on("pageerror", lambda error: errors.append(f"page error: {error}"))
@@ -250,6 +248,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         actions = [parse_action(a) for a in args.do]
+        if args.cookie and not page_url(args.page).startswith(("http://", "https://")):
+            raise UsageError("--cookie needs an http(s) page, not a file")
         out = args.out or Path(tempfile.mkdtemp(prefix="web-shot-"))
         out.mkdir(parents=True, exist_ok=True)
         shots, errors = run(args.page, actions, out, args.size, args.cookie)

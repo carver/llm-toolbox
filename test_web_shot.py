@@ -1,8 +1,10 @@
 """bin/web-shot: action parsing, plus a real run when a Chromium is cached."""
 
+import http.server
 import importlib.machinery
 import importlib.util
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -133,8 +135,6 @@ def test_prints_text_and_links_after_loading_an_endless_page(tmp_path):
 
 def test_cookies_are_sent_with_the_page(tmp_path):
     """For apps that keep who you are in a cookie, so web-shot can skip their login page."""
-    import http.server
-    import threading
 
     class EchoCookie(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -186,9 +186,6 @@ def test_rejects_a_cookie_that_isnt_name_equals_value(tmp_path, cookie):
     assert "NAME=VALUE" in run.stderr
 
 
-@pytest.mark.skipif(
-    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
-)
 def test_cookies_need_an_http_page(tmp_path):
     page = tmp_path / "p.html"
     page.write_text("<p>hi</p>")

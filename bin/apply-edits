@@ -18,13 +18,19 @@ takes any number, applied in order, each to the text the ones before it left. Ev
 old text must occur exactly once. If any block misses, nothing is written, and the
 block is named with the closest text in the file shown as a diff.
 
-Exit status: 0 applied, 1 a block didn't apply (nothing written), 2 usage error.
+A line that is exactly one of the markers can't appear inside a block; edit such a
+line another way. Files keep their line endings (\\n or \\r\\n). A symlink is edited
+through to its target.
+
+Exit status: 0 applied, 1 a block didn't apply (nothing written), 2 usage error (bad
+input, a missing or unreadable file).
 """
 
 import difflib
 import os
 import sys
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -51,18 +57,20 @@ class FileEdits:
 
 
 def parse(text: str) -> list[FileEdits]:
-    """The files and their blocks, in order. Raises UsageError."""
-    files: list[FileEdits] = []
+    """The files and their blocks, in order; a path given twice gets one entry with both
+    sections' blocks. Raises UsageError."""
+    files: dict[Path, FileEdits] = {}
+    current: FileEdits | None = None
     lines = iter(enumerate(text.splitlines(), 1))
     for number, line in lines:
         if line.startswith("--- "):
-            files.append(FileEdits(Path(line[4:].strip())))
+            path = Path(line[4:].strip())
+            current = files.setdefault(path.resolve(), FileEdits(path))
         elif line == OPEN:
-            if not files:
+            if current is None:
                 raise UsageError(f"line {number}: a block before any '--- PATH' line")
-            current = files[-1]
-            old = _until(lines, DIVIDER, number)
-            new = _until(lines, CLOSE, number)
+            old = until(lines, DIVIDER, number)
+            new = until(lines, CLOSE, number)
             if not old.strip():
                 raise UsageError(f"line {number}: a block with no old text")
             current.blocks.append(Block(len(current.blocks) + 1, old, new))
@@ -70,12 +78,12 @@ def parse(text: str) -> list[FileEdits]:
             raise UsageError(
                 f"line {number}: expected '--- PATH' or {OPEN}, got {line!r}"
             )
-    if not any(f.blocks for f in files):
+    if not any(f.blocks for f in files.values()):
         raise UsageError("no blocks on stdin")
-    return files
+    return list(files.values())
 
 
-def _until(lines: "iter[tuple[int, str]]", end: str, start: int) -> str:
+def until(lines: Iterator[tuple[int, str]], end: str, start: int) -> str:
     """The lines up to the `end` marker, joined. Raises UsageError if it never comes."""
     taken: list[str] = []
     for _, line in lines:
@@ -87,36 +95,49 @@ def _until(lines: "iter[tuple[int, str]]", end: str, start: int) -> str:
     raise UsageError(f"line {start}: block has no {end} line where expected")
 
 
+def read(path: Path) -> str:
+    """The file's text, line endings as they are. Raises UsageError."""
+    try:
+        with path.open(encoding="utf-8", newline="") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise UsageError(f"can't read {path} as text: {e}") from e
+
+
 def applied(edits: FileEdits, text: str) -> tuple[str, list[str]]:
-    """The file's text with its blocks applied, and what went wrong with any that missed."""
+    """The file's text with its blocks applied, and what went wrong with any that missed.
+    Blocks come with \\n line breaks; a file with \\r\\n ones gets those."""
+    crlf = "\r\n" in text
     problems = []
     for block in edits.blocks:
-        count = text.count(block.old)
-        name = (
-            f"{edits.path} block {block.number} ({block.old.splitlines()[0].strip()!r})"
-        )
+        old, new = (block.old, block.new)
+        if crlf:
+            old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
+        count = text.count(old)
         if count == 1:
-            text = replaced(text, block)
-        elif count == 0:
+            text = replaced(text, old, new)
+            continue
+        first = next(line.strip() for line in block.old.splitlines() if line.strip())
+        name = f"{edits.path} block {block.number} ({first!r})"
+        if count == 0:
             problems.append(f"{name}: old text not found.\n{closest(block.old, text)}")
         else:
-            at = ", ".join(str(n) for n in line_numbers(text, block.old))
+            at = ", ".join(str(n) for n in line_numbers(text, old))
             problems.append(f"{name}: found {count} times, at lines {at}; add context.")
     return text, problems
 
 
-def replaced(text: str, block: Block) -> str:
-    """The text with the block's old text swapped for its new. Deleting whole lines
-    takes the line break after them too."""
-    at = text.index(block.old)
-    end = at + len(block.old)
-    if (
-        not block.new
-        and text[end : end + 1] == "\n"
-        and (at == 0 or text[at - 1] == "\n")
-    ):
-        end += 1
-    return text[:at] + block.new + text[end:]
+def replaced(text: str, old: str, new: str) -> str:
+    """The text with old swapped for new. Deleting whole lines takes the line break
+    after them too."""
+    at = text.index(old)
+    end = at + len(old)
+    if not new and (at == 0 or text[at - 1] == "\n"):
+        for newline in ("\r\n", "\n"):
+            if text.startswith(newline, end):
+                end += len(newline)
+                break
+    return text[:at] + new + text[end:]
 
 
 def line_numbers(text: str, part: str) -> list[int]:
@@ -128,7 +149,8 @@ def line_numbers(text: str, part: str) -> list[int]:
 
 
 def closest(old: str, text: str) -> str:
-    """The run of the file's lines most like `old`, as a diff from it."""
+    """The run of the file's lines most like `old`, as a diff from it: "-" lines are
+    the old text's, "+" lines the file's."""
     wanted = old.splitlines()
     lines = text.splitlines()
     size = min(len(wanted), len(lines))
@@ -141,47 +163,57 @@ def closest(old: str, text: str) -> str:
         if ratio > best:
             best, best_at = ratio, at
     found = lines[best_at : best_at + size]
-    diff = difflib.unified_diff(
-        wanted, found, "old text", "file", lineterm="", n=len(wanted)
+    diff = difflib.unified_diff(wanted, found, lineterm="", n=len(wanted))
+    shown = "\n".join(
+        f"  {line}" for line in diff if not line.startswith(("---", "+++", "@@"))
     )
-    shown = "\n".join(f"  {line}" for line in list(diff)[2:])
     return f"  closest is lines {best_at + 1}-{best_at + size} ({best:.0%} alike):\n{shown}"
 
 
-def write(path: Path, text: str) -> None:
-    """Replace the file's contents in one step, keeping its permissions."""
-    mode = path.stat().st_mode
-    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-    with os.fdopen(fd, "w") as f:
+def staged(path: Path, text: str) -> str:
+    """A temp file beside the file's real target, holding the new text with the file's
+    permissions, ready to rename into place."""
+    target = path.resolve()
+    fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
         f.write(text)
-    os.chmod(temp, mode)
-    os.replace(temp, path)
+    os.chmod(temp, target.stat().st_mode)
+    return temp
 
 
 def main() -> int:
     if len(sys.argv) > 1:
-        print(
-            __doc__, file=sys.stdout if sys.argv[1] in ("-h", "--help") else sys.stderr
-        )
-        return 0 if sys.argv[1] in ("-h", "--help") else USAGE
+        asked = sys.argv[1] in ("-h", "--help")
+        print(__doc__, file=sys.stdout if asked else sys.stderr)
+        return 0 if asked else USAGE
     try:
         files = parse(sys.stdin.read())
         for edits in files:
             if not edits.path.is_file():
                 raise UsageError(f"no such file: {edits.path}")
+        texts = [read(edits.path) for edits in files]
     except UsageError as e:
         print(f"apply-edits: {e}", file=sys.stderr)
         return USAGE
     results, problems = [], []
-    for edits in files:
-        text, missed = applied(edits, edits.path.read_text())
-        results.append((edits, text))
+    for edits, text in zip(files, texts, strict=True):
+        new_text, missed = applied(edits, text)
+        results.append((edits, new_text))
         problems += missed
     if problems:
         print("\n".join(problems) + "\nNothing was written.", file=sys.stderr)
         return MISSED
-    for edits, text in results:
-        write(edits.path, text)
+    temps = []
+    try:
+        for edits, text in results:
+            temps.append((staged(edits.path, text), edits.path.resolve()))
+    except OSError as e:
+        for temp, _ in temps:
+            os.unlink(temp)
+        print(f"apply-edits: {e}\nNothing was written.", file=sys.stderr)
+        return USAGE
+    for (temp, target), (edits, _) in zip(temps, results, strict=True):
+        os.replace(temp, target)
         count = len(edits.blocks)
         print(f"{edits.path}: {count} edit{'' if count == 1 else 's'}")
     return 0

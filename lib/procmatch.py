@@ -72,7 +72,7 @@ def matches(pattern: str, full: bool) -> dict[int, str]:
     }
 
 
-def none_matched(pattern: str, prog: str, full: bool = True) -> int:
+def none_matched(pattern: str, prog: str, full: bool) -> int:
     """Says nothing matched, on stderr, and returns the exit status for it. A name that
     matches nothing but would match command lines with -f gets those listed: a common
     slip is passing a command line without -f."""

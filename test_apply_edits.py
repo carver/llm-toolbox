@@ -127,3 +127,54 @@ def test_malformed_input_is_a_usage_error(repo: Path, edits: str) -> None:
     assert result.returncode == 2
     assert result.stderr
     assert (repo / "notes.md").read_text() == before
+
+
+def test_a_path_given_twice_gets_both_sections(repo: Path) -> None:
+    result = apply(
+        repo,
+        "--- notes.md\n<<<<<<<\n# Notes\n=======\n# Log\n>>>>>>>\n"
+        "--- notes.md\n<<<<<<<\nOld line.\n=======\nNew line.\n>>>>>>>\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (repo / "notes.md").read_text() == "# Log\n\nNew line."
+    assert result.stdout.splitlines() == ["notes.md: 2 edits"]
+
+
+def test_windows_line_endings_are_kept(repo: Path) -> None:
+    (repo / "crlf.txt").write_bytes(b"a\r\nb\r\nc\r\n")
+
+    result = apply(repo, "--- crlf.txt\n<<<<<<<\nb\nc\n=======\nB\nC\n>>>>>>>\n")
+
+    assert result.returncode == 0, result.stderr
+    assert (repo / "crlf.txt").read_bytes() == b"a\r\nB\r\nC\r\n"
+
+
+def test_a_symlink_is_edited_through_to_its_target(repo: Path) -> None:
+    (repo / "link.md").symlink_to(repo / "notes.md")
+
+    result = apply(
+        repo, "--- link.md\n<<<<<<<\nOld line.\n=======\nNew line.\n>>>>>>>\n"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (repo / "link.md").is_symlink()
+    assert (repo / "notes.md").read_text() == "# Notes\n\nNew line."
+
+
+def test_a_binary_file_is_a_usage_error(repo: Path) -> None:
+    (repo / "blob.bin").write_bytes(b"\xff\xfe\x00junk")
+
+    result = apply(repo, "--- blob.bin\n<<<<<<<\njunk\n=======\nx\n>>>>>>>\n")
+
+    assert result.returncode == 2
+    assert "blob.bin" in result.stderr and "Traceback" not in result.stderr
+
+
+def test_the_closest_text_shows_the_files_line_numbers(repo: Path) -> None:
+    result = apply(
+        repo, "--- src/a.py\n<<<<<<<\n\ndef b():\n    return 3\n=======\nx\n>>>>>>>\n"
+    )
+
+    assert "block 1 ('def b():')" in result.stderr
+    assert "@@ -1" not in result.stderr

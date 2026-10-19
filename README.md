@@ -82,6 +82,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   calling shell, whose command line holds the pattern. `safekill --one` acts
   only when exactly one process matches; `safekill --all` signals every match.
   `waitone --pid` also waits for processes that are not the caller's children.
+  Without `-f` the pattern is the exact process name; when that matches nothing
+  but `-f` would, they list what `-f` would match.
 - **gui-shot**: runs a GUI app on a headless display (Xvfb, or weston for
   Wayland), clicks and types into it, and saves screenshots. For checking a
   desktop app's UI from a sandbox with no screen. `gui-shot -h` lists the

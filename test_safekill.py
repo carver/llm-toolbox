@@ -102,6 +102,26 @@ def test_no_match(mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["--one", "--all"])
+def test_a_command_line_pattern_without_f_is_pointed_at_f(
+    sleepers: list[subprocess.Popen[bytes]], mode: str
+) -> None:
+    marker = uuid.uuid4().hex
+    proc = start(sleepers, marker)
+
+    result = safekill(mode, f"{marker[:8]}.*{marker[-4:]}")
+
+    assert result.returncode == 1
+    assert "-f" in result.stderr and f"{proc.pid}" in result.stderr
+    assert proc.poll() is None
+
+
+def test_an_invalid_regex_name_still_says_nothing_matched() -> None:
+    result = safekill("--one", "demo.py serve (")
+    assert result.returncode == 1
+    assert "no process matches" in result.stderr
+
+
+@pytest.mark.parametrize("mode", ["--one", "--all"])
 def test_the_calling_shell_is_never_a_match(
     sleepers: list[subprocess.Popen[bytes]], mode: str
 ) -> None:

@@ -88,6 +88,18 @@ def test_no_match() -> None:
     assert waitone("-f", uuid.uuid4().hex).returncode == 1
 
 
+def test_a_command_line_pattern_without_f_is_pointed_at_f(
+    sleepers: list[subprocess.Popen[bytes]],
+) -> None:
+    marker = uuid.uuid4().hex
+    proc = start(sleepers, marker, 300)
+
+    result = waitone(marker, "--timeout", "1")
+
+    assert result.returncode == 1
+    assert "-f" in result.stderr and f"{proc.pid}" in result.stderr
+
+
 def test_waits_for_a_pid_that_is_not_our_child(
     sleepers: list[subprocess.Popen[bytes]],
 ) -> None:

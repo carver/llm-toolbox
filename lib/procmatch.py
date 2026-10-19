@@ -63,18 +63,33 @@ def processes() -> dict[int, tuple[str, str]]:
 def matches(pattern: str, full: bool) -> dict[int, str]:
     """pid -> command line of every match: exact name, or with `full` a regex
     over the command line. Never the caller or its ancestors."""
-    regex = re.compile(pattern)
+    regex = re.compile(pattern) if full else None
     skip = ancestors(os.getpid())
     return {
         pid: cmdline
         for pid, (name, cmdline) in processes().items()
-        if pid not in skip and (regex.search(cmdline) if full else name == pattern)
+        if pid not in skip and (regex.search(cmdline) if regex else name == pattern)
     }
 
 
-def none_matched(pattern: str, prog: str) -> int:
-    """Says nothing matched, on stderr, and returns the exit status for it."""
+def none_matched(pattern: str, prog: str, full: bool = True) -> int:
+    """Says nothing matched, on stderr, and returns the exit status for it. A name that
+    matches nothing but would match command lines with -f gets those listed: a common
+    slip is passing a command line without -f."""
     print(f"{prog}: no process matches {pattern!r}", file=sys.stderr)
+    if not full:
+        try:
+            would = matches(pattern, full=True)
+        except re.error:
+            would = {}
+        if would:
+            print(
+                f"{prog}: without -f the pattern is an exact process name;"
+                " with -f it would match:",
+                file=sys.stderr,
+            )
+            for pid, cmdline in sorted(would.items()):
+                print(f"  {pid}  {cmdline}", file=sys.stderr)
     return NONE_MATCHED
 
 
@@ -83,7 +98,7 @@ def exactly_one(pattern: str, full: bool, prog: str) -> tuple[int, str] | int:
     stderr, the exit status for none (NONE_MATCHED) or several (SEVERAL_MATCHED)."""
     found = matches(pattern, full)
     if not found:
-        return none_matched(pattern, prog)
+        return none_matched(pattern, prog, full)
     if len(found) > 1:
         print(
             f"{prog}: {len(found)} processes match {pattern!r}; acted on none:",

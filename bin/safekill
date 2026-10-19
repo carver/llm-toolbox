@@ -91,7 +91,9 @@ def targets(args: argparse.Namespace) -> dict[int, str] | int:
             return found
         pid, cmdline = found
         return {pid: cmdline}
-    return matches(args.pattern, args.full) or none_matched(args.pattern, "safekill")
+    return matches(args.pattern, args.full) or none_matched(
+        args.pattern, "safekill", args.full
+    )
 
 
 def signal_and_wait(found: dict[int, str], sig: signal.Signals, wait: float) -> int:

@@ -102,7 +102,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `new-egui-app DIR [--name CRATE] [--title TITLE]`; it runs `git init` but
   leaves the first commit to you.
 
-- **web-shot**: opens a URL or HTML file in headless Chromium, clicks and
+- **web-shot**: opens a URL or HTML file in headless Chromium (with
+  `--cookie NAME=VALUE` for an app that keeps your login in a cookie), clicks and
   runs scripts in it, saves screenshots of the page or of one element, prints
   a page's text or links (for JS-rendered forms and calendars; `scroll-all`
   loads endless feeds first), and reports the page's JavaScript errors

@@ -149,14 +149,19 @@ def launch(playwright):
     return playwright.chromium.launch(executable_path=str(fallback))
 
 
-def run(page, actions, out, size):
+def run(page, actions, out, size, cookies=()):
     from playwright.sync_api import sync_playwright
 
     width, height = size
     errors, shots = [], []
     with sync_playwright() as playwright:
         browser = launch(playwright)
-        tab = browser.new_page(viewport={"width": width, "height": height})
+        context = browser.new_context(viewport={"width": width, "height": height})
+        url = page_url(page)
+        if cookies and not url.startswith(("http://", "https://")):
+            raise UsageError("--cookie needs an http(s) page, not a file")
+        context.add_cookies([{"name": n, "value": v, "url": url} for n, v in cookies])
+        tab = context.new_page()
         tab.on("pageerror", lambda error: errors.append(f"page error: {error}"))
         tab.on(
             "console",
@@ -164,7 +169,7 @@ def run(page, actions, out, size):
                 msg.type == "error" and errors.append(f"console error: {msg.text}")
             ),
         )
-        tab.goto(page_url(page), wait_until="load")
+        tab.goto(url, wait_until="load")
         for action in actions + [Action("shot", ("final",))]:
             if action.verb == "click":
                 tab.click(action.args[0])
@@ -195,6 +200,15 @@ def run(page, actions, out, size):
     return shots, errors
 
 
+def cookie_arg(text):
+    name, sep, value = text.partition("=")
+    if not (sep and name):
+        raise argparse.ArgumentTypeError(
+            f"cookie is NAME=VALUE, e.g. user_id=2: {text!r}"
+        )
+    return name, value
+
+
 def size_arg(text):
     width, _, height = text.partition("x")
     if not (width.isdigit() and height.isdigit()):
@@ -220,6 +234,14 @@ def main(argv=None):
         "--out", type=Path, help="output directory (default: a new temp dir)"
     )
     parser.add_argument(
+        "--cookie",
+        type=cookie_arg,
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="a cookie to send with the page, such as an app's login; repeatable",
+    )
+    parser.add_argument(
         "--size",
         type=size_arg,
         default=(1280, 900),
@@ -230,7 +252,7 @@ def main(argv=None):
         actions = [parse_action(a) for a in args.do]
         out = args.out or Path(tempfile.mkdtemp(prefix="web-shot-"))
         out.mkdir(parents=True, exist_ok=True)
-        shots, errors = run(args.page, actions, out, args.size)
+        shots, errors = run(args.page, actions, out, args.size, args.cookie)
     except UsageError as error:
         print(f"web-shot: {error}", file=sys.stderr)
         return 2

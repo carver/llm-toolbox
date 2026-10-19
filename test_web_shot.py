@@ -129,3 +129,75 @@ def test_prints_text_and_links_after_loading_an_endless_page(tmp_path):
     assert "item 30" in run.stdout
     assert run.stderr.strip().splitlines() == ["console error: same noise (x5)"]
     assert lines[-1].endswith("final.png")
+
+
+def test_cookies_are_sent_with_the_page(tmp_path):
+    """For apps that keep who you are in a cookie, so web-shot can skip their login page."""
+    import http.server
+    import threading
+
+    class EchoCookie(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = f"<p id=c>{self.headers.get('Cookie', 'none')}</p>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), EchoCookie)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        run = subprocess.run(
+            [
+                str(SCRIPT),
+                "--out",
+                str(tmp_path / "out"),
+                "--cookie",
+                "user_id=2",
+                "--cookie",
+                "tz=UTC",
+                "--do",
+                "text #c",
+                f"http://127.0.0.1:{server.server_port}/items/1",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    finally:
+        server.shutdown()
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.splitlines()[0] == "user_id=2; tz=UTC"
+
+
+@pytest.mark.parametrize("cookie", ["user_id", "=2"])
+def test_rejects_a_cookie_that_isnt_name_equals_value(tmp_path, cookie):
+    run = subprocess.run(
+        [str(SCRIPT), "--cookie", cookie, "http://127.0.0.1:9/"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 2
+    assert "NAME=VALUE" in run.stderr
+
+
+@pytest.mark.skipif(
+    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
+)
+def test_cookies_need_an_http_page(tmp_path):
+    page = tmp_path / "p.html"
+    page.write_text("<p>hi</p>")
+    run = subprocess.run(
+        [str(SCRIPT), "--out", str(tmp_path / "out"), "--cookie", "a=1", str(page)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert run.returncode == 2
+    assert "http(s)" in run.stderr

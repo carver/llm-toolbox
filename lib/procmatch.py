@@ -14,6 +14,9 @@ from pathlib import Path
 PROC = Path("/proc")
 NONE_MATCHED = 1
 SEVERAL_MATCHED = 2
+LISTED_CHARS = 200
+LISTED_HEAD = 80  # of those, the command line's start
+LISTED_CONTEXT = 40  # on each side of the match
 
 
 def _read(path: Path) -> bytes | None:
@@ -72,6 +75,23 @@ def matches(pattern: str, full: bool) -> dict[int, str]:
     }
 
 
+def shortened(cmdline: str, pattern: str, full: bool) -> str:
+    """`cmdline` short enough to list: whole if it fits, else its start and,
+    with `full`, the text around the match, so each line shows why it matched."""
+    if len(cmdline) <= LISTED_CHARS:
+        return cmdline
+    note = f"…[{len(cmdline)} chars]"
+    found = re.search(pattern, cmdline) if full else None
+    if found is None or found.end() <= LISTED_HEAD:
+        return cmdline[:LISTED_CHARS] + note
+    start = max(found.start() - LISTED_CONTEXT, LISTED_HEAD)
+    end = min(
+        found.end() + LISTED_CONTEXT, len(cmdline), start + LISTED_CHARS - LISTED_HEAD
+    )
+    gap = "…" if start > LISTED_HEAD else ""
+    return cmdline[:LISTED_HEAD] + gap + cmdline[start:end] + note
+
+
 def none_matched(pattern: str, prog: str, full: bool) -> int:
     """Says nothing matched, on stderr, and returns the exit status for it. A name that
     matches nothing but would match command lines with -f gets those listed: a common
@@ -89,7 +109,7 @@ def none_matched(pattern: str, prog: str, full: bool) -> int:
                 file=sys.stderr,
             )
             for pid, cmdline in sorted(would.items()):
-                print(f"  {pid}  {cmdline}", file=sys.stderr)
+                print(f"  {pid}  {shortened(cmdline, pattern, True)}", file=sys.stderr)
     return NONE_MATCHED
 
 
@@ -105,7 +125,7 @@ def exactly_one(pattern: str, full: bool, prog: str) -> tuple[int, str] | int:
             file=sys.stderr,
         )
         for pid, cmdline in sorted(found.items()):
-            print(f"  {pid}  {cmdline}", file=sys.stderr)
+            print(f"  {pid}  {shortened(cmdline, pattern, full)}", file=sys.stderr)
         return SEVERAL_MATCHED
     ((pid, cmdline),) = found.items()
     return pid, cmdline

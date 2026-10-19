@@ -84,6 +84,23 @@ def test_several_matches_wait_for_none(sleepers: list[subprocess.Popen[bytes]]) 
     assert str(first.pid) in result.stderr and str(second.pid) in result.stderr
 
 
+def test_a_long_command_line_is_listed_short_with_the_match_in_view(
+    sleepers: list[subprocess.Popen[bytes]],
+) -> None:
+    # A shell running a whole sourced env file matched once and listed 7k characters.
+    marker = uuid.uuid4().hex
+    padding = "x" * 5000
+    first, second = start(sleepers, padding + marker, 300), start(sleepers, marker, 300)
+
+    result = waitone("-f", marker, "--timeout", "5")
+
+    assert result.returncode == 2
+    listed = [line for line in result.stderr.splitlines() if str(first.pid) in line]
+    assert len(listed) == 1 and len(listed[0]) < 300
+    assert marker in listed[0] and "chars" in listed[0]
+    assert str(second.pid) in result.stderr
+
+
 def test_no_match() -> None:
     assert waitone("-f", uuid.uuid4().hex).returncode == 1
 

@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from procmatch import command_line, exactly_one, wait_gone
+from procmatch import command_line, exactly_one, shortened, wait_gone
 
 TIMED_OUT = 4
 
@@ -71,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(found, int):
             return found
         pid, cmdline = found
+    cmdline = shortened(cmdline, args.pattern or "", args.full)
 
     start = time.monotonic()
     if not wait_gone(pid, args.timeout, args.interval):

@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from procmatch import exactly_one, matches, none_matched, wait_gone
+from procmatch import exactly_one, matches, none_matched, shortened, wait_gone
 
 FAILED = 3
 
@@ -84,16 +84,22 @@ def parse_signal(text: str) -> signal.Signals | None:
 
 
 def targets(args: argparse.Namespace) -> dict[int, str] | int:
-    """pid -> command line of the processes to signal, or an exit status."""
+    """pid -> command line, shortened for printing, of the processes to signal,
+    or an exit status."""
     if args.one:
         found = exactly_one(args.pattern, args.full, "safekill")
         if isinstance(found, int):
             return found
         pid, cmdline = found
-        return {pid: cmdline}
-    return matches(args.pattern, args.full) or none_matched(
-        args.pattern, "safekill", args.full
-    )
+        pids = {pid: cmdline}
+    else:
+        pids = matches(args.pattern, args.full)
+        if not pids:
+            return none_matched(args.pattern, "safekill", args.full)
+    return {
+        pid: shortened(cmdline, args.pattern, args.full)
+        for pid, cmdline in pids.items()
+    }
 
 
 def signal_and_wait(found: dict[int, str], sig: signal.Signals, wait: float) -> int:

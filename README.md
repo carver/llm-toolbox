@@ -84,6 +84,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `waitone --pid` also waits for processes that are not the caller's children.
   Without `-f` the pattern is the exact process name; when that matches nothing
   but `-f` would, they list what `-f` would match.
+- **apply-edits**: replaces old text with new across files, all or nothing,
+  from `<<<<<<<` / `=======` / `>>>>>>>` blocks under `--- PATH` lines on
+  stdin. Each old text must occur exactly once; on a miss nothing is written
+  and the closest text in the file is shown as a diff. For edits that would
+  otherwise be a heredoc Python script. `apply-edits -h` shows the format.
 - **gui-shot**: runs a GUI app on a headless display (Xvfb, or weston for
   Wayland), clicks and types into it, and saves screenshots. For checking a
   desktop app's UI from a sandbox with no screen. `gui-shot -h` lists the

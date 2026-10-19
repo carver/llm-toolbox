@@ -24,6 +24,8 @@ Before saying a source lacks something ("the paper has no human verbosity figure
 
 Stop processes with `safekill --one -f PATTERN` (exactly one must match) or `safekill --all -f PATTERN` (every match); without `-f` the pattern is the exact process name (`uv`, `python3`), not the command line, and wait for one with `waitone` (llm-toolbox/bin, on PATH; `-h` for options), not `pkill -f`, `pgrep -f | xargs kill` or a `pgrep -f` loop. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it and a `while pgrep -f` loop waits on itself forever. Both tools skip their callers. Better still, keep the PID (`$!`) of what you start and `kill` or `waitone --pid` that.
 
+To make several text replacements in one or more files, pipe blocks to `apply-edits` (`-h` for the format; all or nothing, and a miss shows the closest text) rather than writing a Python heredoc script.
+
 To see a web page or HTML report you changed, check it for JavaScript errors, or read a page that renders with JavaScript (forms, calendars, endless feeds), use `web-shot` (`-h` for its click, wait, shot, text, links and scroll-all actions), not a one-off Playwright script.
 
 To start a new Rust desktop app, run `new-egui-app DIR` (`-h` for options) rather than copying an earlier app's setup.

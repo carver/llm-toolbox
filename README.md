@@ -29,6 +29,12 @@ and `~/.agents/AGENTS.md`, so one file serves whichever convention a tool reads.
 Links, not copies, so an edit here is live straight away and `git pull` is the
 whole update story.
 
+It also sets the user-scope Claude Code settings in `install.py`'s
+`SETTINGS_VALUES`, such as loading a repo's `AGENTS.md` alongside the
+workspace `CLAUDE.md` (by default Claude Code skips `AGENTS.md` when any
+`CLAUDE.md` is found). A value already set to something else is reported and
+left alone.
+
 Re-run it after adding or renaming a skill. It is idempotent and only touches
 links that point into this repo. If a name already belongs to some other
 skill, it reports the conflict and leaves it alone.

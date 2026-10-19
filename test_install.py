@@ -220,6 +220,68 @@ def test_hooks_leave_a_broken_settings_file_alone(settings, capsys):
     assert settings.read_text() == "{not json" and "CONFLICT" in capsys.readouterr().out
 
 
+AGENTS_MD_OPTION = [
+    "pluginConfigs",
+    "cc-plugin-agents-md@builtin",
+    "options",
+    "instructionFiles",
+]
+
+
+def at(data, keys):
+    for key in keys:
+        data = data[key]
+    return data
+
+
+def test_settings_turn_on_agents_md_beside_existing_settings(settings):
+    settings.parent.mkdir(parents=True)
+    other_plugin = {"options": {"x": 1}}
+    settings.write_text(
+        json.dumps({"model": "opus", "pluginConfigs": {"other@builtin": other_plugin}})
+    )
+    assert install.set_settings() == 0
+    assert install.set_settings() == 0
+    data = json.loads(settings.read_text())
+    assert (
+        data["model"] == "opus"
+        and data["pluginConfigs"]["other@builtin"] == other_plugin
+    )
+    assert at(data, AGENTS_MD_OPTION) == "claude-md-and-agents-md"
+
+
+def test_settings_create_a_missing_settings_file(settings):
+    assert install.set_settings() == 0
+    assert (
+        at(json.loads(settings.read_text()), AGENTS_MD_OPTION)
+        == "claude-md-and-agents-md"
+    )
+
+
+def test_settings_leave_a_value_set_by_hand_alone(settings, capsys):
+    settings.parent.mkdir(parents=True)
+    by_hand = {
+        "pluginConfigs": {
+            "cc-plugin-agents-md@builtin": {
+                "options": {"instructionFiles": "agents-md"}
+            }
+        }
+    }
+    settings.write_text(json.dumps(by_hand))
+    assert install.set_settings() == 1
+    assert (
+        json.loads(settings.read_text()) == by_hand
+        and "CONFLICT" in capsys.readouterr().out
+    )
+
+
+def test_settings_leave_a_broken_settings_file_alone(settings, capsys):
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{not json")
+    assert install.set_settings() == 1
+    assert settings.read_text() == "{not json" and "CONFLICT" in capsys.readouterr().out
+
+
 @pytest.fixture
 def third_party(tmp_path, monkeypatch):
     """A temp ~/.agents/skills, and a record of the installer commands run.

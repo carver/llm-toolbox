@@ -3,7 +3,7 @@
 ~/.agents/skills as a global skill, every tool in bin/ into ~/.local/bin, and
 GLOBAL_CLAUDE.md to ~/.claude/CLAUDE.md and ~/.agents/AGENTS.md, one set of
 guidelines whichever convention a tool reads. Registers the Claude Code hooks in
-HOOKS in ~/.claude/settings.json. Installs the other authors' skills in
+HOOKS and the values in SETTINGS_VALUES in ~/.claude/settings.json. Installs the other authors' skills in
 THIRD_PARTY_SKILLS with the `skills` CLI (npx), so a recreated sandbox gets them back.
 Points this repo's git at the hooks in .githooks.
 
@@ -17,6 +17,8 @@ source is no longer a skill (renamed, deleted, or missing its SKILL.md).
 Guidelines: a real file moves aside to .bak, a link is replaced wherever it
 points, since a link is cheap to put back. Hooks: added once, beside whatever
 else the settings hold; a settings file that is not valid JSON is left alone.
+Settings values: set when missing; one already set to something else is
+reported and left alone.
 Third-party skills: only missing ones are installed; it never removes one,
 and updates them only with --update. Installs a weekly cron job that runs
 bin/skills-news, which emails what changed upstream, so you know when an
@@ -55,6 +57,14 @@ HOOKS = [
         "Bash",
         "agent-commit-gate",
         {"timeout": 10},
+    ),
+]
+# (key path, value, why). Claude Code reads these only at user scope.
+SETTINGS_VALUES = [
+    (
+        ["pluginConfigs", "cc-plugin-agents-md@builtin", "options", "instructionFiles"],
+        "claude-md-and-agents-md",
+        "read a repo's AGENTS.md even though the workspace has a CLAUDE.md",
     ),
 ]
 # Other authors' skills, by GitHub source. Installed into ~/.agents/skills with a
@@ -186,12 +196,24 @@ def link_guidelines() -> int:
     return conflicts
 
 
+def load_settings(what: str) -> dict | None:
+    """None, after reporting it, when the settings file is not valid JSON."""
+    try:
+        return json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+    except json.JSONDecodeError:
+        say(f"CONFLICT {SETTINGS} is not valid JSON -- {what}")
+        return None
+
+
+def save_settings(settings: dict):
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+
+
 def register_hooks() -> int:
     """Returns 1 when the settings file cannot be read as JSON."""
-    try:
-        settings = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
-    except json.JSONDecodeError:
-        say(f"CONFLICT {SETTINGS} is not valid JSON -- hooks not registered")
+    settings = load_settings("hooks not registered")
+    if settings is None:
         return 1
     changed = False
     for event, matcher, tool, fields in HOOKS:
@@ -213,9 +235,32 @@ def register_hooks() -> int:
         say(f"registered {tool} as a {event} hook on {matcher}")
         changed = True
     if changed:
-        SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+        save_settings(settings)
     return 0
+
+
+def set_settings() -> int:
+    """Returns the number of values not set: a broken settings file, or a value set by hand."""
+    settings = load_settings("settings values not set")
+    if settings is None:
+        return 1
+    conflicts = 0
+    changed = False
+    for keys, value, why in SETTINGS_VALUES:
+        parent = settings
+        for key in keys[:-1]:
+            parent = parent.setdefault(key, {})
+        name = ".".join(keys)
+        if keys[-1] not in parent:
+            parent[keys[-1]] = value
+            say(f"set {name} = {value!r}, to {why}")
+            changed = True
+        elif parent[keys[-1]] != value:
+            say(f"CONFLICT {name} is {parent[keys[-1]]!r}, not {value!r} -- left alone")
+            conflicts += 1
+    if changed:
+        save_settings(settings)
+    return conflicts
 
 
 def install_third_party_skills() -> int:
@@ -365,7 +410,13 @@ def main():
     args = parser.parse_args()
     print("[llm-toolbox]")
     prune_stale_links()
-    conflicts = link_skills() + link_tools() + link_guidelines() + register_hooks()
+    conflicts = (
+        link_skills()
+        + link_tools()
+        + link_guidelines()
+        + register_hooks()
+        + set_settings()
+    )
     failures = install_third_party_skills() + enable_git_hooks() + install_cron()
     if args.update:
         failures += update_third_party_skills()

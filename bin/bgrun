@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Start a command in the background, detached, and print its own PID.
+
+`cd DIR && nohup CMD > LOG &` backgrounds a subshell, so `$!` is that shell's
+PID, not CMD's, and killing it leaves CMD running. bgrun starts CMD itself,
+with no shell in between, in a new session, with stdin from /dev/null and
+stdout and stderr in LOG, so it outlives the calling shell and the PID it
+prints is CMD's. Pair it with `waitone --pid PID` and `kill PID`.
+
+  pid=$(bgrun -o run.log -C ~/project -- python3 sweep.py --workers 8)
+
+For a pipeline or a redirection, start a shell: bgrun -o LOG -- sh -c '...'.
+The PID is then that shell's. LOG is relative to the caller's directory, not
+to -C.
+
+Exit status: 0 started, 1 CMD could not start (not found, not executable,
+-C is not a directory, or LOG can't be opened), 2 usage error. A failed
+start leaves LOG as it was.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CANT_START = 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="bgrun",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        metavar="LOG",
+        help="file for CMD's stdout and stderr",
+    )
+    parser.add_argument(
+        "--append", action="store_true", help="append to LOG instead of replacing it"
+    )
+    parser.add_argument("-C", "--cwd", metavar="DIR", help="run CMD in DIR")
+    parser.add_argument("command", nargs=argparse.REMAINDER, help="-- CMD [ARGS...]")
+    args = parser.parse_args(argv)
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        parser.error("no command given")
+    problem = start_problem(command[0], args.cwd)
+    if problem:
+        print(f"bgrun: {problem}", file=sys.stderr)
+        return CANT_START
+    try:
+        log = open(args.output, "ab" if args.append else "wb")  # noqa: SIM115 - handed to the child
+    except OSError as e:
+        print(f"bgrun: can't open {args.output!r}: {e.strerror}", file=sys.stderr)
+        return CANT_START
+    with log:
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                cwd=args.cwd,
+                start_new_session=True,
+            )
+        except OSError as e:
+            print(f"bgrun: can't start {command[0]!r}: {e.strerror}", file=sys.stderr)
+            return CANT_START
+    print(proc.pid)
+    return 0
+
+
+def start_problem(program: str, cwd: str | None) -> str | None:
+    """Why CMD can't start, checked before LOG is opened so a failed start leaves LOG alone."""
+    if cwd is not None and not Path(cwd).is_dir():
+        return f"-C {cwd!r} is not a directory"
+    if "/" in program:
+        path = Path(cwd or ".") / program  # Popen resolves a relative path against cwd
+        if not (path.is_file() and os.access(path, os.X_OK)):
+            return f"can't start {program!r}: not an executable file"
+    elif shutil.which(program) is None:
+        return f"can't start {program!r}: not found on PATH"
+    return None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

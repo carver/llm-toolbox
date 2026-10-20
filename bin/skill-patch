@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Keep hand edits to other authors' skills as patches that survive updates.
 
-    skill-patch save NAME [--why TEXT]
+    skill-patch save NAME [--why TEXT [--replace-why]]
     skill-patch apply [NAME ...]
 
 save writes skill-patches/NAME.patch in llm-toolbox: the diff from the
 upstream version the skill was installed from to the installed copy in
-~/.agents/skills/NAME, headed by a `# Why:` line. Edit the installed copy
-first, then save. --why is required for a new patch and replaces the old one
-when given. A skill back to its upstream state loses its patch.
+~/.agents/skills/NAME, headed by one `# Why:` line per layer of edits. Edit
+the installed copy first, then save. A new patch needs --why. On a skill that
+already has a patch, --why adds a layer: the diff takes in the new edit, and
+its reason joins the earlier ones, which save prints. --replace-why drops the
+earlier reasons instead, for an edit that supersedes them. Saving without
+--why keeps every reason. A skill back to its upstream state loses its patch.
 
 apply puts each patch (or the named ones) on its installed skill, skipping
 those already on. install.py runs it after installing or updating. A patch
@@ -59,7 +62,7 @@ def installed_from(name: str) -> Path:
     return folder
 
 
-def save(name: str, why_text: str | None) -> str:
+def save(name: str, why_text: str | None, replace_why: bool = False) -> str:
     installed = tp.INSTALLED / name
     if not installed.is_dir():
         raise PatchError(f"{name} isn't installed in {tp.INSTALLED}")
@@ -70,10 +73,19 @@ def save(name: str, why_text: str | None) -> str:
             existing.unlink()
             return f"{name} matches upstream; removed {existing.name}"
         return f"{name} matches upstream; no patch"
-    why_text = why_text or (tp.why(existing) if existing else "")
-    if not why_text:
+    why_text = " ".join((why_text or "").split())  # one line, so it stays a # Why: line
+    earlier = tp.whys(existing) if existing else []
+    reasons = [] if replace_why else list(earlier)
+    if why_text and why_text not in reasons:
+        reasons.append(why_text)
+    if not reasons:
         raise PatchError("a new patch needs --why")
-    return f"saved {tp.write_patch(name, why_text, patch)}"
+    path = tp.write_patch(name, reasons, patch)
+    report = [f"saved {path}; its reasons, one per layer of edits:"]
+    report += [f"  {i}. {reason}" for i, reason in enumerate(reasons, 1)]
+    if dropped := [reason for reason in earlier if reason not in reasons]:
+        report += ["dropped:", *(f"  - {reason}" for reason in dropped)]
+    return "\n".join(report)
 
 
 def apply(names: list[str]) -> int:
@@ -110,16 +122,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     save_cmd.add_argument("name")
     save_cmd.add_argument(
-        "--why", help="the reason for the edit; required for a new patch"
+        "--why",
+        help="the reason for the edit; required for a new patch, and added as a "
+        "new layer to an existing one",
+    )
+    save_cmd.add_argument(
+        "--replace-why",
+        action="store_true",
+        help="with --why: drop the earlier reasons, for an edit that supersedes them",
     )
     apply_cmd = commands.add_parser(
         "apply", help="put patches on their installed skills"
     )
     apply_cmd.add_argument("names", nargs="*", metavar="NAME")
     args = parser.parse_args(argv)
+    if args.command == "save" and args.replace_why and not args.why:
+        save_cmd.error("--replace-why needs --why")
     try:
         if args.command == "save":
-            print(save(args.name, args.why))
+            print(save(args.name, args.why, args.replace_why))
             return 0
         return apply(args.names)
     except PatchError as e:

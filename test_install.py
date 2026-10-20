@@ -435,8 +435,8 @@ def test_skill_patches_go_back_on_and_conflicts_count(tmp_path, monkeypatch, cap
     upstream = make_skill(tmp_path, "upstream/pr")
     edited = make_skill(tmp_path, "edited/pr", body="do the thing\nmine\n")
     make_skill(tmp_path, "installed/pr")
-    tp.write_patch("pr", "w", tp.diff(upstream, edited)[1])
-    tp.write_patch("absent", "w", "")
+    tp.write_patch("pr", ["w"], tp.diff(upstream, edited)[1])
+    tp.write_patch("absent", ["w"], "")
     assert install.apply_skill_patches() == 0
     assert "mine" in (tmp_path / "installed/pr/SKILL.md").read_text()
     (tmp_path / "installed/pr/SKILL.md").write_text("rewritten\n")

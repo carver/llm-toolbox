@@ -210,7 +210,7 @@ def test_email_sends_upstream_change(run_main):
 
 
 def save_patch(name: str, upstream: Path, installed: Path, why: str = "mine") -> None:
-    tp.write_patch(name, why, tp.diff(upstream, installed)[1])
+    tp.write_patch(name, [why], tp.diff(upstream, installed)[1])
 
 
 def test_patched_skill_in_sync_is_no_news(world):

@@ -43,8 +43,8 @@ def test_diff_has_short_paths_and_stats(pair):
 
 def test_patch_round_trip_edits_adds_and_deletes_files(pair, tmp_path):
     old, new = pair
-    patch = tp.write_patch("pr", "because", tp.diff(old, new)[1])
-    assert tp.why(patch) == "because"
+    patch = tp.write_patch("pr", ["because"], tp.diff(old, new)[1])
+    assert tp.whys(patch) == ["because"]
     assert tp.apply(old, patch) == "applied"
     assert tp.diff(old, new)[1] == ""
     assert tp.apply(old, patch) == "already"
@@ -53,7 +53,7 @@ def test_patch_round_trip_edits_adds_and_deletes_files(pair, tmp_path):
 def test_reverse_copy_recovers_the_original(pair):
     old, new = pair
     original = tp.diff(old, old)  # empty, for comparison
-    patch = tp.write_patch("pr", "w", tp.diff(old, new)[1])
+    patch = tp.write_patch("pr", ["w"], tp.diff(old, new)[1])
     with tp.copy_with(new, patch, reverse=True) as unpatched:
         assert unpatched is not None
         assert tp.diff(old, unpatched) == original
@@ -61,7 +61,7 @@ def test_reverse_copy_recovers_the_original(pair):
 
 def test_conflict_leaves_the_skill_untouched(pair):
     old, new = pair
-    patch = tp.write_patch("pr", "w", tp.diff(old, new)[1])
+    patch = tp.write_patch("pr", ["w"], tp.diff(old, new)[1])
     (old / "SKILL.md").write_text("rewritten upstream\n")
     before = (old / "SKILL.md").read_text()
     assert tp.apply(old, patch) == "conflict"
@@ -74,3 +74,17 @@ def test_conflict_leaves_the_skill_untouched(pair):
 @pytest.fixture(autouse=True)
 def _patches_in_tmp(tmp_path, monkeypatch):
     monkeypatch.setattr(tp, "PATCHES", tmp_path / "skill-patches")
+
+
+def test_write_patch_wants_a_list_of_reasons(pair):
+    old, new = pair
+    with pytest.raises(TypeError):
+        tp.write_patch("pr", "because", tp.diff(old, new)[1])
+
+
+def test_a_patch_with_several_reasons_round_trips_and_applies(pair):
+    old, new = pair
+    patch = tp.write_patch("pr", ["first", "second"], tp.diff(old, new)[1])
+    assert tp.whys(patch) == ["first", "second"]
+    assert tp.apply(old, patch) == "applied"
+    assert tp.diff(old, new)[1] == ""

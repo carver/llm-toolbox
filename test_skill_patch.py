@@ -35,7 +35,7 @@ def test_save_needs_a_why_for_a_new_patch(world, capsys):
     assert "--why" in capsys.readouterr().err
     assert sp.main(["save", "pr", "--why", "because"]) == 0
     patch = tp.PATCHES / "pr.patch"
-    assert tp.why(patch) == "because" and "+mine" in patch.read_text()
+    assert tp.whys(patch) == ["because"] and "+mine" in patch.read_text()
 
 
 def test_save_again_keeps_the_why_and_takes_the_new_edit(world):
@@ -84,3 +84,69 @@ def test_apply_restores_a_patch_after_an_update_and_reports_conflicts(world, cap
     (skill / "SKILL.md").write_text("rewritten upstream\n")
     assert sp.main(["apply", "pr"]) == 1
     assert "CONFLICT pr" in capsys.readouterr().out
+
+
+def test_a_new_why_on_a_patched_skill_layers_on_the_earlier_reasons(world, capsys):
+    skill, _ = world
+    (skill / "SKILL.md").write_text("mine\n")
+    sp.main(["save", "pr", "--why", "first"])
+    (skill / "SKILL.md").write_text("mine\nand more\n")
+    capsys.readouterr()
+    assert sp.main(["save", "pr", "--why", "second"]) == 0
+    patch = tp.PATCHES / "pr.patch"
+    assert tp.whys(patch) == ["first", "second"] and "+and more" in patch.read_text()
+    out = capsys.readouterr().out
+    assert "first" in out and "second" in out
+
+
+def test_saving_without_a_why_keeps_every_reason(world):
+    skill, _ = world
+    (skill / "SKILL.md").write_text("mine\n")
+    sp.main(["save", "pr", "--why", "first"])
+    sp.main(["save", "pr", "--why", "second"])
+    (skill / "SKILL.md").write_text("mine, revised\n")
+    assert sp.main(["save", "pr"]) == 0
+    assert tp.whys(tp.PATCHES / "pr.patch") == ["first", "second"]
+
+
+def test_the_same_reason_again_isnt_repeated(world):
+    skill, _ = world
+    (skill / "SKILL.md").write_text("mine\n")
+    sp.main(["save", "pr", "--why", "first"])
+    sp.main(["save", "pr", "--why", "first"])
+    assert tp.whys(tp.PATCHES / "pr.patch") == ["first"]
+
+
+def test_replace_why_drops_the_earlier_reasons(world):
+    skill, _ = world
+    (skill / "SKILL.md").write_text("mine\n")
+    sp.main(["save", "pr", "--why", "first"])
+    sp.main(["save", "pr", "--why", "second"])
+    assert sp.main(["save", "pr", "--why", "only this", "--replace-why"]) == 0
+    assert tp.whys(tp.PATCHES / "pr.patch") == ["only this"]
+
+
+def test_replace_why_needs_a_why(world, capsys):
+    with pytest.raises(SystemExit) as exit_:
+        sp.main(["save", "pr", "--replace-why"])
+    assert exit_.value.code == 2
+    assert "--replace-why needs --why" in capsys.readouterr().err
+
+
+def test_save_prints_the_reasons_it_keeps_and_drops(world, capsys):
+    skill, _ = world
+    (skill / "SKILL.md").write_text("mine\n")
+    sp.main(["save", "pr", "--why", "first"])
+    assert "first" in capsys.readouterr().out
+    sp.main(["save", "pr", "--why", "second", "--replace-why"])
+    out = capsys.readouterr().out
+    assert "second" in out and "dropped" in out and "first" in out
+
+
+def test_a_reason_is_one_line_however_it_is_typed(world):
+    skill, _ = world
+    (skill / "SKILL.md").write_text("mine\n")
+    sp.main(["save", "pr", "--why", "first"])
+    sp.main(["save", "pr", "--why", "  first "])
+    sp.main(["save", "pr", "--why", "two\nlines"])
+    assert tp.whys(tp.PATCHES / "pr.patch") == ["first", "two lines"]

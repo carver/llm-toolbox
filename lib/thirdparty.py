@@ -2,8 +2,9 @@
 the patches in skill-patches/ that this repo keeps on top of them.
 
 A patch is a unified diff from a skill's upstream folder to the installed copy,
-with paths relative to the skill folder (a/SKILL.md, b/SKILL.md). Its first
-line is `# Why: ...`, which `patch` skips as leading garbage.
+with paths relative to the skill folder (a/SKILL.md, b/SKILL.md). It starts
+with one `# Why: ...` line per layer of edits, oldest first, which `patch`
+skips as leading garbage.
 """
 
 import difflib
@@ -120,15 +121,22 @@ def patch_file(name: str) -> Path | None:
     return path if path.is_file() else None
 
 
-def why(patch: Path) -> str:
-    first = patch.read_text().partition("\n")[0]
-    return first.removeprefix("# Why:").strip() if first.startswith("# Why:") else ""
+def whys(patch: Path) -> list[str]:
+    """The reasons heading a patch, one per layer of edits, oldest first."""
+    reasons = []
+    for line in patch.read_text().splitlines():
+        if not line.startswith("# Why:"):
+            break
+        reasons.append(line.removeprefix("# Why:").strip())
+    return reasons
 
 
-def write_patch(name: str, why_text: str, patch: str) -> Path:
+def write_patch(name: str, reasons: list[str], patch: str) -> Path:
+    if isinstance(reasons, str):
+        raise TypeError("write_patch takes a list of reasons, not one string")
     PATCHES.mkdir(exist_ok=True)
     path = PATCHES / f"{name}.patch"
-    path.write_text(f"# Why: {why_text}\n{patch}")
+    path.write_text("".join(f"# Why: {reason}\n" for reason in reasons) + patch)
     return path
 
 

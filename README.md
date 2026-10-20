@@ -148,7 +148,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 
 - **skill-patch**: keeps hand edits to other authors' skills. Edit the
   installed copy in `~/.agents/skills/NAME`, then `skill-patch save NAME
-  --why "..."` writes `skill-patches/NAME.patch`, headed by its Why.
+  --why "..."` writes `skill-patches/NAME.patch`, headed by its Why. A later
+  edit saved with its own `--why` adds a layer: the patch keeps every reason,
+  one `# Why:` line each, and `--replace-why` drops the earlier ones.
   `skill-patch apply` puts the patches back on; `install.py` runs it. When an
   upstream change makes a patch no longer fit, redo the edit on the new
   version and save again.

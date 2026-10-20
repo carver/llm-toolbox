@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""List processes found by name or command line, and never the caller.
+
+`ps aux | grep PATTERN` and `pgrep -af PATTERN` also list the shell running
+them, because the pattern is in that shell's own command line, and an agent's
+shell can carry a command line thousands of characters long. safeps skips
+itself and every ancestor, and shortens long command lines around the match.
+
+Each line: PID, time since it started ([[DD-]HH:]MM:SS), command line.
+
+Exit status: 0 something matched, 1 nothing matched, 2 usage error (bad
+pattern). See also safekill and waitone.
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from procmatch import elapsed, matches, none_matched, shortened
+
+
+def clock(seconds: float) -> str:
+    """Like ps's etime: MM:SS, H:MM:SS, or D-HH:MM:SS."""
+    rest = int(seconds)
+    days, rest = divmod(rest, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days}-{hours:02}:{minutes:02}:{secs:02}"
+    if hours:
+        return f"{hours}:{minutes:02}:{secs:02}"
+    return f"{minutes:02}:{secs:02}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="safeps",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "pattern",
+        help="exact process name, or with -f a regex over the full command line",
+    )
+    parser.add_argument(
+        "-f",
+        "--full",
+        action="store_true",
+        help="match the full command line, like pgrep -f",
+    )
+    args = parser.parse_args(argv)
+    try:
+        found = matches(args.pattern, args.full)
+    except re.error as e:
+        parser.error(f"bad pattern {args.pattern!r}: {e}")
+    if not found:
+        return none_matched(args.pattern, "safeps", args.full)
+    for pid, cmdline in sorted(found.items()):
+        age = elapsed(pid)
+        since = "?" if age is None else clock(age)
+        print(f"{pid:>7}  {since:>10}  {shortened(cmdline, args.pattern, args.full)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

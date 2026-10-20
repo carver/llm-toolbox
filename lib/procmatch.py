@@ -32,6 +32,16 @@ def _stat_fields(pid: int) -> list[bytes] | None:
     return None if stat is None else stat[stat.rindex(b")") + 2 :].split()
 
 
+def elapsed(pid: int) -> float | None:
+    """Seconds since `pid` started, or None if it is gone."""
+    fields = _stat_fields(pid)
+    uptime = _read(PROC / "uptime")
+    if fields is None or uptime is None:
+        return None
+    started = int(fields[19]) / os.sysconf("SC_CLK_TCK")  # stat field 22, starttime
+    return max(0.0, float(uptime.split()[0]) - started)
+
+
 def parent_of(pid: int) -> int | None:
     fields = _stat_fields(pid)
     return None if fields is None else int(fields[1])
@@ -77,7 +87,9 @@ def matches(pattern: str, full: bool) -> dict[int, str]:
 
 def shortened(cmdline: str, pattern: str, full: bool) -> str:
     """`cmdline` short enough to list: whole if it fits, else its start and,
-    with `full`, the text around the match, so each line shows why it matched."""
+    with `full`, the text around the match, so each line shows why it matched.
+    Newlines and tabs become spaces, so each process stays on one line."""
+    cmdline = re.sub(r"[\r\n\t]+", " ", cmdline)
     if len(cmdline) <= LISTED_CHARS:
         return cmdline
     note = f"…[{len(cmdline)} chars]"

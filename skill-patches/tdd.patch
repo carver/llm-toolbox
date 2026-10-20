@@ -1,4 +1,5 @@
-# Why: Jason is fine with writing a few tests at once, as long as every one runs red before the code that passes them. Stub new names before writing tests, so red means a failing assertion; tests requested for existing code go red by breaking the code briefly.
+# Why: Jason is fine with writing a few tests at once, as long as every one runs red before the code that passes them.
+# Why: Stub new names before writing tests, so red means a failing assertion; tests requested for existing code go red by breaking the code briefly.
 --- a/SKILL.md
 +++ b/SKILL.md
 @@ -34,5 +34,6 @@

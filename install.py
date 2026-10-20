@@ -159,8 +159,9 @@ def link_tools() -> int:
 def link_one(src: Path, dst: Path) -> int:
     """Returns 1 when something else already holds the name."""
     if dst.is_symlink():
-        # resolve() on a dangling link still gives the intended target.
-        if dst.resolve() == src:
+        # resolve() on a dangling link still gives the intended target. Both sides are
+        # resolved because a tool may itself be a link to another (claude-json).
+        if dst.resolve() == src.resolve():
             return 0
         say(f"CONFLICT {dst} already links to {dst.resolve()} -- left alone")
         return 1

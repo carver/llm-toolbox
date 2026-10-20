@@ -69,6 +69,18 @@ def test_links_executable_tools_only(tools):
     assert install.link_tools() == 0, "idempotent"
 
 
+def test_a_tool_that_links_to_another_tool_is_linked_once_and_then_left_alone(
+    tools, capsys
+):
+    src, dst = tools
+    make_tool(src, "claude-fresh")
+    (src / "claude-json").symlink_to("claude-fresh")
+    assert install.link_tools() == 0
+    assert install.link_tools() == 0, "idempotent"
+    assert "CONFLICT" not in capsys.readouterr().out
+    assert (dst / "claude-json").resolve() == src / "claude-fresh"
+
+
 def test_tool_name_taken_by_another_file_is_a_conflict(tools, capsys):
     src, dst = tools
     make_tool(src, "gui-shot")

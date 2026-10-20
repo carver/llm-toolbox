@@ -1,4 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# ///
 """Condense a Claude Code session, subagents included, for a retrospective.
 
 A session log and each of its subagents' logs run to a megabyte of JSONL, mostly

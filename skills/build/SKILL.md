@@ -26,7 +26,7 @@ Done when every design fork is answered, the user has confirmed the seams (or yo
 
 ## 2. Implement
 
-Load the `coding` and `tdd` skills. Then cycle, one test at a time: write one test at a seam, run it and see it red, then write the code that turns it green. A test that is green on its first run never went red: delete it, or change it until it fails for the reason you meant. Leave code quality to the review that follows. Commit per `coding`. When a choice would break a rule in the brief, or widen what a failure stops, ask the user instead of picking.
+Load the `coding` and `tdd` skills. Then cycle: write a test at a seam, or a few at once, run them and see every one red, then write the code that turns them green. A test that is green on its first run never went red: delete it, or change it until it fails for the reason you meant. Leave code quality to the review that follows. Commit per `coding`. When a choice would break a rule in the brief, or widen what a failure stops, ask the user instead of picking.
 
 Done when `git log <base>..HEAD` shows your commits and the repo's checks pass.
 

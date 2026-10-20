@@ -26,13 +26,13 @@ Done when every design fork is answered, the user has confirmed the seams (or yo
 
 ## 2. Implement
 
-Load the `coding` and `tdd` skills. Then cycle: write a test at a seam, or a few at once, run them and see every one red, then write the code that turns them green. A test that is green on its first run never went red: delete it, or change it until it fails for the reason you meant. Leave code quality to the review that follows. Commit per `coding`. When a choice would break a rule in the brief, or widen what a failure stops, ask the user instead of picking.
+Load the `coding` and `tdd` skills. Then cycle: stub the new names (empty functions and methods), write a test at a seam, or a few at once, run them and see every one red on its assertions, then write the code that turns them green. A test that is green on its first run never went red: delete it, or change it until it fails for the reason you meant. A test the request asks for on code that already exists goes red by breaking that code briefly. Leave code quality to the review that follows. Commit per `coding`. When a choice would break a rule in the brief, or widen what a failure stops, ask the user instead of picking.
 
 Done when `git log <base>..HEAD` shows your commits and the repo's checks pass.
 
 ## 3. Review
 
-Run `/code-review` with `<base>` as the fixed point and the brief file as the spec. When `git diff --shortstat <base>` shows 30 changed lines or fewer (insertions plus deletions), spawn one subagent instead, given both of `/code-review`'s sub-agent briefs (Standards and Spec), and have it report the two axes under separate headings.
+Run `/code-review` with `<base>` as the fixed point and the brief file as the spec. When `git diff --shortstat <base>` shows 30 changed lines or fewer (insertions plus deletions), or the diff is mechanical (a rename, a move, a reformat), spawn one subagent instead, given both of `/code-review`'s sub-agent briefs (Standards and Spec), and have it report the two axes under separate headings.
 
 Code that drives paid or rate-limited runs, such as an experiment or a sweep, gets only a pilot of a few cells before this review. The full run waits for triage, because a bug found after a full run means paying for that run twice.
 

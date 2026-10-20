@@ -1,10 +1,11 @@
-# Why: Jason is fine with writing a few tests at once, as long as every one runs red before the code that passes them.
+# Why: Jason is fine with writing a few tests at once, as long as every one runs red before the code that passes them. Stub new names before writing tests, so red means a failing assertion; tests requested for existing code go red by breaking the code briefly.
 --- a/SKILL.md
 +++ b/SKILL.md
-@@ -34,5 +34,5 @@
+@@ -34,5 +34,6 @@
  ## Rules of the loop
  
  - **Red before green.** Write the failing test first, then only enough code to pass it. Don't anticipate future tests or add speculative features.
 -- **One slice at a time.** One seam, one test, one minimal implementation per cycle.
++- **Stubs before tests.** Stub the new names first (empty functions and methods), so a red test fails on its assertions, not on an import error. A test the user asks for on code that already exists can't fail first: break that code on purpose, watch the test fail, then restore it.
 +- **One slice at a time.** One seam, its test or a few tests (every one red first), one minimal implementation per cycle.
  - **Refactoring is not part of the loop.** It belongs to the review stage (see the `code-review` skill), not the red → green implementation cycle.

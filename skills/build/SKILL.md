@@ -20,19 +20,19 @@ Write the **brief** to a file. It is the spec the reviewers check the code again
 - the **seams**: the public interfaces the tests go through, per `/tdd`. Agree them with the user now. If the user is offline, pick them and record the choice in `uncertainties.md` (see the `coding` skill)
 - the merge danger, judged per the `coding` skill. Create the branch now if it needs one
 
-Record the **base**: `git rev-parse HEAD`. Also record the **repo fingerprint**: `git config --file "$(git rev-parse --git-common-dir)/config" --list | sha1sum` and `git for-each-ref | grep -v <work branch> | sha1sum`.
+Run `build-state start` in the repo. It records the **base** (HEAD) and the **repo fingerprint** in the git dir; `build-state show` prints them again after a context reset.
 
 Done when every design fork is answered, the user has confirmed the seams (or you've recorded them), and the brief would let a reviewer who never saw this chat judge the change.
 
 ## 2. Implement
 
-Load the `coding` and `tdd` skills. Red/green at the seams, then the code that passes them. Leave code quality to the review that follows. Commit per `coding`. When a choice would break a rule in the brief, or widen what a failure stops, ask the user instead of picking.
+Load the `coding` and `tdd` skills. Then cycle, one test at a time: write one test at a seam, run it and see it red, then write the code that turns it green. A test that is green on its first run never went red: delete it, or change it until it fails for the reason you meant. Leave code quality to the review that follows. Commit per `coding`. When a choice would break a rule in the brief, or widen what a failure stops, ask the user instead of picking.
 
 Done when `git log <base>..HEAD` shows your commits and the repo's checks pass.
 
 ## 3. Review
 
-Run `/code-review` with `<base>` as the fixed point and the brief file as the spec.
+Run `/code-review` with `<base>` as the fixed point and the brief file as the spec. When `git diff --shortstat <base>` shows 30 changed lines or fewer (insertions plus deletions), spawn one subagent instead, given both of `/code-review`'s sub-agent briefs (Standards and Spec), and have it report the two axes under separate headings.
 
 Code that drives paid or rate-limited runs, such as an experiment or a sweep, gets only a pilot of a few cells before this review. The full run waits for triage, because a bug found after a full run means paying for that run twice.
 
@@ -51,14 +51,14 @@ Done when every finding has a bucket, every spec gap is fixed with checks green,
 
 ## 5. Refactor
 
-Record the **refactor base**: `git rev-parse HEAD`. Apply the Fix list, nothing else. Behaviour stays the same: the tests pass unchanged unless a finding is about a test. Commit per `coding`.
+Run `build-state refactor` to record the **refactor base**. Apply the Fix list, nothing else. Behaviour stays the same: the tests pass unchanged unless a finding is about a test. Commit per `coding`.
 
 ## 6. Verify
 
 - Run the repo's checks.
-- Read `git diff <refactor base>..HEAD -- <test files>`. Every test change must trace to a finding; a loosened assertion or deleted test that keeps things green is a failure to undo.
-- `git log <base>..HEAD` shows logically isolated commits.
-- The repo fingerprint matches the one from step 1. On a mismatch, find what changed and tell the user before anything else.
+- Run `build-state finish`. It folds each `fixup!` commit into the commit it fixes and leaves every other commit separate, then lists the commits since the base and the test files changed since the refactor base. When it fails because a ref or config key moved, find what changed and tell the user before anything else.
+- Read `git diff <refactor base>..HEAD` for each listed test file. Every test change must trace to a finding; a loosened assertion or deleted test that keeps things green is a failure to undo.
+- The commit list shows logically isolated commits.
 
 ## 7. Report
 

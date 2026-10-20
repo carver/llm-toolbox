@@ -175,3 +175,128 @@ def test_a_bad_schema_is_a_usage_error(run):
         check=False,
     )
     assert proc.returncode == 2
+
+
+# claude-fresh is the same tool under its new name, with a --text mode beside --json.
+# claude-json is a link to it and keeps the JSON mode it always had.
+
+FRESH = Path(__file__).resolve().parent / "bin" / "claude-fresh"
+REFUSAL = "API Error: Sonnet 5.5's safeguards flagged this message. Details: `[reasoning_extraction]`"
+
+
+@pytest.fixture
+def fresh(tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "claude"
+    fake.write_text(FAKE_CLAUDE)
+    fake.chmod(0o755)
+    record = tmp_path / "record.json"
+
+    def fresh(*args, prompt="the prompt", fake_stdout=OK_REPLY, **fake_env):
+        env = {
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "FAKE_RECORD": str(record),
+            "FAKE_STDOUT": fake_stdout,
+            **{f"FAKE_{k.upper()}": str(v) for k, v in fake_env.items()},
+        }
+        proc = subprocess.run(
+            [str(FRESH), *args],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=30,
+            check=False,
+        )
+        sent = json.loads(record.read_text()) if record.exists() else None
+        return proc, sent
+
+    return fresh
+
+
+def test_claude_json_is_a_link_to_claude_fresh():
+    assert SCRIPT.is_symlink()
+    assert SCRIPT.resolve() == FRESH.resolve()
+
+
+def test_text_mode_prints_the_reply_text_and_sends_no_schema(fresh):
+    proc, sent = fresh("--text", fake_stdout=reply(result="Hello there."))
+    assert (proc.returncode, proc.stdout) == (0, "Hello there.\n"), proc.stderr
+    assert "--json-schema" not in sent["argv"]
+    assert flag(sent["argv"], "--tools") == ""
+    assert "--strict-mcp-config" in sent["argv"]
+    assert "--no-session-persistence" in sent["argv"]
+
+
+def test_json_mode_prints_the_structured_output(fresh):
+    proc, sent = fresh("--json", json.dumps(SCHEMA))
+    assert (proc.returncode, json.loads(proc.stdout)) == (0, {"name": "x"}), proc.stderr
+    assert json.loads(flag(sent["argv"], "--json-schema")) == SCHEMA
+
+
+@pytest.mark.parametrize("args", [[], ["--text", "--json", json.dumps(SCHEMA)]])
+def test_exactly_one_mode_is_required(fresh, args):
+    proc, sent = fresh(*args)
+    assert proc.returncode == 2
+    assert sent is None
+
+
+def test_claude_json_still_requires_a_schema(run):
+    proc = subprocess.run(
+        [str(SCRIPT)],
+        input="p",
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 2
+
+
+@pytest.mark.parametrize("mode", [["--text"], ["--json", json.dumps(SCHEMA)]])
+def test_a_refusal_names_its_reason(fresh, mode):
+    # claude -p exits 1 with an empty stderr; the reason is only in stdout's JSON.
+    refused = reply(is_error=True, result=REFUSAL)
+    proc, _ = fresh(*mode, fake_stdout=refused, exit=1)
+    assert proc.returncode == 1
+    assert "reasoning_extraction" in proc.stderr
+
+
+def test_an_error_reply_names_its_result_not_just_its_subtype(fresh):
+    proc, _ = fresh("--text", fake_stdout=reply(is_error=True, result=REFUSAL))
+    assert proc.returncode == 1
+    assert "reasoning_extraction" in proc.stderr
+
+
+def test_text_mode_with_no_text_fails(fresh):
+    proc, _ = fresh("--text", fake_stdout=reply(result=""))
+    assert proc.returncode == 1
+    assert proc.stdout == ""
+
+
+def test_claude_json_keeps_its_old_interface(fresh):
+    proc = subprocess.run(
+        [str(SCRIPT), "--text"],
+        input="p",
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 2
+    assert "--text" not in proc.stderr.splitlines()[0]  # its usage line names only -s
+
+
+@pytest.mark.parametrize("schema", ["null", "5", "[]", '"a string"'])
+def test_a_schema_must_be_a_json_object(fresh, schema):
+    proc, sent = fresh("--json", schema)
+    assert proc.returncode == 2
+    assert sent is None
+
+
+def test_a_json_reply_of_the_wrong_shape_is_not_called_non_json(fresh):
+    proc, _ = fresh("--text", fake_stdout="[1, 2]")
+    assert proc.returncode == 1
+    assert "non-JSON" not in proc.stderr

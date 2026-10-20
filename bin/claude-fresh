@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Run one headless call to a fresh Claude: no tools, settings, hooks, MCP
+servers, CLAUDE.md or saved session. Prompt on stdin, answer on stdout.
+
+    claude-fresh --json SCHEMA < prompt   # the schema-shaped answer, one line of JSON
+    claude-fresh --text < prompt          # the reply's text
+
+For scripts and cron jobs that want an answer from Claude. claude-json is a
+link to this tool; called by that name, `-s SCHEMA` gives the JSON mode, as
+it always has.
+
+Every call bills the Claude subscription: ANTHROPIC_API_KEY is removed from
+the child's environment, because `claude -p` prefers it over the login.
+(`claude --bare` is no substitute; it reads only the API key.)
+
+The call is locked down for prompts that carry untrusted text. By default it
+gets no tools, no user/project/local settings or hooks, no MCP servers, no
+saved session, and runs in an empty temporary directory so no CLAUDE.md loads.
+--tools opts named tools back in and pre-approves them.
+
+The schema constrains shape, not meaning. Validate the fields in your code.
+
+A refused or failed call exits 1 and says why on stderr, including the reason
+`claude -p` gives only in its JSON output (an API safeguard's flag, a spent
+budget).
+
+Exit status: 0 success, 1 the call failed (message on stderr), 2 usage error.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+FAILED, USAGE = 1, 2
+
+
+class CallFailed(Exception):
+    pass
+
+
+def load_schema(text: str) -> dict:
+    """The schema, a JSON object, from JSON text or from a path to a JSON file."""
+    try:
+        schema = json.loads(text)
+    except json.JSONDecodeError:
+        path = Path(text)
+        if not path.is_file():
+            raise ValueError(f"the schema is neither JSON nor a file: {text[:80]!r}")
+        schema = json.loads(path.read_text())
+    if not isinstance(schema, dict):
+        raise TypeError(f"the schema must be a JSON object: {text[:80]!r}")
+    return schema
+
+
+def claude_command(args: argparse.Namespace, schema: dict | None) -> list[str]:
+    cmd = ["claude", "-p", "--model", args.model, "--output-format", "json"]
+    if schema is not None:
+        cmd += ["--json-schema", json.dumps(schema)]
+    cmd += [
+        "--tools",
+        args.tools,
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+    ]
+    if args.tools:
+        cmd += ["--allowedTools", args.tools]
+    if args.system_prompt is not None:
+        cmd += ["--system-prompt", args.system_prompt]
+    if args.max_budget_usd is not None:
+        cmd += ["--max-budget-usd", args.max_budget_usd]
+    return cmd
+
+
+def call(cmd: list[str], prompt: str, timeout: float) -> dict:
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    with tempfile.TemporaryDirectory(prefix="claude-fresh-") as empty_dir:
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=empty_dir,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise CallFailed(f"claude timed out after {timeout:g}s")
+        except OSError as err:
+            raise CallFailed(f"claude did not start: {err}")
+    try:
+        reply = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        reply = None
+    # claude -p puts a refusal's reason in its JSON `result`, often with an empty stderr.
+    reason = reply.get("result") if isinstance(reply, dict) else None
+    if proc.returncode != 0:
+        detail = reason or proc.stderr.strip() or proc.stdout.strip()
+        raise CallFailed(f"claude exited {proc.returncode}: {str(detail)[:500]}")
+    if not isinstance(reply, dict):
+        kind = "non-JSON" if reply is None else "JSON that is not an object"
+        raise CallFailed(f"claude printed {kind}: {proc.stdout[:200]!r}")
+    if reply.get("is_error"):
+        raise CallFailed(
+            f"claude reported an error: {str(reason or reply.get('subtype'))[:500]}"
+        )
+    return reply
+
+
+def answer(reply: dict, json_mode: bool) -> str:
+    """What to print: the structured output as JSON, or the reply's text."""
+    if json_mode:
+        output = reply.get("structured_output")
+        if not isinstance(output, dict):
+            raise CallFailed(
+                f"claude returned no structured output: {str(reply.get('result'))[:300]}"
+            )
+        return json.dumps(output)
+    text = reply.get("result")
+    if not isinstance(text, str) or not text.strip():
+        raise CallFailed("claude returned no text")
+    return text.rstrip("\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Called as claude-json (a link to this file), the old interface: -s SCHEMA, required.
+    legacy = Path(sys.argv[0]).name == "claude-json"
+    prog = "claude-json" if legacy else "claude-fresh"
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    schema_help = "JSON Schema (a JSON object), as JSON text or a path to a .json file"
+    if legacy:
+        parser.add_argument("-s", "--schema", required=True, help=schema_help)
+    else:
+        mode = parser.add_mutually_exclusive_group(required=True)
+        mode.add_argument(
+            "--json",
+            "-s",
+            "--schema",
+            dest="schema",
+            metavar="SCHEMA",
+            help=f"answer as JSON matching this schema: {schema_help}",
+        )
+        mode.add_argument(
+            "--text", action="store_true", help="answer with the reply's text"
+        )
+    parser.add_argument(
+        "-m",
+        "--model",
+        default="sonnet",
+        help="model alias or id (default %(default)s)",
+    )
+    parser.add_argument(
+        "--tools",
+        default="",
+        metavar="LIST",
+        help="comma-separated built-in tools to enable and pre-approve, e.g. WebFetch,WebSearch "
+        "(default: none)",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        metavar="TEXT",
+        help="replace Claude Code's system prompt; cuts about 6k input tokens per call",
+    )
+    parser.add_argument(
+        "--max-budget-usd", metavar="USD", help="stop the call past this spend"
+    )
+    parser.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=600,
+        metavar="SECONDS",
+        help="kill the call after this long (default %(default)g)",
+    )
+    args = parser.parse_args(argv)
+
+    schema = None
+    if args.schema is not None:
+        try:
+            schema = load_schema(args.schema)
+        except (ValueError, TypeError, OSError) as err:
+            parser.error(str(err))
+    prompt = sys.stdin.read()
+    if not prompt.strip():
+        parser.error("empty prompt on stdin")
+
+    try:
+        reply = call(claude_command(args, schema), prompt, args.timeout)
+        print(answer(reply, json_mode=not getattr(args, "text", False)))
+    except CallFailed as err:
+        print(f"{prog}: {err}", file=sys.stderr)
+        return FAILED
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

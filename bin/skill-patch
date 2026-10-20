@@ -62,7 +62,7 @@ def installed_from(name: str) -> Path:
     return folder
 
 
-def save(name: str, why_text: str | None, replace_why: bool = False) -> str:
+def save(name: str, why: str | None, replace_why: bool) -> str:
     installed = tp.INSTALLED / name
     if not installed.is_dir():
         raise PatchError(f"{name} isn't installed in {tp.INSTALLED}")
@@ -73,18 +73,18 @@ def save(name: str, why_text: str | None, replace_why: bool = False) -> str:
             existing.unlink()
             return f"{name} matches upstream; removed {existing.name}"
         return f"{name} matches upstream; no patch"
-    why_text = " ".join((why_text or "").split())  # one line, so it stays a # Why: line
+    why = " ".join((why or "").split())  # one line, so it stays a # Why: line
     earlier = tp.whys(existing) if existing else []
-    reasons = [] if replace_why else list(earlier)
-    if why_text and why_text not in reasons:
-        reasons.append(why_text)
-    if not reasons:
+    whys = [] if replace_why else list(earlier)
+    if why and why not in whys:
+        whys.append(why)
+    if not whys:
         raise PatchError("a new patch needs --why")
-    path = tp.write_patch(name, reasons, patch)
+    path = tp.write_patch(name, whys, patch)
     report = [f"saved {path}; its reasons, one per layer of edits:"]
-    report += [f"  {i}. {reason}" for i, reason in enumerate(reasons, 1)]
-    if dropped := [reason for reason in earlier if reason not in reasons]:
-        report += ["dropped:", *(f"  - {reason}" for reason in dropped)]
+    report += [f"  {i}. {w}" for i, w in enumerate(whys, 1)]
+    if dropped := [w for w in earlier if w not in whys]:
+        report += ["dropped:", *(f"  - {w}" for w in dropped)]
     return "\n".join(report)
 
 

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+WHY = "# Why:"  # starts each reason line heading a patch
 PATCHES = REPO / "skill-patches"
 INSTALLED = Path.home() / ".agents" / "skills"
 LOCK = Path.home() / ".agents" / ".skill-lock.json"
@@ -123,20 +124,20 @@ def patch_file(name: str) -> Path | None:
 
 def whys(patch: Path) -> list[str]:
     """The reasons heading a patch, one per layer of edits, oldest first."""
-    reasons = []
+    found = []
     for line in patch.read_text().splitlines():
-        if not line.startswith("# Why:"):
+        if not line.startswith(WHY):
             break
-        reasons.append(line.removeprefix("# Why:").strip())
-    return reasons
+        found.append(line.removeprefix(WHY).strip())
+    return found
 
 
-def write_patch(name: str, reasons: list[str], patch: str) -> Path:
-    if isinstance(reasons, str):
+def write_patch(name: str, whys: list[str], patch: str) -> Path:
+    if isinstance(whys, str):
         raise TypeError("write_patch takes a list of reasons, not one string")
     PATCHES.mkdir(exist_ok=True)
     path = PATCHES / f"{name}.patch"
-    path.write_text("".join(f"# Why: {reason}\n" for reason in reasons) + patch)
+    path.write_text("".join(f"{WHY} {why}\n" for why in whys) + patch)
     return path
 
 

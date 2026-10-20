@@ -30,6 +30,7 @@ Done when every failed tool call, in the main session and in each subagent, and 
 - **Hungry tool**: trim its default output, or add a flag for the short form.
 - **Mistake from a habit**: in decreasing preference: recommend using a skill that is appropriate but was not used, update a skill that was used, create a new skill. These changes should target the mistaken habit.
 - **Hard-won knowledge**: something another agent would also have to dig for may be worth a SOFA post.
+- **Duplicated skill or tool**: when the skill or tool a fix changes also has a copy elsewhere (a project's `.claude/skills/` or `bin/` copying one from `llm-toolbox`, or the reverse), make the change in every copy it applies to. A change that only fits one place, such as a project-specific rule, stays in that copy.
 
 Drop one-offs with no cheaper path next time.
 

@@ -138,6 +138,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   committed. `install.py` also registers it as a Claude Code hook that
   refuses `git commit --no-verify`.
 
+- **build-state**: `/build`'s bookkeeping. `start` records the base commit and
+  the repo's fingerprint (every other ref, and the config with its values
+  hashed), `refactor` the refactor base. `finish` folds `fixup!` commits into
+  the commits they fix, leaving every other commit separate, then lists the
+  commits since the base and the test files changed since the refactor base,
+  and fails naming any ref or config key that moved. The state lives in the
+  git dir; `show` prints it.
+
 - **skill-patch**: keeps hand edits to other authors' skills. Edit the
   installed copy in `~/.agents/skills/NAME`, then `skill-patch save NAME
   --why "..."` writes `skill-patches/NAME.patch`, headed by its Why.

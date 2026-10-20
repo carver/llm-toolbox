@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Keep /build's bookkeeping: the base commit, the refactor base and the repo fingerprint.
+
+    build-state start       record the base (HEAD) and the repo's fingerprint
+    build-state refactor    record the refactor base (HEAD), before applying review fixes
+    build-state show        print the recorded bases
+    build-state finish      fold fixups into the commits they fix, check the fingerprint,
+                            print the commits since the base and the test files changed
+                            since the refactor base
+
+The state lives in the worktree's git dir, as build-state.json; finish removes it.
+
+finish folds only fixup!, squash! and amend! commits (`git commit --fixup=SHA`), each
+into the commit it names, with an autosquash rebase onto the base. Every other commit
+stays as it is, in order, so logically separate commits stay separate. It refuses
+uncommitted changes, and on a conflict aborts the rebase and leaves the branch as it was.
+
+The fingerprint is every ref except the work branch and its upstream, and every entry
+of the repo's config. When either changed since start, finish names the refs and config
+keys (never config values: a remote URL can hold a token), exits 1 and keeps the state,
+before folding anything. A fix commit left unfolded (its target is older than the base)
+also fails finish. It does not push.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# tests/x.py, test/x.py, spec/x.rb, test_x.py, x_test.go, x.test.ts, x.spec.js
+TEST_FILE = re.compile(
+    r"(^|/)(tests?|spec)/|(^|/)test_[^/]*$|_test\.[^/]+$|\.(test|spec)\.[^/]+$"
+)
+
+
+def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=check)
+
+
+def state_file() -> Path:
+    return (
+        Path(git("rev-parse", "--absolute-git-dir").stdout.strip()) / "build-state.json"
+    )
+
+
+def head() -> str:
+    return git("rev-parse", "HEAD").stdout.strip()
+
+
+def work_refs() -> list[str]:
+    """The checked-out branch and its upstream, which the build itself moves (a push moves
+    the upstream); empty on a detached HEAD."""
+    refs = [git("symbolic-ref", "-q", "HEAD", check=False).stdout.strip()]
+    refs.append(
+        git("rev-parse", "--symbolic-full-name", "@{u}", check=False).stdout.strip()
+    )
+    return [ref for ref in refs if ref]
+
+
+def fingerprint(work: list[str]) -> dict[str, dict[str, str]]:
+    """Every ref but the work refs, and every config entry with its values hashed: a
+    value, such as a remote URL, can hold a token."""
+    common = git("rev-parse", "--git-common-dir").stdout.strip()
+    listed = git("config", "--file", f"{common}/config", "--list").stdout
+    values: dict[str, list[str]] = {}
+    for entry in listed.splitlines():
+        key, _, value = entry.partition("=")
+        values.setdefault(key, []).append(value)
+    config = {
+        key: hashlib.sha1("\n".join(found).encode()).hexdigest()[:12]
+        for key, found in values.items()
+    }
+    listed = git("for-each-ref", "--format=%(refname) %(objectname)").stdout
+    refs = dict(line.split() for line in listed.splitlines())
+    return {"config": config, "refs": {n: s for n, s in refs.items() if n not in work}}
+
+
+def changes(
+    before: dict[str, dict[str, str]], after: dict[str, dict[str, str]]
+) -> list[str]:
+    """The config keys and ref names that differ, without their values."""
+    return sorted(
+        f"{kind} {name}"
+        for kind in ("config", "refs")
+        for name in before[kind].keys() | after[kind].keys()
+        if before[kind].get(name) != after[kind].get(name)
+    )
+
+
+def load(path: Path) -> dict | None:
+    if not path.exists():
+        print("No build is open here: run `build-state start` first.", file=sys.stderr)
+        return None
+    return json.loads(path.read_text())
+
+
+def save(path: Path, state: dict) -> None:
+    path.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def start(args: argparse.Namespace) -> int:
+    path = state_file()
+    if path.exists() and not args.force:
+        base = load(path)["base"]
+        print(
+            f"A build is already open, from base {base}: finish it, or start --force.",
+            file=sys.stderr,
+        )
+        return 1
+    base, work = head(), work_refs()
+    save(path, {"base": base, "work_refs": work, "fingerprint": fingerprint(work)})
+    print(f"base {base}")
+    return 0
+
+
+def refactor(args: argparse.Namespace) -> int:
+    path = state_file()
+    if (state := load(path)) is None:
+        return 1
+    state["refactor_base"] = head()
+    save(path, state)
+    print(f"refactor base {state['refactor_base']}")
+    return 0
+
+
+def show(args: argparse.Namespace) -> int:
+    if (state := load(state_file())) is None:
+        return 1
+    print(f"base {state['base']}")
+    if "refactor_base" in state:
+        print(f"refactor base {state['refactor_base']}")
+    return 0
+
+
+def fail(*lines: str) -> int:
+    print("\n".join(lines), file=sys.stderr)
+    return 1
+
+
+def fold_fixups(base: str) -> bool:
+    """Autosquash onto the base; on failure, abort and say why."""
+    # ":" accepts the todo list as is, and a squash! commit's combined message.
+    env = os.environ | {"GIT_SEQUENCE_EDITOR": ":", "GIT_EDITOR": ":"}
+    rebase = subprocess.run(
+        ["git", "rebase", "-q", "-i", "--autosquash", base],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if rebase.returncode == 0:
+        return True
+    git("rebase", "--abort", check=False)
+    fail(
+        rebase.stdout + rebase.stderr,
+        "Folding the fixups failed; the branch is as it was.",
+    )
+    return False
+
+
+def report_tests(refactor_base: str) -> None:
+    changed = git("diff", "--name-only", refactor_base, "HEAD").stdout.splitlines()
+    if tests := [name for name in changed if TEST_FILE.search(name)]:
+        print(f"\nTest files changed since the refactor base ({refactor_base[:12]});")
+        print("each change must trace to a review finding:")
+        print(git("diff", "--stat", refactor_base, "HEAD", "--", *tests).stdout, end="")
+
+
+def finish(args: argparse.Namespace) -> int:
+    path = state_file()
+    if (state := load(path)) is None:
+        return 1
+    base = state["base"]
+    if git("status", "--porcelain", "--untracked-files=no").stdout:
+        return fail("There are uncommitted changes: commit or stash them first.")
+    if moved := changes(state["fingerprint"], fingerprint(state["work_refs"])):
+        return fail(
+            "The repo changed outside the work branch since start:",
+            *(f"  {name}" for name in moved),
+        )
+    if not fold_fixups(base):
+        return 1
+    print(git("log", "--oneline", "--reverse", f"{base}..HEAD").stdout, end="")
+    subjects = git("log", "--format=%s", f"{base}..HEAD").stdout.splitlines()
+    fixes = ("fixup! ", "squash! ", "amend! ")
+    if unfolded := [subject for subject in subjects if subject.startswith(fixes)]:
+        return fail(
+            "These fix commits before the base, so they weren't folded:",
+            *(f"  {subject}" for subject in unfolded),
+        )
+    if "refactor_base" in state:
+        report_tests(state["refactor_base"])
+    path.unlink()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    start_command = commands.add_parser(
+        "start", help="record the base and the repo fingerprint"
+    )
+    start_command.add_argument(
+        "--force", action="store_true", help="replace a build that is still open"
+    )
+    start_command.set_defaults(run=start)
+    commands.add_parser("refactor", help="record the refactor base").set_defaults(
+        run=refactor
+    )
+    commands.add_parser("show", help="print the recorded bases").set_defaults(run=show)
+    commands.add_parser(
+        "finish", help="fold fixups, check the fingerprint, list the commits"
+    ).set_defaults(run=finish)
+    args = parser.parse_args(argv)
+    return args.run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

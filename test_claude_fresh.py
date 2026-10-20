@@ -1,7 +1,10 @@
-"""claude-json runs one headless `claude -p` call and prints its structured output.
+"""claude-fresh runs one locked-down headless `claude -p` call and prints its answer,
+as JSON (--json SCHEMA) or text (--text). claude-json is a link to it that keeps the
+old `-s SCHEMA` interface.
 
 A fake `claude` on PATH records the argv, environment, working directory and
-stdin it was given, then replies the way the real CLI does.
+stdin it was given, then replies the way the real CLI does. Every test runs with
+it, so none can reach the real CLI.
 """
 
 import json
@@ -12,6 +15,7 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "claude-json"
+FRESH = Path(__file__).resolve().parent / "bin" / "claude-fresh"
 SCHEMA = {
     "type": "object",
     "properties": {"name": {"type": "string"}},
@@ -37,10 +41,11 @@ def reply(**fields) -> str:
 
 
 OK_REPLY = reply(structured_output={"name": "x"})
+REFUSAL = "API Error: Sonnet 5.5's safeguards flagged this message. Details: `[reasoning_extraction]`"
 
 
-@pytest.fixture
-def run(tmp_path):
+def make_runner(tmp_path, script, *preset):
+    """Runs `script` with `preset` and then the call's own arguments, against the fake claude."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     fake = bindir / "claude"
@@ -58,7 +63,7 @@ def run(tmp_path):
             **{f"FAKE_{k.upper()}": str(v) for k, v in fake_env.items()},
         }
         proc = subprocess.run(
-            [str(SCRIPT), "--schema", json.dumps(SCHEMA), *args],
+            [str(script), *preset, *args],
             input=prompt,
             text=True,
             capture_output=True,
@@ -70,6 +75,23 @@ def run(tmp_path):
         return proc, sent
 
     return run
+
+
+@pytest.fixture
+def run(tmp_path):
+    """claude-json with a schema, the way its existing callers use it."""
+    return make_runner(tmp_path, SCRIPT, "--schema", json.dumps(SCHEMA))
+
+
+@pytest.fixture
+def bare_json(tmp_path):
+    """claude-json with only the arguments a test gives."""
+    return make_runner(tmp_path, SCRIPT)
+
+
+@pytest.fixture
+def fresh(tmp_path):
+    return make_runner(tmp_path, FRESH)
 
 
 def flag(argv: list[str], name: str) -> str:
@@ -165,55 +187,10 @@ def test_an_empty_prompt_is_a_usage_error(run):
     assert sent is None
 
 
-def test_a_bad_schema_is_a_usage_error(run):
-    proc = subprocess.run(
-        [str(SCRIPT), "--schema", "{not json"],
-        input="p",
-        text=True,
-        capture_output=True,
-        timeout=30,
-        check=False,
-    )
+def test_a_bad_schema_is_a_usage_error(bare_json):
+    proc, sent = bare_json("--schema", "{not json")
     assert proc.returncode == 2
-
-
-# claude-fresh is the same tool under its new name, with a --text mode beside --json.
-# claude-json is a link to it and keeps the JSON mode it always had.
-
-FRESH = Path(__file__).resolve().parent / "bin" / "claude-fresh"
-REFUSAL = "API Error: Sonnet 5.5's safeguards flagged this message. Details: `[reasoning_extraction]`"
-
-
-@pytest.fixture
-def fresh(tmp_path):
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    fake = bindir / "claude"
-    fake.write_text(FAKE_CLAUDE)
-    fake.chmod(0o755)
-    record = tmp_path / "record.json"
-
-    def fresh(*args, prompt="the prompt", fake_stdout=OK_REPLY, **fake_env):
-        env = {
-            **os.environ,
-            "PATH": f"{bindir}:{os.environ['PATH']}",
-            "FAKE_RECORD": str(record),
-            "FAKE_STDOUT": fake_stdout,
-            **{f"FAKE_{k.upper()}": str(v) for k, v in fake_env.items()},
-        }
-        proc = subprocess.run(
-            [str(FRESH), *args],
-            input=prompt,
-            text=True,
-            capture_output=True,
-            env=env,
-            timeout=30,
-            check=False,
-        )
-        sent = json.loads(record.read_text()) if record.exists() else None
-        return proc, sent
-
-    return fresh
+    assert sent is None
 
 
 def test_claude_json_is_a_link_to_claude_fresh():
@@ -243,16 +220,10 @@ def test_exactly_one_mode_is_required(fresh, args):
     assert sent is None
 
 
-def test_claude_json_still_requires_a_schema(run):
-    proc = subprocess.run(
-        [str(SCRIPT)],
-        input="p",
-        text=True,
-        capture_output=True,
-        timeout=30,
-        check=False,
-    )
+def test_claude_json_still_requires_a_schema(bare_json):
+    proc, sent = bare_json()
     assert proc.returncode == 2
+    assert sent is None
 
 
 @pytest.mark.parametrize("mode", [["--text"], ["--json", json.dumps(SCHEMA)]])
@@ -276,16 +247,10 @@ def test_text_mode_with_no_text_fails(fresh):
     assert proc.stdout == ""
 
 
-def test_claude_json_keeps_its_old_interface(fresh):
-    proc = subprocess.run(
-        [str(SCRIPT), "--text"],
-        input="p",
-        text=True,
-        capture_output=True,
-        timeout=30,
-        check=False,
-    )
+def test_claude_json_keeps_its_old_interface(bare_json):
+    proc, sent = bare_json("--text")
     assert proc.returncode == 2
+    assert sent is None
     assert "--text" not in proc.stderr.splitlines()[0]  # its usage line names only -s
 
 

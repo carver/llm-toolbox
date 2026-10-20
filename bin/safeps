@@ -6,7 +6,8 @@ them, because the pattern is in that shell's own command line, and an agent's
 shell can carry a command line thousands of characters long. safeps skips
 itself and every ancestor, and shortens long command lines around the match.
 
-Each line: PID, time since it started ([[DD-]HH:]MM:SS), command line.
+Each line: PID, time since it started (MM:SS, H:MM:SS or D-HH:MM:SS, as ps
+shows it), command line.
 
 Exit status: 0 something matched, 1 nothing matched, 2 usage error (bad
 pattern). See also safekill and waitone.

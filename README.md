@@ -77,13 +77,19 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 
 ## Tools
 
-- **safekill** and **waitone**: stop processes, or wait for one, found by name
-  or command line. Unlike `pkill -f` and `pgrep -f`, they never match the
-  calling shell, whose command line holds the pattern. `safekill --one` acts
-  only when exactly one process matches; `safekill --all` signals every match.
-  `waitone --pid` also waits for processes that are not the caller's children.
-  Without `-f` the pattern is the exact process name; when that matches nothing
-  but `-f` would, they list what `-f` would match.
+- **safekill**, **waitone** and **safeps**: stop processes, wait for one, or
+  list them, found by name or command line. Unlike `pkill -f` and `pgrep -f`,
+  they never match the calling shell, whose command line holds the pattern.
+  `safekill --one` acts only when exactly one process matches; `safekill --all`
+  signals every match. `waitone --pid` also waits for processes that are not
+  the caller's children. `safeps` prints each match's PID, the time since it
+  started and its command line, shortened around the match. Without `-f` the
+  pattern is the exact process name; when that matches nothing but `-f` would,
+  they list what `-f` would match.
+- **bgrun**: `bgrun -o LOG -- CMD` starts CMD in the background, in its own
+  session with stdin from /dev/null and its output in LOG, and prints CMD's
+  own PID. `$!` after `cd DIR && nohup CMD &` is a subshell's PID, and killing
+  it leaves CMD running. `-C DIR` sets CMD's directory, `--append` keeps LOG.
 - **apply-edits**: replaces old text with new across files, all or nothing,
   from `<<<<<<<` / `=======` / `>>>>>>>` blocks under `--- PATH` lines on
   stdin. Each old text must occur exactly once; on a miss nothing is written
@@ -114,12 +120,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   API key from `$SOFA_API_KEY`, `$SOFA_CREDENTIALS` or the nearest
   `.sofa/credentials.json` and
   never prints it; caches the session in `~/.cache/sofa/`.
-- **claude-json**: one headless Claude call for scripts and cron jobs. Prompt
-  on stdin, JSON Schema as a flag, the answer as JSON on stdout. It always
-  bills the Claude subscription (it drops `ANTHROPIC_API_KEY`), and by
-  default gives the model no tools, settings, hooks, MCP servers or
-  CLAUDE.md, since prompts often carry untrusted text. `--tools` opts named
-  tools back in.
+- **claude-fresh**: one headless call to a fresh Claude, for scripts and cron
+  jobs. Prompt on stdin; `--json SCHEMA` prints the schema-shaped answer as
+  JSON, `--text` the reply's text. It always bills the Claude subscription (it
+  drops `ANTHROPIC_API_KEY`), and by default gives the model no tools,
+  settings, hooks, MCP servers or CLAUDE.md, since prompts often carry
+  untrusted text. `--tools` opts named tools back in. A refused call says why,
+  including the reason `claude -p` gives only in its JSON output.
+  `claude-json` is a link to it that keeps the old `-s SCHEMA` form.
 - **agent-commit-gate**: gives agents' commits a repo's slow checks.
   `agent-commit-gate --install REPO...` adds a line to the top of the repo's
   pre-commit hook: when `$AI_AGENT` is set, as Claude Code sets it, the hook
@@ -167,7 +175,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **paper**: a paper's metadata (`meta`), the papers citing it (`cites`) and
   keyword search (`search`) from Semantic Scholar, and its full text (`text`:
   downloads the arXiv or direct-URL PDF, runs `pdftotext -layout` and prints
-  the `.txt` path). Takes arXiv ids and URLs, DOIs and Semantic Scholar
+  the `.txt` path). `outline` lists the text's section headings with line
+  numbers and `grep` its lines matching a regex, with context, so an agent
+  can read a section instead of the whole paper. Takes arXiv ids and URLs, DOIs and Semantic Scholar
   paperIds, and prints a few lines per paper; `meta` adds an arXiv paper's
   latest version and its first- and latest-version dates, from one arXiv API
   request per call (cached for a day). Retries rate limits, 5xx and
@@ -184,7 +194,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 ```
 
 It checks what's staged. `install.py` points git at `.githooks`. Its `pre-commit` runs the two ruff checks on
-what's staged; `agent-pre-commit` adds the tests (about 35 seconds), and
+what's staged; `agent-pre-commit` adds the tests (about 50 seconds), and
 `pre-commit` runs it first when an agent commits. Both run the tools
 through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.

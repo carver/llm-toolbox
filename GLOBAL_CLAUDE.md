@@ -14,7 +14,7 @@ To write or change code, run `/build`: you implement and refactor, and subagents
 
 ## Research subagents
 
-A brief that sends a subagent to read papers tells it to fetch them with `paper` (`paper -h`). Its `paper text` caches each paper's full text on the host disk, so parallel agents share one download instead of each fetching and converting the same PDF.
+A brief that sends a subagent to read papers tells it to fetch them with `paper` (`paper -h`), start each paper from `paper outline ID` and read only the sections it needs by line range, and find single facts with `paper grep ID PATTERN`. When several agents read in parallel, assign each paper to one agent. `paper text` caches each paper's full text on the host disk, so a paper that two agents do need is downloaded and converted once.
 
 ## Claims
 
@@ -22,7 +22,9 @@ Before saying a source lacks something ("the paper has no human verbosity figure
 
 ## Shell
 
-Stop processes with `safekill --one -f PATTERN` (exactly one must match) or `safekill --all -f PATTERN` (every match); without `-f` the pattern is the exact process name (`uv`, `python3`), not the command line, and wait for one with `waitone` (llm-toolbox/bin, on PATH; `-h` for options), not `pkill -f`, `pgrep -f | xargs kill` or a `pgrep -f` loop. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it and a `while pgrep -f` loop waits on itself forever. Both tools skip their callers. Better still, keep the PID (`$!`) of what you start and `kill` or `waitone --pid` that.
+Stop processes with `safekill --one -f PATTERN` (exactly one must match) or `safekill --all -f PATTERN` (every match); without `-f` the pattern is the exact process name (`uv`, `python3`), not the command line, and wait for one with `waitone` (llm-toolbox/bin, on PATH; `-h` for options), not `pkill -f`, `pgrep -f | xargs kill` or a `pgrep -f` loop. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it and a `while pgrep -f` loop waits on itself forever. Both tools skip their callers, and so does `safeps [-f] PATTERN`, which lists matching processes with their PIDs and ages.
+
+Start a background job with `bgrun -o LOG -- CMD`. It prints the job's own PID, where `cd DIR && nohup CMD &` gives `$!` a subshell's PID. Then `kill` or `waitone --pid` that PID.
 
 To make several text replacements in one or more files, pipe blocks to `apply-edits` (`-h` for the format; all or nothing, and a miss shows the closest text) rather than writing a Python heredoc script.
 
@@ -38,7 +40,7 @@ Before scraping a site, look for its data source: an official API or MCP endpoin
 
 ## Claude from code
 
-Claude runs on my subscription; there is no `ANTHROPIC_API_KEY`, so don't reach for the Anthropic SDK. When a script or cron job needs typed data from Claude, pipe the prompt to `claude-json --schema SCHEMA` (llm-toolbox/bin, on PATH; `-h` for options), which prints the answer as JSON and locks the call down for untrusted text.
+Claude runs on my subscription; there is no `ANTHROPIC_API_KEY`, so don't reach for the Anthropic SDK. When a script or cron job needs an answer from Claude, pipe the prompt to `claude-fresh --json SCHEMA` for typed data, or `claude-fresh --text` for prose (llm-toolbox/bin, on PATH; `-h` for options). It locks the call down for untrusted text.
 
 ## Secrets
 

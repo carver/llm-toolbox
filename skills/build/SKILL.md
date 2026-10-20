@@ -34,6 +34,8 @@ Done when `git log <base>..HEAD` shows your commits and the repo's checks pass.
 
 Run `/code-review` with `<base>` as the fixed point and the brief file as the spec.
 
+Code that drives paid or rate-limited runs, such as an experiment or a sweep, gets only a pilot of a few cells before this review. The full run waits for triage, because a bug found after a full run means paying for that run twice.
+
 ## 4. Triage
 
 Sort every finding into one of:

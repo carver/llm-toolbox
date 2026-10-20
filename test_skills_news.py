@@ -255,3 +255,85 @@ def test_edit_outside_the_patch_is_reported(world):
     lock = {"pr": lock_for(clone, "skills/pr")}
     [change], _, _ = news.find_news({"a/s": ["pr"]}, {"a/s": clone}, {}, lock)
     assert change.kind == "local" and change.stats == [tp.FileStat(0, 1, "notes.md")]
+
+
+@pytest.fixture
+def before_update(run_main, tmp_path, monkeypatch):
+    """The installed skills, with a copy of each as it was before an update."""
+    installed, _, _ = run_main
+    monkeypatch.setattr(tp, "third_party_skills", lambda: {"a/s": ["pr", "teach"]})
+    old = tmp_path / "before"
+    make_skill(old, "pr", body="old steps\n")
+    make_skill(old, "teach")
+    make_skill(installed, "pr", body="new steps\n")
+    make_skill(installed, "teach")
+    return old
+
+
+def test_since_reports_each_skill_the_update_changed(
+    before_update, monkeypatch, capsys
+):
+    asked = []
+    monkeypatch.setattr(
+        news,
+        "summarize",
+        lambda changes, **kw: (
+            asked.extend(c.name for c in changes) or {"pr": "New steps."}
+        ),
+    )
+
+    assert news.main(["--since", str(before_update)]) == 0
+
+    out = capsys.readouterr().out
+    assert asked == ["pr"]
+    assert "## pr (a/s)\nNew steps.\nFiles (+added -removed):" in out
+    assert "teach" not in out
+    assert "install.py --update" not in out
+
+
+def test_since_with_nothing_changed_says_so(before_update, capsys):
+    (before_update / "pr" / "SKILL.md").write_text(
+        (tp.INSTALLED / "pr" / "SKILL.md").read_text()
+    )
+
+    assert news.main(["--since", str(before_update), "--no-summary"]) == 0
+
+    assert capsys.readouterr().out == "no skill changed\n"
+
+
+def test_since_still_lists_the_changes_when_claude_fails(
+    before_update, monkeypatch, capsys
+):
+    def failing(changes, **kw):
+        raise RuntimeError("claude-json failed: boom")
+
+    monkeypatch.setattr(news, "summarize", failing)
+
+    assert news.main(["--since", str(before_update)]) == 1
+
+    captured = capsys.readouterr()
+    assert "## pr (a/s)" in captured.out and "boom" in captured.err
+
+
+def test_since_a_missing_dir_is_an_error(run_main, tmp_path, capsys):
+    assert news.main(["--since", str(tmp_path / "nowhere"), "--no-summary"]) == 1
+    assert "nowhere" in capsys.readouterr().err
+
+
+def test_since_and_email_together_are_refused():
+    with pytest.raises(SystemExit) as exited:
+        news.main(["--since", "x", "--email", "me@example.com"])
+    assert exited.value.code == 2
+
+
+def test_summarize_takes_how_the_diffs_were_made():
+    prompts = []
+    news.summarize(
+        [news.Change("pr", "a/s", [], "+x")],
+        run=fake_claude({"skills": []}, prompts),
+        diffs="from a skill's copy before an update to its copy after",
+    )
+    assert (
+        "a diff from a skill's copy before an update to its copy after." in prompts[0]
+    )
+    assert "latest upstream" not in prompts[0]

@@ -161,7 +161,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   whether it still fits a new upstream version. `--email TO` sends the report only when there are upstream changes or
   new skills. Clones go in `$XDG_CACHE_HOME/skills-news` (default
   `~/.cache/skills-news`). The weekly cron job from `install.py` runs it; its
-  log is `~/.cache/skills-news/cron.log`.
+  log is `~/.cache/skills-news/cron.log`. `--since DIR` instead reports what
+  changed from the skill copies in `DIR` to the installed ones: `install.py
+  --update` copies the skills there first and prints this report after
+  updating, so you see what each skill's update changed.
 
 - **session-digest**: condenses a Claude Code session log, and each of its
   subagents' logs, for a retrospective. Prints what each agent and tool cost

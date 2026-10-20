@@ -3,6 +3,7 @@
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -301,6 +302,7 @@ def third_party(tmp_path, monkeypatch):
     dst = tmp_path / "home" / ".agents" / "skills"
     dst.mkdir(parents=True)
     monkeypatch.setattr(install, "AGENTS_SKILLS_DST", dst)
+    monkeypatch.setattr(install.thirdparty, "INSTALLED", dst)
     monkeypatch.setattr(
         install,
         "THIRD_PARTY_SKILLS",
@@ -440,3 +442,60 @@ def test_skill_patches_go_back_on_and_conflicts_count(tmp_path, monkeypatch, cap
     (tmp_path / "installed/pr/SKILL.md").write_text("rewritten\n")
     assert install.apply_skill_patches() == 1
     assert "CONFLICT pr" in capsys.readouterr().out
+
+
+def test_update_reports_what_it_changed_after_the_patches_go_back_on(
+    third_party, monkeypatch, tmp_path
+):
+    dst, _ = third_party
+    (dst / "tdd").mkdir()
+    (dst / "tdd" / "SKILL.md").write_text("old\n")
+    patched = []
+    monkeypatch.setattr(install, "apply_skill_patches", lambda: patched.append(1) or 0)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "npx":
+            (dst / "tdd" / "SKILL.md").write_text("new\n")
+        else:
+            since = Path(cmd[cmd.index("--since") + 1])
+            seen["cmd"] = cmd
+            seen["before"] = (since / "tdd" / "SKILL.md").read_text()
+            seen["patched first"] = bool(patched)
+        return install.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(install.subprocess, "run", fake_run)
+
+    assert install.update_third_party_skills() == 0
+    assert Path(seen["cmd"][0]).name == "skills-news"
+    assert seen["before"] == "old\n" and seen["patched first"]
+
+
+def test_a_failed_update_report_does_not_fail_the_update(
+    third_party, monkeypatch, capsys
+):
+    monkeypatch.setattr(install, "apply_skill_patches", lambda: 0)
+
+    def fake_run(cmd, **kw):
+        return install.subprocess.CompletedProcess(cmd, 0 if cmd[0] == "npx" else 1)
+
+    monkeypatch.setattr(install.subprocess, "run", fake_run)
+
+    assert install.update_third_party_skills() == 0
+    assert "skills-news" in capsys.readouterr().out
+
+
+def test_an_update_report_that_cannot_run_does_not_fail_the_update(
+    third_party, monkeypatch, capsys
+):
+    monkeypatch.setattr(install, "apply_skill_patches", lambda: 0)
+
+    def fake_run(cmd, **kw):
+        if cmd[0] != "npx":
+            raise PermissionError(cmd[0])
+        return install.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(install.subprocess, "run", fake_run)
+
+    assert install.update_third_party_skills() == 0
+    assert "skills-news" in capsys.readouterr().out

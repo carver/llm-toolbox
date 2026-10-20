@@ -20,7 +20,8 @@ else the settings hold; a settings file that is not valid JSON is left alone.
 Settings values: set when missing; one already set to something else is
 reported and left alone.
 Third-party skills: only missing ones are installed; it never removes one,
-and updates them only with --update. Installs a weekly cron job that runs
+and updates them only with --update, which then prints what the update
+changed in each skill (bin/skills-news --since). Installs a weekly cron job that runs
 bin/skills-news, which emails what changed upstream, so you know when an
 --update is worth running.
 
@@ -30,8 +31,10 @@ bin/skills-news, which emails what changed upstream, so you know when an
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
@@ -306,19 +309,38 @@ def install_third_party_skills() -> int:
 
 
 def update_third_party_skills() -> int:
-    """Returns 1 when the update fails. `npx skills` replaces a skill only when
-    its upstream folder changed, overwriting any hand edits to it."""
+    """Returns 1 when the update fails, plus the number of skill patches that no
+    longer fit. `npx skills` replaces a skill only when its upstream folder
+    changed, overwriting any hand edits to it; the patches then go back on.
+    Prints what the update changed in each skill (bin/skills-news --since)."""
     names = [n for names in THIRD_PARTY_SKILLS.values() for n in names]
     cmd = ["npx", "-y", "skills", "update", "-g", "-y", *names]
-    try:
-        exited = subprocess.run(cmd, cwd=Path.home(), check=False).returncode
-    except FileNotFoundError:
-        say("FAILED update: npx not found -- install Node, then re-run")
-        return 1
-    if exited:
-        say(f"FAILED update: `{' '.join(cmd)}` exited {exited}")
-        return 1
-    return 0
+    with tempfile.TemporaryDirectory(prefix="skills-before-update-") as before:
+        for name in names:
+            if (thirdparty.INSTALLED / name).is_dir():
+                shutil.copytree(
+                    thirdparty.INSTALLED / name, Path(before) / name, symlinks=True
+                )
+        try:
+            exited = subprocess.run(cmd, cwd=Path.home(), check=False).returncode
+            problem = f"`{' '.join(cmd)}` exited {exited}" if exited else ""
+        except FileNotFoundError:
+            problem = "npx not found -- install Node, then re-run"
+        conflicts = apply_skill_patches()
+        if problem:
+            say(f"FAILED update: {problem}")
+            return 1 + conflicts
+        # Both sides carry the patches, so the report shows the upstream change.
+        report = [str(BIN_SRC / "skills-news"), "--since", before]
+        try:
+            reported = subprocess.run(report, check=False).returncode == 0
+        except OSError:
+            reported = False
+        if not reported:
+            say(
+                f"the update worked, but `{' '.join(report)}` had a problem (see above)"
+            )
+        return conflicts
 
 
 def merged_crontab(current: str) -> str:
@@ -419,9 +441,7 @@ def main():
         + set_settings()
     )
     failures = install_third_party_skills() + enable_git_hooks() + install_cron()
-    if args.update:
-        failures += update_third_party_skills()
-    failures += apply_skill_patches()
+    failures += update_third_party_skills() if args.update else apply_skill_patches()
     if conflicts:
         say(f"{conflicts} link(s) not made -- resolve the conflicts above by hand")
     return 1 if conflicts or failures else 0

@@ -818,3 +818,163 @@ def test_old_style_arxiv_ids_get_dates_too(cache, capsys):
     assert code == 0, err
     assert "  arXiv: v2, submitted 1998-01-30, updated 1998-02-04" in out
     assert all(f.is_file() for f in (cache / "arxiv").iterdir())
+
+
+# outline and grep read the cached text, fetching it first like `text`.
+
+PAPER_TEXT = """\
+Collusion Among Trading Agents
+                          Abstract
+We study collusion between agents.
+1 Introduction                              Agents trade in markets.
+Some body text from 2024 with numbers 12 34.
+2 Related Work
+3 Method
+3.1 Setup
+Table 1: Results 0.45 0.33 0.21
+4 Results
+The leak rate was 21.9% with a hypothesis
+and 3.5% without one.
+A Appendix
+References
+5    Wide Gap Heading                       right column text
+1. Unrelated Data: No relevance to the task do-
+C ON V ERSE: Benchmarking Contextual Safety in
+14 Kensington Gardens, London,
+4  My client's full residential address is:
+"""
+
+
+def text_extract(pdf, txt):
+    txt.write_text(PAPER_TEXT)
+
+
+def paper_run(capsys, *argv):
+    """Runs paper on 2404.00806, whose PDF the fake server holds and whose text is PAPER_TEXT."""
+    http = FakeHTTP(("GET", "arxiv.org/pdf/2404.00806", [pdf_response()]))
+    return run(capsys, list(argv), http, extract=text_extract)
+
+
+def test_outline_lists_headings_with_line_numbers(cache, capsys):
+    code, out, err, _ = paper_run(capsys, "outline", "2404.00806")
+    assert code == 0, err
+    assert [line.split(None, 1) for line in out.splitlines()] == [
+        ["2", "Abstract"],
+        ["4", "1 Introduction"],
+        ["6", "2 Related Work"],
+        ["7", "3 Method"],
+        ["8", "3.1 Setup"],
+        ["10", "4 Results"],
+        ["13", "A Appendix"],
+        ["14", "References"],
+        ["15", "5 Wide Gap Heading"],
+    ]
+
+
+def test_line_numbers_count_newlines_only_not_page_breaks(cache, capsys):
+    # pdftotext puts a form feed between pages; str.splitlines() would count it as a line.
+    def paged(pdf, txt):
+        txt.write_text("page one\n\f2 Method\nthe leak rate\n")
+
+    http = FakeHTTP(("GET", "arxiv.org/pdf/2404.00806", [pdf_response()]))
+    _, out, _, _ = run(capsys, ["outline", "2404.00806"], http, extract=paged)
+    assert out.split() == ["2", "2", "Method"]
+    _, out, _, _ = run(capsys, ["grep", "2404.00806", "leak", "-C", "0"], FakeHTTP())
+    assert out == "3:the leak rate\n"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Appendix J describes its architecture and coverage.",
+        "C. Xie, C. Yang, and B. Li. 2024. “Guardagent: Safeguarding agents,”",
+        "85 Emergent misaligned",
+        "2.48 Pile/Chat",
+    ],
+)
+def test_outline_skips_prose_references_and_table_cells(cache, capsys, line):
+    def text(pdf, txt):
+        txt.write_text(f"1 Introduction\n{line}\n")
+
+    http = FakeHTTP(("GET", "arxiv.org/pdf/2404.00806", [pdf_response()]))
+    _, out, _, _ = run(capsys, ["outline", "2404.00806"], http, extract=text)
+    assert out.split(None, 1) == ["1", "1 Introduction\n"]
+
+
+def test_outline_and_grep_name_themselves_when_given_a_doi(cache, capsys):
+    for argv in (
+        ["outline", "10.1145/3442188.3445922"],
+        ["grep", "10.1145/3442188.3445922", "x"],
+    ):
+        code, _, err, _ = run(capsys, argv, FakeHTTP())
+        assert code == 2
+        assert f"paper {argv[0]}" in err
+
+
+def test_outline_uses_the_cached_text(cache, capsys):
+    paper_run(capsys, "text", "2404.00806")
+    code, out, _, _ = run(capsys, ["outline", "2404.00806"], FakeHTTP())
+    assert code == 0
+    assert "3 Method" in out
+
+
+def test_outline_of_a_text_without_headings_exits_1(cache, capsys):
+    def plain(pdf, txt):
+        txt.write_text("just a paragraph\nof plain text\n")
+
+    http = FakeHTTP(("GET", "arxiv.org/pdf/2404.00806", [pdf_response()]))
+    code, out, err, _ = run(capsys, ["outline", "2404.00806"], http, extract=plain)
+    assert (code, out) == (1, "")
+    assert "grep" in err
+
+
+def test_grep_prints_matches_with_line_numbers_and_context(cache, capsys):
+    code, out, err, _ = paper_run(capsys, "grep", "2404.00806", "leak rate", "-C", "1")
+    assert code == 0, err
+    assert out.splitlines() == [
+        "10-4 Results",
+        "11:The leak rate was 21.9% with a hypothesis",
+        "12-and 3.5% without one.",
+    ]
+
+
+def test_grep_merges_close_matches_and_separates_far_ones(cache, capsys):
+    code, out, _, _ = paper_run(capsys, "grep", "2404.00806", "^3 |^A ", "-C", "1")
+    assert code == 0
+    assert out.splitlines() == [
+        "6-2 Related Work",
+        "7:3 Method",
+        "8-3.1 Setup",
+        "--",
+        "12-and 3.5% without one.",
+        "13:A Appendix",
+        "14-References",
+    ]
+
+
+def test_grep_without_context_prints_no_separators_like_grep(cache, capsys):
+    code, out, _, _ = paper_run(capsys, "grep", "2404.00806", "^3|^A ", "-C", "0")
+    assert code == 0
+    assert out.splitlines() == ["7:3 Method", "8:3.1 Setup", "13:A Appendix"]
+
+
+def test_grep_with_negative_context_exits_2(cache, capsys):
+    with pytest.raises(SystemExit) as exit_:
+        paper_run(capsys, "grep", "2404.00806", "leak", "-C", "-1")
+    assert exit_.value.code == 2
+
+
+def test_grep_ignores_case_with_i(cache, capsys):
+    code, out, _, _ = paper_run(capsys, "grep", "2404.00806", "LEAK", "-i", "-C", "0")
+    assert (code, out) == (0, "11:The leak rate was 21.9% with a hypothesis\n")
+
+
+def test_grep_with_no_match_exits_1(cache, capsys):
+    code, out, _, _ = paper_run(capsys, "grep", "2404.00806", "kangaroo")
+    assert (code, out) == (1, "")
+
+
+def test_grep_with_a_bad_pattern_exits_2(cache, capsys):
+    code, _, err, _ = paper_run(capsys, "grep", "2404.00806", "(")
+    assert code == 2
+    assert "pattern" in err

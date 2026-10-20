@@ -8,6 +8,8 @@
     paper cites ID [--limit N]
     paper search QUERY... [--limit N]
     paper text ID
+    paper outline ID
+    paper grep ID PATTERN [-C N] [-i]
 
 meta prints one short block per paper: title, year and venue, authors (with
 affiliations when Semantic Scholar has them), citation count, its arXiv, DOI
@@ -16,7 +18,14 @@ the dates of its first and latest versions (one arXiv API request per call).
 cites lists papers citing ID (default 20), search the top matches for a
 keyword query (default 10), each with year, title, venue, first three authors
 and ids. text downloads the PDF, extracts it with `pdftotext -layout` and
-prints the path of the .txt file; read that.
+prints the path of the .txt file. A whole paper runs to 10-20k tokens, so
+start with outline: its section headings with line numbers, to read just the
+sections you need with an offset and limit. grep prints the lines matching a
+regex, with their line numbers and 2 lines of context (-C N to change, -i to
+ignore case), for finding one number or claim. Both fetch the text first, like
+text. outline spots numbered headings ("3 Method", "4.2 Results", "A
+Appendix") and the usual section names; when a layout defeats it, grep for a
+heading instead.
 
 ID is an arXiv id (2404.00806, version suffix optional), an arxiv.org abs or
 pdf URL, a DOI (10.1145/... bare or as a doi.org URL), or a 40-character
@@ -42,15 +51,18 @@ and timeouts are retried with exponential backoff, honouring Retry-After: up
 to 6 attempts and 2 minutes of waiting. Don't sleep and retry yourself.
 
 Exit status: 0 success, 1 not found (or the URL is not a PDF pdftotext can
-read; search with no hits exits 1; cites with no citing papers says so and
-exits 0), 2 usage error, 3 the remote refused or failed the request after
-retries, or sent an unexpected answer: try again later.
+read; search with no hits exits 1, and so do grep with no matching line and
+outline with no heading; cites with no citing papers says so and exits 0),
+2 usage error, 3 the remote refused or failed the request after retries, or
+sent an unexpected answer: try again later.
 
 Examples:
     paper meta 2404.00806 10.1145/3442188.3445922
     paper cites https://arxiv.org/abs/1706.03762 --limit 50
     paper search detect collusion multi-agent games --limit 5
     less "$(paper text 2404.00806)"
+    paper outline 2404.00806
+    paper grep 2404.00806 'collusion rate|markup' -C 1
 """
 
 import argparse
@@ -147,9 +159,7 @@ class PaperId:
 
     def pdf_source(self) -> tuple[str, str]:
         """The PDF's URL and the cache file stem for it."""
-        raise UsageError(
-            f"`paper text` takes an arXiv id or URL, or a PDF URL: {self.value!r}"
-        )
+        raise UsageError(f"needs an arXiv id or URL, or a PDF URL: {self.value!r}")
 
 
 class ArxivId(PaperId):
@@ -640,8 +650,12 @@ def cmd_search(client: Client, args: argparse.Namespace) -> int:
     return OK
 
 
-def cmd_text(client: Client, args: argparse.Namespace) -> int:
-    url, stem = parse_id(args.id).pdf_source()
+def cached_text(client: Client, id_text: str, command: str) -> Path:
+    """The paper's extracted text, downloaded and extracted first if not cached."""
+    try:
+        url, stem = parse_id(id_text).pdf_source()
+    except UsageError as e:
+        raise UsageError(f"`paper {command}` {e}") from e
     folder = client.cache / "pdf"
     pdf, txt = folder / (stem + ".pdf"), folder / (stem + ".txt")
     if not txt.exists():
@@ -655,8 +669,134 @@ def cmd_text(client: Client, args: argparse.Namespace) -> int:
         write_atomic(pdf, response.content)
         with replaced_on_success(txt) as partial:
             client.extract(pdf, partial)
-    print(txt)
+    return txt
+
+
+def cmd_text(client: Client, args: argparse.Namespace) -> int:
+    print(cached_text(client, args.id, "text"))
     return OK
+
+
+def text_lines(path: Path) -> list[str]:
+    """The text's lines, split on newlines only: str.splitlines() also splits on the
+    form feed pdftotext puts between pages, which would push line numbers off by one
+    per page."""
+    lines = path.read_text(errors="replace").split("\n")
+    return lines[:-1] if lines and lines[-1] == "" else lines
+
+
+# A section number (1-29, with up to two subsection levels) and its title, at a line's
+# start or after a column gap. pdftotext often pads the space after the number, and a
+# run of 3+ spaces ends the title. Larger numbers are table cells, not sections.
+SECTION_PART = r"(?:[1-9]|[12]\d)"
+NUMBERED_HEADING = re.compile(
+    rf"(?:^|\s{{3,}})({SECTION_PART}(?:\.{SECTION_PART}){{0,2}}\.?"
+    rf"|[A-H](?:\.{SECTION_PART}){{0,2}}\.?)\s+([A-Z](?:(?!\s{{3}}).)*)"
+)
+TITLE_WORDS = 12
+NAMED_HEADINGS = {
+    "abstract",
+    "introduction",
+    "background",
+    "related work",
+    "method",
+    "methods",
+    "methodology",
+    "experiments",
+    "experimental setup",
+    "results",
+    "discussion",
+    "limitations",
+    "conclusion",
+    "conclusions",
+    "references",
+    "appendix",
+    "acknowledgments",
+    "acknowledgements",
+}
+HEADING_CHARS = 80
+
+
+def heading_in(line: str) -> str | None:
+    """The section heading on a line of `pdftotext -layout` output, or None. Both
+    columns of a two-column layout count. A page's first line starts with a form feed."""
+    line = line.replace("\f", "")
+    for found in NUMBERED_HEADING.finditer(line):
+        number, title = found.group(1), found.group(2).strip()
+        if is_title(title, lettered=number[0].isalpha()):
+            return f"{number} {title}"
+    for chunk in re.split(r"\s{3,}", line.strip()):
+        name = chunk.rstrip(":").lower()
+        if name in NAMED_HEADINGS:
+            return chunk
+        appendix = re.fullmatch(r"appendix [a-z0-9]\S*(?: (.*))?", name)
+        if appendix and (
+            appendix.group(1) is None or is_title(chunk.split(None, 2)[2], False)
+        ):
+            return chunk
+    return None
+
+
+def is_title(text: str, lettered: bool) -> bool:
+    """Whether the text after a section number reads like a heading: short, mostly
+    letters, not ending mid-sentence (list items, addresses and hyphenated lines do).
+    After a letter ("A Prompts") the first word needs 3+ characters, which rules out
+    small-caps fragments such as "C ON V ERSE"."""
+    words = text.split()
+    visible = [c for c in text if not c.isspace()]
+    letters = sum(c.isalpha() for c in visible)
+    return (
+        len(text) <= HEADING_CHARS
+        and len(words) <= TITLE_WORDS
+        and letters >= 3
+        and letters >= 0.8 * len(visible)
+        and not text.endswith((".", ",", ":", ";", "-", '"', "”", "’"))
+        and not (lettered and len(words[0]) < 3)
+    )
+
+
+def cmd_outline(client: Client, args: argparse.Namespace) -> int:
+    lines = text_lines(cached_text(client, args.id, "outline"))
+    found = [(n, h) for n, line in enumerate(lines, 1) if (h := heading_in(line))]
+    if not found:
+        print(f"paper: no headings found in {args.id}; try paper grep", file=sys.stderr)
+        return NOT_FOUND
+    for n, heading in found:
+        print(f"{n:>6}  {heading}")
+    return OK
+
+
+def cmd_grep(client: Client, args: argparse.Namespace) -> int:
+    try:
+        pattern = re.compile(args.pattern, re.IGNORECASE if args.ignore_case else 0)
+    except re.error as e:
+        raise UsageError(f"bad pattern {args.pattern!r}: {e}") from e
+    lines = text_lines(cached_text(client, args.id, "grep"))
+    hits = [i for i, line in enumerate(lines) if pattern.search(line)]
+    if not hits:
+        return NOT_FOUND
+    # Each hit with its context, merged where they touch or overlap, like grep.
+    blocks: list[list[int]] = []
+    for i in hits:
+        start, end = max(0, i - args.context), min(len(lines), i + args.context + 1)
+        if blocks and start <= blocks[-1][1]:
+            blocks[-1][1] = max(blocks[-1][1], end)
+        else:
+            blocks.append([start, end])
+    hit_set = set(hits)
+    for n, (start, end) in enumerate(blocks):
+        if n and args.context:
+            print("--")
+        for i in range(start, end):
+            print(f"{i + 1}{':' if i in hit_set else '-'}{lines[i]}")
+    return OK
+
+
+def context_lines(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"context can't be negative: {value}")
+    return value
 
 
 COMMANDS = {
@@ -664,6 +804,8 @@ COMMANDS = {
     "cites": cmd_cites,
     "search": cmd_search,
     "text": cmd_text,
+    "outline": cmd_outline,
+    "grep": cmd_grep,
 }
 EXIT_CODES = {UsageError: USAGE, ExtractFailed: NOT_FOUND, RemoteError: REMOTE}
 
@@ -694,6 +836,19 @@ def main(
     search.add_argument("--limit", type=int, default=10, help="how many (default 10)")
     text = sub.add_parser("text", help="full text: prints the cached .txt path")
     text.add_argument("id", metavar="ID", help="arXiv id or URL, or a PDF URL")
+    outline = sub.add_parser("outline", help="section headings with line numbers")
+    outline.add_argument("id", metavar="ID", help="arXiv id or URL, or a PDF URL")
+    grep = sub.add_parser("grep", help="lines matching a regex, with line numbers")
+    grep.add_argument("id", metavar="ID", help="arXiv id or URL, or a PDF URL")
+    grep.add_argument("pattern", metavar="PATTERN", help="a Python regex")
+    grep.add_argument(
+        "-C",
+        "--context",
+        type=context_lines,
+        default=2,
+        help="lines of context (default 2)",
+    )
+    grep.add_argument("-i", "--ignore-case", action="store_true")
     args = parser.parse_args(argv)
     client = Client(fetch or requests_fetch, sleep, extract or pdftotext)
     try:

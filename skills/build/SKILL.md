@@ -34,8 +34,6 @@ Done when `git log <base>..HEAD` shows your commits and the repo's checks pass.
 
 Spawn one review subagent in the foreground, and wait for its report before doing anything else. Give it `<base>` as the fixed point, the brief file as the spec, and both of `/code-review`'s sub-agent briefs (Standards and Spec, with the standards sources and smell baseline its SKILL.md lists), and have it report the two axes under separate headings.
 
-Code that drives paid or rate-limited runs, such as an experiment or a sweep, gets only a pilot of a few cells before this review. The full run waits for triage, because a bug found after a full run means paying for that run twice.
-
 ## 4. Triage
 
 Sort every finding into one of:

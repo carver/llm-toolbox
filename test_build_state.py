@@ -95,6 +95,138 @@ def test_start_refuses_while_a_build_is_open_unless_forced(repo):
     )
 
 
+CODE_REVIEW = Path.home() / ".agents/skills/code-review/SKILL.md"
+STANDARDS_BRIEF = "Report every standard broken. Under 400 words."
+SPEC_BRIEF = "Report: (a) what's missing; (b) scope creep. Under 400 words."
+
+
+# A stand-in for code-review's SKILL.md, laid out like the real one.
+CODE_REVIEW_TEXT = f"""### 3. Identify the standards sources
+
+Search the repo for every file that documents how code should be written.
+
+### 4. Spawn both sub-agents in parallel
+
+**Standards sub-agent prompt** should include:
+
+- The full diff command and commit list.
+- The brief: "{STANDARDS_BRIEF}"
+
+**Spec sub-agent prompt** should include:
+
+- The diff command and commit list.
+- The brief: "{SPEC_BRIEF}"
+"""
+
+
+def code_review_skill(tmp_path, text=CODE_REVIEW_TEXT):
+    path = tmp_path / "code-review.md"
+    path.write_text(text)
+    return path
+
+
+def test_review_prompt_carries_the_build_and_both_code_review_briefs(repo, tmp_path):
+    base = git(repo, "rev-parse", "HEAD").strip()
+    build_state(repo, "start")
+    commit(repo, "AGENTS.md", "Note the house rules")
+    commit(repo, "parser.py", "Parse dates")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Parse dates.\n")
+
+    shown = build_state(
+        repo, "review-prompt", str(brief), "--skill", str(code_review_skill(tmp_path))
+    )
+
+    assert shown.returncode == 0, shown.stderr
+    prompt = shown.stdout
+    assert str(repo) in prompt and f"git diff {base}...HEAD" in prompt
+    assert "Parse dates" in prompt and "Note the house rules" in prompt
+    assert str(brief) in prompt
+    assert f'"{STANDARDS_BRIEF}"' in prompt and f'"{SPEC_BRIEF}"' in prompt
+    assert (
+        prompt.index(STANDARDS_BRIEF)
+        < prompt.index("\n## Spec\n")
+        < prompt.index(SPEC_BRIEF)
+    )
+    assert "AGENTS.md" in prompt and "CONTRIBUTING.md" not in prompt
+    assert "coding/standards.md" in prompt
+
+
+@pytest.mark.parametrize(
+    "text, named",
+    [
+        (CODE_REVIEW_TEXT.replace(f'- The brief: "{SPEC_BRIEF}"\n', ""), "Spec"),
+        # A brief moved out of its section mustn't be taken from the next one.
+        (
+            CODE_REVIEW_TEXT.replace(
+                f'- The brief: "{STANDARDS_BRIEF}"\n',
+                '\n**Security sub-agent prompt** should include:\n\n- The brief: "Hunt CVEs."\n',
+            ),
+            "Standards",
+        ),
+        (
+            CODE_REVIEW_TEXT.replace("### 3. Identify", "### 3. Find"),
+            "standards sources",
+        ),
+    ],
+)
+def test_review_prompt_fails_naming_the_skill_when_it_changed(
+    repo, tmp_path, text, named
+):
+    build_state(repo, "start")
+    skill = code_review_skill(tmp_path, text)
+    (tmp_path / "brief.md").write_text("Parse dates.\n")
+
+    shown = build_state(
+        repo, "review-prompt", str(tmp_path / "brief.md"), "--skill", str(skill)
+    )
+
+    assert shown.returncode == 1 and str(skill) in shown.stderr
+    assert named in shown.stderr and shown.stdout == ""
+
+
+def test_review_prompt_says_when_code_review_is_missing(repo, tmp_path):
+    build_state(repo, "start")
+    (tmp_path / "brief.md").write_text("Parse dates.\n")
+    skill = tmp_path / "nowhere.md"
+
+    shown = build_state(
+        repo, "review-prompt", str(tmp_path / "brief.md"), "--skill", str(skill)
+    )
+
+    assert shown.returncode == 1 and f"{skill} not found" in shown.stderr
+
+
+def test_review_prompt_refuses_a_brief_that_doesnt_exist(repo, tmp_path):
+    build_state(repo, "start")
+    skill = code_review_skill(tmp_path)
+
+    shown = build_state(repo, "review-prompt", "breif.md", "--skill", str(skill))
+
+    assert shown.returncode == 1 and "breif.md" in shown.stderr
+    assert shown.stdout == ""
+
+
+def test_review_prompt_without_start_says_so(repo, tmp_path):
+    skill = code_review_skill(tmp_path)
+
+    shown = build_state(repo, "review-prompt", "brief.md", "--skill", str(skill))
+
+    assert shown.returncode == 1 and "build-state start" in shown.stderr
+
+
+@pytest.mark.skipif(not CODE_REVIEW.is_file(), reason="code-review isn't installed")
+def test_review_prompt_finds_both_briefs_in_the_installed_code_review(repo, tmp_path):
+    """code-review is third-party: this catches an update that moves its briefs."""
+    build_state(repo, "start")
+    (tmp_path / "brief.md").write_text("Parse dates.\n")
+
+    shown = build_state(repo, "review-prompt", str(tmp_path / "brief.md"))
+
+    assert shown.returncode == 0, shown.stderr
+    assert shown.stdout.count("Under 400 words") == 2
+
+
 def test_finish_without_start_says_so(repo):
     done = build_state(repo, "finish")
 

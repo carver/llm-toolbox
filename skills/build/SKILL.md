@@ -32,7 +32,7 @@ Done when `git log <base>..HEAD` shows your commits and the repo's checks pass.
 
 ## 3. Review
 
-Spawn one review subagent in the foreground, and wait for its report before doing anything else. Give it `<base>` as the fixed point, the brief file as the spec, and both of `/code-review`'s sub-agent briefs (Standards and Spec, with the standards sources and smell baseline its SKILL.md lists), and have it report the two axes under separate headings.
+Spawn one review subagent in the foreground, and wait for its report before doing anything else. Its prompt is what `build-state review-prompt BRIEF` prints: `<base>` as the fixed point, the brief file as the spec, and `/code-review`'s Standards and Spec briefs with their standards sources and smell baseline, reported under separate headings. Append any ask this change needs, such as a sweep for leftovers of a rename.
 
 ## 4. Triage
 

@@ -11,7 +11,11 @@ hooks from (`core.hooksPath`, else .git/hooks).
 in its shells, that line runs agent-pre-commit first and fails the commit if it
 fails. Git runs the hook after `commit -a` or `commit PATHS` has updated the
 index, so the check sees exactly what is being committed. AGENT_PRE_COMMIT
-stops the loop when agent-pre-commit runs pre-commit itself.
+stops the loop when agent-pre-commit runs pre-commit itself. The line runs the
+check through `--run`, which skips it when it already passed on the same tree,
+as when an amend changes only the message; an agent without agent-commit-gate
+on PATH, such as a teammate's, runs the check directly instead. An older line
+is replaced.
 
 Without arguments it is a Claude Code PreToolUse hook (install.py registers it
 in ~/.claude/settings.json) that refuses `git commit --no-verify` (or `-n`),
@@ -19,10 +23,12 @@ which would skip the check. It catches a mistake, not an agent set on getting
 around the check (`AI_AGENT= git commit`, `git -c core.hooksPath=...`).
 
     agent-commit-gate --install REPO...    # add the line to each repo's pre-commit
+    agent-commit-gate --run HOOK           # as the line calls it
     agent-commit-gate < hook-input.json    # as Claude Code calls it
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -33,10 +39,21 @@ from pathlib import Path
 
 HOOK_NAME = "agent-pre-commit"
 COMMENT = f"# Agents' commits also run the slower {HOOK_NAME} (llm-toolbox agent-commit-gate)."
+# The hook is shared, so an agent without llm-toolbox runs the check directly, every time.
 LINE = (
+    'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
+    "if command -v agent-commit-gate >/dev/null; then "
+    f'AGENT_PRE_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}"; '
+    f'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}"; fi || exit; fi'
+)
+# Earlier versions of LINE, which --install replaces.
+# The line before --run, which --install replaces.
+OLD_LINE = (
     'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
     f'AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}" || exit; fi'
 )
+# In the git dir: the last tree and agent check that passed together.
+PASS_RECORD = "agent-pre-commit-passed"
 REDIRECT = re.compile(r"^\d*[<>]")
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -159,14 +176,15 @@ def skips_hooks(args):
     return False
 
 
+def git_out(*args):
+    """A git command's output, or None when it fails."""
+    run = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+    return run.stdout.strip() if run.returncode == 0 else None
+
+
 def hooks_dir(repo):
-    run = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--git-path", "hooks"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return Path(repo, run.stdout.strip()) if run.returncode == 0 else None
+    hooks = git_out("-C", str(repo), "rev-parse", "--git-path", "hooks")
+    return None if hooks is None else Path(repo, hooks)
 
 
 def install(repo):
@@ -183,6 +201,10 @@ def install(repo):
     if LINE in text:
         print(f"{pre}: already installed")
         return None
+    if OLD_LINE in text:
+        pre.write_text(text.replace(OLD_LINE, LINE))
+        print(f"{pre}: upgraded")
+        return None
     lines = text.splitlines()
     shebang = lines[0][2:].split() if lines and lines[0].startswith("#!") else []
     if shebang and Path(shebang[0]).name == "env":
@@ -198,6 +220,37 @@ def install(repo):
     return None
 
 
+def run_check(path):
+    """Run the agent check at `path`, unless it passed on this exact tree already, as
+    when an amend changes only the message. The key is the tree being committed and the
+    check's own content. A pass counts only with no unstaged changes to tracked files,
+    since some checks read the working tree rather than the index."""
+    hook = Path(path)
+    if not (hook.is_file() and os.access(hook, os.X_OK)):
+        print(f"{path}: no executable agent check", file=sys.stderr)
+        return 1
+    tree = git_out("write-tree")
+    record = git_out("rev-parse", "--git-path", PASS_RECORD)
+    key = None
+    if tree and record:
+        key = f"{tree} {hashlib.sha1(hook.read_bytes()).hexdigest()}"
+        if Path(record).is_file() and Path(record).read_text() == key:
+            print(
+                f"{HOOK_NAME}: skipped, tree {tree[:12]} already passed it",
+                file=sys.stderr,
+            )
+            return 0
+    clean = subprocess.run(["git", "diff", "--quiet"], check=False).returncode == 0
+    # `path` as given: Path() would drop a leading ./ and send it to a PATH lookup.
+    code = subprocess.run([path], check=False).returncode
+    if code == 0 and clean and key:
+        try:
+            Path(record).write_text(key)
+        except OSError as error:
+            print(f"{HOOK_NAME}: passed; couldn't record it: {error}", file=sys.stderr)
+    return code
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -208,7 +261,14 @@ def main(argv=None):
         metavar="REPO",
         help="add the agent check line to each repo's pre-commit hook",
     )
+    parser.add_argument(
+        "--run",
+        metavar="HOOK",
+        help="run the agent check HOOK, unless it passed on this exact tree already",
+    )
     args = parser.parse_args(argv)
+    if args.run:
+        return run_check(args.run)
     if args.install:
         errors = [e for e in map(install, args.install) if e]
         for error in errors:

@@ -104,8 +104,15 @@ def install(*repos):
     )
 
 
-def commit(repo, *args, agent=True):
+def commit(repo, *args, agent=True, gate_on_path=True):
     env = without_repo_vars(os.environ)
+    # The hook line calls agent-commit-gate from PATH: this checkout's, not the installed one.
+    dirs = [
+        d for d in env["PATH"].split(os.pathsep) if not Path(d, SCRIPT.name).exists()
+    ]
+    if gate_on_path:
+        dirs.insert(0, str(SCRIPT.parent))
+    env["PATH"] = os.pathsep.join(dirs)
     if agent:
         env["AI_AGENT"] = "test-agent"
     return git(repo, "commit", "-q", "-m", "x", *args, env=env, check=False)
@@ -154,6 +161,19 @@ def test_install_refuses_a_pre_commit_that_is_not_a_shell_script(repo):
 )
 def test_checked_in_hooks_carry_the_current_line(path):
     assert gate.LINE in (SCRIPT.parent.parent / path).read_text()
+
+
+def test_install_upgrades_the_old_line(repo):
+    hook(repo, "agent-pre-commit", "exit 0")
+    old = (
+        'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
+        'AGENT_PRE_COMMIT=1 "$(dirname "$0")/agent-pre-commit" || exit; fi'
+    )
+    pre = hook(repo, "pre-commit", f"{gate.COMMENT}\n{old}\necho fast")
+    assert install(repo).returncode == 0
+    text = pre.read_text()
+    assert old not in text and gate.LINE in text
+    assert text.splitlines() == ["#!/bin/sh", gate.COMMENT, gate.LINE, "echo fast"]
 
 
 def test_install_creates_a_missing_pre_commit(repo):
@@ -229,6 +249,55 @@ def test_a_nounset_pre_commit_still_works_for_humans(installed):
     pre = installed / ".githooks" / "pre-commit"
     pre.write_text(pre.read_text().replace("#!/bin/sh", "#!/bin/sh -u", 1))
     assert commit(installed, agent=False).returncode == 0
+
+
+def test_an_unchanged_tree_skips_the_agent_check_it_already_passed(installed):
+    assert commit(installed).returncode == 0
+    reworded = commit(installed, "--amend")
+    assert reworded.returncode == 0
+    assert ran(installed) == ["agent", "fast", "fast"]
+    assert "already passed" in reworded.stderr
+
+
+def test_a_teammates_agent_without_the_gate_runs_the_check_every_time(installed):
+    """The hook is shared; agent-commit-gate is one person's tool."""
+    assert commit(installed, gate_on_path=False).returncode == 0
+    assert commit(installed, "--amend", gate_on_path=False).returncode == 0
+    assert ran(installed) == ["agent", "fast", "agent", "fast"]
+
+
+def test_a_changed_tree_runs_the_agent_check_again(installed):
+    assert commit(installed).returncode == 0
+    (installed / "a").write_text("better\n")
+    assert commit(installed, "--amend", "-a").returncode == 0
+    assert ran(installed) == ["agent", "fast", "agent", "fast"]
+
+
+def test_a_failed_agent_check_runs_again_on_the_same_tree(installed):
+    (installed / "a").write_text("bad\n")
+    git(installed, "add", "a")
+    assert commit(installed).returncode != 0
+    assert commit(installed).returncode != 0
+    assert ran(installed) == ["agent", "agent"]
+
+
+def test_a_pass_with_unstaged_changes_is_not_remembered(installed):
+    """Some agent checks read the working tree, so their pass says nothing of the index."""
+    assert commit(installed).returncode == 0
+    (installed / "a").write_text("staged\n")
+    git(installed, "add", "a")
+    (installed / "a").write_text("unstaged\n")
+    assert commit(installed).returncode == 0
+    assert commit(installed, "--amend").returncode == 0
+    assert ran(installed) == ["agent", "fast", "agent", "fast", "agent", "fast"]
+
+
+def test_a_changed_agent_check_runs_again_on_the_same_tree(installed):
+    assert commit(installed).returncode == 0
+    check = installed / ".githooks" / "agent-pre-commit"
+    check.write_text(check.read_text() + "\n# stricter now\n")
+    assert commit(installed, "--amend").returncode == 0
+    assert ran(installed) == ["agent", "fast", "agent", "fast"]
 
 
 def test_an_agent_check_that_runs_pre_commit_does_not_loop(repo):

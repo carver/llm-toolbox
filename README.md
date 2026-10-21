@@ -139,8 +139,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   commit if that fails. People keep the quick hook; the agent also gets the
   slow checks, such as the whole test suite. Git runs the hook after `commit
   -a` or `commit PATHS` updates the index, so the check sees what is
-  committed. `install.py` also registers it as a Claude Code hook that
-  refuses `git commit --no-verify`.
+  committed. A tree that already passed the check, as in an amend that
+  changes only the message, skips it; an agent without llm-toolbox, such as
+  a teammate's, runs the check every time. `install.py` also registers it as
+  a Claude Code hook that refuses `git commit --no-verify`.
 - **openrouter-credits**: prints an OpenRouter account's credits, bought, used
   and left. The key comes from `OPENROUTER_API_KEY`, else from `./.env` (or
   `--env-file`); it is never printed.

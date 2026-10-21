@@ -26,6 +26,7 @@ Review holds the code to [standards.md](standards.md), in the same order, and a 
 
 Make logically isolated commits.
 Before every commit or amend, check `git diff --cached --stat`. Unstage anything you didn't write: the user may have edits in progress in the same tree.
+Read a commit's whole output, or check its exit status: when a hook fails, nothing is committed, and a `| tail` can hide that.
 Before an unpushed branch is merged, fold fixes into the commits they fix (`git commit --fixup=<sha>`, then `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash <base>`; plain interactive rebase isn't available here). History shouldn't show detours.
 
 Before you start a change, and again on the finished diff, judge its merge danger:

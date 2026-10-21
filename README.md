@@ -137,6 +137,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   -a` or `commit PATHS` updates the index, so the check sees what is
   committed. `install.py` also registers it as a Claude Code hook that
   refuses `git commit --no-verify`.
+- **openrouter-credits**: prints an OpenRouter account's credits, bought, used
+  and left. The key comes from `OPENROUTER_API_KEY`, else from `./.env` (or
+  `--env-file`); it is never printed.
 - **edit-script-gate**: a Claude Code hook, which `install.py` registers, that
   refuses a Bash command running inline Python (a heredoc or `-c`) that reads a
   file, `.replace()`s literal text and writes it back, and points to

@@ -1,5 +1,7 @@
 """safekill signals one (--one) or every (--all) matching process, never its own caller."""
 
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -187,3 +189,55 @@ def test_bad_input_is_a_usage_error(args: list[str], problem: str) -> None:
     assert result.returncode == 2
     assert problem in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_a_shell_and_its_child_are_told_apart_in_the_refusal(shell_and_child) -> None:
+    marker = uuid.uuid4().hex
+    shell, child = shell_and_child(marker)
+    result = safekill("--one", "-f", marker)
+    assert result.returncode == 2
+    child_line = next(
+        line
+        for line in result.stderr.splitlines()
+        if line.strip().startswith(str(child))
+    )
+    assert f"(started by {shell})" in child_line
+    assert "^" in result.stderr and "bgrun" in result.stderr
+    assert Path(f"/proc/{child}").exists() and Path(f"/proc/{shell}").exists()
+
+
+def test_without_f_a_parent_and_child_are_marked_but_not_told_to_anchor(
+    tmp_path,
+) -> None:
+    name = "t" + uuid.uuid4().hex[:12]  # a process name is at most 15 characters
+    script = tmp_path / name
+    script.write_text(
+        '#!/bin/bash\nif [ "$1" = child ]; then sleep 300; true; else "$0" child; true; fi\n'
+    )
+    script.chmod(0o755)
+    parent = subprocess.Popen([str(script)], start_new_session=True)
+    try:
+        # The child running the script by name, not one that sourcing $BASH_ENV started.
+        children = Path(f"/proc/{parent.pid}/task/{parent.pid}/children")
+        child = None
+        for _ in range(500):
+            for pid in children.read_text().split():
+                comm = Path(f"/proc/{pid}/comm")
+                if comm.exists() and comm.read_text().strip() == name:
+                    child = int(pid)
+            if child:
+                break
+            time.sleep(0.01)
+        assert child, "the script's child never started"
+        result = safekill("--one", name)
+        assert result.returncode == 2
+        child_line = next(
+            line
+            for line in result.stderr.splitlines()
+            if line.strip().startswith(str(child))
+        )
+        assert f"(started by {parent.pid})" in child_line
+        assert "anchor" not in result.stderr
+    finally:
+        os.killpg(parent.pid, signal.SIGKILL)
+        parent.wait()

@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 PROC = Path("/proc")
@@ -47,12 +48,17 @@ def parent_of(pid: int) -> int | None:
     return None if fields is None else int(fields[1])
 
 
-def ancestors(pid: int) -> set[int]:
+def parents(pid: int) -> Iterator[int]:
+    """`pid`'s parent, then its parent's, and so on up the tree, stopping at a loop."""
     seen = {pid}
     while (parent := parent_of(pid)) and parent not in seen:
+        yield parent
         seen.add(parent)
         pid = parent
-    return seen
+
+
+def ancestors(pid: int) -> set[int]:
+    return {pid, *parents(pid)}
 
 
 def processes() -> dict[int, tuple[str, str]]:
@@ -83,6 +89,18 @@ def matches(pattern: str, full: bool) -> dict[int, str]:
         for pid, (name, cmdline) in processes().items()
         if pid not in skip and (regex.search(cmdline) if regex else name == pattern)
     }
+
+
+def started_by_notes(found: dict[int, str]) -> dict[int, str]:
+    """pid -> "  (started by PID)" for each match that another match started, directly
+    or further up its tree, naming the nearest; "" for the rest. The usual case is a job
+    and the wrapper shell that launched it, `bash -c "... job ..."`, whose own command
+    line matches too."""
+    notes = {}
+    for pid in found:
+        starter = next((p for p in parents(pid) if p in found), None)
+        notes[pid] = f"  (started by {starter})" if starter else ""
+    return notes
 
 
 def shortened(cmdline: str, pattern: str, full: bool) -> str:
@@ -136,8 +154,19 @@ def exactly_one(pattern: str, full: bool, prog: str) -> tuple[int, str] | int:
             f"{prog}: {len(found)} processes match {pattern!r}; acted on none:",
             file=sys.stderr,
         )
+        notes = started_by_notes(found)
         for pid, cmdline in sorted(found.items()):
-            print(f"  {pid}  {shortened(cmdline, pattern, full)}", file=sys.stderr)
+            print(
+                f"  {pid}  {shortened(cmdline, pattern, full)}{notes[pid]}",
+                file=sys.stderr,
+            )
+        if full and any(notes.values()):  # a wrapper shell matches only by command line
+            print(
+                f"{prog}: a match started by another is usually a job and the shell that"
+                " launched it; anchor the pattern with ^ to the command you mean"
+                " (-f '^python3 job.py'), or start jobs with bgrun and use the PID it prints",
+                file=sys.stderr,
+            )
         return SEVERAL_MATCHED
     ((pid, cmdline),) = found.items()
     return pid, cmdline

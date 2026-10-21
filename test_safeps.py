@@ -121,3 +121,17 @@ def test_a_command_line_with_newlines_stays_on_one_line(sleepers):
 
     assert listed_pids(result.stdout) == [target.pid]
     assert "first line second line" in result.stdout
+
+
+def test_a_child_of_another_match_is_marked(shell_and_child):
+    marker = uuid.uuid4().hex
+    shell, child = shell_and_child(marker)
+    result = safeps("-f", marker)
+    assert result.returncode == 0
+    lines = {
+        pid: line
+        for pid, line in zip(listed_pids(result.stdout), result.stdout.splitlines())
+    }
+    assert set(lines) == {shell, child}
+    assert lines[child].endswith(f"(started by {shell})")
+    assert "started by" not in lines[shell]

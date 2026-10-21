@@ -7,7 +7,8 @@ shell can carry a command line thousands of characters long. safeps skips
 itself and every ancestor, and shortens long command lines around the match.
 
 Each line: PID, time since it started (MM:SS, H:MM:SS or D-HH:MM:SS, as ps
-shows it), command line.
+shows it), command line, and "(started by PID)" when another match started
+it, such as the wrapper shell a background job was launched from.
 
 Exit status: 0 something matched, 1 nothing matched, 2 usage error (bad
 pattern). See also safekill and waitone.
@@ -19,7 +20,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from procmatch import elapsed, matches, none_matched, shortened
+from procmatch import (
+    elapsed,
+    matches,
+    none_matched,
+    shortened,
+    started_by_notes,
+)
 
 
 def clock(seconds: float) -> str:
@@ -58,10 +65,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"bad pattern {args.pattern!r}: {e}")
     if not found:
         return none_matched(args.pattern, "safeps", args.full)
+    notes = started_by_notes(found)
     for pid, cmdline in sorted(found.items()):
         age = elapsed(pid)
         since = "?" if age is None else clock(age)
-        print(f"{pid:>7}  {since:>10}  {shortened(cmdline, args.pattern, args.full)}")
+        shown = shortened(cmdline, args.pattern, args.full)
+        print(f"{pid:>7}  {since:>10}  {shown}{notes[pid]}")
     return 0
 
 

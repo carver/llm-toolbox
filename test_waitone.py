@@ -137,3 +137,17 @@ def test_a_pid_that_already_exited_returns_at_once(
 def test_needs_a_pattern_or_a_pid() -> None:
     assert waitone().returncode == 2
     assert waitone("x", "--pid", "1").returncode == 2
+
+
+def test_a_shell_and_its_child_are_told_apart_in_the_refusal(shell_and_child) -> None:
+    marker = uuid.uuid4().hex
+    shell, child = shell_and_child(marker)
+    result = waitone("-f", marker, "--timeout", "1")
+    assert result.returncode == 2
+    child_line = next(
+        line
+        for line in result.stderr.splitlines()
+        if line.strip().startswith(str(child))
+    )
+    assert f"(started by {shell})" in child_line
+    assert "^" in result.stderr and "bgrun" in result.stderr

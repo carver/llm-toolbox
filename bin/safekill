@@ -9,6 +9,10 @@ ancestor. Say how many processes you mean:
                               signal none
   safekill --all -f PATTERN   signal every match
 
+A job started from a wrapper shell (`bash -c "... job ..."`) matches twice: the
+shell's command line holds the pattern too. The --one listing marks the job
+"(started by PID)" and suggests anchoring the pattern with ^.
+
 Exit status: 0 signalled (and, with --wait, every signalled process exited),
 1 nothing matched, 2 --one found several (listed, none signalled) or a usage
 error (unknown signal, bad pattern), 3 a signal failed or a process outlived

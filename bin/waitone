@@ -7,7 +7,9 @@ pgrep keeps finding that shell. waitone skips itself and every ancestor,
 picks the one matching process up front and then waits on that PID, so a
 later process with the same command line does not extend the wait. Works for
 processes that are not children of the caller, which the `wait` builtin
-cannot wait for.
+cannot wait for. When several match and one started another, as a job and
+the wrapper shell that launched it do, the listing marks it "(started by
+PID)" and suggests anchoring the pattern with ^.
 
 Exit status: 0 the process exited (or had already exited, with --pid),
 1 nothing matched, 2 several matched (listed, waited for none),

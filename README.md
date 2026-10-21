@@ -86,7 +86,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   the caller's children. `safeps` prints each match's PID, the time since it
   started and its command line, shortened around the match. Without `-f` the
   pattern is the exact process name; when that matches nothing but `-f` would,
-  they list what `-f` would match.
+  they list what `-f` would match. A match that another match started, such as
+  a job and the wrapper shell that launched it, is marked "(started by PID)",
+  and the refusal of `safekill --one` or `waitone` suggests anchoring the
+  pattern with `^`.
 - **bgrun**: `bgrun -o LOG -- CMD` starts CMD in the background, in its own
   session with stdin from /dev/null and its output in LOG, and prints CMD's
   own PID. `$!` after `cd DIR && nohup CMD &` is a subshell's PID, and killing

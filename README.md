@@ -202,7 +202,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   can read a section instead of the whole paper. Takes arXiv ids and URLs, DOIs and Semantic Scholar
   paperIds, and prints a few lines per paper; `meta` adds an arXiv paper's
   latest version and its first- and latest-version dates, from one arXiv API
-  request per call (cached for a day). Retries rate limits, 5xx and
+  request per call (cached for a day). Paces requests across every `paper`
+  process sharing the cache, so a fan-out of agents stays under the limits:
+  Semantic Scholar's at least 1.1 seconds apart, the arXiv API's at least 3;
+  PDF downloads aren't paced. Retries rate limits, 5xx and
   timeouts with backoff for up to 2 minutes, so callers needn't sleep and
   retry. Sends a Semantic Scholar API key from `$S2_API_KEY`, else from
   `claudedev/.semantic-scholar/api-key`, when there is one. Caches everything

@@ -2,9 +2,12 @@
 
 import importlib.machinery
 import importlib.util
+import itertools
 import json
 import os
 import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -170,9 +173,11 @@ def cache(monkeypatch, tmp_path):
     return tmp_path / "cache"
 
 
-def run(capsys, argv, http, extract=None):
+def run(capsys, argv, http, extract=None, paces=None):
+    """Runs the CLI with no real pacing; `paces` collects the service of each paced request."""
     sleeps = []
-    code = paper.main(argv, fetch=http, sleep=sleeps.append, extract=extract)
+    pace = paces.append if paces is not None else (lambda service: None)
+    code = paper.main(argv, fetch=http, sleep=sleeps.append, extract=extract, pace=pace)
     out, err = capsys.readouterr()
     return code, out, err, sleeps
 
@@ -978,3 +983,180 @@ def test_grep_with_a_bad_pattern_exits_2(cache, capsys):
     code, _, err, _ = paper_run(capsys, "grep", "2404.00806", "(")
     assert code == 2
     assert "pattern" in err
+
+
+# Pacing: requests to each service stay a minimum interval apart, across processes.
+
+
+class FakeClock:
+    """time.time and time.sleep for a Pacer: sleeping moves the clock on."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def pacer(tmp_path, clock, interval=1.1):
+    return paper.Pacer(tmp_path / "pace", interval, clock=clock, sleep=clock.sleep)
+
+
+def test_the_first_request_does_not_wait_and_records_its_time(tmp_path):
+    clock = FakeClock()
+    pacer(tmp_path, clock).wait()
+    assert clock.sleeps == []
+    assert float((tmp_path / "pace").read_text()) == 1000.0
+
+
+def test_a_request_right_after_another_waits_the_interval(tmp_path):
+    clock = FakeClock()
+    p = pacer(tmp_path, clock)
+    p.wait()
+    p.wait()
+    assert clock.sleeps == [pytest.approx(1.1)]
+
+
+def test_a_request_waits_only_what_is_left_of_the_interval(tmp_path):
+    clock = FakeClock()
+    p = pacer(tmp_path, clock)
+    p.wait()
+    clock.now += 0.4
+    p.wait()
+    assert clock.sleeps == [pytest.approx(0.7)]
+
+
+def test_a_request_after_the_interval_does_not_wait(tmp_path):
+    clock = FakeClock()
+    p = pacer(tmp_path, clock)
+    p.wait()
+    clock.now += 5
+    p.wait()
+    assert clock.sleeps == []
+    assert float((tmp_path / "pace").read_text()) == 1005.0
+
+
+def test_pacers_on_one_file_share_the_interval(tmp_path):
+    clock = FakeClock()
+    pacer(tmp_path, clock).wait()
+    pacer(tmp_path, clock).wait()  # another process, same file
+    assert clock.sleeps == [pytest.approx(1.1)]
+
+
+def test_a_clock_set_back_waits_at_most_one_interval(tmp_path):
+    clock = FakeClock(now=5000.0)
+    p = pacer(tmp_path, clock)
+    p.wait()
+    clock.now = 1000.0
+    p.wait()
+    assert clock.sleeps == [pytest.approx(1.1)]
+
+
+def test_an_unreadable_timestamp_does_not_wait_and_is_replaced(tmp_path):
+    (tmp_path / "pace").write_text("garbage")
+    clock = FakeClock()
+    pacer(tmp_path, clock).wait()
+    assert clock.sleeps == []
+    assert float((tmp_path / "pace").read_text()) == 1000.0
+
+
+PACE_WORKER = """
+import importlib.machinery, importlib.util, sys, time
+loader = importlib.machinery.SourceFileLoader("paper", sys.argv[1])
+spec = importlib.util.spec_from_loader("paper", loader)
+paper = importlib.util.module_from_spec(spec)
+loader.exec_module(paper)
+p = paper.Pacer(__import__("pathlib").Path(sys.argv[2]), 0.2)
+with open(sys.argv[3], "a") as out:
+    for _ in range(3):
+        out.write(f"{p.wait()}\\n")  # the time the pacer recorded, under its lock
+        out.flush()
+"""
+
+
+def test_processes_sharing_a_file_stay_spaced(tmp_path):
+    log = tmp_path / "times"
+    workers = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                PACE_WORKER,
+                str(SCRIPT),
+                str(tmp_path / "pace"),
+                str(log),
+            ]
+        )
+        for _ in range(3)
+    ]
+    for w in workers:
+        assert w.wait(timeout=30) == 0
+    times = sorted(float(t) for t in log.read_text().split())
+    assert len(times) == 9
+    assert min(b - a for a, b in itertools.pairwise(times)) >= 0.2 - 1e-6
+
+
+def test_every_semantic_scholar_attempt_and_arxiv_call_is_paced(cache, capsys):
+    http = FakeHTTP(
+        (
+            "GET",
+            "/paper/",
+            [status(429, RATE_LIMITED), status(429, RATE_LIMITED), ok(ATTENTION)],
+        )
+    )
+    paces = []
+    code, _, err, _ = run(capsys, ["meta", "1706.03762"], http, paces=paces)
+    assert code == 0, err
+    assert paces == ["Semantic Scholar"] * 3 + ["arXiv"]
+
+
+def test_answers_from_the_cache_are_not_paced(cache, capsys):
+    http = FakeHTTP(
+        ("GET", "/paper/", [ok(ATTENTION)]),
+        (
+            "GET",
+            "export.arxiv.org",
+            [arxiv_feed(("1706.03762v7", "2017-06-12", "2023-08-02"))],
+        ),
+    )
+    first, again = [], []
+    run(capsys, ["meta", "1706.03762"], http, paces=first)
+    code, _, err, _ = run(capsys, ["meta", "1706.03762"], http, paces=again)
+    assert code == 0, err
+    assert first == ["Semantic Scholar", "arXiv"]
+    assert again == []
+
+
+def test_pdf_downloads_are_not_paced(cache, capsys):
+    http = FakeHTTP(
+        ("GET", "/paper/", [ok(ATTENTION)]),
+        ("GET", "arxiv.org/pdf/2404.00806", [paper.Response(200, {}, b"%PDF-1.4 x")]),
+    )
+    paces = []
+    run(capsys, ["meta", "1706.03762"], http, paces=paces)
+    assert paces == ["Semantic Scholar", "arXiv"]
+    paces.clear()
+    code, _, err, _ = run(
+        capsys,
+        ["text", "2404.00806"],
+        http,
+        extract=lambda pdf, txt: txt.write_text("x"),
+        paces=paces,
+    )
+    assert code == 0, err
+    assert paces == []
+
+
+def test_by_default_the_pacing_files_live_in_the_cache(cache, capsys):
+    http = FakeHTTP(("GET", "/paper/", [ok(ATTENTION)]))
+    code = paper.main(["meta", "1706.03762"], fetch=http, sleep=lambda s: None)
+    assert code == 0
+    assert sorted(p.name for p in cache.glob(".pace-*")) == [
+        ".pace-arxiv",
+        ".pace-semantic-scholar",
+    ]

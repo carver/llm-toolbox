@@ -46,6 +46,12 @@ sends one when $S2_API_KEY is set, else when the file
 Semantic Scholar, never to arXiv or a PDF host. Without a key, requests go
 anonymous.
 
+Requests are paced across every paper process that shares the cache, so
+agents running paper in parallel stay under the limits: Semantic Scholar's at
+least 1.1 seconds apart (a key allows about one a second), the arXiv API's at
+least 3 seconds apart. Each waits its turn on a lock file in the cache. PDF
+downloads aren't paced.
+
 Rate limits (HTTP 429, including Semantic Scholar's JSON error object), 5xx
 and timeouts are retried with exponential backoff, honouring Retry-After: up
 to 6 attempts and 2 minutes of waiting. Don't sleep and retry yourself.
@@ -66,6 +72,7 @@ Examples:
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -94,6 +101,7 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 TIMEOUT = 30
 ATTEMPTS = 6
 BUDGET = 120  # seconds of sleeping between attempts, at most
+PACED = {"Semantic Scholar": 1.1, "arXiv": 3.0}  # seconds between requests, per service
 META_FIELDS = (
     "title,year,venue,citationCount,externalIds,authors.name,authors.affiliations"
 )
@@ -293,14 +301,58 @@ def pdftotext(pdf: Path, txt: Path) -> None:
         raise ExtractFailed(f"pdftotext failed: {e.stderr.strip()}") from e
 
 
+@dataclass(frozen=True)
+class Pacer:
+    """Keeps requests to one service at least `interval` seconds apart, across every
+    process that shares `path`. The file holds the last request's time; a caller takes
+    its lock and holds it while waiting, so callers queue up."""
+
+    path: Path
+    interval: float
+    clock: Callable[[], float] = time.time
+    sleep: Callable[[float], None] = time.sleep
+
+    def wait(self) -> float:
+        """Waits for this request's turn and returns the time it recorded for it."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)  # released when the file closes
+            f.seek(0)
+            try:
+                last = float(f.read())
+            except ValueError:
+                last = 0.0
+            # At most one interval, so a clock set back can't stall every process.
+            delay = min(last + self.interval - self.clock(), self.interval)
+            if delay > 0:
+                self.sleep(delay)
+            now = self.clock()
+            f.seek(0)
+            f.truncate()
+            f.write(repr(now))
+        return now
+
+
 class Client:
     """Fetches, sleeps between retries and extracts PDFs, all swappable in tests."""
 
-    def __init__(self, fetch: Fetch, sleep: Callable[[float], None], extract: Extract):
+    def __init__(
+        self,
+        fetch: Fetch,
+        sleep: Callable[[float], None],
+        extract: Extract,
+        pace: Callable[[str], None] | None = None,
+    ):
         self.fetch = fetch
         self.sleep = sleep
         self.extract = extract
         self.cache = Path(os.environ.get("PAPER_CACHE") or DEFAULT_CACHE)
+        self.pace = pace or self.wait_turn
+
+    def wait_turn(self, service: str) -> None:
+        """Waits until `service`'s interval since its last request, by any process, has passed."""
+        name = ".pace-" + service.lower().replace(" ", "-")
+        Pacer(self.cache / name, PACED[service]).wait()
 
     @cached_property
     def api_key(self) -> ApiKey | None:
@@ -389,6 +441,8 @@ class Client:
         """The response, retrying 429s, 5xx and timeouts with backoff."""
         slept = 0.0
         for attempt in range(1, ATTEMPTS + 1):
+            if service in PACED:
+                self.pace(service)
             try:
                 return self.request_once(method, url, params, headers)
             except Retryable as e:
@@ -818,6 +872,7 @@ def main(
     fetch: Fetch | None = None,
     sleep: Callable[[float], None] = time.sleep,
     extract: Extract | None = None,
+    pace: Callable[[str], None] | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(
         prog="paper",
@@ -850,7 +905,7 @@ def main(
     )
     grep.add_argument("-i", "--ignore-case", action="store_true")
     args = parser.parse_args(argv)
-    client = Client(fetch or requests_fetch, sleep, extract or pdftotext)
+    client = Client(fetch or requests_fetch, sleep, extract or pdftotext, pace)
     try:
         return COMMANDS[args.command](client, args)
     except NotFound as e:

@@ -2,7 +2,12 @@
 
 import importlib.machinery
 import importlib.util
+import io
+import json
+import urllib.error
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "openrouter-credits"
 loader = importlib.machinery.SourceFileLoader("openrouter_credits", str(SCRIPT))
@@ -60,3 +65,58 @@ def test_without_a_key_it_says_where_it_looked(monkeypatch, capsys, tmp_path):
 
     assert credits.main([]) == 1
     assert "OPENROUTER_API_KEY" in capsys.readouterr().err
+
+
+class FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_it_asks_the_credits_endpoint_with_the_key(monkeypatch, capsys):
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        return FakeResponse(
+            json.dumps({"data": {"total_credits": 10, "total_usage": 2.5}}).encode()
+        )
+
+    monkeypatch.setenv(
+        "OPENROUTER_API_KEY", KEY + "\n"
+    )  # as a line read from a file can end
+    monkeypatch.setattr(credits.urllib.request, "urlopen", urlopen)
+
+    assert credits.main([]) == 0
+
+    [request] = requests
+    assert request.full_url == "https://openrouter.ai/api/v1/credits"
+    assert request.get_header("Authorization") == f"Bearer {KEY}"
+    assert "$10.00 bought, $2.50 used, $7.50 left" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.HTTPError(
+            "https://openrouter.ai", 401, "Unauthorized", None, None
+        ),
+        ValueError(f"Invalid header value b'Bearer {KEY}\\n'"),
+        urllib.error.URLError("no route"),
+        KeyError("data"),
+    ],
+)
+def test_a_failure_is_reported_without_the_key(monkeypatch, capsys, error):
+    def urlopen(request, timeout):
+        raise error
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", KEY)
+    monkeypatch.setattr(credits.urllib.request, "urlopen", urlopen)
+
+    assert credits.main([]) == 1
+
+    captured = capsys.readouterr()
+    assert KEY not in captured.out + captured.err
+    assert "OpenRouter" in captured.err

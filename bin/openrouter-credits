@@ -29,7 +29,7 @@ def fetch_credits(key: str) -> dict:
 
 def key_from(env_file: Path) -> str | None:
     """The key from the environment, else from ``env_file``'s OPENROUTER_API_KEY= line."""
-    if key := os.environ.get(VARIABLE):
+    if key := os.environ.get(VARIABLE, "").strip():
         return key
     if not env_file.is_file():
         return None
@@ -59,10 +59,21 @@ def main(argv=None) -> int:
         return 1
     try:
         data = fetch_credits(key)
+        bought, used = data["total_credits"], data["total_usage"]
     except urllib.error.HTTPError as error:
         print(f"OpenRouter answered HTTP {error.code} for {URL}.", file=sys.stderr)
         return 1
-    bought, used = data["total_credits"], data["total_usage"]
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ) as error:  # its text can quote the key
+        print(
+            f"Couldn't read OpenRouter credits: {type(error).__name__}.",
+            file=sys.stderr,
+        )
+        return 1
     print(
         f"OpenRouter credits: ${bought:.2f} bought, ${used:.2f} used, ${bought - used:.2f} left"
     )

@@ -1,6 +1,6 @@
 ---
 name: build
-description: Carry a code change through implement, review and refactor. You write and refactor the code yourself; /code-review checks it in subagents; you triage the findings. Use for any code change beyond a trivial edit.
+description: Carry a code change through implement, review and refactor. You write and refactor the code yourself; a review subagent checks it against /code-review's two axes; you triage the findings. Use for any code change beyond a trivial edit.
 ---
 
 # Build
@@ -26,13 +26,13 @@ Done when every design fork is answered, the user has confirmed the seams (or yo
 
 ## 2. Implement
 
-Load the `coding` and `tdd` skills. Then cycle: stub the new names (empty functions and methods), write a test at a seam, or a few at once, run them and see every one red on its assertions, then write the code that turns them green. A test that is green on its first run never went red: delete it, or change it until it fails for the reason you meant. A test the request asks for on code that already exists goes red by breaking that code briefly. Leave code quality to the review that follows. Commit per `coding`. When a choice would break a rule in the brief, or widen what a failure stops, ask the user instead of picking.
+Load the `coding` and `tdd` skills. Then cycle: stub the new names (empty functions and methods), write a test at a seam, or a few at once, run them and see every one red on its assertions, then write the code that turns them green. A test that is green on its first run never went red: delete it, or change it until it fails for the reason you meant. A test the request asks for on code that already exists goes red by breaking that code briefly. Leave code quality to the review that follows. Commit per `coding`, and keep every commit local until step 6 is done, even in a repo whose rules say to push each commit. When a choice would break a rule in the brief, or widen what a failure stops, ask the user instead of picking.
 
 Done when `git log <base>..HEAD` shows your commits and the repo's checks pass.
 
 ## 3. Review
 
-Run `/code-review` with `<base>` as the fixed point and the brief file as the spec. When `git diff --shortstat <base>` shows 30 changed lines or fewer (insertions plus deletions), or the diff is mechanical (a rename, a move, a reformat), spawn one subagent instead, given both of `/code-review`'s sub-agent briefs (Standards and Spec), and have it report the two axes under separate headings.
+Spawn one review subagent in the foreground, and wait for its report before doing anything else. Give it `<base>` as the fixed point, the brief file as the spec, and both of `/code-review`'s sub-agent briefs (Standards and Spec, with the standards sources and smell baseline its SKILL.md lists), and have it report the two axes under separate headings.
 
 Code that drives paid or rate-limited runs, such as an experiment or a sweep, gets only a pilot of a few cells before this review. The full run waits for triage, because a bug found after a full run means paying for that run twice.
 
@@ -59,6 +59,7 @@ Run `build-state refactor` to record the **refactor base**. Apply the Fix list, 
 - Run `build-state finish`. It folds each `fixup!` commit into the commit it fixes and leaves every other commit separate, then lists the commits since the base and the test files changed since the refactor base. When it fails because a ref or config key moved, find what changed and tell the user before anything else.
 - Read `git diff <refactor base>..HEAD` for each listed test file. Every test change must trace to a finding; a loosened assertion or deleted test that keeps things green is a failure to undo.
 - The commit list shows logically isolated commits.
+- Push now, if the repo pushes: the change is reviewed and refactored.
 
 ## 7. Report
 

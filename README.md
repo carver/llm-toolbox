@@ -141,10 +141,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   and left. The key comes from `OPENROUTER_API_KEY`, else from `./.env` (or
   `--env-file`); it is never printed.
 - **edit-script-gate**: a Claude Code hook, which `install.py` registers, that
-  refuses a Bash command running inline Python (a heredoc or `-c`) that reads a
-  file, `.replace()`s literal text and writes it back, and points to
-  `apply-edits`. Pattern-based edits (`re.sub`, `sed`) pass, as does a script
-  with a `# not a text edit` line.
+  refuses a Bash command running inline Python (a heredoc or `-c`) whose code
+  reads a file, `.replace()`s text and writes that same file back, and points
+  to `apply-edits`. Only the Python's own code counts, and pattern-based edits
+  (`re.sub`, `sed`) pass.
 
 - **build-state**: `/build`'s bookkeeping. `start` records the base commit and
   the repo's fingerprint (every other ref, and the config with its values

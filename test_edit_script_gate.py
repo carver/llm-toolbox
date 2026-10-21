@@ -34,6 +34,10 @@ def run_hook(monkeypatch, capsys, command, tool="Bash"):
         f"uv run python - <<EOF\n{READ_REPLACE_WRITE}EOF",
         "python3 -c \"p='a.py'; s=open(p).read(); open(p,'w').write(s.replace('x','y'))\"",
         "python3 - <<'EOF'\nfrom pathlib import Path\np = Path('a.py')\np.write_text(p.read_text().replace('x', 'y'))\nEOF",
+        f"/usr/bin/python3 - <<'EOF'\n{READ_REPLACE_WRITE}EOF",
+        f"env PYTHONIOENCODING=utf8 python3 - <<'EOF'\n{READ_REPLACE_WRITE}EOF",
+        f"sudo python3 - <<'EOF'\n{READ_REPLACE_WRITE}EOF",
+        "python3 - <<'EOF'\nlines = open('a.py').readlines()\nopen('a.py', 'w').writelines(l.replace('x', 'y') for l in lines)\nEOF",
     ],
 )
 def test_an_inline_read_replace_write_script_is_refused(monkeypatch, capsys, command):
@@ -51,7 +55,16 @@ def test_an_inline_read_replace_write_script_is_refused(monkeypatch, capsys, com
         "python3 - <<'EOF'\nimport re\np = 'a.py'\ns = open(p).read()\nopen(p, 'w').write(re.sub(r'x+', 'y', s))\nEOF",
         "python3 - <<'EOF'\nfor line in open('log.txt'):\n    print(line.replace('\\n', ' '))\nEOF",
         f"cat > fix.py <<'EOF'\n#!/usr/bin/env python3\n{READ_REPLACE_WRITE}EOF",
-        f"python3 - <<'EOF'\n# not a text edit\n{READ_REPLACE_WRITE}EOF",
+        f"cat > test_x.py <<'EOF'\n{READ_REPLACE_WRITE}EOF\npython3 -m pytest -q",
+        f"apply-edits <<'EOF'\n--- a.py\n<<<<<<<\nx\n=======\n{READ_REPLACE_WRITE}>>>>>>>\nEOF\npython3 -m pytest -q",
+        "git commit -F - <<'EOF'\nRead a file, .replace() it and .write( it back\nEOF\npython3 -c 'print(1)'",
+        (
+            "python3 - <<'EOF'\nimport json\nfrom pathlib import Path\n"
+            "runs = json.loads(Path('runs.json').read_text())\n"
+            "Path('report.md').write_text('\\n'.join(r['model'].replace('/', ' ') for r in runs))\nEOF"
+        ),
+        "python3 -c \"import sys; sys.stdout.write(sys.stdin.read().replace('a', 'b'))\" < in.txt > out.txt",
+        "python3 - <<'EOF'\nimport json\nrows = json.load(open('runs.json'))\nprint(rows)\nEOF\ngrep -rn '\\.replace(' bin/ > hits.txt",
     ],
 )
 def test_other_commands_pass(monkeypatch, capsys, command):

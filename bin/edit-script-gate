@@ -1,46 +1,79 @@
 #!/usr/bin/env python3
 """A Claude Code PreToolUse hook that steers literal text edits to apply-edits.
 
-Refuses a Bash command that runs inline Python (a heredoc or -c) which reads a file,
-calls .replace( and writes a file: the read-replace-write script that apply-edits
-replaces. A pattern-based edit (re.sub, sed) passes, and so does a script marked
-"# not a text edit", for one that only looks like an edit. install.py registers it
-in ~/.claude/settings.json.
+Refuses a Bash command that runs inline Python (a heredoc or -c) whose code reads a
+file, .replace()s text and writes that same file back: the script apply-edits
+replaces. Only the Python's own code counts, not the rest of the command, and a
+pattern-based edit (re.sub, sed) passes. install.py registers it in
+~/.claude/settings.json.
 
     edit-script-gate < hook-input.json    # as Claude Code calls it
 """
 
 import json
 import re
+import shlex
 import sys
 
-# Python run as a command, at the start of the command or after ; & | ( or a newline.
-RUNS_PYTHON = re.compile(
-    r"(?:^|[;&|(\n])\s*(?:uv run(?: \S+)*? )?python3?(?:\.\d+)?\s", re.MULTILINE
+# A python command at the start of a line or after ; & | (, maybe behind sudo, env,
+# variable settings, a path or uv run; the rest of its line in "args".
+PYTHON = re.compile(
+    r"(?:^|[;&|(])\s*(?:(?:sudo|env)\s+)*(?:\w+=\S*\s+)*(?:uv run(?: \S+)*? )?"
+    r"(?:\S*/)?python3?(?:\.\d+)?(?P<args>(?:\s[^\n]*)?)$",
+    re.MULTILINE,
 )
-INLINE_CODE = re.compile(r"<<-?\s*['\"]?\w+|\s-c\s")
-READS = re.compile(r"\.read\(\)|read_text\(")
-WRITES = re.compile(r"\.write\(|write_text\(")
-MARKER = "# not a text edit"
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+OPEN = re.compile(
+    r"open\(\s*([^,()\n]+?)\s*(?:,\s*(?:mode\s*=\s*)?(['\"])([^'\"]*)\2)?\s*[,)]"
+)
+PATH_CALL = re.compile(r"([\w.]+(?:\([^()\n]*\))?)\.(read_text|write_text)\(")
 REASON = (
-    "Refused: an inline Python script that reads a file, .replace()s literal text and "
-    "writes it back. Pipe old/new blocks to apply-edits instead (apply-edits -h): it "
-    "applies them all or nothing and shows the closest text when one misses. A "
-    "pattern-based edit can use re.sub or sed; mark a script that isn't a text edit "
-    f"with a '{MARKER}' line."
+    "Refused: an inline Python script that reads a file, .replace()s text and writes it "
+    "back. Pipe old/new blocks to apply-edits instead (apply-edits -h): it applies them "
+    "all or nothing and shows the closest text when one misses. A pattern-based edit "
+    "can use re.sub or sed."
 )
+
+
+def python_code(command: str) -> list[str]:
+    """The inline code of each python command in ``command``: a heredoc's body, or -c's
+    argument."""
+    codes = []
+    for match in PYTHON.finditer(command):
+        args = match.group("args")
+        if heredoc := HEREDOC.search(args):
+            rest = command[match.end() + 1 :].split("\n")
+            body = []
+            for line in rest:
+                if line.strip() == heredoc.group(2):
+                    break
+                body.append(line)
+            codes.append("\n".join(body))
+        elif " -c" in args:
+            try:
+                words = shlex.split(args)
+            except ValueError:
+                continue
+            if "-c" in words and words.index("-c") + 1 < len(words):
+                codes.append(words[words.index("-c") + 1])
+    return codes
+
+
+def edits_a_file(code: str) -> bool:
+    """Whether ``code`` .replace()s text and writes back a file it reads."""
+    if ".replace(" not in code:
+        return False
+    reads, writes = set(), set()
+    for target, _, mode in OPEN.findall(code):
+        (writes if set(mode) & set("wa+") else reads).add(target.strip())
+    for target, method in PATH_CALL.findall(code):
+        (reads if method == "read_text" else writes).add(target)
+    return bool(reads & writes)
 
 
 def is_edit_script(command: str) -> bool:
-    """Whether ``command`` runs inline Python that reads, .replace()s and writes."""
-    return (
-        MARKER not in command
-        and RUNS_PYTHON.search(command) is not None
-        and INLINE_CODE.search(command) is not None
-        and ".replace(" in command
-        and READS.search(command) is not None
-        and WRITES.search(command) is not None
-    )
+    """Whether ``command`` runs inline Python that edits a file with .replace()."""
+    return any(edits_a_file(code) for code in python_code(command))
 
 
 def main(argv=None) -> int:

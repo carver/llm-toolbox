@@ -12,8 +12,8 @@ import pytest
 SCRIPT = Path(__file__).resolve().parent / "bin" / "openrouter-credits"
 loader = importlib.machinery.SourceFileLoader("openrouter_credits", str(SCRIPT))
 spec = importlib.util.spec_from_loader("openrouter_credits", loader)
-credits = importlib.util.module_from_spec(spec)
-loader.exec_module(credits)
+tool = importlib.util.module_from_spec(spec)
+loader.exec_module(tool)
 
 KEY = "sk-or-v1-test-key-123"
 
@@ -29,9 +29,9 @@ def fake_fetch(seen):
 def test_prints_bought_used_and_left(monkeypatch, capsys):
     seen = []
     monkeypatch.setenv("OPENROUTER_API_KEY", KEY)
-    monkeypatch.setattr(credits, "fetch_credits", fake_fetch(seen))
+    monkeypatch.setattr(tool, "fetch_credits", fake_fetch(seen))
 
-    assert credits.main([]) == 0
+    assert tool.main([]) == 0
 
     out = capsys.readouterr().out
     assert "$25.00 bought, $15.34 used, $9.66 left" in out
@@ -43,9 +43,9 @@ def test_the_key_can_come_from_a_dotenv_file(monkeypatch, capsys, tmp_path):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(f"OTHER=1\nOPENROUTER_API_KEY={KEY}\n")
-    monkeypatch.setattr(credits, "fetch_credits", fake_fetch(seen))
+    monkeypatch.setattr(tool, "fetch_credits", fake_fetch(seen))
 
-    assert credits.main([]) == 0
+    assert tool.main([]) == 0
     assert seen == [KEY]
 
 
@@ -53,9 +53,21 @@ def test_env_file_names_another_file(monkeypatch, capsys, tmp_path):
     seen = []
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     (tmp_path / "keys.env").write_text(f'export OPENROUTER_API_KEY="{KEY}"\n')
-    monkeypatch.setattr(credits, "fetch_credits", fake_fetch(seen))
+    monkeypatch.setattr(tool, "fetch_credits", fake_fetch(seen))
 
-    assert credits.main(["--env-file", str(tmp_path / "keys.env")]) == 0
+    assert tool.main(["--env-file", str(tmp_path / "keys.env")]) == 0
+    assert seen == [KEY]
+
+
+def test_an_env_file_given_on_the_command_line_wins_over_the_environment(
+    monkeypatch, capsys, tmp_path
+):
+    seen = []
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-from-the-environment")
+    (tmp_path / "keys.env").write_text(f"OPENROUTER_API_KEY={KEY}\n")
+    monkeypatch.setattr(tool, "fetch_credits", fake_fetch(seen))
+
+    assert tool.main(["--env-file", str(tmp_path / "keys.env")]) == 0
     assert seen == [KEY]
 
 
@@ -63,7 +75,7 @@ def test_without_a_key_it_says_where_it_looked(monkeypatch, capsys, tmp_path):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.chdir(tmp_path)
 
-    assert credits.main([]) == 1
+    assert tool.main([]) == 1
     assert "OPENROUTER_API_KEY" in capsys.readouterr().err
 
 
@@ -87,9 +99,9 @@ def test_it_asks_the_credits_endpoint_with_the_key(monkeypatch, capsys):
     monkeypatch.setenv(
         "OPENROUTER_API_KEY", KEY + "\n"
     )  # as a line read from a file can end
-    monkeypatch.setattr(credits.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(tool.urllib.request, "urlopen", urlopen)
 
-    assert credits.main([]) == 0
+    assert tool.main([]) == 0
 
     [request] = requests
     assert request.full_url == "https://openrouter.ai/api/v1/credits"
@@ -113,9 +125,9 @@ def test_a_failure_is_reported_without_the_key(monkeypatch, capsys, error):
         raise error
 
     monkeypatch.setenv("OPENROUTER_API_KEY", KEY)
-    monkeypatch.setattr(credits.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(tool.urllib.request, "urlopen", urlopen)
 
-    assert credits.main([]) == 1
+    assert tool.main([]) == 1
 
     captured = capsys.readouterr()
     assert KEY not in captured.out + captured.err

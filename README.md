@@ -63,8 +63,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   code is about to change, so the rest of `GLOBAL_CLAUDE.md` stays short. Its
   `standards.md` holds the quality rules, which apply at review, not while
   implementing.
-- **build**: carries a code change through. The agent makes it work,
-  `/code-review` subagents check it against `coding/standards.md`, and the agent
+- **build**: carries a code change through. The agent makes it work, a review
+  subagent checks it on `/code-review`'s two axes, against
+  `coding/standards.md`, and the agent
   triages the findings and refactors. It asks before handing a large change to
   an implementer subagent.
 - **unslop**: cut AI tells from writing.

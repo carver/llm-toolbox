@@ -5,7 +5,7 @@ description: Carry a code change through implement, review and refactor. You wri
 
 # Build
 
-You hold the request, the conversation and the decisions, so you write the code yourself. Review runs in subagents, so fresh eyes judge it. Make it work, then make it good: implementation carries no coding standards beyond the brief, and review carries them all.
+You hold the request, the conversation and the decisions, so you write the code yourself. Review runs in a subagent, so fresh eyes judge it. Make it work, then make it good: implementation carries no coding standards beyond the brief, and review carries them all.
 
 If a change looks too big to hold in your context (many files, or an already long session), stop and ask the user whether to hand implementation to a subagent. Expect this to be rare. The user makes that call, not you.
 

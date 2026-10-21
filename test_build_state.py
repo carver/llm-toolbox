@@ -201,3 +201,31 @@ def test_the_work_branchs_upstream_may_move(repo):
     done = build_state(repo, "finish")
 
     assert done.returncode == 0, done.stderr
+
+
+def test_a_push_doesnt_trip_a_symbolic_ref_to_the_upstream(repo):
+    git(repo, "config", "branch.main.remote", "origin")
+    git(repo, "config", "branch.main.merge", "refs/heads/main")
+    git(repo, "config", "remote.origin.url", "/nowhere")
+    git(repo, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")  # as a push would
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+
+
+def test_repointing_a_symbolic_ref_counts_as_a_change(repo):
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "update-ref", "refs/remotes/origin/other", "HEAD")
+    git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    build_state(repo, "start")
+    git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/other")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1 and "refs/remotes/origin/HEAD" in done.stderr

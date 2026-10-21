@@ -15,7 +15,8 @@ into the commit it names, with an autosquash rebase onto the base. Every other c
 stays as it is, in order, so logically separate commits stay separate. It refuses
 uncommitted changes, and on a conflict aborts the rebase and leaves the branch as it was.
 
-The fingerprint is every ref except the work branch and its upstream, and every entry
+The fingerprint is every ref except the work branch and its upstream (a symbolic ref, such
+as origin/HEAD, by the ref it points to), and every entry
 of the repo's config. When either changed since start, finish names the refs and config
 keys (never config values: a remote URL can hold a token), exits 1 and keeps the state,
 before folding anything. A fix commit left unfolded (its target is older than the base)
@@ -74,8 +75,13 @@ def fingerprint(work: list[str]) -> dict[str, dict[str, str]]:
         key: hashlib.sha1("\n".join(found).encode()).hexdigest()[:12]
         for key, found in values.items()
     }
-    listed = git("for-each-ref", "--format=%(refname) %(objectname)").stdout
-    refs = dict(line.split() for line in listed.splitlines())
+    # A symbolic ref (origin/HEAD) counts by what it points to, not the commit that
+    # resolves to: a push moves origin/main, and with it what origin/HEAD resolves to.
+    listed = git("for-each-ref", "--format=%(refname) %(objectname) %(symref)").stdout
+    refs = {}
+    for line in listed.splitlines():
+        name, commit, *target = line.split()
+        refs[name] = f"-> {target[0]}" if target else commit
     return {"config": config, "refs": {n: s for n, s in refs.items() if n not in work}}
 
 

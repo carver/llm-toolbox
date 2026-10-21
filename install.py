@@ -61,6 +61,12 @@ HOOKS = [
         "agent-commit-gate",
         {"timeout": 10},
     ),
+    (
+        "PreToolUse",
+        "Bash",
+        "edit-script-gate",
+        {"timeout": 10},
+    ),
 ]
 # (key path, value, why). Claude Code reads these only at user scope.
 SETTINGS_VALUES = [

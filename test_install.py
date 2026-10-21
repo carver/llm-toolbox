@@ -215,10 +215,11 @@ def test_hooks_register_once_beside_existing_settings(settings):
     data = json.loads(settings.read_text())
     assert data["model"] == "opus"
     groups = data["hooks"]["PreToolUse"]
-    assert groups[0] == other and len(groups) == 2
-    assert groups[1]["hooks"][0]["command"] == str(
-        install.BIN_DST / "agent-commit-gate"
-    )
+    assert groups[0] == other
+    assert [g["hooks"][0]["command"] for g in groups[1:]] == [
+        str(install.BIN_DST / "agent-commit-gate"),
+        str(install.BIN_DST / "edit-script-gate"),
+    ]
 
 
 def test_hooks_create_a_missing_settings_file(settings):

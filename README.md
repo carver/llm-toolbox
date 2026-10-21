@@ -137,6 +137,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   -a` or `commit PATHS` updates the index, so the check sees what is
   committed. `install.py` also registers it as a Claude Code hook that
   refuses `git commit --no-verify`.
+- **edit-script-gate**: a Claude Code hook, which `install.py` registers, that
+  refuses a Bash command running inline Python (a heredoc or `-c`) that reads a
+  file, `.replace()`s literal text and writes it back, and points to
+  `apply-edits`. Pattern-based edits (`re.sub`, `sed`) pass, as does a script
+  with a `# not a text edit` line.
 
 - **build-state**: `/build`'s bookkeeping. `start` records the base commit and
   the repo's fingerprint (every other ref, and the config with its values

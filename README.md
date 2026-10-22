@@ -94,6 +94,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   session with stdin from /dev/null and its output in LOG, and prints CMD's
   own PID. `$!` after `cd DIR && nohup CMD &` is a subshell's PID, and killing
   it leaves CMD running. `-C DIR` sets CMD's directory, `--append` keeps LOG.
+  `--wait` then waits for CMD, prints its exit status and LOG's last lines
+  (`--tail N`, default 10) and exits with CMD's status: run it as an agent's
+  background job to get one notification when CMD ends, while CMD survives if
+  the waiting bgrun is killed.
 - **apply-edits**: replaces old text with new across files, all or nothing,
   from Aider-style `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` blocks
   under `--- PATH` lines on stdin (bare markers and Aider's bare path lines
@@ -156,7 +160,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   refuses a Bash command running inline Python (a heredoc or `-c`) whose code
   reads a file, `.replace()`s text and writes that same file back, and points
   to `apply-edits`. Only the Python's own code counts, and pattern-based edits
-  (`re.sub`, `sed`) pass.
+  (`re.sub`, `sed`) pass. So do edits of files that are all provably under
+  `/tmp/` (scratch copies, an agent's scratchpad): a literal path, `Path()` of
+  one, or `sys.argv[i]` from the command line, directly or through a name
+  bound once; a shell variable counts when it's set once, before the python
+  command, to a plain value.
 
 - **build-state**: `/build`'s bookkeeping. `start` records the base commit and
   the repo's fingerprint (every other ref, and the config with its values
@@ -190,12 +198,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   updating, so you see what each skill's update changed.
 
 - **session-digest**: condenses a Claude Code session log, and each of its
-  subagents' logs, for a retrospective. Prints what each agent and tool cost
-  (calls, errors, estimated tokens of tool output, API tokens in and out)
-  and its five biggest tool outputs,
-  then each agent's timeline: user turns, the assistant's text, one line per
+  subagents' and workflow agents' logs, for a retrospective. Prints what each
+  agent and tool cost (calls, errors, estimated tokens of tool output, API
+  tokens in and out) and its five biggest tool outputs,
+  then each subagent's timeline: user turns, the assistant's text, one line per
   tool call with its output's size, one line per background task notification
-  (id, status, summary), and every error in full. Defaults to the
+  (id, status, summary), and every error in full. Workflow agents, named
+  `<run>:<label>`, show only their failed calls unless `--timelines` is given.
+  Images count about width × height / 750 tokens, from their header. Defaults to the
   newest session for the current directory (or its nearest parent with sessions),
   under `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
 

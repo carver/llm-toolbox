@@ -30,7 +30,7 @@ Before saying a source lacks something ("the paper has no human verbosity figure
 
 Stop processes with `safekill --one -f PATTERN` (exactly one must match) or `safekill --all -f PATTERN` (every match); without `-f` the pattern is the exact process name (`uv`, `python3`), not the command line, and wait for one with `waitone` (llm-toolbox/bin, on PATH; `-h` for options), not `pkill -f`, `pgrep -f | xargs kill` or a `pgrep -f` loop. The Bash tool's own shell has your pattern in its command line, so `pkill -f` kills it and a `while pgrep -f` loop waits on itself forever. Both tools skip their callers, and so does `safeps [-f] PATTERN`, which lists matching processes with their PIDs and ages.
 
-Start a background job with `bgrun -o LOG -- CMD`. It prints the job's own PID, where `cd DIR && nohup CMD &` gives `$!` a subshell's PID. Then `kill` or `waitone --pid` that PID.
+Start a background job with `bgrun -o LOG -- CMD`. It prints the job's own PID, where `cd DIR && nohup CMD &` gives `$!` a subshell's PID. Then `kill` or `waitone --pid` that PID. To be told when it ends, run `bgrun --wait -o LOG -- CMD` as a background call: it prints the PID, then the job's exit status and LOG's last lines.
 
 To make several text replacements in one or more files, pipe blocks to `apply-edits` rather than writing a Python heredoc script: a `--- PATH` line starts each file, then each block is `<<<<<<< SEARCH`, the old text, `=======`, the new text, `>>>>>>> REPLACE`, every marker on its own line. It applies all or nothing, and a miss shows the closest text.
 

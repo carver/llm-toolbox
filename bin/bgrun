@@ -13,9 +13,18 @@ For a pipeline or a redirection, start a shell: bgrun -o LOG -- sh -c '...'.
 The PID is then that shell's. LOG is relative to the caller's directory, not
 to -C.
 
+With --wait, bgrun stays after printing the PID, waits for CMD, then prints
+"PID exited with status N after Xs" and LOG's last lines, and exits with CMD's
+status (128+signal if a signal ended it). Run it with an agent's background
+job runner to get one notification when CMD ends; CMD still survives if the
+waiting bgrun is killed.
+
+  bgrun --wait -o run.log -- python3 sweep.py    # e.g. as a run_in_background call
+
 Exit status: 0 started, 1 CMD could not start (not found, not executable,
 -C is not a directory, or LOG can't be opened), 2 usage error. A failed
-start leaves LOG as it was.
+start leaves LOG as it was. With --wait, after a successful start: CMD's
+status.
 """
 
 import argparse
@@ -23,9 +32,11 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 CANT_START = 1
+TAIL_BYTES = 64 * 1024  # --wait reads only LOG's end, in case it has no newlines
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -45,11 +56,27 @@ def main(argv: list[str] | None = None) -> int:
         "--append", action="store_true", help="append to LOG instead of replacing it"
     )
     parser.add_argument("-C", "--cwd", metavar="DIR", help="run CMD in DIR")
+    parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="after printing the PID, wait for CMD, print how it ended and LOG's last lines, "
+        "and exit with CMD's status",
+    )
+    parser.add_argument(
+        "--tail",
+        type=int,
+        metavar="N",
+        help="with --wait, LOG lines to print (default 10)",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- CMD [ARGS...]")
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("no command given")
+    if args.tail is not None and not args.wait:
+        parser.error("--tail needs --wait")
+    if args.tail is not None and args.tail < 0:
+        parser.error("--tail must be 0 or more")
     problem = start_problem(command[0], args.cwd)
     if problem:
         print(f"bgrun: {problem}", file=sys.stderr)
@@ -72,8 +99,32 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as e:
             print(f"bgrun: can't start {command[0]!r}: {e.strerror}", file=sys.stderr)
             return CANT_START
-    print(proc.pid)
-    return 0
+    print(proc.pid, flush=True)
+    if not args.wait:
+        return 0
+    return wait_and_report(
+        proc, Path(args.output), 10 if args.tail is None else args.tail
+    )
+
+
+def wait_and_report(proc: subprocess.Popen, log: Path, tail: int) -> int:
+    """Wait for CMD, print how it ended and LOG's last lines, and return its status."""
+    started = time.monotonic()
+    code = proc.wait()
+    status = 128 - code if code < 0 else code  # Popen gives -N for death by signal N
+    print(
+        f"{proc.pid} exited with status {status} after {time.monotonic() - started:.1f}s"
+    )
+    try:
+        with log.open("rb") as f:
+            f.seek(max(0, f.seek(0, os.SEEK_END) - TAIL_BYTES))
+            end = f.read().decode(errors="replace")
+    except OSError as e:
+        print(f"bgrun: can't read {str(log)!r}: {e.strerror}")
+        return status
+    for line in end.splitlines()[-tail:] if tail else []:
+        print(line)
+    return status
 
 
 def start_problem(program: str, cwd: str | None) -> str | None:

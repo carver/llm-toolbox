@@ -1,6 +1,7 @@
 """bgrun starts a command detached, with its output in a log, and prints the command's own PID."""
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -173,3 +174,109 @@ def test_a_missing_directory_is_named_as_the_problem(tmp_path):
 
     assert "/no/such/dir" in result.stderr
     assert "'true'" not in result.stderr
+
+
+def test_wait_prints_the_pid_then_how_the_job_ended_and_exits_with_its_status(tmp_path):
+    log = tmp_path / "out.log"
+    script = "import sys; [print(f'line {i}') for i in range(15)]; sys.exit(3)"
+
+    result = bgrun("--wait", "-o", str(log), "--", sys.executable, "-c", script)
+
+    assert result.returncode == 3, result.stderr
+    first, *rest = result.stdout.splitlines()
+    pid = int(first)
+    assert re.fullmatch(rf"{pid} exited with status 3 after \d+(\.\d+)?s", rest[0])
+    assert rest[1:] == [f"line {i}" for i in range(5, 15)]
+
+
+def test_wait_tail_sets_how_many_log_lines_it_prints(tmp_path):
+    log = tmp_path / "out.log"
+    script = "[print(f'line {i}') for i in range(15)]"
+
+    result = bgrun(
+        "--wait", "--tail", "2", "-o", str(log), "--", sys.executable, "-c", script
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[2:] == ["line 13", "line 14"]
+
+
+def test_wait_reports_a_signal_death_as_128_plus_the_signal(tmp_path):
+    log = tmp_path / "out.log"
+    script = "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"
+
+    result = bgrun("--wait", "-o", str(log), "--", sys.executable, "-c", script)
+
+    assert result.returncode == 128 + signal.SIGTERM
+    assert f"exited with status {128 + signal.SIGTERM} after" in result.stdout
+
+
+def test_wait_prints_the_pid_before_the_job_ends_and_killing_it_leaves_the_job(
+    tmp_path, started
+):
+    log = tmp_path / "out.log"
+    marker = tmp_path / "done"
+    script = f"import time, pathlib; time.sleep(1.5); pathlib.Path({str(marker)!r}).write_text('x')"
+    waiter = subprocess.Popen(
+        [str(SCRIPT), "--wait", "-o", str(log), "--", sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        pid = int(waiter.stdout.readline())
+        started.append(pid)
+        assert not marker.exists()
+        time.sleep(0.5)
+        assert waiter.poll() is None, "bgrun --wait returned before the job ended"
+        waiter.kill()
+        waiter.wait()
+        wait_for_file(marker)
+    finally:
+        waiter.kill()
+
+
+def wait_for_file(path: Path, seconds: float = 10) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{path} never appeared")
+
+
+def test_wait_with_a_start_failure_exits_1_without_waiting(tmp_path):
+    result = bgrun(
+        "--wait", "-o", str(tmp_path / "out.log"), "--", "no-such-program-xyz"
+    )
+
+    assert result.returncode == 1
+    assert "not found" in result.stderr
+
+
+def test_wait_still_reports_and_exits_with_the_status_when_the_log_is_gone(tmp_path):
+    log = tmp_path / "out.log"
+    script = f"import os, sys; os.remove({str(log)!r}); sys.exit(4)"
+
+    result = bgrun("--wait", "-o", str(log), "--", sys.executable, "-c", script)
+
+    assert result.returncode == 4, result.stderr
+    assert "exited with status 4 after" in result.stdout
+    assert "can't read" in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+def test_wait_prints_only_the_end_of_a_log_with_no_newlines(tmp_path):
+    log = tmp_path / "out.log"
+    script = "import sys; sys.stdout.write('x' * 300_000)"
+
+    result = bgrun("--wait", "-o", str(log), "--", sys.executable, "-c", script)
+
+    assert result.returncode == 0, result.stderr
+    assert len(result.stdout) < 70_000
+
+
+@pytest.mark.parametrize("args", [["--wait", "--tail", "-1"], ["--tail", "3"]])
+def test_tail_must_be_non_negative_and_comes_with_wait(tmp_path, args):
+    result = bgrun(*args, "-o", str(tmp_path / "out.log"), "--", "true")
+
+    assert result.returncode == 2

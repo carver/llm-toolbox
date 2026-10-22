@@ -3,13 +3,13 @@
 
   apply-edits <<'EOF'
   --- src/app.py
-  <<<<<<<
+  <<<<<<< SEARCH
   old text, exactly as in the file, any number of lines
   =======
   new text (leave empty to delete the old text's lines)
-  >>>>>>>
+  >>>>>>> REPLACE
   --- README.md
-  <<<<<<<
+  <<<<<<< SEARCH
   ...
   EOF
 
@@ -17,6 +17,10 @@ Each `--- PATH` (relative to the current directory) starts a file's blocks; a fi
 takes any number, applied in order, each to the text the ones before it left. Every
 old text must occur exactly once. If any block misses, nothing is written, and the
 block is named with the closest text in the file shown as a diff.
+
+Bare markers, without SEARCH and REPLACE, work too. So does the rest of Aider's
+SEARCH/REPLACE format: a bare path on the line before a block instead of `--- PATH`,
+and ``` fences around blocks, which are skipped. A marker may end in spaces.
 
 A line that is exactly one of the markers can't appear inside a block; edit such a
 line another way. Files keep their line endings (\\n or \\r\\n). A symlink is edited
@@ -30,13 +34,20 @@ import difflib
 import os
 import sys
 import tempfile
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
 USAGE = 2
 MISSED = 1
 OPEN, DIVIDER, CLOSE = "<<<<<<<", "=======", ">>>>>>>"
+SPELLINGS = {
+    OPEN: {OPEN, f"{OPEN} SEARCH"},
+    DIVIDER: {DIVIDER},
+    CLOSE: {CLOSE, f"{CLOSE} REPLACE"},
+}
+"""How each marker may be spelled: bare, or with Aider's label."""
+HOW_TO_CLOSE = f"end it with {CLOSE} REPLACE"
+EXPECTED = f"expected '--- PATH' or {OPEN} SEARCH"
 
 
 class UsageError(Exception):
@@ -61,38 +72,94 @@ def parse(text: str) -> list[FileEdits]:
     sections' blocks. Raises UsageError."""
     files: dict[Path, FileEdits] = {}
     current: FileEdits | None = None
-    lines = iter(enumerate(text.splitlines(), 1))
-    for number, line in lines:
-        if line.startswith("--- "):
-            path = Path(line[4:].strip())
-            current = files.setdefault(path.resolve(), FileEdits(path))
-        elif line == OPEN:
+    lines = list(enumerate(text.splitlines(), 1))
+    at = 0
+    while at < len(lines):
+        number, line = lines[at]
+        at += 1
+        found = marker(line)
+        if found == OPEN:
             if current is None:
-                raise UsageError(f"line {number}: a block before any '--- PATH' line")
-            old = until(lines, DIVIDER, number)
-            new = until(lines, CLOSE, number)
+                raise UsageError(f"line {number}: a block before any file's path")
+            old, at = until(lines, at, DIVIDER, number)
+            new, at = until(lines, at, CLOSE, number)
             if not old.strip():
                 raise UsageError(f"line {number}: a block with no old text")
             current.blocks.append(Block(len(current.blocks) + 1, old, new))
-        elif line.strip():
-            raise UsageError(
-                f"line {number}: expected '--- PATH' or {OPEN}, got {line!r}"
-            )
-    if not any(f.blocks for f in files.values()):
+        elif (path := header(line, number, opens_block(lines, at))) is not None:
+            current = files.setdefault(path.resolve(), FileEdits(path))
+        elif line.strip() and not is_fence(line):
+            raise UsageError(f"line {number}: {EXPECTED}, got {line!r}")
+    edited = [f for f in files.values() if f.blocks]
+    if not edited:
         raise UsageError("no blocks on stdin")
-    return list(files.values())
+    return edited
 
 
-def until(lines: Iterator[tuple[int, str]], end: str, start: int) -> str:
-    """The lines up to the `end` marker, joined. Raises UsageError if it never comes."""
+def header(line: str, number: int, before_block: bool) -> Path | None:
+    """The file a line names when it starts a file's blocks: `--- PATH`, or Aider's bare
+    path just before a block. Raises UsageError on a header spelled another way, and on
+    a bare path to no file."""
+    if line.startswith("--- "):
+        return Path(line[4:].strip())
+    if line.startswith("===") and marker(line) is None:
+        raise UsageError(
+            f"line {number}: start a file's blocks with '--- PATH', got {line!r}"
+        )
+    name = line.strip()
+    if not before_block or not name or " " in name or is_fence(line):
+        return None
+    if not Path(name).is_file():
+        raise UsageError(f"line {number}: no such file: {name}")
+    return Path(name)
+
+
+def opens_block(lines: list[tuple[int, str]], at: int) -> bool:
+    """Whether the next line from `at` that isn't blank or a fence opens a block."""
+    for _, line in lines[at:]:
+        if line.strip() and not is_fence(line):
+            return marker(line) == OPEN
+    return False
+
+
+def is_fence(line: str) -> bool:
+    return line.startswith("```")
+
+
+def marker(line: str) -> str | None:
+    """The marker a line is, bare or with Aider's label and trailing spaces, else None."""
+    line = line.rstrip()
+    return next((mark for mark, spelled in SPELLINGS.items() if line in spelled), None)
+
+
+def until(
+    lines: list[tuple[int, str]], at: int, end: str, start: int
+) -> tuple[str, int]:
+    """The lines from `at` up to the `end` marker, joined, and the index after it.
+    Raises UsageError, saying how to fix the block, when another marker or the end of
+    input comes first."""
     taken: list[str] = []
-    for _, line in lines:
-        if line == end:
-            return "\n".join(taken)
-        if line in (OPEN, DIVIDER, CLOSE):
-            break
+    for number, line in lines[at:]:
+        at += 1
+        found = marker(line)
+        if found == end:
+            return "\n".join(taken), at
+        if found == DIVIDER:
+            raise UsageError(
+                f"line {start}: block has a second {DIVIDER} at line {number}; {HOW_TO_CLOSE}"
+            )
+        if found == CLOSE:
+            raise UsageError(
+                f"line {start}: block reaches {CLOSE} at line {number} "
+                f"with no {DIVIDER} between old and new text"
+            )
+        if found == OPEN:
+            raise UsageError(
+                f"line {start}: block not closed before the next {OPEN} at line {number}; "
+                f"{HOW_TO_CLOSE}"
+            )
         taken.append(line)
-    raise UsageError(f"line {start}: block has no {end} line where expected")
+    raise UsageError(f"line {start}: block never closed; {HOW_TO_CLOSE}")
 
 
 def read(path: Path) -> str:

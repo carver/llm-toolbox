@@ -3,10 +3,10 @@
 
   mutate-check -- uv run pytest -q tests/test_watch.py -k seen_before <<'EOF'
   --- src/app/watch.py
-  <<<<<<<
+  <<<<<<< SEARCH
                   and p.listing.id not in sketchy
   =======
-  >>>>>>>
+  >>>>>>> REPLACE
   EOF
 
 Stdin holds apply-edits blocks (`apply-edits -h` shows the format), which apply-edits

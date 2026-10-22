@@ -95,8 +95,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   own PID. `$!` after `cd DIR && nohup CMD &` is a subshell's PID, and killing
   it leaves CMD running. `-C DIR` sets CMD's directory, `--append` keeps LOG.
 - **apply-edits**: replaces old text with new across files, all or nothing,
-  from `<<<<<<<` / `=======` / `>>>>>>>` blocks under `--- PATH` lines on
-  stdin. Each old text must occur exactly once; on a miss nothing is written
+  from Aider-style `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` blocks
+  under `--- PATH` lines on stdin (bare markers and Aider's bare path lines
+  work too). Each old text must occur exactly once; on a miss nothing is written
   and the closest text in the file is shown as a diff. For edits that would
   otherwise be a heredoc Python script. `apply-edits -h` shows the format.
 - **mutate-check**: `mutate-check -- CMD` breaks code briefly with apply-edits

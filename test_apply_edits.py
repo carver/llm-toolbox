@@ -178,3 +178,135 @@ def test_the_closest_text_shows_the_files_line_numbers(repo: Path) -> None:
 
     assert "block 1 ('def b():')" in result.stderr
     assert "@@ -1" not in result.stderr
+
+
+def test_aiders_labelled_markers_work(repo: Path) -> None:
+    result = apply(
+        repo,
+        "--- notes.md\n<<<<<<< SEARCH\nOld line.\n=======\nNew line.\n>>>>>>> REPLACE\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (repo / "notes.md").read_text() == "# Notes\n\nNew line."
+
+
+def test_aiders_bare_path_and_fences_work(repo: Path) -> None:
+    result = apply(
+        repo,
+        "notes.md\n```markdown\n<<<<<<< SEARCH\nOld line.\n=======\nNew line.\n"
+        ">>>>>>> REPLACE\n```\n\nsrc/a.py\n```python\n<<<<<<< SEARCH\n    return 1\n"
+        "=======\n    return 10\n>>>>>>> REPLACE\n```\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (repo / "notes.md").read_text() == "# Notes\n\nNew line."
+    assert "return 10" in (repo / "src" / "a.py").read_text()
+
+
+def test_other_labelled_marker_lines_are_content(repo: Path) -> None:
+    (repo / "merge.txt").write_text("a\n<<<<<<< HEAD\nb\n")
+
+    result = apply(
+        repo, "--- merge.txt\n<<<<<<<\n<<<<<<< HEAD\nb\n=======\nb\n>>>>>>>\n"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (repo / "merge.txt").read_text() == "a\nb\n"
+
+
+@pytest.mark.parametrize(
+    ("edits", "says"),
+    [
+        (
+            "--- notes.md\n<<<<<<<\nOld line.\n=======\nNew line.\n=======\n",
+            "line 2: block has a second ======= at line 6; end it with >>>>>>> REPLACE",
+        ),
+        (
+            "--- notes.md\n<<<<<<<\nOld line.\n>>>>>>>\n",
+            "line 2: block reaches >>>>>>> at line 4 with no ======= between old and new text",
+        ),
+        (
+            "--- notes.md\n<<<<<<<\nOld line.\n=======\nNew line.\n",
+            "line 2: block never closed; end it with >>>>>>> REPLACE",
+        ),
+        (
+            "--- notes.md\n<<<<<<<\nOld line.\n=======\nNew.\n<<<<<<<\nx\n=======\ny\n>>>>>>>\n",
+            "line 2: block not closed before the next <<<<<<< at line 6; end it with >>>>>>> REPLACE",
+        ),
+        (
+            "=== notes.md\n<<<<<<<\nOld line.\n=======\nNew line.\n>>>>>>>\n",
+            "line 1: start a file's blocks with '--- PATH', got '=== notes.md'",
+        ),
+        (
+            "--- notes.md\n<<<<<<<\nOld line.\n=======\nNew.\n>>>>>>>\nNow the readme:\n",
+            "line 7: expected '--- PATH' or <<<<<<< SEARCH, got 'Now the readme:'",
+        ),
+        (
+            "missing.md\n<<<<<<<\nOld line.\n=======\nNew line.\n>>>>>>>\n",
+            "line 1: no such file: missing.md",
+        ),
+    ],
+    ids=[
+        "second divider",
+        "no divider",
+        "unclosed",
+        "next opens",
+        "=== header",
+        "prose",
+        "bare missing",
+    ],
+)
+def test_malformed_blocks_say_what_to_do(repo: Path, edits: str, says: str) -> None:
+    result = apply(repo, edits)
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == f"apply-edits: {says}"
+    assert (repo / "notes.md").read_text() == "# Notes\n\nOld line."
+
+
+def test_a_file_name_with_no_block_after_it_is_no_header(repo: Path) -> None:
+    edits = "--- notes.md\n<<<<<<<\n# Notes\n=======\n# Log\n>>>>>>>\nsrc/a.py\n"
+    before = (repo / "src" / "a.py").read_text()
+
+    result = apply(repo, edits)
+
+    assert result.returncode == 2
+    assert "got 'src/a.py'" in result.stderr
+    assert (repo / "src" / "a.py").read_text() == before
+    assert (repo / "notes.md").read_text() == "# Notes\n\nOld line."
+
+
+def test_markers_may_end_in_spaces(repo: Path) -> None:
+    result = apply(
+        repo,
+        "--- notes.md\n<<<<<<< SEARCH \nOld line.\n======= \nNew.\n>>>>>>> REPLACE  \n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (repo / "notes.md").read_text() == "# Notes\n\nNew."
+
+
+def test_a_divider_with_a_label_is_content(repo: Path) -> None:
+    (repo / "odd.txt").write_text("a\n======= None\nb\n")
+
+    result = apply(repo, "--- odd.txt\n<<<<<<<\n======= None\n=======\n>>>>>>>\n")
+
+    assert result.returncode == 0, result.stderr
+    assert (repo / "odd.txt").read_text() == "a\nb\n"
+
+
+def test_a_squashed_equals_header_gets_the_hint(repo: Path) -> None:
+    result = apply(repo, "===notes.md\n<<<<<<<\nOld line.\n=======\nNew.\n>>>>>>>\n")
+
+    assert result.returncode == 2
+    assert "start a file's blocks with '--- PATH'" in result.stderr
+
+
+def test_a_path_with_no_blocks_is_left_alone(repo: Path) -> None:
+    result = apply(
+        repo,
+        "--- notes.md\n--- src/a.py\n<<<<<<<\n    return 1\n=======\n    return 3\n>>>>>>>\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "src/a.py: 1 edit\n"

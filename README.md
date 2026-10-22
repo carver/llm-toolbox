@@ -99,6 +99,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   stdin. Each old text must occur exactly once; on a miss nothing is written
   and the closest text in the file is shown as a diff. For edits that would
   otherwise be a heredoc Python script. `apply-edits -h` shows the format.
+- **mutate-check**: `mutate-check -- CMD` breaks code briefly with apply-edits
+  blocks from stdin, runs CMD (a test run), and puts every file back, also when
+  stopped. It exits 0 when CMD failed (the tests catch the break) and 1 when it
+  passed, printing one line and at most 3 of pytest's `E ` lines. For checking
+  that a test which passed on its first run guards what it's meant to.
 - **gui-shot**: runs a GUI app on a headless display (Xvfb, or weston for
   Wayland), clicks and types into it, and saves screenshots. For checking a
   desktop app's UI from a sandbox with no screen. `gui-shot -h` lists the

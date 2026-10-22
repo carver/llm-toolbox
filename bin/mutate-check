@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Break code briefly and see whether a command catches it, then put the code back.
+
+  mutate-check -- uv run pytest -q tests/test_watch.py -k seen_before <<'EOF'
+  --- src/app/watch.py
+  <<<<<<<
+                  and p.listing.id not in sketchy
+  =======
+  >>>>>>>
+  EOF
+
+Stdin holds apply-edits blocks (`apply-edits -h` shows the format), which apply-edits
+applies all or nothing. Then the command runs, and every file the blocks name is put
+back byte for byte, also when mutate-check is stopped by Ctrl-C, SIGTERM or SIGHUP.
+
+Prints one line, with up to 3 of the command's pytest `E ` lines when it failed, or its
+last line of output when there are none; never the whole output.
+
+Exit status: 0 the command failed, so the mutation was caught; 1 it passed, so the
+tests miss it; 2 usage error or blocks that didn't apply (the command didn't run);
+128+N stopped by signal N.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from types import FrameType, ModuleType
+
+CAUGHT, MISSED, USAGE = 0, 1, 2
+BIN = Path(__file__).resolve().parent
+SHOWN_ERRORS = 3
+STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+
+
+class UsageError(Exception):
+    pass
+
+
+class Stopped(Exception):
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+
+
+def apply_edits() -> ModuleType:
+    """bin/apply-edits as a module, for its parser: the one place the format lives."""
+    path = str(BIN / "apply-edits")
+    loader = importlib.machinery.SourceFileLoader("apply_edits", path)
+    spec = importlib.util.spec_from_loader("apply_edits", loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+FORMAT = apply_edits()
+
+
+@dataclass(frozen=True)
+class Original:
+    content: bytes
+    mode: int
+
+
+def snapshot(paths: list[Path]) -> dict[Path, Original]:
+    """The files' bytes and permissions, by their real paths."""
+    originals = {}
+    for path in paths:
+        target = path.resolve()
+        if target.is_file():
+            originals[target] = Original(target.read_bytes(), target.stat().st_mode)
+    return originals
+
+
+def restore(originals: dict[Path, Original]) -> list[str]:
+    """Put each file back as it was, through a temp file beside it so a crash can't leave
+    half of one, also when the command deleted it. Signals wait until it's done. Returns
+    what couldn't be put back."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    failed = []
+    for target, original in originals.items():
+        try:
+            fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+            with os.fdopen(fd, "wb") as f:
+                f.write(original.content)
+            os.chmod(temp, original.mode)
+            os.replace(temp, target)
+        except OSError as e:
+            failed.append(f"mutate-check: couldn't put back {target}: {e}")
+    return failed
+
+
+def run(command: list[str]) -> tuple[int, str]:
+    """The command's exit status and output. Stopped, it stops the command too, killing it
+    if it ignores SIGTERM for 5 seconds."""
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        output, _ = child.communicate()
+    except Stopped:
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+        raise
+    return child.returncode, output.decode(errors="replace")
+
+
+def summary(output: str) -> list[str]:
+    """Up to SHOWN_ERRORS of pytest's `E ` lines, else the last non-empty line."""
+    lines = output.splitlines()
+    errors = [line for line in lines if line.startswith("E ")]
+    if errors:
+        return errors[:SHOWN_ERRORS]
+    last = next((line for line in reversed(lines) if line.strip()), None)
+    return [last] if last is not None else []
+
+
+def stop(signum: int, _frame: FrameType | None) -> None:
+    raise Stopped(signum)
+
+
+def mutated_run(edits: str, command: list[str]) -> tuple[int, str]:
+    """Apply the edits, run the command, and give its status and output. Raises
+    Stopped, and UsageError when the edits don't apply or the command won't start."""
+    applied = subprocess.run(
+        [str(BIN / "apply-edits")],
+        input=edits,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if applied.returncode != 0:
+        raise UsageError(applied.stderr.rstrip())
+    try:
+        return run(command)
+    except OSError as e:
+        raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    if args[:1] != ["--"] or len(args) < 2:
+        print(f"mutate-check: give the command after --\n{__doc__}", file=sys.stderr)
+        return USAGE
+    edits = sys.stdin.read()
+    try:
+        files = FORMAT.parse(edits)
+    except FORMAT.UsageError as e:
+        print(f"apply-edits: {e}", file=sys.stderr)
+        return USAGE
+    originals = snapshot([f.path for f in files])
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, stop)
+    status: int | None = None
+    try:
+        code, output = mutated_run(edits, args[1:])
+    except UsageError as e:
+        print(e, file=sys.stderr)
+        status = USAGE
+    except Stopped as e:
+        print(f"mutate-check: stopped by signal {e.signum}", file=sys.stderr)
+        status = 128 + e.signum
+    finally:
+        failed = restore(originals)
+    if failed:
+        print("\n".join(failed), file=sys.stderr)
+        return USAGE
+    if status is not None:
+        return status
+    if code == 0:
+        print("mutate-check: not caught: the command passed with the mutation")
+        return MISSED
+    print(f"mutate-check: caught: the command exited {code}")
+    for line in summary(output):
+        print(f"  {line}")
+    return CAUGHT
+
+
+if __name__ == "__main__":
+    sys.exit(main())

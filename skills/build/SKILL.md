@@ -26,7 +26,7 @@ Done when every design fork is answered, the user has confirmed the seams (or yo
 
 ## 2. Implement
 
-Load the `coding` and `tdd` skills. Then cycle: stub the new names (empty functions and methods), write a test at a seam, or a few at once, run them and see every one red on its assertions, then write the code that turns them green. A test that is green on its first run never went red: delete it, or change it until it fails for the reason you meant. A test the request asks for on code that already exists goes red by breaking that code briefly. Leave code quality to the review that follows. Commit per `coding`, and keep every commit local until step 6 is done, even in a repo whose rules say to push each commit. When a choice would break a rule in the brief, or widen what a failure stops, ask the user instead of picking.
+Load the `coding` and `tdd` skills. Then cycle: stub the new names (empty functions and methods), write a test at a seam, or a few at once, run them and see every one red on its assertions, then write the code that turns them green. A test that is green on its first run never went red: delete it, or change it until it fails for the reason you meant. A test the request asks for on code that already exists goes red by breaking that code briefly, with `mutate-check` (`-h`), which puts the code back. Leave code quality to the review that follows. Commit per `coding`, and keep every commit local until step 6 is done, even in a repo whose rules say to push each commit. When a choice would break a rule in the brief, or widen what a failure stops, ask the user instead of picking.
 
 Done when `git log <base>..HEAD` shows your commits and the repo's checks pass.
 

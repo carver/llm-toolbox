@@ -10,7 +10,7 @@ Chat replies to me skip /unslop: be extremely concise, and sacrifice grammar for
 
 ## Coding
 
-To write or change code, run `/build`: you implement and refactor, and subagents review. A trivial edit, such as a one-file change with no behaviour worth a test, you make yourself with the `coding` skill (`~/.agents/skills/coding/SKILL.md`). If you wrote or changed a test, it isn't trivial: run `/build` with its reviews, small follow-ups late in a session included.
+To write or change code, run `/build`: you implement and refactor, and subagents review. A trivial edit, such as a one-file change with no behaviour worth a test, you make yourself with the `coding` skill (`~/.agents/skills/coding/SKILL.md`). If you wrote or changed a test, it isn't trivial: run `/build` with its reviews, small follow-ups late in a session included. With no subagent tool, as inside a workflow agent, run `/build`'s review step yourself: take the prompt `build-state review-prompt BRIEF` prints and review your own diff against it, both headings, before the refactor.
 
 When the working tree is dirty at the start of a session, those changes are someone else's: leave them alone and build in a detached worktree beside the repo, `git worktree add --detach ../<repo>-wt`. It has no `.venv` or untracked files, so set up the environment the repo's README describes before running checks there. Commit in the worktree. To finish:
 

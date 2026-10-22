@@ -4,21 +4,28 @@
 Refuses a Bash command that runs inline Python (a heredoc or -c) whose code reads a
 file, .replace()s text and writes that same file back: the script apply-edits
 replaces. Only the Python's own code counts, not the rest of the command, and a
-pattern-based edit (re.sub, sed) passes. install.py registers it in
+pattern-based edit (re.sub, sed) passes. So does an edit of files that are all
+under /tmp (scratch copies, an agent's scratchpad), when the path can be read
+off the code: a literal, Path() of one, sys.argv[i] from the command line, or a
+shell variable assigned in the same command. install.py registers it in
 ~/.claude/settings.json.
 
     edit-script-gate < hook-input.json    # as Claude Code calls it
 """
 
+import ast
 import json
+import os
 import re
 import shlex
 import sys
+from dataclasses import dataclass
 
-# A python command at the start of a line or after ; & | (, maybe behind sudo, env,
-# variable settings, a path or uv run; the rest of its line in "args".
+# A python command at the start of a line, after ; & | ( or a do/then/else, maybe behind
+# sudo, env, variable settings, a path or uv run; the rest of its line in "args".
 PYTHON = re.compile(
-    r"(?:^|[;&|(])\s*(?:(?:sudo|env)\s+)*(?:\w+=\S*\s+)*(?:uv run(?: \S+)*? )?"
+    r"(?:^|[;&|(]|\b(?:do|then|else)\b)\s*(?:(?:sudo|env)\s+)*(?:\w+=\S*\s+)*"
+    r"(?:uv run(?: \S+)*? )?"
     r"(?:\S*/)?python3?(?:\.\d+)?(?P<args>(?:\s[^\n]*)?)$",
     re.MULTILINE,
 )
@@ -35,12 +42,25 @@ REASON = (
 )
 
 
-def python_code(command: str) -> list[str]:
-    """The inline code of each python command in ``command``: a heredoc's body, or -c's
-    argument."""
-    codes = []
+@dataclass
+class Script:
+    """One inline python command: its code, the raw shell words it gets as sys.argv
+    ("-" or "-c" first), and the shell text before it, heredoc bodies blanked."""
+
+    code: str
+    argv: list[str]
+    shell_before: str
+
+
+def python_scripts(command: str) -> list[Script]:
+    """Each inline python command in ``command``: a heredoc's body, or -c's argument."""
+    shell = blank_heredocs(command)
+    scripts = []
     for match in PYTHON.finditer(command):
         args = match.group("args")
+        before = shell[
+            : match.end() - len(args)
+        ]  # up to the python word, separators kept
         if heredoc := HEREDOC.search(args):
             rest = command[match.end() + 1 :].split("\n")
             body = []
@@ -48,32 +68,211 @@ def python_code(command: str) -> list[str]:
                 if line.strip() == heredoc.group(2):
                     break
                 body.append(line)
-            codes.append("\n".join(body))
+            words = raw_words(args[: heredoc.start()])
+            argv = words[words.index("-") :] if "-" in words else []
+            scripts.append(Script("\n".join(body), argv, before))
         elif " -c" in args:
             try:
                 words = shlex.split(args)
             except ValueError:
                 continue
-            if "-c" in words and words.index("-c") + 1 < len(words):
-                codes.append(words[words.index("-c") + 1])
-    return codes
+            raw = raw_words(args)
+            if "-c" in words and "-c" in raw and words.index("-c") + 1 < len(words):
+                argv = ["-c", *raw[raw.index("-c") + 2 :]]
+                scripts.append(Script(words[words.index("-c") + 1], argv, before))
+    return scripts
 
 
-def edits_a_file(code: str) -> bool:
-    """Whether ``code`` .replace()s text and writes back a file it reads."""
+def blank_heredocs(command: str) -> str:
+    """``command`` with every heredoc's body replaced by an empty line each."""
+    lines, out, end = command.split("\n"), [], None
+    for line in lines:
+        if end is not None:
+            out.append("")
+            if line.strip() == end:
+                end = None
+            continue
+        out.append(line)
+        if heredoc := HEREDOC.search(line):
+            end = heredoc.group(2)
+    return "\n".join(out)
+
+
+def raw_words(text: str) -> list[str]:
+    """Shell words with their quotes kept, so a word's quoting can be judged."""
+    try:
+        return shlex.split(text, posix=False)
+    except ValueError:
+        return []
+
+
+def edited_targets(code: str) -> set[str]:
+    """The file expressions ``code`` reads and writes back, when it .replace()s text."""
     if ".replace(" not in code:
-        return False
+        return set()
     reads, writes = set(), set()
     for target, _, mode in OPEN.findall(code):
         (writes if set(mode) & set("wa+") else reads).add(target.strip())
     for target, method in PATH_CALL.findall(code):
         (reads if method == "read_text" else writes).add(target)
-    return bool(reads & writes)
+    return reads & writes
+
+
+def resolve(expr: str, script: Script) -> str | None:
+    """The path a file expression names, read off the code and the command: a string
+    literal, Path(<literal>), sys.argv[i], or a name bound once, at top level, to one of
+    those. None when it can't be read off."""
+    try:
+        tree = ast.parse(script.code)
+        node = ast.parse(expr.strip(), mode="eval").body
+    except SyntaxError:
+        return None
+    if isinstance(node, ast.Name):
+        node = sole_binding(tree, node.id)
+    if node is None:
+        return None
+    if path := literal_path(node):
+        return path
+    if (index := argv_index(node)) is not None and not argv_changed(tree):
+        words = script.argv
+        if 0 < index < len(words) and all(map(one_word, words[1:index])):
+            return shell_value(words[index], script.shell_before)
+    return None
+
+
+def one_word(word: str) -> bool:
+    """Whether a raw shell word stays one argument: quoted whole, or unquoted with no
+    expansion, glob or brace that could split it or make more."""
+    if len(word) >= 2 and word[0] == word[-1] and word[0] in "'\"":
+        return word[0] == "'" or "$(" not in word and "`" not in word
+    return re.fullmatch(VALUE, word) is not None
+
+
+def literal_path(node: ast.expr) -> str | None:
+    """A string constant, or Path() / pathlib.Path() of one."""
+    if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
+        func = ast.unparse(node.func)
+        node = node.args[0] if func in ("Path", "pathlib.Path") else node
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def argv_index(node: ast.expr) -> int | None:
+    if (
+        isinstance(node, ast.Subscript)
+        and ast.unparse(node.value) == "sys.argv"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, int)
+    ):
+        return node.slice.value
+    return None
+
+
+def argv_changed(tree: ast.Module) -> bool:
+    """Whether the code assigns to sys.argv or one of its items, or calls a method on it."""
+    for node in ast.walk(tree):
+        stored = isinstance(node, (ast.Subscript, ast.Attribute)) and isinstance(
+            node.ctx, ast.Store
+        )
+        if stored and ast.unparse(node).startswith("sys.argv"):
+            return True
+        if isinstance(node, ast.Call) and ast.unparse(node.func).startswith(
+            "sys.argv."
+        ):
+            return True
+    return False
+
+
+def sole_binding(tree: ast.Module, name: str) -> ast.expr | None:
+    """The value ``name`` is bound to, when the code binds it exactly once, by a plain
+    top-level ``name = value``. Any other binding (loops, with/except/import, parameters,
+    augmented or annotated assignment, walrus, unpacking, nested scopes) gives None."""
+    bindings = [n for n in ast.walk(tree) if binds(n, name)]
+    if len(bindings) != 1:
+        return None
+    for statement in tree.body:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id == name
+        ):
+            return statement.value
+    return None
+
+
+def binds(node: ast.AST, name: str) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == name and isinstance(node.ctx, (ast.Store, ast.Del))
+    if isinstance(node, ast.arg):
+        return node.arg == name
+    if isinstance(node, ast.alias):
+        return (node.asname or node.name.split(".")[0]) == name
+    if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        return node.name == name
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name == name
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return name in node.names
+    return False
+
+
+# One whole shell value: unquoted with no expansion or globbing, or wholly quoted.
+VALUE = r"""(?:[^\s'"$`\\;&|(){}*?\[\]~#]+|'[^']*'|"[^"$`\\]*")"""
+
+
+def shell_value(word: str, shell_before: str) -> str | None:
+    """A raw shell word's value: a plain or wholly quoted literal, or "$VAR"/${VAR} for a
+    VAR the shell text sets exactly once, at top level, before the python command, to such
+    a literal. None for anything else (globs, braces, other expansions, prefix
+    assignments, subshells)."""
+    quoted = len(word) >= 2 and word[0] == word[-1] == '"'
+    if variable := re.fullmatch(r"\$\{?(\w+)\}?", word[1:-1] if quoted else word):
+        value = variable_value(variable.group(1), shell_before)
+        splits = value is not None and not quoted and re.search(r"[\s*?\[{]", value)
+        return None if splits else value
+    if word.startswith("'") and word.endswith("'") and len(word) >= 2:
+        return word[1:-1]
+    if re.fullmatch(VALUE, word):
+        return word.strip('"')
+    return None
+
+
+def variable_value(name: str, shell_before: str) -> str | None:
+    mentions = re.findall(
+        rf"\b{name}\+?=|\bfor\s+{name}\b|\b(?:read|local|declare|typeset|readonly)\b[^\n;]*\b{name}\b",
+        shell_before,
+    )
+    if len(mentions) != 1:
+        return None
+    statement = re.search(
+        rf"(?:^|[;\n]|&&|\|\|)\s*(?:export\s+)?{name}=({VALUE})\s*(?:;|&&|\|\||\n|$)",
+        shell_before,
+    )
+    if not statement or depth_at(shell_before, statement.start()) != 0:
+        return None
+    return statement.group(1).strip("'\"")
+
+
+def depth_at(text: str, position: int) -> int:
+    """How many parentheses are open at ``position``: a subshell's assignments don't
+    reach the commands after it."""
+    return text[:position].count("(") - text[:position].count(")")
+
+
+def under_tmp(path: str | None) -> bool:
+    return bool(path) and os.path.normpath(path).startswith("/tmp/")
 
 
 def is_edit_script(command: str) -> bool:
-    """Whether ``command`` runs inline Python that edits a file with .replace()."""
-    return any(edits_a_file(code) for code in python_code(command))
+    """Whether ``command`` runs inline Python that edits a file with .replace(), other than
+    files that are all provably under /tmp (scratch copies, the agent's scratchpad)."""
+    for script in python_scripts(command):
+        targets = edited_targets(script.code)
+        if targets and not all(under_tmp(resolve(t, script)) for t in targets):
+            return True
+    return False
 
 
 def main(argv=None) -> int:

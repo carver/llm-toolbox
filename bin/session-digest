@@ -11,17 +11,27 @@ with the size of its output, and the text of every error. Output bodies are
 left out; their size is given in characters and estimated tokens (chars / 4).
 A background task's notification gets one line, its id, status and summary,
 without the report: a subagent's report shows in that agent's own timeline.
+An image counts about width * height / 750 tokens, from its header (PNG, GIF,
+JPEG), capped at 1600.
+
+Workflow agents (Workflow tool runs) each get a summary row named
+<run>:<label>, and their failed calls are printed with the call that failed;
+--timelines prints their full timelines too.
 
 The session defaults to the newest one for the current directory's project,
 or its nearest parent directory's.
 Logs live under $CLAUDE_CONFIG_DIR (default ~/.claude) in
 projects/<project>/<session>.jsonl, with subagents in
-projects/<project>/<session>/subagents/agent-<id>.jsonl.
+projects/<project>/<session>/subagents/agent-<id>.jsonl and workflow agents in
+projects/<project>/<session>/subagents/workflows/<run>/agent-<id>.jsonl.
 """
 
 import argparse
+import base64
+import binascii
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -33,6 +43,7 @@ BIGGEST = 5
 INPUT_LIMIT = 200
 CHARS_PER_TOKEN = 4
 IMAGE_TOKENS = 1600
+IMAGE_EDGE = 1568
 
 
 @dataclass
@@ -55,8 +66,12 @@ class Agent:
     totals: ToolStats = field(default_factory=ToolStats)
     tools: dict[str, ToolStats] = field(default_factory=dict)
     outputs: list[tuple[int, str]] = field(default_factory=list)
+    errors: list[tuple[str, str]] = field(
+        default_factory=list
+    )  # (call, full error text)
     context_in: int = 0
     output: int = 0
+    workflow: bool = False
 
 
 def short(text: str, limit: int) -> str:
@@ -84,8 +99,47 @@ def result_size(content: str | list) -> tuple[str, int, int]:
     if isinstance(content, str):
         return content, len(content) // CHARS_PER_TOKEN, 0
     text = "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
-    images = sum(b.get("type") == "image" for b in content)
-    return text, len(text) // CHARS_PER_TOKEN + images * IMAGE_TOKENS, images
+    images = [b for b in content if b.get("type") == "image"]
+    tokens = len(text) // CHARS_PER_TOKEN + sum(image_tokens(b) for b in images)
+    return text, tokens, len(images)
+
+
+def image_tokens(block: dict) -> int:
+    """About width * height / 750 tokens, after scaling the long edge to IMAGE_EDGE, at
+    most IMAGE_TOKENS; IMAGE_TOKENS when the size can't be read from the data's header."""
+    size = image_size(str((block.get("source") or {}).get("data", "")))
+    if size is None:
+        return IMAGE_TOKENS
+    width, height = size
+    scale = min(1.0, IMAGE_EDGE / max(width, height, 1))
+    return min(IMAGE_TOKENS, math.ceil(width * scale * height * scale / 750))
+
+
+def image_size(data: str) -> tuple[int, int] | None:
+    """Width and height from a base64 PNG, GIF or JPEG's header."""
+    try:
+        head = base64.b64decode(data[: 4 * 16384], validate=False)
+    except (binascii.Error, ValueError):
+        return None
+    if head.startswith(b"\x89PNG\r\n\x1a\n") and len(head) >= 24:
+        return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+    if head[:6] in (b"GIF87a", b"GIF89a") and len(head) >= 10:
+        return int.from_bytes(head[6:8], "little"), int.from_bytes(head[8:10], "little")
+    if head.startswith(b"\xff\xd8"):
+        return jpeg_size(head)
+    return None
+
+
+def jpeg_size(head: bytes) -> tuple[int, int] | None:
+    """Walk the JPEG's segments to its start-of-frame marker."""
+    at = 2
+    while at + 9 < len(head) and head[at] == 0xFF:
+        marker, length = head[at + 1], int.from_bytes(head[at + 2 : at + 4], "big")
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            height = int.from_bytes(head[at + 5 : at + 7], "big")
+            return int.from_bytes(head[at + 7 : at + 9], "big"), height
+        at += 2 + length
+    return None
 
 
 def notification(text: str) -> str | None:
@@ -159,6 +213,7 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
                     agent.outputs.append((tokens, call))
                     if error:
                         agent.lines.append(f"    ERROR {short(text, TEXT_LIMIT)}")
+                        agent.errors.append((call, text))
                     else:
                         size = f"{len(text)} chars ~{tokens} tok"
                         if images:
@@ -195,7 +250,10 @@ def find_session(config: Path, cwd: str, session: str | None) -> Path | None:
 
 
 def load_subagents(session: Path) -> list[tuple[str, dict, list[dict]]]:
-    folder = session.with_suffix("") / "subagents"
+    return load_subagents_in(session.with_suffix("") / "subagents")
+
+
+def load_subagents_in(folder: Path) -> list[tuple[str, dict, list[dict]]]:
     found = []
     for log in sorted(folder.glob("agent-*.jsonl"), key=lambda p: p.stat().st_mtime):
         meta_path = log.with_suffix(".meta.json")
@@ -204,8 +262,27 @@ def load_subagents(session: Path) -> list[tuple[str, dict, list[dict]]]:
     return found
 
 
+def load_workflow_agents(session: Path) -> list[tuple[str, dict, list[dict]]]:
+    """Agents of the session's workflow runs, named <run>:<label> (run id without wf_),
+    plus #<agent id tail> when two agents in one run share a label."""
+    folder = session.with_suffix("") / "subagents" / "workflows"
+    found = []
+    for run in sorted(folder.glob("*/"), key=lambda p: p.stat().st_mtime):
+        agents = load_subagents_in(run)
+        labels = [meta.get("description") or name for name, meta, _ in agents]
+        for (name, meta, records), label in zip(agents, labels, strict=True):
+            suffix = (
+                f"#{name.removeprefix('agent-')[:6]}" if labels.count(label) > 1 else ""
+            )
+            found.append(
+                (f"{run.name.removeprefix('wf_')}:{label}{suffix}", meta, records)
+            )
+    return found
+
+
 def summary(agents: list[Agent]) -> list[str]:
-    row = "{:<24} {:>6} {:>6} {:>9} {:>10} {:>8}"
+    width = max(24, *(len(a.name) for a in agents))  # workflow names run long
+    row = f"{{:<{width}}} {{:>6}} {{:>6}} {{:>9}} {{:>10}} {{:>8}}"
     lines = [row.format("agent", "calls", "errors", "out~tok", "api-in", "api-out")]
     for a in agents:
         t = a.totals
@@ -239,7 +316,7 @@ def summary(agents: list[Agent]) -> list[str]:
     ]
     outputs = [(tokens, a.name, call) for a in agents for tokens, call in a.outputs]
     for tokens, name, call in sorted(outputs, key=lambda o: -o[0])[:BIGGEST]:
-        lines.append(f"{human(tokens):>7}  {name:<24} {short(call, 100)}")
+        lines.append(f"{human(tokens):>7}  {name:<{width}} {short(call, 100)}")
     return lines
 
 
@@ -258,6 +335,11 @@ def main(argv: list[str] | None = None) -> int:
         "--cwd",
         default=os.getcwd(),
         help="project directory whose sessions to search (default: current)",
+    )
+    parser.add_argument(
+        "--timelines",
+        action="store_true",
+        help="also print workflow agents' full timelines (default: only their failed calls)",
     )
     args = parser.parse_args(argv)
 
@@ -278,13 +360,28 @@ def main(argv: list[str] | None = None) -> int:
     for name, meta, records in subagents:
         label = f"{meta.get('agentType', '?')}: {meta.get('description', '')}"
         agents.append(digest(Agent(name, label), records, spawned))
+    for name, meta, records in load_workflow_agents(session):
+        label = f"workflow phase {meta.get('workflowPhase', '?')}"
+        agents.append(digest(Agent(name, label, workflow=True), records, spawned))
 
     print(f"session {session.stem}  ({session})")
     print("\n".join(summary(agents)))
     for agent in agents:
+        if agent.workflow and not args.timelines:
+            continue
         header = "main" if agent.name == "main" else f"{agent.name} ({agent.label})"
         print(f"\n== {header}")
         print("\n".join(agent.lines))
+    failed = [a for a in agents if a.workflow and a.errors]
+    if failed and not args.timelines:
+        print(
+            "\n== workflow agents' failed calls (--timelines prints their full timelines)"
+        )
+        for agent in failed:
+            print(f"-- {agent.name} ({agent.label})")
+            for call, text in agent.errors:
+                print(f"  > {call}")
+                print("    ERROR " + text.strip().replace("\n", "\n          "))
     return 0
 
 

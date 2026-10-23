@@ -1,4 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# ///
 """Wait for exactly one process to exit, found by name, command line or PID.
 
 The shell-safe replacement for `while pgrep -f PATTERN; do sleep 1; done`,

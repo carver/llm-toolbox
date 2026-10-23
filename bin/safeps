@@ -1,4 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# ///
 """List processes found by name or command line, and never the caller.
 
 `ps aux | grep PATTERN` and `pgrep -af PATTERN` also list the shell running

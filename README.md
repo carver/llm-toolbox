@@ -27,7 +27,8 @@ Code picks them up as global skills, and into `~/.agents/skills/`, the AGENTS.md
 convention's home for them, and `GLOBAL_CLAUDE.md` to `~/.claude/CLAUDE.md`
 and `~/.agents/AGENTS.md`, so one file serves whichever convention a tool reads.
 Links, not copies, so an edit here is live straight away and `git pull` is the
-whole update story.
+whole update story. A tool whose first line runs `uv run --script` needs uv on
+`PATH`, which finds or fetches a Python 3.12 or later for it.
 
 It also sets the user-scope Claude Code settings in `install.py`'s
 `SETTINGS_VALUES`, such as loading a repo's `AGENTS.md` alongside the

@@ -378,3 +378,175 @@ def test_two_agents_with_one_label_in_a_run_get_distinct_names(
         line.split()[0] for line in agent_table.splitlines() if "build:harness" in line
     ]
     assert sorted(names) == ["abc123:build:harness#w9", "abc123:build:harness#x7"]
+
+
+def hook_record(kind: str, tool_use_id: str, **fields: object) -> dict:
+    return {
+        "type": "attachment",
+        "timestamp": "2026-10-02T12:00:00Z",
+        "attachment": {
+            "type": kind,
+            "hookName": "PreToolUse:Bash",
+            "toolUseID": tool_use_id,
+            "hookEvent": "PreToolUse",
+            **fields,
+        },
+    }
+
+
+def hook_failed(tool_use_id: str, stderr: str, **extra: object) -> dict:
+    fields = {"command": "bin/gate", "stderr": stderr, "stdout": "", "exitCode": 1}
+    return hook_record("hook_non_blocking_error", tool_use_id, **(fields | extra))
+
+
+def hook_timed_out(tool_use_id: str, timed_out: bool = True) -> dict:
+    return hook_record(
+        "hook_cancelled",
+        tool_use_id,
+        command="pre-commit check",
+        durationMs=900587,
+        timedOut=timed_out,
+        timeoutMs=900000,
+    )
+
+
+def hook_session(tmp_path: Path, records: list[dict]) -> Path:
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    return tmp_path
+
+
+def timeline(out: str) -> list[str]:
+    return out.split("\n== main")[1].splitlines()
+
+
+def test_failed_hook_prints_its_last_error_line_under_its_call(tmp_path: Path) -> None:
+    out = digest(
+        hook_session(
+            tmp_path,
+            [
+                assistant("r1", tool_use("t1", "Bash", command="ls")),
+                hook_failed(
+                    "t1", "Traceback (most recent call last):\nValueError: bad"
+                ),
+                user([result("t1", "a.py")]),
+            ],
+        )
+    )
+    lines = timeline(out)
+    call = next(i for i, line in enumerate(lines) if "Bash: ls" in line)
+    assert (
+        lines[call + 1].strip()
+        == "HOOK ERROR PreToolUse:Bash bin/gate: ValueError: bad"
+    )
+    assert "Traceback" not in out
+
+
+def test_hook_logged_before_its_call_still_prints_under_it(tmp_path: Path) -> None:
+    out = digest(
+        hook_session(
+            tmp_path,
+            [
+                hook_failed("t2", "gate broke"),
+                assistant("r1", tool_use("t1", "Bash", command="ls")),
+                assistant("r1", tool_use("t2", "Bash", command="pwd")),
+                user([result("t1", "a.py")]),
+                user([result("t2", "/repo")]),
+            ],
+        )
+    )
+    lines = timeline(out)
+    call = next(i for i, line in enumerate(lines) if "Bash: pwd" in line)
+    assert lines[call + 1].strip() == "HOOK ERROR PreToolUse:Bash bin/gate: gate broke"
+    assert sum("HOOK ERROR" in line for line in lines) == 1
+
+
+@pytest.mark.parametrize(
+    ("record", "error"),
+    [
+        (hook_timed_out("t1"), "timed out after 900s"),
+        (hook_timed_out("t1", timed_out=False), "cancelled"),
+        (hook_failed("t1", "", stdout="warn\nfrom stdout\n"), "from stdout"),
+        (hook_failed("t1", "", exitCode=3), "exit 3"),
+        (hook_failed("t1", " \n", stdout="from stdout"), "from stdout"),
+    ],
+)
+def test_hook_error_text(tmp_path: Path, record: dict, error: str) -> None:
+    out = digest(
+        hook_session(
+            tmp_path,
+            [assistant("r1", tool_use("t1", "Bash", command="ls")), record],
+        )
+    )
+    assert (
+        f"HOOK ERROR PreToolUse:Bash {record['attachment']['command']}: {error}" in out
+    )
+
+
+def test_hook_for_no_call_prints_where_it_ran(tmp_path: Path) -> None:
+    stop_hook = hook_failed("", "stop hook broke", hookName="Stop", hookEvent="Stop")
+    out = digest(
+        hook_session(
+            tmp_path,
+            [
+                user("Fix it"),
+                assistant("r1", {"type": "text", "text": "Fixed."}),
+                stop_hook,
+                user("Thanks"),
+            ],
+        )
+    )
+    lines = [line.strip() for line in timeline(out)]
+    hook = lines.index("HOOK ERROR Stop bin/gate: stop hook broke")
+    assert "Fixed." in lines[hook - 1]
+    assert "USER Thanks" in lines[hook + 1]
+
+
+def test_summary_counts_hook_errors_per_hook_across_agents(config: Path) -> None:
+    project = config / "projects" / "-work-repo"
+    write_jsonl(
+        project / "sess1.jsonl",
+        [*MAIN, hook_failed("t1", "x"), hook_failed("t2", "y"), hook_timed_out("t1")],
+    )
+    write_jsonl(
+        project / "sess1" / "subagents" / "agent-abc.jsonl",
+        [*SUB, hook_failed("u2", "z")],
+    )
+    summary = digest(config).split("\n== main")[0]
+    counts = summary.split("hook errors")[1].strip().splitlines()
+    assert [line.split(None, 1) for line in counts] == [
+        ["3", "PreToolUse:Bash bin/gate"],
+        ["1", "PreToolUse:Bash pre-commit check"],
+    ]
+
+
+def test_summary_has_no_hook_section_without_hook_errors(config: Path) -> None:
+    assert "hook errors" not in digest(config)
+
+
+def test_workflow_agent_hook_errors_print_with_their_call(
+    workflow_config: Path,
+) -> None:
+    run = (
+        workflow_config
+        / "projects"
+        / "-work-repo"
+        / "sess1"
+        / "subagents"
+        / "workflows"
+        / "wf_abc123"
+    )
+    write_jsonl(
+        run / "agent-w9.jsonl",
+        [
+            assistant("w1", tool_use("v1", "Bash", command="echo fine")),
+            hook_failed("v1", "gate broke"),
+            user([result("v1", "fine")]),
+        ],
+    )
+    out = digest(workflow_config)
+    assert "failed calls" in out
+    section = out.split("failed calls")[-1]
+    assert "abc123:build:harness" in section
+    lines = [line.strip() for line in section.splitlines()]
+    call = lines.index("> Bash: echo fine")
+    assert lines[call + 1] == "HOOK ERROR PreToolUse:Bash bin/gate: gate broke"

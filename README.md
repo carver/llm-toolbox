@@ -203,8 +203,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   tokens in and out) and its five biggest tool outputs,
   then each subagent's timeline: user turns, the assistant's text, one line per
   tool call with its output's size, one line per background task notification
-  (id, status, summary), and every error in full. Workflow agents, named
-  `<run>:<label>`, show only their failed calls unless `--timelines` is given.
+  (id, status, summary), and every error in full. A hook that failed or was
+  cancelled (by a timeout, say) gets a line with its error's last line, under
+  the tool call it ran for or, if it ran for none, where it ran; the summary
+  counts hook errors per hook. Workflow agents, named
+  `<run>:<label>`, show only their failed calls and hooks unless `--timelines`
+  is given.
   Images count about width × height / 750 tokens, from their header. Defaults to the
   newest session for the current directory (or its nearest parent with sessions),
   under `$CLAUDE_CONFIG_DIR` (default `~/.claude`).

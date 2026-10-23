@@ -7,16 +7,19 @@
 A session log and each of its subagents' logs run to a megabyte of JSONL, mostly
 tool output. This prints a summary of what each agent and each tool cost, then
 every agent's timeline: user turns, the assistant's text, one line per tool call
-with the size of its output, and the text of every error. Output bodies are
-left out; their size is given in characters and estimated tokens (chars / 4).
+with the size of its output, and the text of every error. A hook that failed
+or was cancelled (by a timeout, say) gets a line with its error's last line,
+under the tool call it ran for (or where it ran, if it ran for none), and the
+summary counts them per hook. Output bodies are left out; their size is given
+in characters and estimated tokens (chars / 4).
 A background task's notification gets one line, its id, status and summary,
 without the report: a subagent's report shows in that agent's own timeline.
 An image counts about width * height / 750 tokens, from its header (PNG, GIF,
 JPEG), capped at 1600.
 
 Workflow agents (Workflow tool runs) each get a summary row named
-<run>:<label>, and their failed calls are printed with the call that failed;
---timelines prints their full timelines too.
+<run>:<label>, and their errors and failed hooks are printed with the call
+they belong to; --timelines prints their full timelines too.
 
 The session defaults to the newest one for the current directory's project,
 or its nearest parent directory's.
@@ -35,6 +38,7 @@ import math
 import os
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,6 +48,7 @@ INPUT_LIMIT = 200
 CHARS_PER_TOKEN = 4
 IMAGE_TOKENS = 1600
 IMAGE_EDGE = 1568
+HOOK_FAILURES = ("hook_non_blocking_error", "hook_cancelled")
 
 
 @dataclass
@@ -66,9 +71,10 @@ class Agent:
     totals: ToolStats = field(default_factory=ToolStats)
     tools: dict[str, ToolStats] = field(default_factory=dict)
     outputs: list[tuple[int, str]] = field(default_factory=list)
-    errors: list[tuple[str, str]] = field(
-        default_factory=list
-    )  # (call, full error text)
+    # The lines that show what failed, by tool call id: the call, then its failed
+    # hooks and its error in full. A hook that ran for no call has a key of its own.
+    failures: dict[str, list[str]] = field(default_factory=dict)
+    hook_errors: Counter[str] = field(default_factory=Counter)
     context_in: int = 0
     output: int = 0
     workflow: bool = False
@@ -155,6 +161,25 @@ def notification(text: str) -> str | None:
     return f"NOTIFY {head}: {short(tag('summary'), TEXT_LIMIT)}"
 
 
+def hook_failure(attachment: dict) -> tuple[str, str] | None:
+    """For a hook that failed or was cancelled, the hook (its event and command) and
+    the last line of its error; None for any other attachment."""
+    if attachment.get("type") not in HOOK_FAILURES:
+        return None
+    hook = f"{attachment.get('hookName', '?')} {attachment.get('command', '?')}"
+    if attachment["type"] == "hook_cancelled":
+        timeout = attachment.get("timeoutMs")
+        if attachment.get("timedOut") and timeout:
+            return hook, f"timed out after {timeout / 1000:g}s"
+        return hook, "cancelled"
+    output = (attachment.get("stderr") or "").strip() or (
+        attachment.get("stdout") or ""
+    ).strip()
+    if not output:
+        return hook, f"exit {attachment.get('exitCode')}"
+    return hook, output.splitlines()[-1]
+
+
 def read_jsonl(path: Path) -> list[dict]:
     records = []
     for line in path.read_text().splitlines():
@@ -165,13 +190,47 @@ def read_jsonl(path: Path) -> list[dict]:
     return records
 
 
+def hook_line(failure: tuple[str, str]) -> str:
+    hook, error = failure
+    return f"    HOOK ERROR {hook}: {short(error, TEXT_LIMIT)}"
+
+
+def hook_lines(records: list[dict]) -> dict[str, list[str]]:
+    """Each tool call's failed hooks, one line each. The log may put a hook's record
+    before its call's, so they are gathered first."""
+    calls = {
+        block["id"]
+        for record in records
+        if record.get("type") == "assistant"
+        for block in (record.get("message") or {}).get("content") or []
+        if block.get("type") == "tool_use"
+    }
+    found: dict[str, list[str]] = {}
+    for record in records:
+        attachment = record.get("attachment") or {}
+        failure = hook_failure(attachment)
+        if failure and attachment.get("toolUseID") in calls:
+            found.setdefault(attachment["toolUseID"], []).append(hook_line(failure))
+    return found
+
+
 def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
     pending: dict[str, tuple[str, str]] = {}
     requests: set[str] = set()
+    hooks_by_call = hook_lines(records)
     for record in records:
         message = record.get("message") or {}
         content = message.get("content")
-        if record.get("type") == "assistant":
+        if record.get("type") == "attachment":
+            attachment = record.get("attachment") or {}
+            if failure := hook_failure(attachment):
+                hook, _ = failure
+                agent.hook_errors[hook] += 1
+                # A hook that ran for no tool call prints where it ran.
+                if attachment.get("toolUseID") not in hooks_by_call:
+                    agent.lines.append(hook_line(failure))
+                    agent.failures[f"hook {len(agent.failures)}"] = [hook_line(failure)]
+        elif record.get("type") == "assistant":
             request = record.get("requestId") or message.get("id")
             usage = message.get("usage")
             if usage and request not in requests:
@@ -192,6 +251,12 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
                     if block["id"] in spawned:
                         line += f" -> {spawned[block['id']]}"
                     agent.lines.append(line)
+                    if hooks := hooks_by_call.get(block["id"]):
+                        agent.lines += hooks
+                        agent.failures[block["id"]] = [
+                            f"  > {call}",
+                            *hooks,
+                        ]
         elif record.get("type") == "user":
             if isinstance(content, str):
                 if record.get("isMeta"):
@@ -213,7 +278,10 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
                     agent.outputs.append((tokens, call))
                     if error:
                         agent.lines.append(f"    ERROR {short(text, TEXT_LIMIT)}")
-                        agent.errors.append((call, text))
+                        full = text.strip().replace("\n", "\n          ")
+                        agent.failures.setdefault(
+                            block.get("tool_use_id"), [f"  > {call}"]
+                        ).append(f"    ERROR {full}")
                     else:
                         size = f"{len(text)} chars ~{tokens} tok"
                         if images:
@@ -317,6 +385,11 @@ def summary(agents: list[Agent]) -> list[str]:
     outputs = [(tokens, a.name, call) for a in agents for tokens, call in a.outputs]
     for tokens, name, call in sorted(outputs, key=lambda o: -o[0])[:BIGGEST]:
         lines.append(f"{human(tokens):>7}  {name:<{width}} {short(call, 100)}")
+    hook_errors = sum((a.hook_errors for a in agents), Counter())
+    if hook_errors:
+        lines += ["", "hook errors"]
+        for hook, count in hook_errors.most_common():
+            lines.append(f"{count:>7}  {short(hook, 100)}")
     return lines
 
 
@@ -372,16 +445,15 @@ def main(argv: list[str] | None = None) -> int:
         header = "main" if agent.name == "main" else f"{agent.name} ({agent.label})"
         print(f"\n== {header}")
         print("\n".join(agent.lines))
-    failed = [a for a in agents if a.workflow and a.errors]
+    failed = [a for a in agents if a.workflow and a.failures]
     if failed and not args.timelines:
         print(
             "\n== workflow agents' failed calls (--timelines prints their full timelines)"
         )
         for agent in failed:
             print(f"-- {agent.name} ({agent.label})")
-            for call, text in agent.errors:
-                print(f"  > {call}")
-                print("    ERROR " + text.strip().replace("\n", "\n          "))
+            for lines in agent.failures.values():
+                print("\n".join(lines))
     return 0
 
 

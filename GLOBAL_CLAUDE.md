@@ -6,7 +6,7 @@ We collaborate. Question my assumptions. When I'm ambiguous, use the `grilling` 
 
 ## Writing
 
-Chat replies to me skip /unslop: be extremely concise, and sacrifice grammar for brevity.
+Chat replies to me skip /unslop: be as concise as possible, without hurting clarity.
 
 ## Coding
 

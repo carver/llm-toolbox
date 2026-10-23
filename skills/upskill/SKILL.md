@@ -20,7 +20,7 @@ Walk the whole transcript, first turn to last. Your context holds only a subagen
 - **Missing context**: anything you learned by trial, by asking the user, or by digging through code, that a doc could have told you. That includes hidden dependencies: files that must change together with nothing pointing from one to the other.
 - **Hungry tools**: a CLI, MCP server or script of ours whose output costs more tokens than the agent used. `session-digest`'s biggest outputs are the place to start.
 
-Done when every failed tool call, in the main session and in each subagent, and every user correction is accounted for, either as a finding or dismissed with a reason.
+Done when every failed tool call and hook error, in the main session and in each subagent, and every user correction is accounted for, either as a finding or dismissed with a reason.
 
 ## 2. Match each finding to a fix
 

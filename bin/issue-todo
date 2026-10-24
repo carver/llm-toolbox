@@ -1,0 +1,210 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""A GitHub issue's task-list items, across its body and its comments, and ticking one.
+
+`gh issue view N` prints the body without the comments, and `--comments` the comments
+without the body, so a to-do list split between them reads as two partial lists.
+`show` prints every item in one place; `tick` checks one off where it lives.
+
+    issue-todo show 42
+    issue-todo tick 42 "forecast measure" --note "built in 8d5068e"
+    issue-todo tick 42 "Add hub" --undo
+    issue-todo tick 42 "Add hub" --dry-run
+
+An item is a list line with a box, `- [ ] text`, `1. [x] text` and the like, outside
+fenced code. `tick` finds the one open item (a ticked one with --undo) whose text
+contains MATCH, or equals it, in the body or any comment, ticks it, appends ` *NOTE*`,
+and writes that body or comment back, unless it changed since it was read. No match,
+or several, writes nothing and lists the candidates. It calls `gh`, so it acts as
+gh's logged-in user, in the current directory's repo unless --repo names one.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+
+BOX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+\[)([ xX])(\]\s+)(.*)$")
+FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+WIDTH = 100  # show cuts an item's text to this many characters
+
+
+@dataclass(frozen=True)
+class Item:
+    line: int  # its line's index in the markdown, split on "\n"
+    done: bool
+    text: str
+
+
+@dataclass(frozen=True)
+class Part:
+    """The issue's body, or one of its comments: where items live, and where a tick is written."""
+
+    label: str  # "body", or "comment ID AUTHOR DATE"
+    path: str  # its REST path, to read it again and to write it back
+    markdown: str
+
+
+def items(markdown: str) -> list[Item]:
+    """The task-list items in `markdown`, in order, leaving out lines in fenced code. A
+    fence closes only on a fence of its own character, at least as long."""
+    found, fence = [], None
+    for i, line in enumerate(markdown.split("\n")):
+        line = line.removesuffix("\r")
+        if m := FENCE.match(line):
+            mark = m.group(1)
+            if fence is None:
+                fence = mark
+            elif mark[0] == fence[0] and len(mark) >= len(fence):
+                fence = None
+        elif fence is None and (m := BOX.match(line)):
+            found.append(Item(i, m.group(2) != " ", m.group(4)))
+    return found
+
+
+def tick(markdown: str, item: Item, note: str | None, undo: bool = False) -> str:
+    """`markdown` with the item's box ticked (or cleared, with `undo`) and ` *NOTE*`
+    after its text. The line keeps its ending, "\\r\\n" included."""
+    lines = markdown.split("\n")
+    line = lines[item.line]
+    cr = "\r" if line.endswith("\r") else ""
+    m = BOX.match(line.removesuffix("\r"))
+    assert m, f"line {item.line} holds no task-list item"
+    text = m.group(4) + (f" *{note}*" if note else "")
+    lines[item.line] = f"{m.group(1)}{' ' if undo else 'x'}{m.group(3)}{text}{cr}"
+    return "\n".join(lines)
+
+
+def short(text: str) -> str:
+    return text if len(text) <= WIDTH else text[: WIDTH - 1] + "…"
+
+
+def gh(*args: str, stdin: str | None = None) -> str:
+    """gh's output; exits with gh's message when it fails."""
+    r = subprocess.run(
+        ["gh", *args], input=stdin, capture_output=True, text=True, check=False
+    )
+    if r.returncode != 0:
+        sys.exit(
+            f"issue-todo: gh {' '.join(args[:3])} failed: {r.stderr.strip()[-300:]}"
+        )
+    return r.stdout
+
+
+def parts(repo: str, number: int) -> tuple[dict, list[Part]]:
+    """The issue, and its body and comments as parts, in order."""
+    issue = json.loads(gh("api", f"repos/{repo}/issues/{number}"))
+    comments = json.loads(
+        gh("api", "--paginate", f"repos/{repo}/issues/{number}/comments")
+    )
+    found = [Part("body", f"repos/{repo}/issues/{number}", issue.get("body") or "")]
+    for c in comments:
+        label = f"comment {c['id']} {c['user']['login']} {c['created_at'][:10]}"
+        found.append(
+            Part(label, f"repos/{repo}/issues/comments/{c['id']}", c.get("body") or "")
+        )
+    return issue, found
+
+
+def show(repo: str, number: int) -> int:
+    issue, found = parts(repo, number)
+    print(f"#{issue['number']} {issue['title']} ({issue['state']})")
+    for part in found:
+        listed = items(part.markdown)
+        if not listed:
+            continue
+        print(part.label)
+        for i, item in enumerate(listed, 1):
+            print(f"  [{'x' if item.done else ' '}] {i}  {short(item.text)}")
+    return 0
+
+
+def tick_one(
+    repo: str, number: int, match: str, note: str | None, undo: bool, dry_run: bool
+) -> int:
+    _, found = parts(repo, number)
+    every = [(part, item) for part in found for item in items(part.markdown)]
+    candidates = [(p, i) for p, i in every if match in i.text and i.done == undo]
+    exact = [(p, i) for p, i in candidates if i.text == match]
+    if len(exact) == 1:
+        candidates = exact
+    if len(candidates) != 1:
+        state = "ticked" if undo else "open"
+        print(
+            f"issue-todo: {len(candidates)} {state} items match {match!r}",
+            file=sys.stderr,
+        )
+        for part, item in candidates:
+            print(f"  {part.label}: {short(item.text)}", file=sys.stderr)
+        other = sum(match in i.text and i.done != undo for _, i in every)
+        if not candidates and other:
+            flag = "tick it without --undo" if undo else "--undo clears it"
+            items_do = "item matches" if other == 1 else "items match"
+            print(
+                f"  {other} {'open' if undo else 'ticked'} {items_do}; {flag}",
+                file=sys.stderr,
+            )
+        return 1
+    part, item = candidates[0]
+    new = tick(part.markdown, item, note, undo)
+    if not dry_run:
+        if (json.loads(gh("api", part.path)).get("body") or "") != part.markdown:
+            print(
+                f"issue-todo: {part.label} changed since it was read; run again",
+                file=sys.stderr,
+            )
+            return 1
+        gh(
+            "api",
+            "-X",
+            "PATCH",
+            part.path,
+            "--input",
+            "-",
+            stdin=json.dumps({"body": new}),
+        )
+    print(
+        f"{part.label}{' (dry run)' if dry_run else ''}:\n{new.split('\n')[item.line]}"
+    )
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="issue-todo",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("number", type=int, help="the issue's number")
+    common.add_argument("--repo", help="OWNER/REPO; default: the current directory's")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    what = "every task-list item in the issue's body and comments, numbered within each"
+    sub.add_parser("show", parents=[common], help=what, description=what)
+    what = (
+        "tick the one open item whose text contains MATCH (or equals it, when several "
+        "contain it), appending --note, and write its body or comment back"
+    )
+    t = sub.add_parser("tick", parents=[common], help=what, description=what)
+    t.add_argument("match", help="text the item contains (case-sensitive)")
+    t.add_argument("--note", help="appended to the item, in italics")
+    t.add_argument("--undo", action="store_true", help="clear a ticked item instead")
+    t.add_argument(
+        "--dry-run", action="store_true", help="print the new line, write nothing"
+    )
+    args = p.parse_args(argv)
+    repo = (
+        args.repo
+        or gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").strip()
+    )
+    if args.cmd == "show":
+        return show(repo, args.number)
+    return tick_one(repo, args.number, args.match, args.note, args.undo, args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

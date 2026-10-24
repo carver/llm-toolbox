@@ -156,6 +156,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   changes only the message, skips it; an agent without llm-toolbox, such as
   a teammate's, runs the check every time. `install.py` also registers it as
   a Claude Code hook that refuses `git commit --no-verify`.
+- **issue-todo**: a GitHub issue's task-list items across its body and every
+  comment (`issue-todo show N`), which `gh issue view` splits between two
+  commands, and ticking one where it lives (`issue-todo tick N MATCH --note
+  TEXT`, with `--undo` and `--dry-run`). It writes through `gh api`.
 - **openrouter-credits**: prints an OpenRouter account's credits, bought, used
   and left. The key comes from `OPENROUTER_API_KEY`, else from `./.env` (or
   `--env-file`); it is never printed.

@@ -4,7 +4,8 @@ Every test is kept away from the repository pytest was started in: `git rebase
 --exec`, `commit -a` and hooks export GIT_DIR, GIT_INDEX_FILE and the like, and a
 test's throwaway repo, or the production code under test, would inherit them and
 write to the real repository instead. `shell_and_child` starts a wrapper shell and
-its job, for the process tools' tests."""
+its job, for the process tools' tests, and `started_child` finds a process's child
+by an argument it was started with."""
 
 import os
 import re
@@ -72,6 +73,29 @@ def no_inherited_repo(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+def started_child(parent: int, arg: str) -> int:
+    """The pid of `parent`'s child that has `arg` as one of its arguments, waiting up
+    to 5 seconds for it to start. While a shell sources $BASH_ENV it forks short-lived
+    copies of itself to run commands (pgrep, say), and it forks again before exec'ing
+    each job; until they exec, those copies have the shell's argv and process name, so
+    `arg` must be a whole argument only the real child has, not a piece of the shell's
+    command line. A child that exits while being read is skipped."""
+    children = Path(f"/proc/{parent}/task/{parent}/children")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        for pid in children.read_text().split():
+            try:
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if arg.encode() in cmdline.rstrip(b"\0").split(b"\0"):
+                return int(pid)
+        time.sleep(0.01)
+    raise AssertionError(
+        f"process {parent}'s child with argument {arg!r} never started"
+    )
+
+
 @pytest.fixture
 def shell_and_child():
     """Starts `bash -c "python3 ... MARKER; true"` and returns (shell pid, child pid): a
@@ -89,15 +113,7 @@ def shell_and_child():
             start_new_session=True,
         )
         groups.append(shell)
-        # Not just the first child: a shell sourcing $BASH_ENV can start others first.
-        children = Path(f"/proc/{shell.pid}/task/{shell.pid}/children")
-        for _ in range(500):
-            for pid in children.read_text().split():
-                cmdline = Path(f"/proc/{pid}/cmdline")
-                if cmdline.exists() and marker.encode() in cmdline.read_bytes():
-                    return shell.pid, int(pid)
-            time.sleep(0.01)
-        raise AssertionError("the shell's child never started")
+        return shell.pid, started_child(shell.pid, marker)
 
     yield start
     for shell in groups:

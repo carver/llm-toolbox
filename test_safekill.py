@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import started_child
+
 SCRIPT = Path(__file__).resolve().parent / "bin" / "safekill"
 
 
@@ -217,18 +219,7 @@ def test_without_f_a_parent_and_child_are_marked_but_not_told_to_anchor(
     script.chmod(0o755)
     parent = subprocess.Popen([str(script)], start_new_session=True)
     try:
-        # The child running the script by name, not one that sourcing $BASH_ENV started.
-        children = Path(f"/proc/{parent.pid}/task/{parent.pid}/children")
-        child = None
-        for _ in range(500):
-            for pid in children.read_text().split():
-                comm = Path(f"/proc/{pid}/comm")
-                if comm.exists() and comm.read_text().strip() == name:
-                    child = int(pid)
-            if child:
-                break
-            time.sleep(0.01)
-        assert child, "the script's child never started"
+        child = started_child(parent.pid, "child")
         result = safekill("--one", name)
         assert result.returncode == 2
         child_line = next(

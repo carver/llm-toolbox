@@ -42,8 +42,6 @@ To start a new Rust desktop app, run `new-egui-app DIR` (`-h` for options) rathe
 
 To read what a YouTube video says, around a timestamp or in full, use `yt-transcript`.
 
-To read a GitHub issue's to-dos, or tick one off, use `issue-todo` (`-h`): `gh issue view` prints the body, and `--comments` only the comments, so a list split between them reads as two partial lists.
-
 A new user-level skill or tool goes in llm-toolbox (`skills/` or `bin/`), then run its `install.py` to link it. Anything written straight into `~/.claude` or `~/.agents` is lost when the sandbox is recreated. To change another author's skill, edit it in `~/.agents/skills`, then run `skill-patch save NAME --why "..."`; an edit without a patch is lost at the next update.
 
 Before scraping a site, look for its data source: an official API or MCP endpoint (often linked as "use with your AI assistant"), an applicant-tracking-system API such as Greenhouse's `boards-api`, or JSON embedded in the page. These return complete, structured data and usually skip the bot checks that block scripted page fetches.

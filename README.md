@@ -172,6 +172,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   one, or `sys.argv[i]` from the command line, directly or through a name
   bound once; a shell variable counts when it's set once, before the python
   command, to a plain value.
+- **issue-view-hint**: a Claude Code hook, which `install.py` registers. After a
+  `gh issue view` that printed task-list boxes, or any with `--comments`, it
+  adds a note for the agent: the body and the comments come out separately, and
+  `issue-todo show N` lists both. It never blocks, and other commands get no
+  note.
 
 - **build-state**: `/build`'s bookkeeping. `start` records the base commit and
   the repo's fingerprint (every other ref, and the config with its values

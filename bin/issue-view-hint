@@ -1,0 +1,64 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""A Claude Code PostToolUse hook that points an agent reading an issue's to-dos at issue-todo.
+
+`gh issue view N` prints the issue's body without its comments, and `--comments` its
+comments without the body, so a to-do list split between them reads as part of the
+list. When a Bash command ran `gh issue view` and what it printed holds a task-list
+box (`- [ ]`, `- [x]`), this adds a note for the agent beside the result, naming
+`issue-todo show N`. Otherwise it says nothing, and it never blocks. install.py
+registers it in ~/.claude/settings.json.
+
+    issue-view-hint < hook-input.json    # as Claude Code calls it
+"""
+
+import json
+import re
+import sys
+
+# A gh issue view call, to the end of its shell command; a repo flag may come before "view".
+ISSUE_VIEW = re.compile(
+    r"\bgh\s+issue\s+(?:(?:-R|--repo)(?:\s+|=)\S+\s+)?view\b[^|;&\n]*"
+)
+REPO = re.compile(r"(?:-R|--repo)(?:\s+|=)(\S+)")
+NUMBER = re.compile(r"(?:^|\s)#?(\d+)\b|/issues/(\d+)")
+COMMENTS = re.compile(r"(?:^|\s)(?:--comments|-c)\b")
+BOX = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\[[ xX]\]\s", re.MULTILINE)
+
+
+def note(call: str) -> str:
+    """The note for one `gh issue view` call, naming its issue and repo."""
+    number = NUMBER.search(call.split("view", 1)[1])
+    issue = next((g for g in number.groups() if g), "N") if number else "N"
+    repo = REPO.search(call)
+    show = f"issue-todo show {issue}" + (f" --repo {repo.group(1)}" if repo else "")
+    return (
+        "`gh issue view` prints an issue's body without its comments, and with --comments "
+        "the comments without the body, so a to-do list split between them reads as part "
+        f"of the list. `{show}` lists the task-list items of the body and every comment, "
+        "and `issue-todo tick N MATCH --note TEXT` ticks one where it lives."
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        event = json.load(sys.stdin)
+        command = event["tool_input"]["command"]
+        printed = event["tool_response"].get("stdout") or ""
+        call = ISSUE_VIEW.search(command) if event.get("tool_name") == "Bash" else None
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return 0  # not a Bash event this hook can read: say nothing
+    # Box-free output says nothing, except under --comments, where the to-dos may be in the body
+    if call and (COMMENTS.search(call.group()) or BOX.search(printed)):
+        output = {
+            "hookEventName": "PostToolUse",
+            "additionalContext": note(call.group()),
+        }
+        print(json.dumps({"hookSpecificOutput": output}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

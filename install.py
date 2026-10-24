@@ -67,6 +67,15 @@ HOOKS = [
         "edit-script-gate",
         {"timeout": 10},
     ),
+    (
+        "PostToolUse",
+        "Bash",
+        "issue-view-hint",
+        {
+            "timeout": 10,
+            "if": "Bash(gh issue *)",
+        },  # starts the script only for gh issue
+    ),
 ]
 # (key path, value, why). Claude Code reads these only at user scope.
 SETTINGS_VALUES = [

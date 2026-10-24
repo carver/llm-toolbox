@@ -12,6 +12,11 @@ prints is CMD's. Pair it with `waitone --pid PID` and `kill PID`.
 
   pid=$(bgrun -o run.log -C ~/project -- python3 sweep.py --workers 8)
 
+An earlier run's output is kept: bgrun renames a non-empty LOG to LOG plus the
+time of its last write (run.log.2026-10-22T17-32-50, numbered if that name is
+taken), says so on stderr, and starts a fresh LOG. --append adds to LOG
+instead, after a "=== bgrun TIME: CMD" line; --truncate replaces its contents.
+
 For a pipeline or a redirection, start a shell: bgrun -o LOG -- sh -c '...'.
 The PID is then that shell's. LOG is relative to the caller's directory, not
 to -C.
@@ -25,20 +30,28 @@ waiting bgrun is killed.
   bgrun --wait -o run.log -- python3 sweep.py    # e.g. as a run_in_background call
 
 Exit status: 0 started, 1 CMD could not start (not found, not executable,
--C is not a directory, or LOG can't be opened), 2 usage error. A failed
+-C is not a directory, or LOG can't be moved aside or opened), 2 usage error. A failed
 start leaves LOG as it was. With --wait, after a successful start: CMD's
 status.
 """
 
 import argparse
 import os
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 CANT_START = 1
+ROTATE, APPEND, TRUNCATE = (
+    "rotate",
+    "append",
+    "truncate",
+)  # what happens to an earlier run's LOG
 TAIL_BYTES = 64 * 1024  # --wait reads only LOG's end, in case it has no newlines
 
 
@@ -55,8 +68,21 @@ def main(argv: list[str] | None = None) -> int:
         metavar="LOG",
         help="file for CMD's stdout and stderr",
     )
-    parser.add_argument(
-        "--append", action="store_true", help="append to LOG instead of replacing it"
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--append",
+        dest="mode",
+        action="store_const",
+        const=APPEND,
+        default=ROTATE,
+        help="add to LOG after a start line, instead of moving it aside",
+    )
+    mode.add_argument(
+        "--truncate",
+        dest="mode",
+        action="store_const",
+        const=TRUNCATE,
+        help="replace LOG's contents, instead of moving it aside",
     )
     parser.add_argument("-C", "--cwd", metavar="DIR", help="run CMD in DIR")
     parser.add_argument(
@@ -85,31 +111,61 @@ def main(argv: list[str] | None = None) -> int:
     if problem:
         print(f"bgrun: {problem}", file=sys.stderr)
         return CANT_START
-    try:
-        log = open(args.output, "ab" if args.append else "wb")  # noqa: SIM115 - handed to the child
-    except OSError as e:
-        print(f"bgrun: can't open {args.output!r}: {e.strerror}", file=sys.stderr)
+    log = Path(args.output)
+    proc = start(command, log, args.mode, args.cwd, env)
+    if proc is None:
         return CANT_START
-    with log:
+    print(proc.pid, flush=True)
+    if not args.wait:
+        return 0
+    return wait_and_report(proc, log, 10 if args.tail is None else args.tail)
+
+
+def start(
+    command: list[str], log: Path, mode: str, cwd: str | None, env: dict[str, str]
+) -> subprocess.Popen | None:
+    """Start CMD with its output in LOG, after dealing with an earlier run's LOG as mode says.
+
+    When CMD can't start, says why on stderr, puts LOG back as it was and returns None."""
+    try:
+        moved = None if mode == APPEND else rotate(log)
+    except OSError as e:
+        return cant(f"can't move {str(log)!r} aside: {e.strerror}")
+    try:
+        out = log.open("ab" if mode == APPEND else "wb")
+    except OSError as e:
+        put_back(moved, log)
+        return cant(f"can't open {str(log)!r}: {e.strerror}")
+    with out:
+        size = os.fstat(out.fileno()).st_size
+        if mode == APPEND:
+            started = datetime.now().astimezone().isoformat(timespec="seconds")
+            out.write(f"=== bgrun {started}: {shlex.join(command)}\n".encode())
+            out.flush()
         try:
             proc = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
-                stdout=log,
+                stdout=out,
                 stderr=subprocess.STDOUT,
-                cwd=args.cwd,
+                cwd=cwd,
                 env=env,
                 start_new_session=True,
             )
         except OSError as e:
-            print(f"bgrun: can't start {command[0]!r}: {e.strerror}", file=sys.stderr)
-            return CANT_START
-    print(proc.pid, flush=True)
-    if not args.wait:
-        return 0
-    return wait_and_report(
-        proc, Path(args.output), 10 if args.tail is None else args.tail
-    )
+            if mode == APPEND:
+                out.truncate(size)
+            put_back(moved, log)
+            return cant(f"can't start {command[0]!r}: {e.strerror}")
+    if moved and mode == TRUNCATE:
+        moved.unlink()
+    elif moved:
+        print(f"bgrun: moved {log} to {moved}", file=sys.stderr)
+    return proc
+
+
+def cant(problem: str) -> None:
+    print(f"bgrun: {problem}", file=sys.stderr)
 
 
 def wait_and_report(proc: subprocess.Popen, log: Path, tail: int) -> int:
@@ -130,6 +186,36 @@ def wait_and_report(proc: subprocess.Popen, log: Path, tail: int) -> int:
     for line in end.splitlines()[-tail:] if tail else []:
         print(line)
     return status
+
+
+def rotate(log: Path) -> Path | None:
+    """Move a non-empty LOG aside and return where it went, or None if it stayed.
+
+    The new name is LOG plus the time of its last write, numbered if that name is taken."""
+    try:
+        info = log.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
+        return None
+    stamp = time.strftime("%Y-%m-%dT%H-%M-%S", time.localtime(info.st_mtime))
+    moved = log.with_name(f"{log.name}.{stamp}")
+    n = 0
+    while os.path.lexists(moved):
+        n += 1
+        moved = log.with_name(f"{log.name}.{stamp}-{n}")
+    log.rename(moved)
+    return moved
+
+
+def put_back(moved: Path | None, log: Path) -> None:
+    """Undo rotate() after a failed start, so the earlier run's log is LOG again."""
+    if not moved:
+        return
+    try:
+        moved.replace(log)
+    except OSError as e:
+        print(f"bgrun: can't move {moved} back to {log}: {e.strerror}", file=sys.stderr)
 
 
 def caller_env() -> dict[str, str]:

@@ -7,17 +7,37 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "bgrun"
+UTC_ENV = {**os.environ, "TZ": "UTC"}
+OLD_RUN = 1729618370  # 2024-10-22T17:32:50Z, the last write of an earlier run's log
 
 
-def bgrun(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def bgrun(
+    *args: str, cwd: Path | None = None, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(SCRIPT), *args], text=True, capture_output=True, check=False, cwd=cwd
+        [str(SCRIPT), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=cwd,
+        env=env,
     )
+
+
+def old_log(path: Path) -> Path:
+    path.write_text("old run\n")
+    os.utime(path, (OLD_RUN, OLD_RUN))
+    return path
+
+
+def names(folder: Path) -> list[str]:
+    return sorted(p.name for p in folder.iterdir())
 
 
 @pytest.fixture
@@ -95,16 +115,97 @@ def test_stdin_is_empty(tmp_path, started):
     assert "read ''" in wait_for(log, "read")
 
 
-def test_truncates_the_log_unless_append(tmp_path, started):
+def test_moves_an_earlier_log_aside_named_for_its_last_write(tmp_path, started):
+    log = old_log(tmp_path / "out.log")
+
+    result = bgrun("-o", str(log), "--", "echo", "new run", env=UTC_ENV)
+
+    started.append(int(result.stdout))
+    moved = tmp_path / "out.log.2024-10-22T17-32-50"
+    assert moved.read_text() == "old run\n"
+    assert wait_for(log, "new run") == "new run\n"
+    assert result.stderr == f"bgrun: moved {log} to {moved}\n"
+
+
+def test_a_moved_log_never_replaces_an_older_one(tmp_path, started):
+    log = old_log(tmp_path / "out.log")
+    (tmp_path / "out.log.2024-10-22T17-32-50").write_text("run 1\n")
+    (tmp_path / "out.log.2024-10-22T17-32-50-1").write_text("run 2\n")
+
+    result = bgrun("-o", str(log), "--", "true", env=UTC_ENV)
+
+    started.append(int(result.stdout))
+    assert (tmp_path / "out.log.2024-10-22T17-32-50").read_text() == "run 1\n"
+    assert (tmp_path / "out.log.2024-10-22T17-32-50-1").read_text() == "run 2\n"
+    assert (tmp_path / "out.log.2024-10-22T17-32-50-2").read_text() == "old run\n"
+
+
+@pytest.mark.parametrize("before", [None, ""])
+def test_a_missing_or_empty_log_is_not_moved(tmp_path, started, before):
     log = tmp_path / "out.log"
-    log.write_text("old line\n")
-    printer = [sys.executable, "-c", "print('new line')"]
+    if before is not None:
+        log.write_text(before)
 
-    started.append(int(bgrun("-o", str(log), "--", *printer).stdout))
-    assert wait_for(log, "new line") == "new line\n"
+    result = bgrun("-o", str(log), "--", "echo", "new run")
 
-    started.append(int(bgrun("--append", "-o", str(log), "--", *printer).stdout))
-    assert wait_for(log, "new line\nnew line") == "new line\nnew line\n"
+    started.append(int(result.stdout))
+    assert wait_for(log, "new run") == "new run\n"
+    assert names(tmp_path) == ["out.log"]
+    assert result.stderr == ""
+
+
+def test_a_log_that_is_a_symlink_is_written_through_not_moved(tmp_path, started):
+    target = old_log(tmp_path / "target.log")
+    log = tmp_path / "out.log"
+    log.symlink_to(target)
+
+    result = bgrun("-o", str(log), "--", "echo", "new run")
+
+    started.append(int(result.stdout))
+    assert log.is_symlink()
+    assert wait_for(target, "new run") == "new run\n"
+    assert names(tmp_path) == ["out.log", "target.log"]
+
+
+def test_truncate_replaces_the_earlier_log(tmp_path, started):
+    log = old_log(tmp_path / "out.log")
+
+    result = bgrun("--truncate", "-o", str(log), "--", "echo", "new run")
+
+    started.append(int(result.stdout))
+    assert wait_for(log, "new run") == "new run\n"
+    assert names(tmp_path) == ["out.log"]
+    assert result.stderr == ""
+
+
+def test_append_keeps_the_earlier_log_and_marks_where_this_run_starts(
+    tmp_path, started
+):
+    log = old_log(tmp_path / "out.log")
+
+    result = bgrun(
+        "--append", "-o", str(log), "--", "sh", "-c", "echo new run", env=UTC_ENV
+    )
+
+    started.append(int(result.stdout))
+    old, header, new = wait_for(log, "new run").splitlines()
+    assert (old, new) == ("old run", "new run")
+    when, command = re.fullmatch(r"=== bgrun (\S+\+00:00): (.*)", header).groups()
+    assert command == "sh -c 'echo new run'"
+    assert abs(datetime.fromisoformat(when) - datetime.now().astimezone()) < timedelta(
+        minutes=1
+    )
+    assert names(tmp_path) == ["out.log"]
+
+
+def test_append_and_truncate_together_are_a_usage_error(tmp_path):
+    log = old_log(tmp_path / "out.log")
+
+    result = bgrun("--append", "--truncate", "-o", str(log), "--", "true")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert log.read_text() == "old run\n"
 
 
 def test_runs_in_the_directory_given_by_c_with_the_log_relative_to_the_caller(
@@ -167,6 +268,37 @@ def test_a_failed_start_leaves_the_old_log_alone(tmp_path, bad):
 
     assert result.returncode == 1
     assert log.read_text() == "previous run\n"
+
+
+def broken_program(folder: Path) -> Path:
+    program = folder / "prog"  # executable, so it passes the checks, but can't run
+    program.write_text("#!/no/such/interpreter\n")
+    program.chmod(0o755)
+    return program
+
+
+@pytest.mark.parametrize("mode", [[], ["--append"], ["--truncate"]])
+def test_a_start_that_fails_after_the_checks_leaves_the_old_log_as_it_was(
+    tmp_path, mode
+):
+    log = old_log(tmp_path / "out.log")
+
+    result = bgrun(*mode, "-o", str(log), "--", str(broken_program(tmp_path)))
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert log.read_text() == "old run\n"
+    assert names(tmp_path) == ["out.log", "prog"]
+
+
+def test_a_start_that_fails_after_the_checks_with_a_device_log_is_reported(
+    tmp_path,
+):
+    result = bgrun("-o", os.devnull, "--", str(broken_program(tmp_path)))
+
+    assert result.returncode == 1
+    assert "can't start" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_a_missing_directory_is_named_as_the_problem(tmp_path):

@@ -94,7 +94,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **bgrun**: `bgrun -o LOG -- CMD` starts CMD in the background, in its own
   session with stdin from /dev/null and its output in LOG, and prints CMD's
   own PID. `$!` after `cd DIR && nohup CMD &` is a subshell's PID, and killing
-  it leaves CMD running. `-C DIR` sets CMD's directory, `--append` keeps LOG.
+  it leaves CMD running. `-C DIR` sets CMD's directory. A non-empty LOG from
+  an earlier run is renamed to LOG plus the time of its last write
+  (`run.log.2026-10-22T17-32-50`); `--append` adds to it instead, after a
+  `=== bgrun TIME: CMD` line, and `--truncate` replaces it.
   `--wait` then waits for CMD, prints its exit status and LOG's last lines
   (`--tail N`, default 10) and exits with CMD's status: run it as an agent's
   background job to get one notification when CMD ends, while CMD survives if

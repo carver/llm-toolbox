@@ -113,23 +113,29 @@ COLLUSION = {
 class FakeHTTP:
     """Answers requests from a script of (method, url fragment, responses).
 
-    Each response is a paper.Response, or an exception to raise. A route's
-    last response repeats once the others are used up."""
+    Each response is a paper.Response, an exception to raise, or a function
+    that makes the Response from the request's call record. A route's last
+    response repeats once the others are used up."""
 
     def __init__(self, *routes):
         self.routes = [(m, frag, list(rs)) for m, frag, rs in routes]
         self.calls = []
 
-    def __call__(self, method, url, *, params=None, headers=None):
-        self.calls.append(
-            {"method": method, "url": url, "params": params, "headers": headers}
-        )
+    def __call__(self, method, url, *, params=None, headers=None, json=None):
+        call = {
+            "method": method,
+            "url": url,
+            "params": params,
+            "headers": headers,
+            "json": json,
+        }
+        self.calls.append(call)
         for m, frag, responses in self.routes:
             if m == method and frag in url:
                 answer = responses.pop(0) if len(responses) > 1 else responses[0]
                 if isinstance(answer, Exception):
                     raise answer
-                return answer
+                return answer(call) if callable(answer) else answer
         if "export.arxiv.org" in url:
             return arxiv_feed()  # tests that don't route arXiv get no dates
         raise AssertionError(f"unexpected request {method} {url}")
@@ -275,15 +281,7 @@ def test_a_client_error_is_not_retried(cache, capsys):
 
 
 def test_meta_prints_a_block_per_id_and_exits_1_for_one_not_found(cache, capsys):
-    http = FakeHTTP(
-        ("GET", f"/paper/{S2_ID}", [ok(COLLUSION)]),
-        (
-            "GET",
-            "/paper/DOI:10.1000/missing",
-            [status(404, {"error": "Paper not found"})],
-        ),
-        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
-    )
+    http = FakeHTTP(("POST", "/paper/batch", [ok([COLLUSION, None, ATTENTION])]))
     code, out, err, _ = run(
         capsys,
         ["meta", S2_ID, "https://doi.org/10.1000/missing", "1706.03762"],
@@ -480,7 +478,7 @@ def test_text_of_a_page_that_is_not_a_pdf_exits_1_and_caches_nothing(cache, caps
     )
     assert (code, out) == (1, "")
     assert "not a PDF" in err
-    assert not any(cache.rglob("*.*"))
+    assert [p.name for p in cache.rglob("*.*")] == ["requests.jsonl"]
 
 
 def test_text_of_a_missing_pdf_exits_1(cache, capsys):
@@ -705,8 +703,7 @@ def test_meta_adds_arxiv_version_and_dates(cache, capsys):
 def test_meta_asks_arxiv_once_for_every_paper_in_the_call(cache, capsys):
     other = dict(ATTENTION, paperId="f" * 40, externalIds={"ArXiv": "2404.00806"})
     http = FakeHTTP(
-        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
-        ("GET", "/paper/arXiv:2404.00806", [ok(other)]),
+        ("POST", "/paper/batch", [ok([ATTENTION, other])]),
         (
             "GET",
             "export.arxiv.org",
@@ -788,8 +785,11 @@ def test_an_arxiv_failure_leaves_the_rest_and_warns(cache, capsys):
 def test_a_later_semantic_scholar_failure_keeps_the_blocks_already_fetched(
     cache, capsys
 ):
+    first = FakeHTTP(("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]))
+    run(
+        capsys, ["meta", "1706.03762"], first
+    )  # cached, so only the second is asked for
     http = FakeHTTP(
-        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
         ("GET", "/paper/arXiv:2404.00806", [status(403, {"error": "forbidden"})]),
         ("GET", "export.arxiv.org", [ATTENTION_FEED]),
     )
@@ -1173,6 +1173,7 @@ def test_by_default_the_pacing_files_live_in_the_cache(cache, capsys):
 # OpenAlex, the fallback when Semantic Scholar gives up
 
 S2_DOWN = ("GET", "semanticscholar.org", [status(429, RATE_LIMITED)])
+S2_BATCH_DOWN = ("POST", "semanticscholar.org", [status(429, RATE_LIMITED)])
 OA_ATTENTION = {
     "id": "https://openalex.org/W2626778328",
     "doi": "https://doi.org/10.48550/arxiv.1706.03762",
@@ -1256,7 +1257,7 @@ def test_once_semantic_scholar_gives_up_later_ids_go_straight_to_openalex(
     cache, capsys
 ):
     http = FakeHTTP(
-        S2_DOWN,
+        S2_BATCH_DOWN,
         OA_ATTENTION_ROUTE,
         ("GET", "api.openalex.org/works/doi:10.1111/1467-937X.00136", [ok(OA_JOURNAL)]),
     )
@@ -1335,7 +1336,7 @@ def test_an_unactivated_openalex_key_is_dropped_with_one_warning(
 ):
     openalex_key_file.write_text(OA_KEY)
     http = FakeHTTP(
-        S2_DOWN,
+        S2_BATCH_DOWN,
         ("GET", "api.openalex.org", [NOT_ACTIVATED, ok(OA_ATTENTION), ok(OA_JOURNAL)]),
     )
     code, out, err, _ = run(
@@ -1626,3 +1627,719 @@ def test_the_openalex_key_never_reaches_arxiv_or_a_pdf_host(
     others = [c for c in http.calls if "api.openalex.org" not in c["url"]]
     assert calls_to(http, "export.arxiv.org") and calls_to(http, OPEN_PDF)
     assert all(OA_KEY not in json.dumps(c) for c in others)
+
+
+# The request log and paper stats
+
+
+def logged(cache):
+    path = cache / "requests.jsonl"
+    return (
+        [json.loads(line) for line in path.read_text().splitlines()]
+        if path.exists()
+        else []
+    )
+
+
+def test_each_request_is_logged_with_its_outcome(cache, capsys):
+    http = FakeHTTP(("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]))
+    run(capsys, ["meta", "1706.03762"], http)
+    (s2,) = [line for line in logged(cache) if line["service"] == "Semantic Scholar"]
+    assert s2["method"] == "GET"
+    assert (
+        s2["url"] == "https://api.semanticscholar.org/graph/v1/paper/arXiv:1706.03762"
+    )
+    assert (s2["status"], s2["attempts"], s2["backoff"]) == (200, 1, 0)
+    assert {"time", "waited", "seconds"} <= set(s2)
+
+
+def test_a_request_that_gave_up_is_logged_as_such(cache, capsys):
+    http = FakeHTTP(S2_DOWN, OPENALEX_HAS_NOTHING)
+    run(capsys, ["meta", "1706.03762"], http)
+    s2 = [line for line in logged(cache) if line["service"] == "Semantic Scholar"]
+    assert [(line["status"], line["attempts"]) for line in s2] == [("gave up", 6)]
+    assert s2[0]["backoff"] > 0
+    assert [
+        line["status"] for line in logged(cache) if line["service"] == "OpenAlex"
+    ] == [404]
+
+
+def test_the_log_holds_no_parameters_keys_or_mailto(
+    cache, capsys, key_file, openalex_key_file
+):
+    key_file.write_text(KEY)
+    openalex_key_file.write_text(OA_KEY)
+    run(capsys, ["meta", "1706.03762"], FakeHTTP(S2_DOWN, OA_ATTENTION_ROUTE))
+    run(
+        capsys,
+        ["search", "secret query words"],
+        FakeHTTP(S2_DOWN, OPENALEX_HAS_NOTHING),
+    )
+    text = (cache / "requests.jsonl").read_text()
+    for secret in (KEY, OA_KEY, "mailto", "worldofmail", "secret query words", "?"):
+        assert secret not in text
+
+
+def test_a_log_that_cant_be_written_warns_once_and_changes_nothing(cache, capsys):
+    (cache / "requests.jsonl").mkdir(parents=True)
+    http = FakeHTTP(("POST", "/paper/batch", [ok([ATTENTION, ATTENTION])]))
+    code, out, err, _ = run(capsys, ["meta", "1706.03762", "2404.00806"], http)
+    assert code == 0
+    assert out.count("Attention is All you Need") == 2
+    assert err.count("request log") == 1
+
+
+def write_log(cache, *lines):
+    cache.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    with (cache / "requests.jsonl").open("w") as f:
+        for ago, service, status, attempts, backoff_s, waited in lines:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - ago))
+            f.write(
+                json.dumps(
+                    {"time": stamp, "service": service, "method": "GET", "url": "u",
+                     "status": status, "attempts": attempts, "backoff": backoff_s,
+                     "waited": waited, "seconds": 1.0}
+                ) + "\n"
+            )  # fmt: skip
+
+
+def test_stats_summarises_the_log_per_service(cache, capsys):
+    write_log(
+        cache,
+        (60, "Semantic Scholar", 200, 1, 0, 0.2),
+        (61, "Semantic Scholar", 200, 1, 0, 1.4),
+        (62, "Semantic Scholar", 404, 1, 0, 2.5),
+        (63, "Semantic Scholar", "gave up", 6, 80.0, 0.4),
+        (3600, "OpenAlex", 200, 2, 3.0, 0.0),
+        (90000, "Semantic Scholar", 200, 1, 0, 9.0),  # older than 24 hours
+    )
+    code, out, err, _ = run(capsys, ["stats"], FakeHTTP())
+    assert code == 0, err
+    s2 = next(line for line in out.splitlines() if line.startswith("Semantic Scholar"))
+    assert "4 requests" in s2
+    assert "2 ok, 1 not found, 1 gave up or 429, 0 other" in s2
+    assert "5 extra attempts, 80s backoff" in s2
+    assert "waited: median 0.9s, max 2.5s, 2 over 1s" in s2
+    assert "busiest minute 4" in s2
+    oa = next(line for line in out.splitlines() if line.startswith("OpenAlex"))
+    assert "1 requests" in oa and "1 extra attempts, 3s backoff" in oa
+
+
+def test_stats_with_nothing_logged_in_the_window_says_so(cache, capsys):
+    write_log(cache, (90000, "arXiv", 200, 1, 0, 0.0))
+    code, out, _, _ = run(capsys, ["stats", "--hours", "1"], FakeHTTP())
+    assert code == 0
+    assert out == "paper: no requests logged in the last 1 hours\n"
+
+
+def test_the_busiest_minute_counts_a_60_second_window(cache, capsys):
+    write_log(cache, (120, "arXiv", 200, 1, 0, 0.0), (60, "arXiv", 200, 1, 0, 0.0))
+    _, out, _, _ = run(capsys, ["stats"], FakeHTTP())
+    assert out.rstrip().endswith("busiest minute 1")
+
+
+def test_the_log_drops_a_urls_query_and_userinfo(cache, capsys):
+    url = "https://user:pw123@example.org/a/b.pdf?token=s3cret"
+    run(
+        capsys,
+        ["text", url],
+        FakeHTTP(("GET", "example.org", [pdf_response()])),
+        extract=fake_extract,
+    )
+    (entry,) = logged(cache)
+    assert entry["url"] == "https://example.org/a/b.pdf"
+    text = (cache / "requests.jsonl").read_text()
+    assert "pw123" not in text and "s3cret" not in text
+
+
+def test_an_unexpected_fetch_error_is_still_logged(cache, capsys):
+    http = FakeHTTP(("GET", "/paper/", [RuntimeError("boom")]))
+    with pytest.raises(RuntimeError):
+        run(capsys, ["meta", "1706.03762"], http)
+    (entry,) = logged(cache)
+    assert entry["status"] == "error: RuntimeError"
+
+
+def test_stats_skips_lines_it_cant_read(cache, capsys):
+    write_log(cache, (60, "arXiv", 200, 1, 0, 0.0))
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with (cache / "requests.jsonl").open("a") as f:
+        f.write(json.dumps({"time": stamp, "status": 200}) + "\n")
+        f.write(json.dumps({"time": stamp, "service": "x", "attempts": "many"}) + "\n")
+        f.write("not json\n")
+    code, out, err, _ = run(capsys, ["stats"], FakeHTTP())
+    assert code == 0, err
+    assert [line.split(":")[0] for line in out.splitlines()] == ["arXiv"]
+
+
+# meta through POST /paper/batch
+
+
+def batch_route(*answers):
+    return ("POST", "/paper/batch", list(answers))
+
+
+def test_meta_of_several_ids_sends_one_batch(cache, capsys):
+    http = FakeHTTP(batch_route(ok([ATTENTION, COLLUSION])))
+    code, out, err, _ = run(capsys, ["meta", "1706.03762v5", S2_ID], http)
+    assert code == 0, err
+    titles = [line for line in out.splitlines() if not line.startswith(" ")]
+    assert titles == [ATTENTION["title"], COLLUSION["title"]]
+    (call,) = s2_calls(http)
+    assert call["method"] == "POST"
+    assert call["json"] == {"ids": ["arXiv:1706.03762", S2_ID]}
+    assert call["params"] == {"fields": paper.META_FIELDS}
+
+
+def test_batch_answers_serve_later_single_lookups(cache, capsys):
+    run(
+        capsys,
+        ["meta", "1706.03762", S2_ID],
+        FakeHTTP(batch_route(ok([ATTENTION, COLLUSION]))),
+    )
+    again = FakeHTTP()
+    code, out, _, _ = run(capsys, ["meta", S2_ID], again)
+    assert code == 0 and COLLUSION["title"] in out
+    assert s2_calls(again) == []
+
+
+def test_a_cached_id_stays_out_of_the_batch(cache, capsys):
+    run(
+        capsys,
+        ["meta", "1706.03762"],
+        FakeHTTP(("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)])),
+    )
+    other = dict(
+        ATTENTION, paperId="f" * 40, title="Other", externalIds={"ArXiv": "2404.00806"}
+    )
+    http = FakeHTTP(batch_route(ok([COLLUSION, other])))
+    code, out, err, _ = run(capsys, ["meta", "1706.03762", S2_ID, "2404.00806"], http)
+    assert code == 0, err
+    (call,) = s2_calls(http)
+    assert call["json"] == {"ids": [S2_ID, "arXiv:2404.00806"]}
+    titles = [line for line in out.splitlines() if not line.startswith(" ")]
+    assert titles == [ATTENTION["title"], COLLUSION["title"], "Other"]
+
+
+def test_a_single_cache_miss_still_uses_a_get(cache, capsys):
+    run(
+        capsys,
+        ["meta", "1706.03762"],
+        FakeHTTP(("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)])),
+    )
+    http = FakeHTTP(("GET", f"/paper/{S2_ID}", [ok(COLLUSION)]))
+    code, _, err, _ = run(capsys, ["meta", "1706.03762", S2_ID], http)
+    assert code == 0, err
+    assert [c["method"] for c in s2_calls(http)] == ["GET"]
+
+
+def test_a_null_in_the_batch_is_not_found_for_that_id(cache, capsys):
+    http = FakeHTTP(batch_route(ok([ATTENTION, None])))
+    code, out, err, _ = run(capsys, ["meta", "1706.03762", "10.1000/missing"], http)
+    assert code == 1
+    assert out.startswith(ATTENTION["title"] + "\n")
+    assert "not found: 10.1000/missing" in err
+    assert len(s2_calls(http)) == 1
+
+
+def test_a_batch_refused_with_400_falls_back_to_single_lookups(cache, capsys):
+    http = FakeHTTP(
+        batch_route(status(400, {"error": "bad ids"})),
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+        ("GET", f"/paper/{S2_ID}", [ok(COLLUSION)]),
+    )
+    code, out, err, _ = run(capsys, ["meta", "1706.03762", S2_ID], http)
+    assert code == 0, err
+    assert [c["method"] for c in s2_calls(http)] == ["POST", "GET", "GET"]
+    assert COLLUSION["title"] in out
+
+
+def test_a_throttled_batch_falls_back_to_openalex_for_each_id(cache, capsys):
+    http = FakeHTTP(
+        ("POST", "semanticscholar.org", [status(429, RATE_LIMITED)]),
+        OA_ATTENTION_ROUTE,
+        ("GET", "api.openalex.org/works/doi:10.1111/1467-937X.00136", [ok(OA_JOURNAL)]),
+    )
+    code, out, err, _ = run(
+        capsys, ["meta", "1706.03762", "10.1111/1467-937X.00136"], http
+    )
+    assert code == 0, err
+    assert [c["method"] for c in s2_calls(http)] == ["POST"] * 6
+    assert out.count(paper.SOURCE_LINE) == 2
+
+
+def test_batches_hold_at_most_500_ids(cache, capsys):
+    ids = [f"{n:040x}" for n in range(1, 502)]
+
+    def answer(call):
+        return ok(
+            [
+                dict(COLLUSION, paperId=i, title=f"Paper {i[-3:]}")
+                for i in call["json"]["ids"]
+            ]
+        )
+
+    http = FakeHTTP(batch_route(answer))
+    code, out, err, _ = run(capsys, ["meta", *ids], http)
+    assert code == 0, err
+    assert [len(c["json"]["ids"]) for c in s2_calls(http)] == [500, 1]
+    assert out.count("\nPaper ") + out.startswith("Paper ") == 501
+
+
+def test_a_batch_answer_of_the_wrong_length_sends_the_ids_singly(cache, capsys):
+    http = FakeHTTP(
+        batch_route(ok([ATTENTION])),
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+        ("GET", f"/paper/{S2_ID}", [ok(COLLUSION)]),
+    )
+    code, _, err, _ = run(capsys, ["meta", "1706.03762", S2_ID], http)
+    assert code == 0, err
+    assert [c["method"] for c in s2_calls(http)] == ["POST", "GET", "GET"]
+
+
+def test_a_batch_is_logged_with_its_id_count(cache, capsys):
+    run(
+        capsys,
+        ["meta", "1706.03762", S2_ID],
+        FakeHTTP(batch_route(ok([ATTENTION, COLLUSION]))),
+    )
+    (line,) = [
+        entry for entry in logged(cache) if entry["service"] == "Semantic Scholar"
+    ]
+    assert (line["method"], line["ids"]) == ("POST", 2)
+
+
+def test_a_failed_chunk_keeps_what_the_chunks_before_it_found(cache, capsys):
+    ids = [f"{n:040x}" for n in range(1, 502)]
+
+    def answer(call):
+        asked = call["json"]["ids"]
+        if len(asked) < 500:
+            return status(403, {"error": "forbidden"})
+        found = [dict(COLLUSION, paperId=i, title=f"Paper {i[-3:]}") for i in asked]
+        found[1] = None  # the second id is unknown
+        return ok(found)
+
+    http = FakeHTTP(
+        batch_route(answer),
+        ("GET", f"/paper/{ids[-1]}", [ok(dict(COLLUSION, paperId=ids[-1]))]),
+    )
+    code, _, err, _ = run(capsys, ["meta", *ids], http)
+    assert code == 1
+    assert f"not found: {ids[1]}" in err
+    assert [
+        c["url"].rsplit("/", 1)[-1] for c in s2_calls(http) if c["method"] == "GET"
+    ] == [ids[-1]]
+
+
+def test_a_refused_batch_still_prints_the_cached_blocks_first(cache, capsys):
+    run(
+        capsys,
+        ["meta", "1706.03762"],
+        FakeHTTP(("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)])),
+    )
+    http = FakeHTTP(
+        batch_route(status(403, {"error": "forbidden"})),
+        ("GET", "/paper/arXiv:2404.00806", [status(403, {"error": "forbidden"})]),
+    )
+    code, out, err, _ = run(capsys, ["meta", "1706.03762", "2404.00806", S2_ID], http)
+    assert code == 3
+    assert out.startswith(ATTENTION["title"] + "\n")
+    assert "forbidden" in err
+
+
+def test_a_batch_element_that_isnt_a_paper_sends_the_ids_singly(cache, capsys):
+    http = FakeHTTP(
+        batch_route(ok([ATTENTION, {"unexpected": True}])),
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+        ("GET", f"/paper/{S2_ID}", [ok(COLLUSION)]),
+    )
+    code, _, err, _ = run(capsys, ["meta", "1706.03762", S2_ID], http)
+    assert code == 0, err
+    assert [c["method"] for c in s2_calls(http)] == ["POST", "GET", "GET"]
+
+
+def test_a_duplicate_id_is_asked_for_once_and_printed_each_time(cache, capsys):
+    http = FakeHTTP(batch_route(ok([ATTENTION, COLLUSION])))
+    code, out, err, _ = run(capsys, ["meta", "1706.03762", "1706.03762v2", S2_ID], http)
+    assert code == 0, err
+    (call,) = s2_calls(http)
+    assert call["json"] == {"ids": ["arXiv:1706.03762", S2_ID]}
+    assert out.count(ATTENTION["title"]) == 2
+
+
+# paper sweep: /paper/search/bulk to a TSV file
+
+SWEPT = [
+    {
+        "paperId": "1" * 40,
+        "title": "Secret Collusion among AI Agents",
+        "year": 2024,
+        "publicationDate": "2024-02-12",
+        "venue": "NeurIPS",
+        "citationCount": 154,
+        "externalIds": {"ArXiv": "2402.07510", "DOI": "10.5555/secret"},
+        "authors": [{"name": "Sumeet Motwani"}, {"name": "Mikhail Baranchuk"}],
+    },
+    {
+        "paperId": "2" * 40,
+        "title": "Algorithmic Collusion by\tLarge\nLanguage Models",
+        "year": 2024,
+        "publicationDate": "2024-04-01",
+        "venue": "",
+        "citationCount": 75,
+        "externalIds": {"ArXiv": "2404.00806"},
+        "authors": [{"name": "Sara Fish"}],
+    },
+    {
+        "paperId": "3" * 40,
+        "title": "Tacit collusion",
+        "year": 2025,
+        "publicationDate": "2025-06-30",
+        "venue": "AER",
+        "citationCount": 3,
+        "externalIds": {},
+        "authors": [],
+    },
+]
+SECRET, FISH, TACIT = SWEPT
+
+
+def bulk_route(*pages):
+    return ("GET", "/paper/search/bulk", [ok(page) for page in pages])
+
+
+def one_page(*papers, total=None):
+    return bulk_route(
+        {"total": total or len(papers), "token": None, "data": list(papers)}
+    )
+
+
+def sweep_file(out):
+    return Path(out.splitlines()[-1].removeprefix("full list: "))
+
+
+def listed_titles(out):
+    """The printed rows' titles, in order (each row starts "year · title")."""
+    return [
+        line.split(" · ")[1] for line in out.splitlines() if " · citations: " in line
+    ]
+
+
+def test_sweep_pages_with_the_token_and_writes_every_paper_to_a_file(cache, capsys):
+    http = FakeHTTP(
+        bulk_route(
+            {"total": 3, "token": "t1", "data": [SECRET, FISH]},
+            {"total": 3, "token": None, "data": [TACIT]},
+        )
+    )
+    code, out, err, _ = run(capsys, ["sweep", '"collusion"', "+", "LLM"], http)
+    assert code == 0, err
+    lines = out.splitlines()
+    assert lines[:3] == [
+        "3 papers fetched; Semantic Scholar estimates 3 match",
+        "most cited:",
+        "2024 · Secret Collusion among AI Agents · NeurIPS · citations: 154"
+        " · arXiv:2402.07510 DOI:10.5555/secret S2:" + "1" * 40,
+    ]
+    assert lines[3].startswith(
+        "2024 · Algorithmic Collusion by Large Language Models · citations: 75"
+    )
+    assert len(lines) == 6 and lines[-1].startswith("full list: ")
+    first, second = s2_calls(http)
+    assert first["params"] == {
+        "query": '"collusion" + LLM',
+        "fields": paper.SWEEP_FIELDS,
+        "sort": "citationCount:desc",
+    }
+    assert second["params"]["token"] == "t1"
+    rows = sweep_file(out).read_text().splitlines()
+    assert (
+        rows[0] == "year\tdate\tcitations\ttitle\tvenue\tfirst author\tarXiv\tDOI\tS2"
+    )
+    assert rows[1] == (
+        "2024\t2024-02-12\t154\tSecret Collusion among AI Agents\tNeurIPS"
+        "\tSumeet Motwani et al.\t2402.07510\t10.5555/secret\t" + "1" * 40
+    )
+    assert rows[2].split("\t")[3] == "Algorithmic Collusion by Large Language Models"
+    assert rows[3] == "2025\t2025-06-30\t3\tTacit collusion\tAER\t\t\t\t" + "3" * 40
+
+
+def test_the_newest_list_shows_what_the_most_cited_list_leaves_out(cache, capsys):
+    http = FakeHTTP(one_page(*SWEPT))
+    code, out, err, _ = run(capsys, ["sweep", "collusion", "--top", "1"], http)
+    assert code == 0, err
+    lines = out.splitlines()
+    assert lines[1] == "most cited:" and lines[3] == "newest, not listed above:"
+    assert listed_titles(out) == ["Secret Collusion among AI Agents", "Tacit collusion"]
+    assert len(s2_calls(http)) == 1
+
+
+def test_a_paper_both_most_cited_and_newest_is_listed_once(cache, capsys):
+    landmark = dict(
+        SECRET,
+        paperId="9" * 40,
+        title="Landmark",
+        publicationDate="2026-01-02",
+        year=2026,
+        citationCount=500,
+    )
+    http = FakeHTTP(one_page(landmark, *SWEPT))
+    _, out, _, _ = run(capsys, ["sweep", "collusion", "--top", "1"], http)
+    assert listed_titles(out) == ["Landmark", "Tacit collusion"]
+
+
+def test_a_paper_without_a_date_counts_as_its_year(cache, capsys):
+    undated = dict(
+        TACIT,
+        paperId="8" * 40,
+        title="Undated",
+        year=2026,
+        publicationDate=None,
+        citationCount=1,
+    )
+    http = FakeHTTP(one_page(*SWEPT, undated))
+    _, out, _, _ = run(capsys, ["sweep", "collusion", "--top", "1"], http)
+    assert listed_titles(out) == ["Secret Collusion among AI Agents", "Undated"]
+
+
+def test_every_paper_in_the_first_list_leaves_out_the_second(cache, capsys):
+    http = FakeHTTP(one_page(*SWEPT))
+    _, out, _, _ = run(capsys, ["sweep", "collusion"], http)
+    assert "newest" not in out
+    assert len(listed_titles(out)) == 3
+
+
+def test_a_cut_short_sweep_asks_again_newest_first_and_merges(cache, capsys):
+    http = FakeHTTP(
+        bulk_route(
+            {"total": 900, "token": "t1", "data": [SECRET, FISH]},
+            {"total": 900, "token": "t2", "data": [TACIT, FISH]},
+        )
+    )
+    code, out, err, _ = run(
+        capsys, ["sweep", "collusion", "--max", "2", "--top", "1"], http
+    )
+    assert code == 0, err
+    first, second = s2_calls(http)
+    assert first["params"]["sort"] == "citationCount:desc"
+    assert (
+        second["params"]["sort"] == "publicationDate:desc"
+        and "token" not in second["params"]
+    )
+    assert out.splitlines()[0] == (
+        "3 papers fetched; Semantic Scholar estimates 900 match; the file holds the 2 most"
+        " cited and the 2 newest, so raise --max for the rest"
+    )
+    assert listed_titles(out) == ["Secret Collusion among AI Agents", "Tacit collusion"]
+    rows = sweep_file(out).read_text().splitlines()[1:]
+    assert [row.split("\t")[2] for row in rows] == ["154", "75", "3"]
+    assert (
+        json.loads(sweep_file(out).with_suffix(".json").read_text())["complete"]
+        is False
+    )
+
+
+def test_a_complete_sweep_says_so_in_its_details(cache, capsys):
+    _, out, _, _ = run(capsys, ["sweep", "collusion"], FakeHTTP(one_page(*SWEPT)))
+    assert (
+        json.loads(sweep_file(out).with_suffix(".json").read_text())["complete"] is True
+    )
+
+
+def test_sweep_sends_its_filters(cache, capsys):
+    http = FakeHTTP(one_page(*SWEPT))
+    run(
+        capsys,
+        ["sweep", "collusion", "--year", "2024-", "--min-citations", "5",
+         "--fields-of-study", "Computer Science,Economics"],
+        http,
+    )  # fmt: skip
+    (call,) = s2_calls(http)
+    params = call["params"]
+    assert params["year"] == "2024-" and params["minCitationCount"] == 5
+    assert params["fieldsOfStudy"] == "Computer Science,Economics"
+
+
+def test_sweep_reuses_its_file_for_a_day(cache, capsys):
+    _, first, _, _ = run(capsys, ["sweep", "collusion"], FakeHTTP(one_page(*SWEPT)))
+    again = FakeHTTP()
+    code, out, _, _ = run(capsys, ["sweep", "collusion"], again)
+    assert (code, again.calls) == (0, [])
+    assert out == first
+    two_days_ago = time.time() - 2 * 86400
+    os.utime(sweep_file(out), (two_days_ago, two_days_ago))
+    later = FakeHTTP(one_page(*SWEPT))
+    run(capsys, ["sweep", "collusion"], later)
+    assert len(s2_calls(later)) == 1
+
+
+def test_a_sweep_with_no_match_exits_1(cache, capsys):
+    code, out, err, _ = run(capsys, ["sweep", "zzzz"], FakeHTTP(one_page()))
+    assert (code, out) == (1, "")
+    assert "no papers match" in err
+
+
+def test_a_sweep_never_falls_back_to_openalex(cache, capsys):
+    http = FakeHTTP(S2_DOWN)
+    code, out, err, _ = run(capsys, ["sweep", "collusion"], http)
+    assert (code, out) == (3, "")
+    assert openalex_calls(http) == [] and "gave up" in err
+
+
+def test_help_explains_sweep_and_its_query_syntax(capsys):
+    with pytest.raises(SystemExit):
+        paper.main(["-h"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "sweep" in out and "title and abstract" in out and "relevance" in out
+    assert "most cited" in out and "newest" in out
+    for syntax in ("+", "|", '"', "*"):
+        assert syntax in out
+
+
+def test_zero_citations_show_as_0(cache, capsys):
+    unread = dict(TACIT, citationCount=0)
+    _, out, _, _ = run(capsys, ["sweep", "tacit"], FakeHTTP(one_page(unread)))
+    assert "citations: 0 ·" in out
+    assert sweep_file(out).read_text().splitlines()[1].split("\t")[2] == "0"
+
+
+@pytest.mark.parametrize("argv", [["--max", "0"], ["--top", "-1"]])
+def test_sweep_refuses_a_max_below_1_or_a_negative_top(cache, capsys, argv):
+    http = FakeHTTP()
+    with pytest.raises(SystemExit) as e:
+        run(capsys, ["sweep", "collusion", *argv], http)
+    assert e.value.code == 2 and http.calls == []
+
+
+def test_the_sweep_synopsis_names_every_option():
+    synopsis = paper.__doc__.split("\n\n")[1]
+    sweep = synopsis[synopsis.index("paper sweep") :].split("    paper ")[0]
+    for option in ("--year", "--min-citations", "--fields-of-study", "--max", "--top"):
+        assert option in sweep
+    assert "--sort" not in sweep
+
+
+def test_the_sweep_file_is_plain_tsv_with_its_details_beside_it(cache, capsys):
+    query = 'estimated total: 7\n"collusion"'
+    code, out, err, _ = run(capsys, ["sweep", query], FakeHTTP(one_page(*SWEPT)))
+    assert code == 0, err
+    assert out.splitlines()[0] == "3 papers fetched; Semantic Scholar estimates 3 match"
+    rows = sweep_file(out).read_text().splitlines()
+    assert rows[0] == paper.SWEEP_HEADER and len(rows) == 4
+    details = json.loads(sweep_file(out).with_suffix(".json").read_text())
+    assert details["query"] == query and details["estimated_total"] == 3
+
+
+def test_a_truncated_sweep_file_is_fetched_again(cache, capsys):
+    _, out, _, _ = run(capsys, ["sweep", "collusion"], FakeHTTP(one_page(*SWEPT)))
+    sweep_file(out).write_text("")
+    again = FakeHTTP(one_page(*SWEPT))
+    code, out, _, _ = run(capsys, ["sweep", "collusion"], again)
+    assert code == 0 and len(s2_calls(again)) == 1
+    assert out.splitlines()[0] == "3 papers fetched; Semantic Scholar estimates 3 match"
+
+
+def test_sweep_files_differ_by_query_filter_and_max(cache, capsys):
+    variants = [
+        ["collusion"], ["cartel"], ["collusion", "--year", "2024-"],
+        ["collusion", "--min-citations", "5"], ["collusion", "--fields-of-study", "Economics"],
+        ["collusion", "--max", "5"],
+    ]  # fmt: skip
+    paths = set()
+    for argv in variants:
+        _, out, _, _ = run(capsys, ["sweep", *argv], FakeHTTP(one_page(*SWEPT)))
+        paths.add(sweep_file(out))
+    assert len(paths) == len(variants)
+
+
+@pytest.mark.parametrize(
+    "data", [[None], ["x"], [{"title": "No id"}]], ids=["null", "string", "no-id"]
+)
+def test_a_malformed_bulk_answer_exits_3(cache, capsys, data):
+    http = FakeHTTP(bulk_route({"total": 1, "token": None, "data": data}))
+    code, out, err, _ = run(capsys, ["sweep", "collusion"], http)
+    assert (code, out) == (3, "")
+    assert "unexpected" in err
+
+
+def test_a_total_that_isnt_a_number_still_caches(cache, capsys):
+    run(
+        capsys,
+        ["sweep", "collusion"],
+        FakeHTTP(bulk_route({"total": "lots", "token": None, "data": SWEPT})),
+    )
+    again = FakeHTTP()
+    code, out, _, _ = run(capsys, ["sweep", "collusion"], again)
+    assert (code, again.calls) == (0, [])
+    assert (
+        out.splitlines()[0]
+        == "3 papers fetched; Semantic Scholar's estimate of the matches is missing"
+    )
+
+
+def test_a_top_above_max_keeps_the_newest_out_of_the_most_cited_list(cache, capsys):
+    http = FakeHTTP(
+        bulk_route(
+            {"total": 900, "token": "t1", "data": [SECRET, FISH]},
+            {"total": 900, "token": "t2", "data": [TACIT, FISH]},
+        )
+    )
+    _, out, _, _ = run(capsys, ["sweep", "collusion", "--max", "2"], http)
+    cited = out.split("newest, not listed above:")[0]
+    assert "Tacit collusion" not in cited
+    assert listed_titles(out) == [
+        "Secret Collusion among AI Agents",
+        "Algorithmic Collusion by Large Language Models",
+        "Tacit collusion",
+    ]
+
+
+def test_a_paper_repeated_across_pages_is_written_and_listed_once(cache, capsys):
+    http = FakeHTTP(
+        bulk_route(
+            {"total": 3, "token": "t1", "data": [SECRET, FISH]},
+            {"total": 3, "token": None, "data": [FISH, TACIT]},
+        )
+    )
+    _, out, _, _ = run(capsys, ["sweep", "collusion", "--top", "1"], http)
+    assert len(sweep_file(out).read_text().splitlines()) == 1 + 3
+    assert sorted(listed_titles(out)) == [
+        "Secret Collusion among AI Agents",
+        "Tacit collusion",
+    ]
+
+
+def test_a_sweep_file_cut_short_after_its_header_is_fetched_again(cache, capsys):
+    _, out, _, _ = run(capsys, ["sweep", "collusion"], FakeHTTP(one_page(*SWEPT)))
+    sweep_file(out).write_text(paper.SWEEP_HEADER + "\n")
+    again = FakeHTTP(one_page(*SWEPT))
+    code, out, _, _ = run(capsys, ["sweep", "collusion"], again)
+    assert code == 0 and len(s2_calls(again)) == 1
+    assert out.splitlines()[0].startswith("3 papers fetched")
+
+
+def test_details_without_their_counts_mean_a_refetch(cache, capsys):
+    _, out, _, _ = run(capsys, ["sweep", "collusion"], FakeHTTP(one_page(*SWEPT)))
+    details = sweep_file(out).with_suffix(".json")
+    details.write_text(json.dumps({"estimated_total": 3}))
+    again = FakeHTTP(one_page(*SWEPT))
+    run(capsys, ["sweep", "collusion"], again)
+    assert len(s2_calls(again)) == 1
+
+
+def test_a_page_over_max_with_no_token_still_asks_for_the_newest(cache, capsys):
+    http = FakeHTTP(one_page(*SWEPT, total=3))
+    run(capsys, ["sweep", "collusion", "--max", "2"], http)
+    assert [c["params"]["sort"] for c in s2_calls(http)] == [
+        "citationCount:desc",
+        "publicationDate:desc",
+    ]
+
+
+def test_help_says_a_thin_result_means_rephrase(capsys):
+    with pytest.raises(SystemExit):
+        paper.main(["-h"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "2-3 key terms" in out and "synonyms" in out and "rephrase" in out

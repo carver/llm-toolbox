@@ -7,14 +7,19 @@
     paper meta ID...
     paper cites ID [--limit N]
     paper search QUERY... [--limit N]
+    paper sweep QUERY... [--year Y] [--min-citations N] [--fields-of-study LIST]
+                         [--max N] [--top N]
     paper text ID
     paper outline ID
     paper grep ID PATTERN [-C N] [-i]
+    paper stats [--hours H]
 
 meta prints one short block per paper: title, year and venue, authors (with
 affiliations when Semantic Scholar has them), citation count, its arXiv, DOI
 and Semantic Scholar ids, and, for an arXiv paper, its latest version with
 the dates of its first and latest versions (one arXiv API request per call).
+Pass every id to one meta call: the ids missing from the cache go to Semantic
+Scholar as one batch request (up to 500 ids each), not one request apiece.
 cites lists papers citing ID (default 20), search the top matches for a
 keyword query (default 10), each with year, title, venue, first three authors
 and ids. text downloads the PDF, extracts it with `pdftotext -layout` and
@@ -26,6 +31,31 @@ ignore case), for finding one number or claim. Both fetch the text first, like
 text. outline spots numbered headings ("3 Method", "4.2 Results", "A
 Appendix") and the usual section names; when a layout defeats it, grep for a
 heading instead.
+
+sweep fetches every paper matching QUERY from Semantic Scholar's bulk search,
+most cited first, up to --max (default 1000), optionally only papers from
+--year (2024, 2016-2020, 2010-, -2015), with --min-citations, or in
+--fields-of-study ("Computer Science,Economics"). When there are more matches
+than --max, it fetches again newest first, so the newest papers are there
+too. It writes them all to a TSV file in the cache, reused for a day, and
+prints how many it fetched, the --top most cited (default 20), the --top
+newest the first list doesn't show, and the file's path: grep the file for
+the rest. The query is matched against title and abstract, stemmed, and every term must
+appear: + is AND, | OR, - NOT, "..." a phrase, * a prefix, ( ) groups, and
+~N after a word or phrase allows N edits or N words apart. So keep a query to
+2-3 key terms and list synonyms with |, such as
+collusion + (LLM | "language model"): a paper that says "tacit coordination"
+where the query says "collude" doesn't match. A thin or empty result, from
+sweep or search, is a reason to rephrase, not evidence that no such paper
+exists. Matches aren't ranked by relevance, so use search for the few best
+papers on a topic and sweep for everything that matches. sweep has no
+OpenAlex fallback.
+
+stats summarises requests.jsonl in the cache, a line per request paper makes
+(service, URL without its query, status, attempts, pacing wait, backoff;
+never parameters or keys), per service over the last --hours (default 24):
+how requests ended, extra attempts, backoff, pacing waits and the busiest
+minute.
 
 ID is an arXiv id (2404.00806, version suffix optional), an arxiv.org abs or
 pdf URL, a DOI (10.1145/... bare or as a doi.org URL), or a 40-character
@@ -91,16 +121,19 @@ Examples:
 """
 
 import argparse
+import bisect
+import calendar
 import fcntl
 import hashlib
 import json
 import os
 import random
 import re
+import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from functools import cached_property
@@ -120,6 +153,10 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 TIMEOUT = 30
 ATTEMPTS = 6
 BUDGET = 120  # seconds of sleeping between attempts, at most
+BATCH_MAX = 500  # ids per POST /paper/batch, Semantic Scholar's limit
+ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"  # the request log's and the sweep details' timestamps
+SWEEP_FIELDS = "title,year,publicationDate,venue,citationCount,externalIds,authors"
+SWEEP_TTL = 24 * 3600  # seconds; a sweep's file is fetched again after a day
 PACED = {
     "Semantic Scholar": 1.1,
     "arXiv": 3.0,
@@ -297,7 +334,9 @@ class Response:
     content: bytes
 
 
-Fetch = Callable[..., Response]  # (method, url, *, params=None, headers=None)
+Fetch = Callable[
+    ..., Response
+]  # (method, url, *, params=None, headers=None, json=None)
 Extract = Callable[[Path, Path], None]  # (pdf, txt) -> None
 
 
@@ -307,12 +346,13 @@ def requests_fetch(
     *,
     params: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
+    json: Any = None,
 ) -> Response:
     import requests
 
     try:
         r = requests.request(
-            method, url, params=params, headers=headers, timeout=TIMEOUT
+            method, url, params=params, headers=headers, json=json, timeout=TIMEOUT
         )
     except (requests.Timeout, requests.ConnectionError) as e:
         raise TransportError(type(e).__name__) from e
@@ -420,6 +460,7 @@ class Client:
         self.s2_gave_up: GaveUp | None = None
         self.openalex_key_refused = False
         self.warned_fallback = False
+        self.warned_log = False
 
     def wait_turn(self, service: str) -> None:
         """Waits until `service`'s interval since its last request, by any process, has passed."""
@@ -437,32 +478,85 @@ class Client:
         """A Semantic Scholar response's JSON, from the cache when it's there.
 
         The answer must be an object, holding the key `require` if given."""
-        url = S2 + path
-        cached = self.cache_file("s2", url, params)
+        cached = self.s2_cache_file(path, params)
         if cached.exists():
             return json.loads(cached.read_text(encoding="utf-8"))
+        response = self.s2_request("GET", path, params)
+        data = json_object("Semantic Scholar", response, require)
+        write_atomic(cached, json.dumps(data).encode())
+        return data
+
+    def s2_request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any],
+        body: dict[str, Any] | None = None,
+    ) -> Response:
+        """A Semantic Scholar request's answer when it is a 200, uncached. Once Semantic
+        Scholar has given up in this run, it isn't asked again. A 404 is NotFound, any
+        other refusal a RemoteError."""
         if self.s2_gave_up:
             raise self.s2_gave_up
         headers = {"x-api-key": self.api_key.value} if self.api_key else None
         try:
             response = self.request(
-                "Semantic Scholar", "GET", url, params=params, headers=headers
+                "Semantic Scholar",
+                method,
+                S2 + path,
+                params=params,
+                headers=headers,
+                body=body,
+                ids=len(body["ids"]) if body else None,
             )
         except GaveUp as e:
             self.s2_gave_up = e
             raise
+        if response.status == 200:
+            return response
         if response.status == 404:
             raise NotFound(error_text(response))
-        if response.status != 200:
-            problem = (
-                f"Semantic Scholar: HTTP {response.status}: {error_text(response)}"
+        problem = f"Semantic Scholar: HTTP {response.status}: {error_text(response)}"
+        if response.status in (401, 403) and self.api_key:
+            problem += f" (the API key from {self.api_key.source} may be invalid)"
+        raise RemoteError(problem)
+
+    def s2_batch(
+        self, pids: Sequence["PaperId"], fields: str
+    ) -> dict[str, Paper | None]:
+        """Semantic Scholar's paper for each of at most BATCH_MAX ids, by its s2_id,
+        from one POST; None for an id it doesn't know. Each paper is cached under the
+        key the id's single lookup uses. An answer that isn't one paper or null per id
+        is a RemoteError."""
+        ids = [pid.s2_id() for pid in pids]
+        response = self.s2_request(
+            "POST", "/paper/batch", {"fields": fields}, {"ids": ids}
+        )
+        papers = parsed_json(response)
+        if (
+            not isinstance(papers, list)
+            or len(papers) != len(ids)
+            or any(
+                p is not None and not (isinstance(p, dict) and p.get("paperId"))
+                for p in papers
             )
-            if response.status in (401, 403) and self.api_key:
-                problem += f" (the API key from {self.api_key.source} may be invalid)"
-            raise RemoteError(problem)
-        data = json_object("Semantic Scholar", response, require)
-        write_atomic(cached, json.dumps(data).encode())
-        return data
+        ):
+            raise RemoteError(
+                "Semantic Scholar sent an unexpected answer to a batch: "
+                + response.content[:200].decode(errors="replace")
+            )
+        found: dict[str, Paper | None] = {}
+        for pid, paper in zip(pids, papers):
+            if paper is not None:
+                cached = self.s2_cache_file(pid.s2_path(), {"fields": fields})
+                write_atomic(cached, json.dumps(paper).encode())
+            found[pid.s2_id()] = paper
+        return found
+
+    def s2_cache_file(self, path: str, params: dict[str, Any]) -> Path:
+        """Where Semantic Scholar's answer to `path` with `params` is cached. A batch
+        caches each paper under its single lookup's key, so both find it."""
+        return self.cache_file("s2", S2 + path, params)
 
     def cache_file(self, folder: str, url: str, params: dict[str, Any]) -> Path:
         """Where the answer to `url` with `params` is cached, named by a hash of both."""
@@ -576,25 +670,71 @@ class Client:
         url: str,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        body: dict[str, Any] | None = None,
+        ids: int | None = None,
     ) -> Response:
-        """The response, retrying 429s, 5xx and timeouts with backoff."""
-        slept = 0.0
+        """The response, retrying 429s, 5xx and timeouts with backoff. `body` is sent as
+        JSON. Each request, however it ends, gets a line in the request log, with `ids`,
+        the number of ids a batch asks for, when given."""
+        started = time.monotonic()
+        slept = waited = 0.0
+
+        def log(status: int | str, attempts: int) -> None:
+            entry = {
+                "time": utc_now(),
+                "service": service,
+                "method": method,
+                "url": logged_url(url),
+                **({"ids": ids} if ids is not None else {}),
+                "status": status,
+                "attempts": attempts,
+                "waited": round(waited, 3),
+                "backoff": round(slept, 3),
+                "seconds": round(time.monotonic() - started, 3),
+            }
+            self.write_log(entry)
+
         for attempt in range(1, ATTEMPTS + 1):
             if service in PACED:
+                turn_started = time.monotonic()
                 self.pace(service)
+                waited += time.monotonic() - turn_started
             try:
-                return self.request_once(method, url, params, headers)
+                response = self.request_once(method, url, params, headers, body)
             except Retryable as e:
                 failure = e
+            except Exception as e:
+                log(f"error: {type(e).__name__}", attempt)
+                raise
+            else:
+                log(response.status, attempt)
+                return response
             if attempt == ATTEMPTS or slept >= BUDGET:
                 break
             delay = min(backoff(attempt, failure.retry_after), BUDGET - slept)
             self.sleep(delay)
             slept += delay
+        log("gave up", attempt)
         raise GaveUp(
             f"{service} failed, gave up after {attempt} attempts"
             f" ({slept:.0f}s of backoff): {failure}"
         )
+
+    def write_log(self, entry: dict[str, Any]) -> None:
+        """Appends `entry` to the request log as one line. A log that can't be written
+        is warned about once per run."""
+        path = self.cache / "requests.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError as e:
+            if not self.warned_log:
+                print(
+                    f"paper: can't write the request log {path}: {e.strerror}",
+                    file=sys.stderr,
+                )
+                self.warned_log = True
 
     def request_once(
         self,
@@ -602,13 +742,16 @@ class Client:
         url: str,
         params: dict[str, Any] | None,
         headers: dict[str, str] | None,
+        body: dict[str, Any] | None = None,
     ) -> Response:
         """The response, or Retryable for a 429, a 5xx or a timeout.
 
         Semantic Scholar's error object, {"message": ..., "code": "429"},
         counts as that status whatever the HTTP status says."""
         try:
-            response = self.fetch(method, url, params=params, headers=headers)
+            response = self.fetch(
+                method, url, params=params, headers=headers, json=body
+            )
         except TransportError as e:
             raise Retryable(str(e) or "timeout") from e
         code = s2_error_code(response) or response.status
@@ -642,14 +785,30 @@ def s2_error_code(response: Response) -> int | None:
     return None
 
 
+def parsed_json(response: Response) -> Any:
+    """The response's content as JSON, or None when it isn't JSON."""
+    try:
+        return json.loads(response.content)
+    except ValueError:
+        return None
+
+
+def utc_now() -> str:
+    return time.strftime(ISO_UTC, time.gmtime())
+
+
+def logged_url(url: str) -> str:
+    """The URL as the request log keeps it: no query string, and no user:password@."""
+    parts = urlsplit(url)
+    port = f":{parts.port}" if parts.port else ""
+    return f"{parts.scheme}://{parts.hostname}{port}{parts.path}"
+
+
 def json_object(
     service: str, response: Response, require: str | None = None
 ) -> dict[str, Any]:
     """The response's JSON object, holding the key `require` if given."""
-    try:
-        data = json.loads(response.content)
-    except ValueError:
-        data = None
+    data = parsed_json(response)
     if not isinstance(data, dict) or (require and not data.get(require)):
         raise RemoteError(
             f"{service} sent an unexpected answer: "
@@ -881,15 +1040,43 @@ def meta_paper(client: Client, pid: PaperId) -> Paper:
         return from_openalex(client, pid, e)
 
 
+def prefetch_batch(client: Client, pids: list[PaperId]) -> set[str]:
+    """Fetches, in batches of BATCH_MAX, every id that misses the cache, when two or
+    more do, so the single lookups that follow find them cached. Returns the s2_ids
+    Semantic Scholar doesn't know. Once a batch fails in any way (gives up, is refused,
+    sends something unexpected), its ids and the rest are left to those lookups, which
+    fail the old way if they must; what earlier batches found is kept."""
+    misses = list(
+        {
+            pid.s2_id(): pid
+            for pid in pids
+            if not client.s2_cache_file(pid.s2_path(), {"fields": META_FIELDS}).exists()
+        }.values()
+    )
+    unknown: set[str] = set()
+    if len(misses) < 2:
+        return unknown
+    for start in range(0, len(misses), BATCH_MAX):
+        try:
+            found = client.s2_batch(misses[start : start + BATCH_MAX], META_FIELDS)
+        except (RemoteError, NotFound):
+            break
+        unknown |= {s2_id for s2_id, paper in found.items() if paper is None}
+    return unknown
+
+
 def cmd_meta(client: Client, args: argparse.Namespace) -> int:
     pids = [parse_id(text) for text in args.ids]
     for pid in pids:
         pid.s2_path()  # a PDF URL is refused here, before any request
+    unknown = prefetch_batch(client, pids)
     code = OK
     papers = []
     failure = None
     for text, pid in zip(args.ids, pids):
         try:
+            if pid.s2_id() in unknown:
+                raise NotFound(text)
             papers.append(meta_paper(client, pid))
         except NotFound:
             print(f"paper: not found: {text}", file=sys.stderr)
@@ -1155,11 +1342,264 @@ def cmd_grep(client: Client, args: argparse.Namespace) -> int:
     return OK
 
 
-def context_lines(text: str) -> int:
-    value = int(text)
-    if value < 0:
-        raise argparse.ArgumentTypeError(f"context can't be negative: {value}")
-    return value
+def at_least(minimum: int) -> Callable[[str], int]:
+    """An argparse type: an int no smaller than `minimum`."""
+
+    def parse(text: str) -> int:
+        value = int(text)
+        if value < minimum:
+            raise argparse.ArgumentTypeError(f"must be at least {minimum}: {value}")
+        return value
+
+    return parse
+
+
+def cmd_sweep(client: Client, args: argparse.Namespace) -> int:
+    """Every paper matching a bulk query, to a TSV file reused for a day; prints the
+    count, the most cited and the newest, and the file's path. The newest come from
+    the same fetch when it got every match, else from a second, newest-first one.
+    No OpenAlex fallback."""
+    params = sweep_params(args)
+    key = json.dumps([params, args.max], sort_keys=True).encode()
+    path = client.cache / "sweep" / (hashlib.sha256(key).hexdigest()[:16] + ".tsv")
+    details = fresh_sweep(path) or fetch_sweep(client, params, args.max, path)
+    if details is None:
+        print(f"paper: no papers match {params['query']!r}", file=sys.stderr)
+        return NOT_FOUND
+    print_sweep(path, details, args.top)
+    return OK
+
+
+def sweep_params(args: argparse.Namespace) -> dict[str, Any]:
+    """The bulk search's parameters for the sweep's query and filters, without a sort."""
+    params: dict[str, Any] = {"query": " ".join(args.query), "fields": SWEEP_FIELDS}
+    if args.year:
+        params["year"] = args.year
+    if args.min_citations is not None:
+        params["minCitationCount"] = args.min_citations
+    if args.fields_of_study:
+        params["fieldsOfStudy"] = args.fields_of_study
+    return params
+
+
+def fetch_sweep(
+    client: Client, params: dict[str, Any], most: int, path: Path
+) -> dict[str, Any] | None:
+    """Fetches the sweep, writes its file and its details beside it, and returns the
+    details; None when nothing matches. The file holds the most-cited fetch first, then
+    the papers only the newest-first fetch found, when that fetch was needed."""
+    cited, total, complete = sweep_papers(
+        client, dict(params, sort="citationCount:desc"), most
+    )
+    if not cited:
+        return None
+    papers = cited
+    if not complete:
+        newest, _, _ = sweep_papers(
+            client, dict(params, sort="publicationDate:desc"), most
+        )
+        papers = list({p["paperId"]: p for p in [*cited, *newest]}.values())
+    write_atomic(path, sweep_tsv(papers).encode())
+    details = {
+        "query": params["query"],
+        "params": params,
+        "max": most,
+        "estimated_total": total,
+        "complete": complete,
+        "rows": len(papers),
+        "cited": len(cited),
+        "fetched": utc_now(),
+    }
+    write_atomic(path.with_suffix(".json"), json.dumps(details).encode())
+    return details
+
+
+def print_sweep(path: Path, details: dict[str, Any], top: int) -> None:
+    """The count, the `top` most cited, the `top` newest the first list doesn't show,
+    and the file's path."""
+    names = [name for name, _ in SWEEP_COLUMNS]
+    rows = [
+        dict(zip(names, line.split("\t")))
+        for line in path.read_text(encoding="utf-8").splitlines()[1:]
+    ]
+    total = details["estimated_total"]
+    head = f"{len(rows)} papers fetched; " + (
+        f"Semantic Scholar estimates {total} match"
+        if total is not None
+        else "Semantic Scholar's estimate of the matches is missing"
+    )
+    if not details["complete"]:
+        head += (
+            f"; the file holds the {details['max']} most cited and the"
+            f" {details['max']} newest, so raise --max for the rest"
+        )
+    print(head)
+    cited = rows[: min(top, details["cited"])]
+    rest = rows[len(cited) :]
+    newest = sorted(rest, key=lambda row: row["date"] or row["year"], reverse=True)
+    for label, listed in (
+        ("most cited:", cited),
+        ("newest, not listed above:", newest[:top]),
+    ):
+        if listed:
+            print(label)
+            for row in listed:
+                print(sweep_line(row))
+    print(f"full list: {path}")
+
+
+def sweep_papers(
+    client: Client, params: dict[str, Any], most: int
+) -> tuple[list[Paper], int | None, bool]:
+    """Up to `most` papers from the bulk search, page by page, each once, its estimated
+    total (None if it sent none), and whether that was every match (no continuation
+    token left). An answer that isn't a list of papers with ids is a RemoteError."""
+    found: dict[str, Paper] = {}
+    total, token = None, None
+    while True:
+        page = dict(params, token=token) if token else params
+        data = json_object(
+            "Semantic Scholar", client.s2_request("GET", "/paper/search/bulk", page)
+        )
+        if isinstance(data.get("total"), int):
+            total = data["total"]
+        papers = data.get("data") or []
+        if not isinstance(papers, list) or not all(
+            isinstance(p, dict) and isinstance(p.get("paperId"), str) for p in papers
+        ):
+            raise RemoteError(
+                "Semantic Scholar sent an unexpected answer to a bulk search: "
+                + json.dumps(papers)[:200]
+            )
+        for paper in papers:
+            found.setdefault(paper["paperId"], paper)
+        token = data.get("token")
+        if not token or len(found) >= most:
+            return list(found.values())[:most], total, not token and len(found) <= most
+
+
+def first_author(paper: Paper) -> str:
+    authors = paper.get("authors") or []
+    first = (authors[0].get("name") or "") if authors else ""
+    return first + " et al." if len(authors) > 1 else first
+
+
+# The sweep file's columns, and how each is read from a paper.
+SWEEP_COLUMNS: tuple[tuple[str, Callable[[Paper], Any]], ...] = (
+    ("year", lambda p: p.get("year")),
+    ("date", lambda p: p.get("publicationDate")),
+    ("citations", lambda p: p.get("citationCount")),
+    ("title", lambda p: p.get("title")),
+    ("venue", lambda p: p.get("venue")),
+    ("first author", first_author),
+    ("arXiv", lambda p: (p.get("externalIds") or {}).get("ArXiv")),
+    ("DOI", lambda p: (p.get("externalIds") or {}).get("DOI")),
+    ("S2", lambda p: p.get("paperId")),
+)
+SWEEP_HEADER = "\t".join(name for name, _ in SWEEP_COLUMNS)
+
+
+def fresh_sweep(path: Path) -> dict[str, Any] | None:
+    """The details of a sweep fetched under a day ago, or None when its file is older or
+    missing, holds a different number of rows than its details say, or its details
+    beside it are missing or unreadable."""
+    try:
+        if time.time() - path.stat().st_mtime >= SWEEP_TTL:
+            return None
+        lines = path.read_text(encoding="utf-8").splitlines()
+        details = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(details, dict) and lines and lines[0] == SWEEP_HEADER):
+        return None
+    counts = [details.get(name) for name in ("rows", "cited", "max")]
+    total = details.get("estimated_total")
+    sound = (
+        all(isinstance(n, int) for n in counts)
+        and isinstance(details.get("complete"), bool)
+        and (total is None or isinstance(total, int))
+        and details["rows"] == len(lines) - 1
+    )
+    return details if sound else None
+
+
+def sweep_tsv(papers: list[Paper]) -> str:
+    """The sweep's file: a header, and a row per paper in the order given."""
+    lines = [SWEEP_HEADER]
+    for paper in papers:
+        cells = (cell(paper) for _, cell in SWEEP_COLUMNS)
+        lines.append(
+            "\t".join(" ".join(("" if c is None else str(c)).split()) for c in cells)
+        )
+    return "\n".join(lines) + "\n"
+
+
+def sweep_line(row: dict[str, str]) -> str:
+    """One of the sweep file's rows, by column name, as a line to print."""
+    head = " · ".join(x for x in (row["year"], row["title"], row["venue"]) if x)
+    ids = [
+        f"arXiv:{row['arXiv']}" if row["arXiv"] else "",
+        f"DOI:{row['DOI']}" if row["DOI"] else "",
+        f"S2:{row['S2']}",
+    ]
+    return f"{head} · citations: {row['citations']} · " + " ".join(i for i in ids if i)
+
+
+def cmd_stats(client: Client, args: argparse.Namespace) -> int:
+    """A line per service summarising the request log over the last --hours."""
+    since = time.time() - args.hours * 3600
+    by_service: dict[str, list[dict[str, Any]]] = {}
+    for entry in logged_requests(client.cache / "requests.jsonl"):
+        if entry["at"] >= since:
+            by_service.setdefault(entry["service"], []).append(entry)
+    if not by_service:
+        print(f"paper: no requests logged in the last {args.hours:g} hours")
+        return OK
+    for service, entries in by_service.items():
+        print(stats_line(service, entries))
+    return OK
+
+
+def logged_requests(path: Path) -> Iterator[dict[str, Any]]:
+    """The request log's lines, each with its time as epoch seconds in "at"; lines
+    that don't parse are skipped."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        try:
+            entry = json.loads(raw)
+            yield {
+                "service": str(entry["service"]),
+                "status": entry.get("status"),
+                "attempts": int(entry.get("attempts", 1)),
+                "backoff": float(entry.get("backoff", 0)),
+                "waited": float(entry.get("waited", 0)),
+                "at": calendar.timegm(time.strptime(entry["time"], ISO_UTC)),
+            }
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+
+
+def stats_line(service: str, entries: list[dict[str, Any]]) -> str:
+    statuses = [entry["status"] for entry in entries]
+    ok = sum(isinstance(s, int) and 200 <= s < 300 for s in statuses)
+    missing = statuses.count(404)
+    throttled = statuses.count(429) + statuses.count("gave up")
+    other = len(entries) - ok - missing - throttled
+    extra = sum(entry["attempts"] - 1 for entry in entries)
+    slept = sum(entry["backoff"] for entry in entries)
+    waits = sorted(entry["waited"] for entry in entries)
+    times = sorted(entry["at"] for entry in entries)
+    busiest = max(bisect.bisect_left(times, t + 60) - i for i, t in enumerate(times))
+    return (
+        f"{service}: {len(entries)} requests; {ok} ok, {missing} not found,"
+        f" {throttled} gave up or 429, {other} other; {extra} extra attempts,"
+        f" {slept:.0f}s backoff; waited: median {statistics.median(waits):.1f}s,"
+        f" max {waits[-1]:.1f}s, {sum(w > 1 for w in waits)} over 1s;"
+        f" busiest minute {busiest}"
+    )
 
 
 COMMANDS = {
@@ -1169,6 +1609,8 @@ COMMANDS = {
     "text": cmd_text,
     "outline": cmd_outline,
     "grep": cmd_grep,
+    "stats": cmd_stats,
+    "sweep": cmd_sweep,
 }
 EXIT_CODES = {UsageError: USAGE, ExtractFailed: NOT_FOUND, RemoteError: REMOTE}
 
@@ -1198,6 +1640,27 @@ def main(
     search = sub.add_parser("search", help="keyword search")
     search.add_argument("query", nargs="+", metavar="QUERY")
     search.add_argument("--limit", type=int, default=10, help="how many (default 10)")
+    sweep = sub.add_parser(
+        "sweep", help="every paper matching a query, to a file; prints the top rows"
+    )
+    sweep.add_argument("query", nargs="+", metavar="QUERY")
+    sweep.add_argument("--year", help="a year or range: 2024, 2016-2020, 2010-, -2015")
+    sweep.add_argument("--min-citations", type=int, metavar="N")
+    sweep.add_argument(
+        "--fields-of-study",
+        metavar="LIST",
+        help='comma-separated, e.g. "Computer Science,Economics"',
+    )
+    sweep.add_argument(
+        "--max", type=at_least(1), default=1000, help="papers to fetch (default 1000)"
+    )
+    sweep.add_argument(
+        "--top", type=at_least(0), default=20, help="rows in each list (default 20)"
+    )
+    stats = sub.add_parser("stats", help="a summary of the requests paper made")
+    stats.add_argument(
+        "--hours", type=float, default=24, help="how far back (default 24)"
+    )
     id_help = "arXiv id or URL, DOI, or PDF URL"
     text = sub.add_parser("text", help="full text: prints the cached .txt path")
     text.add_argument("id", metavar="ID", help=id_help)
@@ -1209,7 +1672,7 @@ def main(
     grep.add_argument(
         "-C",
         "--context",
-        type=context_lines,
+        type=at_least(0),
         default=2,
         help="lines of context (default 2)",
     )

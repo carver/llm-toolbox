@@ -238,13 +238,19 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   request (it blocks IPs that fetch a lot), so callers can retry later.
 
 - **paper**: a paper's metadata (`meta`), the papers citing it (`cites`) and
-  keyword search (`search`) from Semantic Scholar, and its full text (`text`:
+  keyword search (`search`) from Semantic Scholar, every paper matching a boolean
+  query (`sweep`: Semantic Scholar's bulk search, written to a TSV file reused for
+  a day, printing the 20 most cited and the 20 newest; a second, newest-first
+  fetch runs when there are more matches than `--max`; keep queries to 2-3 key
+  terms with `|` for synonyms, and take a thin result as a reason to rephrase,
+  not as absence), a summary of its request log (`stats`), and its full text (`text`:
   downloads the arXiv or direct-URL PDF, or a DOI's open-access PDF found
   through OpenAlex, runs `pdftotext -layout` and prints the `.txt` path). `outline` lists the text's section headings with line
   numbers and `grep` its lines matching a regex, with context, so an agent
   can read a section instead of the whole paper. Takes arXiv ids and URLs, DOIs and Semantic Scholar
-  paperIds, and prints a few lines per paper; `meta` adds an arXiv paper's
-  latest version and its first- and latest-version dates, from one arXiv API
+  paperIds, and prints a few lines per paper; `meta` asks Semantic Scholar for
+  all its uncached ids in one batch request, so pass every id to one call, and
+  adds an arXiv paper's latest version and its first- and latest-version dates, from one arXiv API
   request per call (cached for a day). Paces requests across every `paper`
   process sharing the cache, so a fan-out of agents stays under the limits:
   Semantic Scholar's at least 1.1 seconds apart, the arXiv API's at least 3;

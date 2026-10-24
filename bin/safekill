@@ -1,4 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# ///
 """Signal processes found by name or command line, and never the caller.
 
 `pkill -f PATTERN` also matches the shell running it, because the pattern is in

@@ -26,7 +26,7 @@ A brief that sends a subagent to read papers tells it to fetch them with `paper`
 
 ## Claims
 
-Before saying a source lacks something ("the paper has no human verbosity figure", "nothing calls this"), search the source itself. What cites it, or what you remember of it, is not enough. The same goes for superlatives: first, only, never, all.
+Before saying a source lacks something ("the paper has no human verbosity figure", "nothing calls this"), search the source itself. What cites it, or what you remember of it, is not enough. The same goes for superlatives: first, only, never, all. A keyword search that finds nothing, such as `paper sweep`, calls for synonyms and another phrasing, not a claim that no such work exists; list the queries you ran.
 
 ## Shell
 

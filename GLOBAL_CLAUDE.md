@@ -17,7 +17,7 @@ Before your first edit in a repo's main tree, claim it: make sure `.git/info/exc
 The main tree is someone else's when the claim fails on another session's id, or when it is dirty at the start of your session. Leave their changes alone, tell me the flag's age so I can clear one a crashed session left, and build in a detached worktree beside the repo, named for its topic: `git worktree add --detach ../<repo>-wt-<topic>`. Other sessions may hold worktrees there too, so check `git worktree list` first. It has no `.venv` or untracked files, so set up the environment the repo's README describes before running checks there. Commit in the worktree. To finish:
 
 1. If the branch moved meanwhile (`build-state finish` names it), rebase in the worktree, folding your fixups in the same step: `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash <branch>`. Rerun the checks. Go ahead without asking when your commits touch none of the files the new commits on the branch do; otherwise ask me first.
-2. From the main tree, `git merge --ff-only <worktree HEAD sha>`. If git refuses because the uncommitted changes there touch the same files, stop and ask me.
+2. From the main tree, `git merge --ff-only <worktree HEAD sha>`. If git refuses because the uncommitted changes there touch the same files, stop and ask me. If another session has claimed the main tree by now, leave it alone. In a repo whose rules say to push, rebase onto `origin/<branch>` instead, rerun the checks and push from the worktree (`git push origin HEAD:<branch>`), then tell me that tree's branch is behind its remote. In any other repo, ask me.
 3. `git worktree remove ../<repo>-wt-<topic>`.
 
 ## Research subagents

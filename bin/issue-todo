@@ -6,8 +6,10 @@
 
 `gh issue view N` prints the body without the comments, and `--comments` the comments
 without the body, so a to-do list split between them reads as two partial lists.
-`show` prints every item in one place; `tick` checks one off where it lives.
+`show` prints every item in one place; `tick` checks one off where it lives; `open`
+prints every open issue's open items, leaving out pull requests and ticked items.
 
+    issue-todo open
     issue-todo show 42
     issue-todo tick 42 "forecast measure" --note "built in 8d5068e"
     issue-todo tick 42 "Add hub" --undo
@@ -98,6 +100,12 @@ def gh(*args: str, stdin: str | None = None) -> str:
 def parts(repo: str, number: int) -> tuple[dict, list[Part]]:
     """The issue, and its body and comments as parts, in order."""
     issue = json.loads(gh("api", f"repos/{repo}/issues/{number}"))
+    return issue, issue_parts(repo, issue)
+
+
+def issue_parts(repo: str, issue: dict) -> list[Part]:
+    """The issue's body and comments as parts, in order."""
+    number = issue["number"]
     comments = json.loads(
         gh("api", "--paginate", f"repos/{repo}/issues/{number}/comments")
     )
@@ -107,7 +115,7 @@ def parts(repo: str, number: int) -> tuple[dict, list[Part]]:
         found.append(
             Part(label, f"repos/{repo}/issues/comments/{c['id']}", c.get("body") or "")
         )
-    return issue, found
+    return found
 
 
 def show(repo: str, number: int) -> int:
@@ -120,6 +128,31 @@ def show(repo: str, number: int) -> int:
         print(part.label)
         for i, item in enumerate(listed, 1):
             print(f"  [{'x' if item.done else ' '}] {i}  {short(item.text)}")
+    return 0
+
+
+def show_open(repo: str) -> int:
+    listing = json.loads(
+        gh("api", "--paginate", f"repos/{repo}/issues?state=open&per_page=100")
+    )
+    done = []  # the open issues with no open item
+    for issue in (i for i in listing if "pull_request" not in i):
+        by_part = [
+            (part, [item for item in items(part.markdown) if not item.done])
+            for part in issue_parts(repo, issue)
+        ]
+        with_open = [(part, open_) for part, open_ in by_part if open_]
+        if not with_open:
+            done.append(f"#{issue['number']}")
+            continue
+        who = ", ".join(a["login"] for a in issue.get("assignees") or [])
+        print(f"#{issue['number']} {issue['title']}" + (f" [{who}]" if who else ""))
+        for part, open_ in with_open:
+            print(f"  {part.label}")
+            for item in open_:
+                print(f"    [ ] {short(item.text)}")
+    if done:
+        print(f"no open items: {' '.join(done)}")
     return 0
 
 
@@ -179,10 +212,16 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    common = argparse.ArgumentParser(add_help=False)
+    where = argparse.ArgumentParser(add_help=False)
+    where.add_argument("--repo", help="OWNER/REPO; default: the current directory's")
+    common = argparse.ArgumentParser(add_help=False, parents=[where])
     common.add_argument("number", type=int, help="the issue's number")
-    common.add_argument("--repo", help="OWNER/REPO; default: the current directory's")
     sub = p.add_subparsers(dest="cmd", required=True)
+    what = (
+        "every open issue's open items, by issue (number, title, assignees) and by "
+        "body or comment, then the open issues with none"
+    )
+    sub.add_parser("open", parents=[where], help=what, description=what)
     what = "every task-list item in the issue's body and comments, numbered within each"
     sub.add_parser("show", parents=[common], help=what, description=what)
     what = (
@@ -201,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
         args.repo
         or gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").strip()
     )
+    if args.cmd == "open":
+        return show_open(repo)
     if args.cmd == "show":
         return show(repo, args.number)
     return tick_one(repo, args.number, args.match, args.note, args.undo, args.dry_run)

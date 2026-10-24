@@ -159,7 +159,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **issue-todo**: a GitHub issue's task-list items across its body and every
   comment (`issue-todo show N`), which `gh issue view` splits between two
   commands, and ticking one where it lives (`issue-todo tick N MATCH --note
-  TEXT`, with `--undo` and `--dry-run`). It writes through `gh api`.
+  TEXT`, with `--undo` and `--dry-run`). `issue-todo open` lists every open
+  issue's open items, a cheap answer to "what's left to do here". It writes
+  through `gh api`.
 - **openrouter-credits**: prints an OpenRouter account's credits, bought, used
   and left. The key comes from `OPENROUTER_API_KEY`, else from `./.env` (or
   `--env-file`); it is never printed.

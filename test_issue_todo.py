@@ -74,6 +74,7 @@ class FakeGh:
                 "body": "## To-dos\n\n- [ ] Replace the forecast measure\n- [ ] Add hub",
             },
         ]
+        self.listing = []  # the open issues and pull requests, as GitHub lists them
         self.patched = []
 
     def __call__(self, *args, stdin=None):
@@ -87,6 +88,10 @@ class FakeGh:
             return json.dumps(self.issue)
         if path.endswith("/issues/7/comments"):
             return json.dumps(self.comments)
+        if "/issues?" in path:
+            return json.dumps(self.listing)
+        if path.endswith("/comments"):
+            return "[]"
         if "/issues/comments/" in path:
             (comment,) = [c for c in self.comments if path.endswith(f"/{c['id']}")]
             return json.dumps(comment)
@@ -193,6 +198,30 @@ def test_a_part_that_changed_since_it_was_read_is_left_alone(fake, capsys):
 def test_undo_through_the_command_clears_the_box(fake):
     assert tool.main(["tick", "7", "Starred and capital X", "--undo"]) == 0
     assert "* [ ] Starred and capital X" in fake.patched[0][1]
+
+
+def test_open_lists_each_open_issues_open_items_and_names_the_issues_with_none(
+    fake, capsys
+):
+    fake.listing = [
+        fake.issue | {"assignees": [{"login": "carver"}]},
+        {"number": 8, "title": "Past research", "body": "- [x] done", "assignees": []},
+        {
+            "number": 9,
+            "title": "A pull request",
+            "body": "- [ ] not an issue's",
+            "assignees": [],
+            "pull_request": {},
+        },
+    ]
+    assert tool.main(["open"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[:1] == ["#7 Criterion: consistent [carver]"]
+    assert "    [ ] The forecast question" in out and "    [ ] Add hub" in out
+    assert any("comment 12 robo 2026-10-24" in line for line in out)
+    assert not any("A missing control" in line for line in out)  # ticked
+    assert not any("#9" in line or "not an issue" in line for line in out)
+    assert out[-1] == "no open items: #8"
 
 
 def test_show_cuts_a_long_item_to_one_line(fake, capsys):

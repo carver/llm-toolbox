@@ -29,16 +29,18 @@ heading instead.
 
 ID is an arXiv id (2404.00806, version suffix optional), an arxiv.org abs or
 pdf URL, a DOI (10.1145/... bare or as a doi.org URL), or a 40-character
-Semantic Scholar paperId. text takes only arXiv ids and URLs, or a direct PDF
-URL. For a paper with none of these (PMLR, OpenReview), find its paperId with
-search.
+Semantic Scholar paperId. text takes arXiv ids and URLs, DOIs or a direct PDF
+URL: an arXiv DOI (10.48550/arXiv....) fetches from arXiv, and any other DOI
+fetches the open-access PDF OpenAlex lists, if it lists one. For a paper with
+none of these (PMLR, OpenReview), find its paperId with search.
 
 Every answer is cached in $PAPER_CACHE (default
 /home/carver/code/claudedev/cache/paper): Semantic Scholar responses as JSON,
-arXiv versions and dates for a day (new versions appear), PDFs with their
-text. Delete the s2 folder there to refetch Semantic Scholar answers
-(metadata, citations, searches), or a paper's files in pdf/ to fetch its text
-anew. If arXiv can't be reached, meta prints the rest and warns.
+OpenAlex responses likewise in openalex/, arXiv versions and dates for a day
+(new versions appear), PDFs with their text. Delete the s2 folder there to
+refetch Semantic Scholar answers (metadata, citations, searches), or a
+paper's files in pdf/ to fetch its text anew. If arXiv can't be reached, meta
+prints the rest and warns.
 
 Semantic Scholar answers more requests, and 429s less, with an API key. paper
 sends one when $S2_API_KEY is set, else when the file
@@ -48,25 +50,42 @@ anonymous.
 
 Requests are paced across every paper process that shares the cache, so
 agents running paper in parallel stay under the limits: Semantic Scholar's at
-least 1.1 seconds apart (a key allows about one a second), the arXiv API's at
-least 3 seconds apart. Each waits its turn on a lock file in the cache. PDF
-downloads aren't paced.
+least 1.1 seconds apart (a key allows about one a second), OpenAlex's at least
+0.15 seconds, the arXiv API's at least 3 seconds apart. Each waits its turn on
+a lock file in the cache. PDF downloads aren't paced.
 
 Rate limits (HTTP 429, including Semantic Scholar's JSON error object), 5xx
 and timeouts are retried with exponential backoff, honouring Retry-After: up
 to 6 attempts and 2 minutes of waiting. Don't sleep and retry yourself.
 
+When Semantic Scholar still fails after those retries, meta, search and cites
+answer from OpenAlex instead, for arXiv ids and DOIs (a Semantic Scholar
+paperId has no OpenAlex form), and later lookups in the same run go straight
+to OpenAlex. A `source:` line in the output says so: OpenAlex counts and
+lists far fewer citations than Semantic Scholar for arXiv papers, so rerun
+later for Semantic Scholar's numbers, and an empty OpenAlex citer list doesn't
+show that nothing cites the paper. OpenAlex requests carry
+mailto=robocarver@worldofmail.com, and an API key when $OPENALEX_API_KEY is
+set, else when /home/carver/code/claudedev/.openalex/api-key holds one; it
+goes only to OpenAlex. Without a key, every request from this network shares
+one small daily budget. A key OpenAlex refuses (not yet activated, or
+invalid) is dropped, with a warning. OpenAlex lists at most 200 papers per
+request, so --limit above 200 gets 200.
+
 Exit status: 0 success, 1 not found (or the URL is not a PDF pdftotext can
-read; search with no hits exits 1, and so do grep with no matching line and
-outline with no heading; cites with no citing papers says so and exits 0),
-2 usage error, 3 the remote refused or failed the request after retries, or
-sent an unexpected answer: try again later.
+read, or a DOI has no open-access PDF; search with no hits exits 1, and so
+do grep with no matching line and outline with no heading; cites with no
+citing papers says so and exits 0), 2 usage error, 3 the remote refused or
+failed the request after retries, or sent an unexpected answer, including
+Semantic Scholar failing while OpenAlex fails too or has no record: try
+again later.
 
 Examples:
     paper meta 2404.00806 10.1145/3442188.3445922
     paper cites https://arxiv.org/abs/1706.03762 --limit 50
     paper search detect collusion multi-agent games --limit 5
     less "$(paper text 2404.00806)"
+    paper text https://doi.org/10.1093/joclec/nhy016
     paper outline 2404.00806
     paper grep 2404.00806 'collusion rate|markup' -C 1
 """
@@ -101,7 +120,16 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 TIMEOUT = 30
 ATTEMPTS = 6
 BUDGET = 120  # seconds of sleeping between attempts, at most
-PACED = {"Semantic Scholar": 1.1, "arXiv": 3.0}  # seconds between requests, per service
+PACED = {
+    "Semantic Scholar": 1.1,
+    "arXiv": 3.0,
+    "OpenAlex": 0.15,
+}  # seconds between requests
+OPENALEX = "https://api.openalex.org"
+OPENALEX_MAILTO = "robocarver@worldofmail.com"
+OPENALEX_KEY_ENV = "OPENALEX_API_KEY"
+OPENALEX_KEY_FILE = Path("/home/carver/code/claudedev/.openalex/api-key")
+OPENALEX_PAGE_MAX = 200  # OpenAlex refuses a larger per_page
 META_FIELDS = (
     "title,year,venue,citationCount,externalIds,authors.name,authors.affiliations"
 )
@@ -119,7 +147,9 @@ S2_HEX = re.compile(r"[0-9a-f]{40}")
 ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org"}
 DOI_HOSTS = {"doi.org", "dx.doi.org", "www.doi.org"}
 
-Paper = dict[str, Any]  # a Semantic Scholar paper object
+Paper = dict[
+    str, Any
+]  # a Semantic Scholar paper object, or an OpenAlex work in its shape
 
 
 class UsageError(Exception):
@@ -140,6 +170,10 @@ class ExtractFailed(Exception):
 
 class TransportError(Exception):
     """The request never got an HTTP answer: a timeout or a dropped connection."""
+
+
+class GaveUp(RemoteError):
+    """A service still failed (throttled, 5xx, timeout) after every retry."""
 
 
 class Retryable(Exception):
@@ -165,14 +199,24 @@ class PaperId:
     def s2_id(self) -> str:
         return self.value
 
-    def pdf_source(self) -> tuple[str, str]:
-        """The PDF's URL and the cache file stem for it."""
-        raise UsageError(f"needs an arXiv id or URL, or a PDF URL: {self.value!r}")
+    def openalex_path(self) -> str | None:
+        """The OpenAlex work path for this id, or None when OpenAlex can't take it."""
+        return None
+
+    def pdf_source(self) -> tuple[str | None, str]:
+        """The PDF's URL and the cache file stem for it. The URL is None when it has to
+        be looked up (a DOI's open-access PDF, through OpenAlex)."""
+        raise UsageError(
+            f"needs an arXiv id or URL, a DOI, or a PDF URL: {self.value!r}"
+        )
 
 
 class ArxivId(PaperId):
     def s2_id(self) -> str:
         return "arXiv:" + ARXIV_VERSION.sub("", self.value)
+
+    def openalex_path(self) -> str | None:
+        return "/works/doi:10.48550/arXiv." + ARXIV_VERSION.sub("", self.value)
 
     def pdf_source(self) -> tuple[str, str]:
         return f"https://arxiv.org/pdf/{self.value}", "arxiv-" + self.value
@@ -181,6 +225,16 @@ class ArxivId(PaperId):
 class Doi(PaperId):
     def s2_id(self) -> str:
         return "DOI:" + self.value
+
+    def openalex_path(self) -> str | None:
+        return "/works/doi:" + quote(self.value, safe=":/")
+
+    def pdf_source(self) -> tuple[str | None, str]:
+        m = ARXIV_DOI.fullmatch(self.value)
+        if m and ARXIV.fullmatch(m.group(1)):
+            return ArxivId(m.group(1)).pdf_source()
+        doi = self.value.lower()  # DOIs are case-insensitive
+        return None, cache_stem("doi", doi, doi)
 
 
 class S2PaperId(PaperId):
@@ -193,9 +247,15 @@ class PdfUrl(PaperId):
 
     def pdf_source(self) -> tuple[str, str]:
         name = Path(urlparse(self.value).path).stem
-        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:60]
-        digest = hashlib.sha256(self.value.encode()).hexdigest()[:12]
-        return self.value, f"url-{digest}-{stem}"
+        return self.value, cache_stem("url", self.value, name)
+
+
+def cache_stem(prefix: str, key: str, name: str) -> str:
+    """A flat, safe file stem for a PDF's cache: the prefix, a hash of `key`, and
+    `name` with anything unsafe in a file name replaced."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:60]
+    digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return f"{prefix}-{digest}-{safe}"
 
 
 def parse_id(text: str) -> PaperId:
@@ -261,28 +321,36 @@ def requests_fetch(
 
 @dataclass(frozen=True)
 class ApiKey:
-    """A Semantic Scholar API key, and where it came from for error messages."""
+    """An API key, and where it came from for error messages."""
 
     value: str = field(repr=False)
     source: str
 
 
-def find_api_key() -> ApiKey | None:
-    """The key from $S2_API_KEY, else from KEY_FILE, else None."""
-    value = os.environ.get(KEY_ENV, "").strip()
+def read_key(env: str, path: Path) -> ApiKey | None:
+    """The key from $env, else from the file at `path`, else None."""
+    value = os.environ.get(env, "").strip()
     if value:
-        return ApiKey(value, "$" + KEY_ENV)
+        return ApiKey(value, "$" + env)
     try:
-        value = KEY_FILE.read_text(encoding="utf-8").strip()
+        value = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return None
     except UnicodeDecodeError:
-        raise UsageError(f"the API key file {KEY_FILE} is not UTF-8 text") from None
+        raise UsageError(f"the API key file {path} is not UTF-8 text") from None
     except OSError as e:
-        raise UsageError(
-            f"can't read the API key file {KEY_FILE}: {e.strerror}"
-        ) from None
-    return ApiKey(value, str(KEY_FILE)) if value else None
+        raise UsageError(f"can't read the API key file {path}: {e.strerror}") from None
+    return ApiKey(value, str(path)) if value else None
+
+
+def find_api_key() -> ApiKey | None:
+    """The Semantic Scholar key from $S2_API_KEY, else from KEY_FILE, else None."""
+    return read_key(KEY_ENV, KEY_FILE)
+
+
+def find_openalex_key() -> ApiKey | None:
+    """The OpenAlex key from $OPENALEX_API_KEY, else from OPENALEX_KEY_FILE, else None."""
+    return read_key(OPENALEX_KEY_ENV, OPENALEX_KEY_FILE)
 
 
 def pdftotext(pdf: Path, txt: Path) -> None:
@@ -348,6 +416,10 @@ class Client:
         self.extract = extract
         self.cache = Path(os.environ.get("PAPER_CACHE") or DEFAULT_CACHE)
         self.pace = pace or self.wait_turn
+        # Once Semantic Scholar has given up, later cache misses in this run skip it.
+        self.s2_gave_up: GaveUp | None = None
+        self.openalex_key_refused = False
+        self.warned_fallback = False
 
     def wait_turn(self, service: str) -> None:
         """Waits until `service`'s interval since its last request, by any process, has passed."""
@@ -366,16 +438,19 @@ class Client:
 
         The answer must be an object, holding the key `require` if given."""
         url = S2 + path
-        key = json.dumps([url, params], sort_keys=True)
-        cached = (
-            self.cache / "s2" / (hashlib.sha256(key.encode()).hexdigest() + ".json")
-        )
+        cached = self.cache_file("s2", url, params)
         if cached.exists():
             return json.loads(cached.read_text(encoding="utf-8"))
+        if self.s2_gave_up:
+            raise self.s2_gave_up
         headers = {"x-api-key": self.api_key.value} if self.api_key else None
-        response = self.request(
-            "Semantic Scholar", "GET", url, params=params, headers=headers
-        )
+        try:
+            response = self.request(
+                "Semantic Scholar", "GET", url, params=params, headers=headers
+            )
+        except GaveUp as e:
+            self.s2_gave_up = e
+            raise
         if response.status == 404:
             raise NotFound(error_text(response))
         if response.status != 200:
@@ -385,17 +460,81 @@ class Client:
             if response.status in (401, 403) and self.api_key:
                 problem += f" (the API key from {self.api_key.source} may be invalid)"
             raise RemoteError(problem)
-        try:
-            data = json.loads(response.content)
-        except ValueError:
-            data = None
-        if not isinstance(data, dict) or (require and not data.get(require)):
-            raise RemoteError(
-                "Semantic Scholar sent an unexpected answer: "
-                + response.content[:200].decode(errors="replace")
-            )
+        data = json_object("Semantic Scholar", response, require)
         write_atomic(cached, json.dumps(data).encode())
         return data
+
+    def cache_file(self, folder: str, url: str, params: dict[str, Any]) -> Path:
+        """Where the answer to `url` with `params` is cached, named by a hash of both."""
+        key = json.dumps([url, params], sort_keys=True)
+        return (
+            self.cache / folder / (hashlib.sha256(key.encode()).hexdigest() + ".json")
+        )
+
+    @cached_property
+    def openalex_key(self) -> ApiKey | None:
+        return find_openalex_key()
+
+    def openalex(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """An OpenAlex response's JSON, from the cache when it's there. The cache key
+        leaves out the mailto and the API key."""
+        url = OPENALEX + path
+        cached = self.cache_file("openalex", url, params)
+        if cached.exists():
+            return json.loads(cached.read_text(encoding="utf-8"))
+        response = self.openalex_request(url, params)
+        if response.status == 404:
+            raise NotFound(url)
+        if response.status != 200:
+            problem = error_text(response)
+            if self.openalex_key:
+                problem = problem.replace(self.openalex_key.value, "<api key>")
+            raise RemoteError(f"OpenAlex: HTTP {response.status}: {problem}")
+        data = json_object("OpenAlex", response)
+        write_atomic(cached, json.dumps(data).encode())
+        return data
+
+    def fallback(
+        self, gave_up: GaveUp, path: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """OpenAlex's answer, after Semantic Scholar gave up. Says so on stderr once per
+        run. OpenAlex failing too, or not knowing the paper, is a RemoteError naming
+        both."""
+        if not self.warned_fallback:
+            print(f"paper: {gave_up}; answering from OpenAlex", file=sys.stderr)
+            self.warned_fallback = True
+        try:
+            return self.openalex(path, params)
+        except NotFound:
+            raise RemoteError(
+                f"{gave_up}; OpenAlex has no record of it either"
+            ) from None
+        except RemoteError as e:
+            raise RemoteError(f"{gave_up}; OpenAlex failed too: {e}") from None
+
+    def openalex_request(self, url: str, params: dict[str, Any]) -> Response:
+        """One OpenAlex request with mailto and the key. A key OpenAlex refuses (not yet
+        activated, or invalid) is dropped, with a warning, and the request sent again
+        without it."""
+        sent = dict(params, mailto=OPENALEX_MAILTO)
+        key = None if self.openalex_key_refused else self.openalex_key
+        if key:
+            sent["api_key"] = key.value
+        response = self.request("OpenAlex", "GET", url, params=sent)
+        if key and response.status in (401, 403):
+            why = (
+                "is not activated yet"
+                if error_code(response) == "key_not_activated"
+                else f"was refused (HTTP {response.status}; it may be invalid)"
+            )
+            print(
+                f"paper: the OpenAlex key from {key.source} {why}; asking without it",
+                file=sys.stderr,
+            )
+            self.openalex_key_refused = True
+            keyless = {k: v for k, v in sent.items() if k != "api_key"}
+            response = self.request("OpenAlex", "GET", url, params=keyless)
+        return response
 
     def arxiv_dates(self, ids: list[str]) -> dict[str, "ArxivDates"]:
         """Version and dates per arXiv id (given without a version), from the cache when
@@ -452,7 +591,7 @@ class Client:
             delay = min(backoff(attempt, failure.retry_after), BUDGET - slept)
             self.sleep(delay)
             slept += delay
-        raise RemoteError(
+        raise GaveUp(
             f"{service} failed, gave up after {attempt} attempts"
             f" ({slept:.0f}s of backoff): {failure}"
         )
@@ -501,6 +640,31 @@ def s2_error_code(response: Response) -> int | None:
     ):
         return int(data["code"])
     return None
+
+
+def json_object(
+    service: str, response: Response, require: str | None = None
+) -> dict[str, Any]:
+    """The response's JSON object, holding the key `require` if given."""
+    try:
+        data = json.loads(response.content)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or (require and not data.get(require)):
+        raise RemoteError(
+            f"{service} sent an unexpected answer: "
+            + response.content[:200].decode(errors="replace")
+        )
+    return data
+
+
+def error_code(response: Response) -> str | None:
+    """The `code` field of a JSON error body, such as OpenAlex's "key_not_activated"."""
+    try:
+        data = json.loads(response.content)
+    except ValueError:
+        return None
+    return str(data.get("code")) if isinstance(data, dict) and "code" in data else None
 
 
 def parse_retry_after(headers: dict[str, str]) -> float | None:
@@ -576,6 +740,71 @@ def arxiv_cache_name(aid: str) -> str:
     return aid.replace("/", "_") + ".json"
 
 
+# OpenAlex
+
+ARXIV_DOI = re.compile(r"10\.48550/arxiv\.(.+)", re.IGNORECASE)
+ARXIV_LANDING = re.compile(rf"https?://(?:www\.)?arxiv\.org/abs/({ARXIV_ANY})(?:v\d+)?")
+
+
+def openalex_paper(work: dict[str, Any]) -> Paper:
+    """An OpenAlex work in the shape the formatting functions take."""
+    doi = (work.get("doi") or "").removeprefix("https://doi.org/")
+    external = {}
+    aid = openalex_arxiv_id(work, doi)
+    if aid:
+        external["ArXiv"] = aid
+    if doi:
+        external["DOI"] = doi
+    source = (work.get("primary_location") or {}).get("source") or {}
+    return {
+        "openalexId": str(work.get("id") or "").rsplit("/", 1)[-1],
+        "title": work.get("display_name"),
+        "year": work.get("publication_year"),
+        "venue": source.get("display_name"),
+        "citationCount": work.get("cited_by_count"),
+        "externalIds": external,
+        "authors": [
+            {
+                "name": (a.get("author") or {}).get("display_name"),
+                "affiliations": [
+                    i.get("display_name") for i in a.get("institutions") or []
+                ],
+            }
+            for a in work.get("authorships") or []
+        ],
+        "source": "OpenAlex",
+    }
+
+
+def openalex_arxiv_id(work: dict[str, Any], doi: str) -> str | None:
+    """The work's arXiv id, from its arXiv DOI or an arxiv.org landing page."""
+    m = ARXIV_DOI.fullmatch(doi)
+    if m and ARXIV_ID.fullmatch(m.group(1)):
+        return m.group(1)
+    locations = [work.get("primary_location"), work.get("best_oa_location")]
+    for location in [*locations, *(work.get("locations") or [])]:
+        m = ARXIV_LANDING.fullmatch((location or {}).get("landing_page_url") or "")
+        if m:
+            return m.group(1)
+    return None
+
+
+def from_openalex(client: Client, pid: PaperId, gave_up: GaveUp) -> Paper:
+    """The paper from OpenAlex, after Semantic Scholar gave up on it."""
+    path = pid.openalex_path()
+    if path is None:
+        raise gave_up
+    return openalex_paper(client.fallback(gave_up, path, {}))
+
+
+SOURCE_NOTE = (
+    "source: OpenAlex, because Semantic Scholar gave up after its retries. OpenAlex"
+    " counts and lists far fewer citations than Semantic Scholar for arXiv papers;"
+    " rerun later for Semantic Scholar's."
+)
+SOURCE_LINE = "  " + SOURCE_NOTE
+
+
 # Formatting
 
 
@@ -586,7 +815,10 @@ def ids_line(paper: Paper) -> str:
         parts.append("arXiv:" + ext["ArXiv"])
     if ext.get("DOI"):
         parts.append("DOI:" + ext["DOI"])
-    parts.append("S2:" + paper["paperId"])
+    if paper.get("paperId"):
+        parts.append("S2:" + paper["paperId"])
+    elif paper.get("openalexId"):
+        parts.append("OpenAlex:" + paper["openalexId"])
     return " ".join(parts)
 
 
@@ -605,6 +837,8 @@ def author_names(paper: Paper, limit: int | None = None) -> str:
 
 def meta_block(paper: Paper, dates: ArxivDates | None = None) -> str:
     lines = [paper.get("title") or "(untitled)"]
+    if paper.get("source") == "OpenAlex":
+        lines.append(SOURCE_LINE)
     where = " · ".join(str(x) for x in (paper.get("year"), paper.get("venue")) if x)
     if where:
         lines.append("  " + where)
@@ -639,14 +873,24 @@ def list_block(paper: Paper, show_citation_count: bool = False) -> str:
 # Commands
 
 
+def meta_paper(client: Client, pid: PaperId) -> Paper:
+    """The paper's metadata from Semantic Scholar, or from OpenAlex once it gives up."""
+    try:
+        return client.s2(pid.s2_path(), {"fields": META_FIELDS}, require="paperId")
+    except GaveUp as e:
+        return from_openalex(client, pid, e)
+
+
 def cmd_meta(client: Client, args: argparse.Namespace) -> int:
-    paths = [parse_id(text).s2_path() for text in args.ids]
+    pids = [parse_id(text) for text in args.ids]
+    for pid in pids:
+        pid.s2_path()  # a PDF URL is refused here, before any request
     code = OK
     papers = []
     failure = None
-    for text, path in zip(args.ids, paths):
+    for text, pid in zip(args.ids, pids):
         try:
-            papers.append(client.s2(path, {"fields": META_FIELDS}, require="paperId"))
+            papers.append(meta_paper(client, pid))
         except NotFound:
             print(f"paper: not found: {text}", file=sys.stderr)
             code = NOT_FOUND
@@ -673,11 +917,14 @@ def cmd_meta(client: Client, args: argparse.Namespace) -> int:
 
 
 def cmd_cites(client: Client, args: argparse.Namespace) -> int:
-    path = parse_id(args.id).s2_path() + "/citations"
+    pid = parse_id(args.id)
+    path = pid.s2_path() + "/citations"
     try:
         data = client.s2(path, {"fields": CITES_FIELDS, "limit": args.limit})
     except NotFound:
         raise NotFound(args.id) from None
+    except GaveUp as e:
+        return openalex_cites(client, pid, args, e)
     citing = [
         row["citingPaper"]
         for row in data.get("data") or []
@@ -690,15 +937,51 @@ def cmd_cites(client: Client, args: argparse.Namespace) -> int:
     return OK
 
 
+def openalex_cites(
+    client: Client, pid: PaperId, args: argparse.Namespace, gave_up: GaveUp
+) -> int:
+    """cites from OpenAlex, under a source note. An empty list isn't "no papers cite"."""
+    work = from_openalex(client, pid, gave_up)
+    data = client.fallback(
+        gave_up,
+        "/works",
+        {
+            "filter": "cites:" + work["openalexId"],
+            "per_page": min(args.limit, OPENALEX_PAGE_MAX),
+        },
+    )
+    print(SOURCE_NOTE)
+    citing = [openalex_paper(w) for w in data.get("results") or []]
+    if not citing:
+        print(f"OpenAlex lists no papers citing {args.id}; that doesn't show none do")
+    for paper in citing:
+        print(list_block(paper))
+    return OK
+
+
 def cmd_search(client: Client, args: argparse.Namespace) -> int:
     query = " ".join(args.query)
-    data = client.s2(
-        "/paper/search", {"query": query, "fields": SEARCH_FIELDS, "limit": args.limit}
-    )
-    papers = data.get("data") or []
+    note = None
+    try:
+        data = client.s2(
+            "/paper/search",
+            {"query": query, "fields": SEARCH_FIELDS, "limit": args.limit},
+        )
+        papers = data.get("data") or []
+    except GaveUp as e:
+        found = client.fallback(
+            e,
+            "/works",
+            {"search": query, "per_page": min(args.limit, OPENALEX_PAGE_MAX)},
+        )
+        papers = [openalex_paper(w) for w in found.get("results") or []]
+        note = SOURCE_NOTE
     if not papers:
-        print(f"paper: no papers match {query!r}", file=sys.stderr)
+        where = " in OpenAlex" if note else ""
+        print(f"paper: no papers match {query!r}{where}", file=sys.stderr)
         return NOT_FOUND
+    if note:
+        print(note)
     for paper in papers:
         print(list_block(paper, show_citation_count=True))
     return OK
@@ -707,12 +990,15 @@ def cmd_search(client: Client, args: argparse.Namespace) -> int:
 def cached_text(client: Client, id_text: str, command: str) -> Path:
     """The paper's extracted text, downloaded and extracted first if not cached."""
     try:
-        url, stem = parse_id(id_text).pdf_source()
+        pid = parse_id(id_text)
+        url, stem = pid.pdf_source()
     except UsageError as e:
         raise UsageError(f"`paper {command}` {e}") from e
     folder = client.cache / "pdf"
     pdf, txt = folder / (stem + ".pdf"), folder / (stem + ".txt")
     if not txt.exists():
+        if url is None:
+            url = open_access_pdf(client, pid)
         response = client.request("PDF download", "GET", url)
         if response.status == 404:
             raise NotFound(url)
@@ -724,6 +1010,29 @@ def cached_text(client: Client, id_text: str, command: str) -> Path:
         with replaced_on_success(txt) as partial:
             client.extract(pdf, partial)
     return txt
+
+
+def open_access_pdf(client: Client, pid: PaperId) -> str:
+    """The URL of an open-access PDF of the paper, found through OpenAlex."""
+    path = pid.openalex_path()
+    assert path is not None  # only a DOI's pdf_source leaves the URL to look up
+    try:
+        work = client.openalex(path, {})
+    except NotFound:
+        raise NotFound(f"{pid.value} is not in OpenAlex") from None
+    best = work.get("best_oa_location") or {}
+    locations = work.get("locations") or []
+    pdfs = [best.get("pdf_url"), *((loc or {}).get("pdf_url") for loc in locations)]
+    for url in pdfs:
+        if url:
+            return url
+    primary = work.get("primary_location") or {}
+    pages = [best.get("landing_page_url"), primary.get("landing_page_url")]
+    pages += [(loc or {}).get("landing_page_url") for loc in locations]
+    landing = next((p for p in pages if p), None) or work.get("doi") or "none listed"
+    raise NotFound(
+        f"no open-access PDF for {pid.value} in OpenAlex; its landing page: {landing}"
+    )
 
 
 def cmd_text(client: Client, args: argparse.Namespace) -> int:
@@ -889,12 +1198,13 @@ def main(
     search = sub.add_parser("search", help="keyword search")
     search.add_argument("query", nargs="+", metavar="QUERY")
     search.add_argument("--limit", type=int, default=10, help="how many (default 10)")
+    id_help = "arXiv id or URL, DOI, or PDF URL"
     text = sub.add_parser("text", help="full text: prints the cached .txt path")
-    text.add_argument("id", metavar="ID", help="arXiv id or URL, or a PDF URL")
+    text.add_argument("id", metavar="ID", help=id_help)
     outline = sub.add_parser("outline", help="section headings with line numbers")
-    outline.add_argument("id", metavar="ID", help="arXiv id or URL, or a PDF URL")
+    outline.add_argument("id", metavar="ID", help=id_help)
     grep = sub.add_parser("grep", help="lines matching a regex, with line numbers")
-    grep.add_argument("id", metavar="ID", help="arXiv id or URL, or a PDF URL")
+    grep.add_argument("id", metavar="ID", help=id_help)
     grep.add_argument("pattern", metavar="PATTERN", help="a Python regex")
     grep.add_argument(
         "-C",
@@ -913,7 +1223,7 @@ def main(
         return NOT_FOUND
     except (UsageError, ExtractFailed, RemoteError) as e:
         print(f"paper: {e}", file=sys.stderr)
-        return EXIT_CODES[type(e)]
+        return next(code for kind, code in EXIT_CODES.items() if isinstance(e, kind))
 
 
 if __name__ == "__main__":

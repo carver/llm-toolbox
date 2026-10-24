@@ -5,6 +5,7 @@ import importlib.util
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -160,11 +161,18 @@ def status(code, body=None, headers=None):
 
 @pytest.fixture(autouse=True)
 def key_file(monkeypatch, tmp_path):
-    """No test reads the real API key: env unset, key file under tmp_path."""
+    """No test reads a real API key: env vars unset, key files under tmp_path."""
     monkeypatch.delenv("S2_API_KEY", raising=False)
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    monkeypatch.setattr(paper, "OPENALEX_KEY_FILE", tmp_path / "openalex-api-key")
     path = tmp_path / "api-key"
     monkeypatch.setattr(paper, "KEY_FILE", path)
     return path
+
+
+@pytest.fixture
+def openalex_key_file(tmp_path):
+    return tmp_path / "openalex-api-key"
 
 
 @pytest.fixture
@@ -238,10 +246,10 @@ def test_backoff_honours_retry_after(cache, capsys):
     ids=["429", "timeout", "error-object-in-200"],
 )
 def test_gives_up_after_the_retry_budget_and_exits_3(cache, capsys, failure):
-    http = FakeHTTP(("GET", "/paper/", [failure]))
+    http = FakeHTTP(("GET", "/paper/", [failure]), OPENALEX_HAS_NOTHING)
     code, out, err, sleeps = run(capsys, ["meta", "1706.03762"], http)
     assert (code, out) == (3, "")
-    assert len(http.calls) == 6
+    assert len(s2_calls(http)) == 6
     assert sum(sleeps) <= 130
     assert "gave up after 6 attempts" in err
     assert not (cache / "s2").exists() or not any((cache / "s2").iterdir())
@@ -249,10 +257,13 @@ def test_gives_up_after_the_retry_budget_and_exits_3(cache, capsys, failure):
 
 def test_a_long_retry_after_is_capped_by_the_budget(cache, capsys):
     limited = status(429, RATE_LIMITED, {"Retry-After": "3600"})
-    http = FakeHTTP(("GET", "/paper/", [limited]))
+    http = FakeHTTP(("GET", "/paper/", [limited]), OPENALEX_HAS_NOTHING)
     code, _, _, sleeps = run(capsys, ["meta", "1706.03762"], http)
     assert code == 3
     assert sum(sleeps) <= 130
+
+
+OPENALEX_HAS_NOTHING = ("GET", "api.openalex.org", [paper.Response(404, {}, b"<html>")])
 
 
 def test_a_client_error_is_not_retried(cache, capsys):
@@ -906,11 +917,8 @@ def test_outline_skips_prose_references_and_table_cells(cache, capsys, line):
     assert out.split(None, 1) == ["1", "1 Introduction\n"]
 
 
-def test_outline_and_grep_name_themselves_when_given_a_doi(cache, capsys):
-    for argv in (
-        ["outline", "10.1145/3442188.3445922"],
-        ["grep", "10.1145/3442188.3445922", "x"],
-    ):
+def test_outline_and_grep_name_themselves_when_given_an_s2_paper_id(cache, capsys):
+    for argv in (["outline", S2_ID], ["grep", S2_ID, "x"]):
         code, _, err, _ = run(capsys, argv, FakeHTTP())
         assert code == 2
         assert f"paper {argv[0]}" in err
@@ -1160,3 +1168,461 @@ def test_by_default_the_pacing_files_live_in_the_cache(cache, capsys):
         ".pace-arxiv",
         ".pace-semantic-scholar",
     ]
+
+
+# OpenAlex, the fallback when Semantic Scholar gives up
+
+S2_DOWN = ("GET", "semanticscholar.org", [status(429, RATE_LIMITED)])
+OA_ATTENTION = {
+    "id": "https://openalex.org/W2626778328",
+    "doi": "https://doi.org/10.48550/arxiv.1706.03762",
+    "display_name": "Attention Is All You Need",
+    "publication_year": 2017,
+    "cited_by_count": 6000,
+    "authorships": [
+        {
+            "author": {"display_name": "Ashish Vaswani"},
+            "institutions": [{"display_name": "Google (United States)"}],
+        },
+        {"author": {"display_name": "Noam Shazeer"}, "institutions": []},
+    ],
+    "primary_location": {
+        "source": {"display_name": "arXiv (Cornell University)"},
+        "landing_page_url": "http://arxiv.org/abs/1706.03762",
+    },
+    "best_oa_location": {
+        "pdf_url": "https://arxiv.org/pdf/1706.03762",
+        "landing_page_url": "http://arxiv.org/abs/1706.03762",
+    },
+    "locations": [],
+}
+OA_JOURNAL = {
+    "id": "https://openalex.org/W2095883081",
+    "doi": "https://doi.org/10.1111/1467-937x.00136",
+    "display_name": "A Study of Collusion in First-Price Auctions",
+    "publication_year": 2000,
+    "cited_by_count": 364,
+    "authorships": [
+        {
+            "author": {"display_name": "Martin Pesendorfer"},
+            "institutions": [{"display_name": "Yale University"}],
+        }
+    ],
+    "primary_location": {"source": {"display_name": "The Review of Economic Studies"}},
+    "best_oa_location": None,
+    "locations": [
+        {"pdf_url": None, "landing_page_url": "https://doi.org/10.1111/1467-937x.00136"}
+    ],
+}
+OA_ATTENTION_ROUTE = (
+    "GET",
+    "api.openalex.org/works/doi:10.48550/arXiv.1706.03762",
+    [ok(OA_ATTENTION)],
+)
+
+
+def openalex_calls(http):
+    return calls_to(http, "api.openalex.org")
+
+
+def test_meta_falls_back_to_openalex_when_semantic_scholar_gives_up(cache, capsys):
+    http = FakeHTTP(S2_DOWN, OA_ATTENTION_ROUTE)
+    code, out, err, _ = run(capsys, ["meta", "1706.03762v5"], http)
+    assert code == 0, err
+    title, source, *rest = out.splitlines()
+    assert title == "Attention Is All You Need"
+    assert source.startswith("  source: OpenAlex")
+    assert "Semantic Scholar gave up" in source
+    assert "counts and lists far fewer citations" in source and "arXiv" in source
+    assert rest[:4] == [
+        "  2017 · arXiv (Cornell University)",
+        "  authors: Ashish Vaswani (Google (United States)), Noam Shazeer",
+        "  citations: 6000",
+        "  ids: arXiv:1706.03762 DOI:10.48550/arxiv.1706.03762 OpenAlex:W2626778328",
+    ]
+    assert len(s2_calls(http)) == 6
+    (call,) = openalex_calls(http)
+    assert call["params"]["mailto"] == "robocarver@worldofmail.com"
+    assert "gave up" in err and "OpenAlex" in err
+
+
+def test_a_semantic_scholar_answer_carries_no_source_line(cache, capsys):
+    http = FakeHTTP(("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]))
+    _, out, _, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert "source:" not in out
+
+
+def test_once_semantic_scholar_gives_up_later_ids_go_straight_to_openalex(
+    cache, capsys
+):
+    http = FakeHTTP(
+        S2_DOWN,
+        OA_ATTENTION_ROUTE,
+        ("GET", "api.openalex.org/works/doi:10.1111/1467-937X.00136", [ok(OA_JOURNAL)]),
+    )
+    code, out, err, _ = run(
+        capsys, ["meta", "1706.03762", "10.1111/1467-937X.00136"], http
+    )
+    assert code == 0, err
+    assert len(s2_calls(http)) == 6
+    assert "A Study of Collusion in First-Price Auctions" in out
+    assert "  ids: DOI:10.1111/1467-937x.00136 OpenAlex:W2095883081" in out
+
+
+def test_a_semantic_scholar_paper_id_has_no_fallback(cache, capsys):
+    http = FakeHTTP(S2_DOWN)
+    code, out, err, _ = run(capsys, ["meta", S2_ID], http)
+    assert (code, out) == (3, "")
+    assert openalex_calls(http) == []
+    assert "gave up" in err
+
+
+def test_openalex_without_the_paper_still_exits_3_naming_both(cache, capsys):
+    http = FakeHTTP(S2_DOWN, OPENALEX_HAS_NOTHING)
+    code, out, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert (code, out) == (3, "")
+    assert "Semantic Scholar" in err and "OpenAlex" in err
+
+
+def test_openalex_failing_too_exits_3(cache, capsys):
+    http = FakeHTTP(S2_DOWN, ("GET", "api.openalex.org", [status(503)]))
+    code, out, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert (code, out) == (3, "")
+    assert "OpenAlex" in err
+
+
+OA_KEY = "oa-secret-key-0123456789"
+
+
+def test_the_openalex_key_goes_only_to_openalex(cache, capsys, openalex_key_file):
+    openalex_key_file.write_text(OA_KEY + "\n")
+    http = FakeHTTP(S2_DOWN, OA_ATTENTION_ROUTE)
+    code, out, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert code == 0, err
+    (call,) = openalex_calls(http)
+    assert call["params"]["api_key"] == OA_KEY
+    assert all(OA_KEY not in json.dumps(c) for c in s2_calls(http))
+    assert OA_KEY not in out + err
+    for f in cache.rglob("*"):
+        if f.is_file():
+            assert OA_KEY not in f.read_text() and OA_KEY not in f.name
+
+
+def test_the_openalex_env_var_wins_over_its_key_file(
+    cache, capsys, openalex_key_file, monkeypatch
+):
+    openalex_key_file.write_text("from-file")
+    monkeypatch.setenv("OPENALEX_API_KEY", " " + OA_KEY + " ")
+    http = FakeHTTP(S2_DOWN, OA_ATTENTION_ROUTE)
+    run(capsys, ["meta", "1706.03762"], http)
+    assert openalex_calls(http)[0]["params"]["api_key"] == OA_KEY
+
+
+def test_without_an_openalex_key_requests_carry_none(cache, capsys):
+    http = FakeHTTP(S2_DOWN, OA_ATTENTION_ROUTE)
+    run(capsys, ["meta", "1706.03762"], http)
+    assert "api_key" not in openalex_calls(http)[0]["params"]
+
+
+NOT_ACTIVATED = status(
+    403,
+    {"error": "Forbidden", "code": "key_not_activated", "message": "not activated"},
+)
+
+
+def test_an_unactivated_openalex_key_is_dropped_with_one_warning(
+    cache, capsys, openalex_key_file
+):
+    openalex_key_file.write_text(OA_KEY)
+    http = FakeHTTP(
+        S2_DOWN,
+        ("GET", "api.openalex.org", [NOT_ACTIVATED, ok(OA_ATTENTION), ok(OA_JOURNAL)]),
+    )
+    code, out, err, _ = run(
+        capsys, ["meta", "1706.03762", "10.1111/1467-937X.00136"], http
+    )
+    assert code == 0, err
+    first, *rest = openalex_calls(http)
+    assert first["params"]["api_key"] == OA_KEY
+    assert rest and all("api_key" not in c["params"] for c in rest)
+    assert err.count("not activated") == 1
+    assert OA_KEY not in out + err
+
+
+def test_help_says_where_the_openalex_key_goes_and_what_the_fallback_does(capsys):
+    with pytest.raises(SystemExit):
+        paper.main(["-h"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "OPENALEX_API_KEY" in out and ".openalex/api-key" in out
+    assert "OpenAlex" in out and "fewer citations" in out
+
+
+def test_search_falls_back_to_openalex_under_a_source_line(cache, capsys):
+    http = FakeHTTP(
+        S2_DOWN,
+        ("GET", "api.openalex.org/works", [ok({"meta": {}, "results": [OA_JOURNAL]})]),
+    )
+    code, out, err, _ = run(
+        capsys, ["search", "collusion", "auctions", "--limit", "3"], http
+    )
+    assert code == 0, err
+    first, *rest = out.splitlines()
+    assert first.startswith("source: OpenAlex") and "fewer citations" in first
+    assert rest == [
+        "2000 · A Study of Collusion in First-Price Auctions · The Review of Economic Studies",
+        "  authors: Martin Pesendorfer (Yale University)",
+        "  ids: DOI:10.1111/1467-937x.00136 OpenAlex:W2095883081 · citations: 364",
+    ]
+    (call,) = openalex_calls(http)
+    assert call["params"]["search"] == "collusion auctions"
+    assert call["params"]["per_page"] == 3
+
+
+def test_an_openalex_search_with_no_match_exits_1_naming_openalex(cache, capsys):
+    http = FakeHTTP(
+        S2_DOWN, ("GET", "api.openalex.org/works", [ok({"meta": {}, "results": []})])
+    )
+    code, out, err, _ = run(capsys, ["search", "zzzz"], http)
+    assert (code, out) == (1, "")
+    assert "no papers match" in err and "OpenAlex" in err
+
+
+OA_CITING = dict(
+    OA_JOURNAL,
+    id="https://openalex.org/W2141486460",
+    doi="https://doi.org/10.1162/003465303772815871",
+    display_name="Deciding Between Competition and Collusion",
+    publication_year=2003,
+    primary_location={"source": {"display_name": "Review of Economics and Statistics"}},
+)
+
+
+def test_cites_falls_back_to_openalex_under_a_source_line(cache, capsys):
+    http = FakeHTTP(
+        S2_DOWN,
+        OA_ATTENTION_ROUTE,
+        ("GET", "api.openalex.org/works", [ok({"meta": {}, "results": [OA_CITING]})]),
+    )
+    code, out, err, _ = run(capsys, ["cites", "1706.03762", "--limit", "2"], http)
+    assert code == 0, err
+    first, *rest = out.splitlines()
+    assert first.startswith("source: OpenAlex") and "fewer citations" in first
+    assert rest == [
+        "2003 · Deciding Between Competition and Collusion · Review of Economics and Statistics",
+        "  authors: Martin Pesendorfer (Yale University)",
+        "  ids: DOI:10.1162/003465303772815871 OpenAlex:W2141486460",
+    ]
+    lookup, citing = openalex_calls(http)
+    assert "/works/doi:10.48550/arXiv.1706.03762" in lookup["url"]
+    assert citing["params"]["filter"] == "cites:W2626778328"
+    assert citing["params"]["per_page"] == 2
+
+
+def test_no_citers_in_openalex_is_not_reported_as_no_citers(cache, capsys):
+    http = FakeHTTP(
+        S2_DOWN,
+        OA_ATTENTION_ROUTE,
+        ("GET", "api.openalex.org/works", [ok({"meta": {}, "results": []})]),
+    )
+    code, out, err, _ = run(capsys, ["cites", "1706.03762"], http)
+    assert code == 0, err
+    assert "no papers cite" not in out
+    assert "OpenAlex lists no papers citing 1706.03762" in out
+
+
+def test_cites_of_a_semantic_scholar_paper_id_has_no_fallback(cache, capsys):
+    http = FakeHTTP(S2_DOWN)
+    code, _, _, _ = run(capsys, ["cites", S2_ID], http)
+    assert code == 3
+    assert openalex_calls(http) == []
+
+
+def test_text_takes_an_arxiv_doi_straight_to_arxiv(cache, capsys):
+    http = FakeHTTP(("GET", "https://arxiv.org/pdf/2404.00806", [pdf_response()]))
+    code, out, err, _ = run(
+        capsys, ["text", "10.48550/arXiv.2404.00806"], http, extract=fake_extract
+    )
+    assert code == 0, err
+    assert Path(out.strip()).read_text() == "extracted from %PDF-1.4"
+    assert openalex_calls(http) == []
+
+
+OPEN_PDF = "https://repository.example.org/open.pdf"
+
+
+@pytest.mark.parametrize(
+    "work",
+    [
+        dict(
+            OA_JOURNAL, best_oa_location={"pdf_url": OPEN_PDF, "landing_page_url": "x"}
+        ),
+        dict(
+            OA_JOURNAL,
+            best_oa_location=None,
+            locations=[{"pdf_url": None}, {"pdf_url": OPEN_PDF}],
+        ),
+    ],
+    ids=["best-location", "any-location"],
+)
+def test_text_finds_a_doi_open_access_pdf_through_openalex(cache, capsys, work):
+    http = FakeHTTP(
+        ("GET", "api.openalex.org/works/doi:10.1111/1467-937X.00136", [ok(work)]),
+        ("GET", OPEN_PDF, [pdf_response()]),
+    )
+    code, out, err, _ = run(
+        capsys,
+        ["text", "https://doi.org/10.1111/1467-937X.00136"],
+        http,
+        extract=fake_extract,
+    )
+    assert code == 0, err
+    assert Path(out.strip()).read_text() == "extracted from %PDF-1.4"
+    assert openalex_calls(http)[0]["params"]["mailto"] == "robocarver@worldofmail.com"
+    assert s2_calls(http) == []
+
+
+def test_text_of_a_doi_answers_a_repeat_from_the_cache(cache, capsys):
+    work = dict(OA_JOURNAL, best_oa_location={"pdf_url": OPEN_PDF})
+    http = FakeHTTP(
+        ("GET", "api.openalex.org/works/doi:", [ok(work)]),
+        ("GET", OPEN_PDF, [pdf_response()]),
+    )
+    _, first, _, _ = run(
+        capsys, ["text", "10.1111/1467-937X.00136"], http, extract=fake_extract
+    )
+    again = FakeHTTP()
+    code, out, _, _ = run(
+        capsys, ["text", "10.1111/1467-937X.00136"], again, extract=fake_extract
+    )
+    assert (code, out) == (0, first)
+    assert again.calls == []
+
+
+def test_text_of_a_doi_with_no_open_access_pdf_exits_1_naming_its_landing_page(
+    cache, capsys
+):
+    http = FakeHTTP(("GET", "api.openalex.org/works/doi:", [ok(OA_JOURNAL)]))
+    code, out, err, _ = run(
+        capsys, ["text", "10.1111/1467-937X.00136"], http, extract=fake_extract
+    )
+    assert (code, out) == (1, "")
+    assert "no open-access PDF" in err
+    assert "https://doi.org/10.1111/1467-937x.00136" in err
+
+
+def test_text_of_a_doi_openalex_doesnt_know_exits_1(cache, capsys):
+    http = FakeHTTP(OPENALEX_HAS_NOTHING)
+    code, out, err, _ = run(
+        capsys, ["text", "10.1000/unknown"], http, extract=fake_extract
+    )
+    assert (code, out) == (1, "")
+    assert "10.1000/unknown" in err
+
+
+def test_outline_takes_a_doi_too(cache, capsys):
+    work = dict(OA_JOURNAL, best_oa_location={"pdf_url": OPEN_PDF})
+    http = FakeHTTP(
+        ("GET", "api.openalex.org/works/doi:", [ok(work)]),
+        ("GET", OPEN_PDF, [pdf_response()]),
+    )
+
+    def headed(pdf, txt):
+        txt.write_text("1 Introduction\nbody\n")
+
+    code, out, err, _ = run(
+        capsys, ["outline", "10.1111/1467-937X.00136"], http, extract=headed
+    )
+    assert code == 0, err
+    assert "Introduction" in out
+
+
+def test_a_doi_with_no_pdf_names_its_primary_landing_page(cache, capsys):
+    work = dict(
+        OA_JOURNAL,
+        best_oa_location=None,
+        primary_location={"landing_page_url": "https://academic.example.org/article/1"},
+        locations=[{"pdf_url": None, "landing_page_url": "https://elsewhere.example"}],
+    )
+    http = FakeHTTP(("GET", "api.openalex.org/works/doi:", [ok(work)]))
+    code, _, err, _ = run(
+        capsys, ["text", "10.1111/1467-937X.00136"], http, extract=fake_extract
+    )
+    assert code == 1
+    assert "https://academic.example.org/article/1" in err
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_a_refused_openalex_key_is_dropped_naming_where_it_came_from(
+    cache, capsys, openalex_key_file, code
+):
+    openalex_key_file.write_text(OA_KEY)
+    refused = status(code, {"error": "Unauthorized"})
+    http = FakeHTTP(S2_DOWN, ("GET", "api.openalex.org", [refused, ok(OA_ATTENTION)]))
+    exit_code, out, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert exit_code == 0, err
+    first, second = openalex_calls(http)
+    assert first["params"]["api_key"] == OA_KEY and "api_key" not in second["params"]
+    assert str(openalex_key_file) in err
+    assert OA_KEY not in out + err
+
+
+def test_openalex_lists_ask_for_at_most_200(cache, capsys):
+    http = FakeHTTP(
+        S2_DOWN,
+        OA_ATTENTION_ROUTE,
+        ("GET", "api.openalex.org/works", [ok({"meta": {}, "results": [OA_CITING]})]),
+    )
+    run(capsys, ["cites", "1706.03762", "--limit", "500"], http)
+    run(capsys, ["search", "collusion", "--limit", "300"], http)
+    lists = [c for c in openalex_calls(http) if "per_page" in c["params"]]
+    assert [c["params"]["per_page"] for c in lists] == [200, 200]
+
+
+def test_the_openalex_key_never_shows_in_an_openalex_error(
+    cache, capsys, openalex_key_file
+):
+    openalex_key_file.write_text(OA_KEY)
+    echo = status(
+        400, {"error": "bad request", "message": f"api_key={OA_KEY} rejected"}
+    )
+    http = FakeHTTP(S2_DOWN, ("GET", "api.openalex.org", [echo]))
+    code, out, err, _ = run(capsys, ["search", "collusion"], http)
+    assert code == 3
+    assert "OpenAlex" in err and OA_KEY not in out + err
+
+
+SICI = "10.1002/(SICI)1097-4571(199806)49:8<693::AID-ASI4>3.0.CO;2-0"
+
+
+def test_a_doi_with_reserved_characters_is_escaped_for_openalex(cache, capsys):
+    work = dict(OA_JOURNAL, best_oa_location={"pdf_url": OPEN_PDF})
+    http = FakeHTTP(
+        ("GET", "api.openalex.org/works/doi:", [ok(work)]),
+        ("GET", OPEN_PDF, [pdf_response()]),
+    )
+    code, out, err, _ = run(capsys, ["text", SICI], http, extract=fake_extract)
+    assert code == 0, err
+    (call,) = openalex_calls(http)
+    assert call["url"].endswith(
+        "/works/doi:10.1002/%28SICI%291097-4571%28199806%2949:8%3C693::AID-ASI4%3E3.0.CO%3B2-0"
+    )
+    assert re.fullmatch(r"doi-[0-9a-f]{12}-[a-z0-9._-]+\.txt", Path(out.strip()).name)
+
+
+def test_the_openalex_key_never_reaches_arxiv_or_a_pdf_host(
+    cache, capsys, openalex_key_file
+):
+    openalex_key_file.write_text(OA_KEY)
+    work = dict(OA_JOURNAL, best_oa_location={"pdf_url": OPEN_PDF})
+    http = FakeHTTP(
+        S2_DOWN,
+        OA_ATTENTION_ROUTE,
+        ("GET", "export.arxiv.org", [ATTENTION_FEED]),
+        ("GET", "api.openalex.org/works/doi:10.1111", [ok(work)]),
+        ("GET", OPEN_PDF, [pdf_response()]),
+    )
+    run(capsys, ["meta", "1706.03762"], http)
+    run(capsys, ["text", "10.1111/1467-937X.00136"], http, extract=fake_extract)
+    others = [c for c in http.calls if "api.openalex.org" not in c["url"]]
+    assert calls_to(http, "export.arxiv.org") and calls_to(http, OPEN_PDF)
+    assert all(OA_KEY not in json.dumps(c) for c in others)

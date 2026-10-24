@@ -236,8 +236,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 
 - **paper**: a paper's metadata (`meta`), the papers citing it (`cites`) and
   keyword search (`search`) from Semantic Scholar, and its full text (`text`:
-  downloads the arXiv or direct-URL PDF, runs `pdftotext -layout` and prints
-  the `.txt` path). `outline` lists the text's section headings with line
+  downloads the arXiv or direct-URL PDF, or a DOI's open-access PDF found
+  through OpenAlex, runs `pdftotext -layout` and prints the `.txt` path). `outline` lists the text's section headings with line
   numbers and `grep` its lines matching a regex, with context, so an agent
   can read a section instead of the whole paper. Takes arXiv ids and URLs, DOIs and Semantic Scholar
   paperIds, and prints a few lines per paper; `meta` adds an arXiv paper's
@@ -247,8 +247,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   Semantic Scholar's at least 1.1 seconds apart, the arXiv API's at least 3;
   PDF downloads aren't paced. Retries rate limits, 5xx and
   timeouts with backoff for up to 2 minutes, so callers needn't sleep and
-  retry. Sends a Semantic Scholar API key from `$S2_API_KEY`, else from
-  `claudedev/.semantic-scholar/api-key`, when there is one. Caches everything
+  retry. When Semantic Scholar still fails, `meta`, `search` and `cites`
+  answer from OpenAlex under a `source:` line; OpenAlex counts far fewer
+  citations for arXiv papers. Sends a Semantic Scholar API key from
+  `$S2_API_KEY`, else from `claudedev/.semantic-scholar/api-key`, and an
+  OpenAlex key from `$OPENALEX_API_KEY`, else from `claudedev/.openalex/api-key`,
+  when there is one. Caches everything
   in `claudedev/cache/paper/` (`$PAPER_CACHE` overrides). Exits 1 when not found or when a URL is not a PDF, 3 when the
   remote still refuses.
 

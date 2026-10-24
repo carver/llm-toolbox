@@ -12,11 +12,11 @@ Chat replies to me skip /unslop: be as concise as possible, without hurting clar
 
 To write or change code, run `/build`: you implement and refactor, and subagents review. A trivial edit, such as a one-file change with no behaviour worth a test, you make yourself with the `coding` skill (`~/.agents/skills/coding/SKILL.md`). If you wrote or changed a test, it isn't trivial: run `/build` with its reviews, small follow-ups late in a session included. With no subagent tool, as inside a workflow agent, run `/build`'s review step yourself: take the prompt `build-state review-prompt BRIEF` prints and review your own diff against it, both headings, before the refactor.
 
-When the working tree is dirty at the start of a session, those changes are someone else's: leave them alone and build in a detached worktree beside the repo, `git worktree add --detach ../<repo>-wt`. It has no `.venv` or untracked files, so set up the environment the repo's README describes before running checks there. Commit in the worktree. To finish:
+When the working tree is dirty at the start of a session, those changes are someone else's: leave them alone and build in a detached worktree beside the repo, named for its topic: `git worktree add --detach ../<repo>-wt-<topic>`. Other sessions may hold worktrees there too, so check `git worktree list` first. It has no `.venv` or untracked files, so set up the environment the repo's README describes before running checks there. Commit in the worktree. To finish:
 
 1. If the branch moved meanwhile (`build-state finish` names it), rebase in the worktree, folding your fixups in the same step: `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash <branch>`. Rerun the checks. Go ahead without asking when your commits touch none of the files the new commits on the branch do; otherwise ask me first.
 2. From the main tree, `git merge --ff-only <worktree HEAD sha>`. If git refuses because the uncommitted changes there touch the same files, stop and ask me.
-3. `git worktree remove ../<repo>-wt`.
+3. `git worktree remove ../<repo>-wt-<topic>`.
 
 ## Research subagents
 

@@ -80,7 +80,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--tail needs --wait")
     if args.tail is not None and args.tail < 0:
         parser.error("--tail must be 0 or more")
-    problem = start_problem(command[0], args.cwd)
+    env = caller_env()
+    problem = start_problem(command[0], args.cwd, env)
     if problem:
         print(f"bgrun: {problem}", file=sys.stderr)
         return CANT_START
@@ -97,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 cwd=args.cwd,
+                env=env,
                 start_new_session=True,
             )
         except OSError as e:
@@ -130,7 +132,22 @@ def wait_and_report(proc: subprocess.Popen, log: Path, tail: int) -> int:
     return status
 
 
-def start_problem(program: str, cwd: str | None) -> str | None:
+def caller_env() -> dict[str, str]:
+    """bgrun's environment without what uv added to run bgrun itself: its own environment as VIRTUAL_ENV,
+    and that environment's bin first on PATH. Left in, every `uv run` in CMD warns that VIRTUAL_ENV doesn't
+    match its project, and a bare `python` in CMD is bgrun's."""
+    env = dict(os.environ)
+    if env.get("VIRTUAL_ENV") == sys.prefix:
+        del env["VIRTUAL_ENV"]
+    if "PATH" in env:
+        own_bin = os.path.join(sys.prefix, "bin")
+        env["PATH"] = os.pathsep.join(
+            p for p in env["PATH"].split(os.pathsep) if p != own_bin
+        )
+    return env
+
+
+def start_problem(program: str, cwd: str | None, env: dict[str, str]) -> str | None:
     """Why CMD can't start, checked before LOG is opened so a failed start leaves LOG alone."""
     if cwd is not None and not Path(cwd).is_dir():
         return f"-C {cwd!r} is not a directory"
@@ -138,7 +155,7 @@ def start_problem(program: str, cwd: str | None) -> str | None:
         path = Path(cwd or ".") / program  # Popen resolves a relative path against cwd
         if not (path.is_file() and os.access(path, os.X_OK)):
             return f"can't start {program!r}: not an executable file"
-    elif shutil.which(program) is None:
+    elif shutil.which(program, path=env.get("PATH")) is None:
         return f"can't start {program!r}: not found on PATH"
     return None
 

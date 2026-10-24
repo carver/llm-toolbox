@@ -280,3 +280,17 @@ def test_tail_must_be_non_negative_and_comes_with_wait(tmp_path, args):
     result = bgrun(*args, "-o", str(tmp_path / "out.log"), "--", "true")
 
     assert result.returncode == 2
+
+
+def test_the_command_gets_the_callers_path_not_bgruns_own_environment(
+    tmp_path, started
+):
+    log = tmp_path / "env.log"
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    out = subprocess.run(
+        [str(SCRIPT), "-o", str(log), "--", "sh", "-c", 'echo "VE=${VIRTUAL_ENV-unset}"; echo "PATH=$PATH"; echo end'],
+        text=True, capture_output=True, check=False, env=env,
+    )  # fmt: skip
+    started.append(int(out.stdout.split()[0]))
+    content = wait_for(log, "end")
+    assert "VE=unset" in content and f"PATH={env['PATH']}\n" in content

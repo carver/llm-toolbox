@@ -98,7 +98,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `--wait` then waits for CMD, prints its exit status and LOG's last lines
   (`--tail N`, default 10) and exits with CMD's status: run it as an agent's
   background job to get one notification when CMD ends, while CMD survives if
-  the waiting bgrun is killed.
+  the waiting bgrun is killed. CMD gets the caller's environment, without the
+  `VIRTUAL_ENV` and PATH entry of the uv environment bgrun itself runs in (a
+  `VIRTUAL_ENV` the caller had set is gone too: uv replaced it first).
 - **apply-edits**: replaces old text with new across files, all or nothing,
   from Aider-style `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` blocks
   under `--- PATH` lines on stdin (bare markers and Aider's bare path lines

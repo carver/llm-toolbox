@@ -2311,7 +2311,9 @@ def test_bib_prints_a_dois_entry_keyed_by_family_name_and_year(cache, capsys):
 
 
 def test_bib_of_an_arxiv_id_asks_doi_org_for_its_datacite_doi(cache, capsys):
-    http = FakeHTTP(bib_route("10.48550/arXiv.1706.03762", ATTENTION_BIB))
+    http = FakeHTTP(
+        *NO_VERSION_OF_RECORD, bib_route("10.48550/arXiv.1706.03762", ATTENTION_BIB)
+    )
     code, out, err, _ = run(capsys, ["bib", "https://arxiv.org/abs/1706.03762v5"], http)
     assert code == 0, err
     first, *rest = out.splitlines()
@@ -2344,6 +2346,12 @@ SIMILARITY_LATEST = (
     ("Caspar Oesterheld", "Johannes Treutlein", "Roger Grosse"),
 )
 ATTENTION_BIB_ROUTE = bib_route("10.48550/arXiv.1706.03762", ATTENTION_BIB)
+# Neither Semantic Scholar (single lookups or a batch) nor OpenAlex knows the paper.
+NO_VERSION_OF_RECORD = (
+    S2_DOESNT_KNOW,
+    batch_route(lambda call: ok([None] * len(call["json"]["ids"]))),
+    OPENALEX_HAS_NOTHING,
+)
 
 
 def arxiv_route(*entries):
@@ -2351,7 +2359,9 @@ def arxiv_route(*entries):
 
 
 def test_bib_of_an_arxiv_preprint_gives_its_latest_version(cache, capsys):
-    http = FakeHTTP(ATTENTION_BIB_ROUTE, arxiv_route(ATTENTION_LATEST))
+    http = FakeHTTP(
+        *NO_VERSION_OF_RECORD, ATTENTION_BIB_ROUTE, arxiv_route(ATTENTION_LATEST)
+    )
     code, out, err, _ = run(capsys, ["bib", "1706.03762v5"], http)
     assert code == 0, err
     assert out == (
@@ -2371,6 +2381,7 @@ def test_bib_of_an_arxiv_preprint_gives_its_latest_version(cache, capsys):
 
 def test_bib_takes_title_and_authors_from_arxivs_latest_version(cache, capsys):
     http = FakeHTTP(
+        *NO_VERSION_OF_RECORD,
         bib_route("10.48550/arXiv.2211.14468", SIMILARITY_V1_BIB),
         arxiv_route(SIMILARITY_LATEST),
     )
@@ -2399,6 +2410,7 @@ def test_bib_keeps_datacites_names_and_writes_a_name_it_cant_split_as_arxiv_has_
         ("Yoshua Bengio", "Yann Le Cun", "Geoffrey Hinton"),
     )
     http = FakeHTTP(
+        *NO_VERSION_OF_RECORD,
         bib_route("10.48550/arXiv.2211.14468", datacite),
         arxiv_route(latest),
     )
@@ -2410,6 +2422,7 @@ def test_bib_keeps_datacites_names_and_writes_a_name_it_cant_split_as_arxiv_has_
 
 def test_bib_asks_arxiv_once_for_every_preprint_in_the_call(cache, capsys):
     http = FakeHTTP(
+        *NO_VERSION_OF_RECORD,
         ATTENTION_BIB_ROUTE,
         bib_route("10.48550/arXiv.2211.14468", SIMILARITY_V1_BIB),
         arxiv_route(ATTENTION_LATEST, SIMILARITY_LATEST),
@@ -2422,7 +2435,9 @@ def test_bib_asks_arxiv_once_for_every_preprint_in_the_call(cache, capsys):
 
 
 def test_bib_takes_an_arxiv_doi_as_its_arxiv_id(cache, capsys):
-    http = FakeHTTP(ATTENTION_BIB_ROUTE, arxiv_route(ATTENTION_LATEST))
+    http = FakeHTTP(
+        *NO_VERSION_OF_RECORD, ATTENTION_BIB_ROUTE, arxiv_route(ATTENTION_LATEST)
+    )
     code, out, err, _ = run(capsys, ["bib", "10.48550/arXiv.1706.03762"], http)
     assert code == 0, err
     assert "  version = {7}\n" in out
@@ -2439,7 +2454,11 @@ def test_bib_takes_an_arxiv_doi_as_its_arxiv_id(cache, capsys):
 def test_bib_without_arxivs_latest_version_prints_datacites_entry_and_warns(
     cache, capsys, answer, warning
 ):
-    http = FakeHTTP(ATTENTION_BIB_ROUTE, ("GET", "export.arxiv.org", [answer]))
+    http = FakeHTTP(
+        *NO_VERSION_OF_RECORD,
+        ATTENTION_BIB_ROUTE,
+        ("GET", "export.arxiv.org", [answer]),
+    )
     code, out, err, _ = run(capsys, ["bib", "1706.03762"], http)
     assert code == 0, err
     assert out.splitlines() == [
@@ -2455,11 +2474,377 @@ def test_arxiv_versions_cached_without_title_and_authors_are_fetched_again(
     old = {"version": 7, "submitted": "2017-06-12", "updated": "2023-08-02"}
     (cache / "arxiv").mkdir(parents=True)
     (cache / "arxiv" / "1706.03762.json").write_text(json.dumps(old))
-    http = FakeHTTP(ATTENTION_BIB_ROUTE, arxiv_route(ATTENTION_LATEST))
+    http = FakeHTTP(
+        *NO_VERSION_OF_RECORD, ATTENTION_BIB_ROUTE, arxiv_route(ATTENTION_LATEST)
+    )
     code, out, err, _ = run(capsys, ["bib", "1706.03762"], http)
     assert code == 0, err
     assert len(arxiv_calls(http)) == 1
     assert "  version = {7}\n" in out
+
+
+# bib: an arXiv paper's version of record first
+
+S2_SIMILARITY = {  # Semantic Scholar knows the venue but no DOI
+    "paperId": "435dbef1d60cf2bf282b2b139703fd1609ad0a81",
+    "title": "Similarity-based cooperative equilibrium",
+    "year": 2022,
+    "venue": "Neural Information Processing Systems",
+    "citationCount": 9,
+    "externalIds": {"ArXiv": "2211.14468", "DBLP": "conf/nips/OesterheldTGCF23"},
+    "authors": [{"name": "Caspar Oesterheld"}],
+}
+NEURIPS_DOI = "10.52202/075280-1063"
+OA_SIMILARITY = {
+    "id": "https://openalex.org/W4310000000",
+    "doi": "https://doi.org/10.52202/075280-1063",
+    "display_name": "Similarity-based cooperative equilibrium",
+    "type": "conference-paper",
+    "primary_location": {
+        "source": {
+            "display_name": "neural information processing systems",
+            "type": "conference",
+        },
+        "landing_page_url": "https://doi.org/10.52202/075280-1063",
+        "version": "publishedVersion",
+    },
+}
+OA_ATTENTION_REDEPOSIT = {  # OpenAlex's doi for 1706.03762: a 2025 re-deposit
+    "id": "https://openalex.org/W2626778328",
+    "doi": "https://doi.org/10.65215/2q58a426",
+    "display_name": "Attention Is All You Need",
+    "type": "preprint",
+    "primary_location": {
+        "source": None,
+        "landing_page_url": "https://doi.org/10.65215/2q58a426",
+        "version": "acceptedVersion",
+    },
+}
+NEURIPS_BIB = (
+    " @inproceedings{Oesterheld_2023, series={NeurIPS 2023},"
+    " title={Similarity-based cooperative equilibrium},"
+    " DOI={10.52202/075280-1063}, author={Oesterheld, Caspar and Treutlein,"
+    " Johannes}, year={2023}, pages={24434–24465}, collection={NeurIPS 2023} }"
+)
+S2_SIMILARITY_ROUTE = ("GET", "/paper/arXiv:2211.14468", [ok(S2_SIMILARITY)])
+OA_SIMILARITY_ROUTE = (
+    "GET",
+    "api.openalex.org/works/doi:10.48550/arXiv.2211.14468",
+    [ok(OA_SIMILARITY)],
+)
+NEURIPS_BIB_ROUTE = bib_route(NEURIPS_DOI, NEURIPS_BIB)
+SIMILARITY_LATEST_ROUTE = arxiv_route(SIMILARITY_LATEST)
+SIMILARITY_PREPRINT_ROUTES = (
+    bib_route("10.48550/arXiv.2211.14468", SIMILARITY_V1_BIB),
+    SIMILARITY_LATEST_ROUTE,
+)
+PUBLISHED_NOTE = (
+    "paper: 2211.14468 was published as 10.52202/075280-1063"
+    " (neural information processing systems); printed that."
+    " --preprint prints the arXiv entry.\n"
+)
+
+
+def test_bib_prints_the_version_of_record_openalex_has_for_an_arxiv_id(cache, capsys):
+    http = FakeHTTP(
+        S2_SIMILARITY_ROUTE,
+        OA_SIMILARITY_ROUTE,
+        NEURIPS_BIB_ROUTE,
+        SIMILARITY_LATEST_ROUTE,
+    )
+    code, out, err, _ = run(capsys, ["bib", "2211.14468v1"], http)
+    assert code == 0, err
+    assert out == (
+        "@inproceedings{oesterheld2023, series={NeurIPS 2023},"
+        " title={Similarity-based cooperative equilibrium},"
+        " DOI={10.52202/075280-1063}, author={Oesterheld, Caspar and Treutlein,"
+        " Johannes}, year={2023}, pages={24434–24465}, collection={NeurIPS 2023},"
+        " eprint={2211.14468}, archiveprefix={arXiv} }\n"
+    )
+    assert err == PUBLISHED_NOTE
+    assert [c["url"] for c in calls_to(http, "doi.org/")] == [
+        "https://doi.org/10.52202/075280-1063"
+    ]
+
+
+def test_bib_takes_semantic_scholars_doi_for_a_published_arxiv_paper(cache, capsys):
+    published = dict(
+        S2_SIMILARITY,
+        venue="Advances in Neural Information Processing Systems",
+        externalIds={"ArXiv": "2211.14468", "DOI": NEURIPS_DOI},
+    )
+    http = FakeHTTP(
+        ("GET", "/paper/arXiv:2211.14468", [ok(published)]),
+        NEURIPS_BIB_ROUTE,
+        SIMILARITY_LATEST_ROUTE,
+    )
+    code, out, err, _ = run(capsys, ["bib", "2211.14468"], http)
+    assert code == 0, err
+    assert out.startswith("@inproceedings{oesterheld2023,")
+    assert "(Advances in Neural Information Processing Systems)" in err
+    assert openalex_calls(http) == []
+
+
+def test_bib_passes_over_a_doi_that_isnt_a_published_version(cache, capsys):
+    http = FakeHTTP(
+        ("GET", "/paper/arXiv:1706.03762", [ok(dict(ATTENTION, externalIds={}))]),
+        ("GET", "api.openalex.org", [ok(OA_ATTENTION_REDEPOSIT)]),
+        ATTENTION_BIB_ROUTE,
+        arxiv_route(ATTENTION_LATEST),
+    )
+    code, out, err, _ = run(capsys, ["bib", "1706.03762"], http)
+    assert code == 0, err
+    assert out.startswith("@misc{vaswani2017,") and "  version = {7}\n" in out
+    assert "10.65215" not in out + err
+    assert [c["url"] for c in calls_to(http, "doi.org/")] == [
+        "https://doi.org/10.48550/arXiv.1706.03762"
+    ]
+
+
+def test_preprint_prints_the_arxiv_entry_without_looking_for_a_published_one(
+    cache, capsys
+):
+    http = FakeHTTP(
+        bib_route("10.48550/arXiv.2211.14468", SIMILARITY_V1_BIB),
+        arxiv_route(SIMILARITY_LATEST),
+    )
+    code, out, err, _ = run(capsys, ["bib", "--preprint", "2211.14468"], http)
+    assert code == 0, err
+    assert out.startswith("@misc{oesterheld2022,") and "version = {2}" in out
+    assert s2_calls(http) == [] and openalex_calls(http) == []
+
+
+@pytest.mark.parametrize(
+    "s2", [S2_DOESNT_KNOW, S2_DOWN], ids=["s2-doesnt-know", "s2-gives-up"]
+)
+def test_bib_asks_openalex_for_a_published_version_without_semantic_scholar(
+    cache, capsys, s2
+):
+    http = FakeHTTP(s2, OA_SIMILARITY_ROUTE, NEURIPS_BIB_ROUTE, SIMILARITY_LATEST_ROUTE)
+    code, out, err, _ = run(capsys, ["bib", "2211.14468"], http)
+    assert code == 0, err
+    assert out.startswith("@inproceedings{oesterheld2023,")
+    assert PUBLISHED_NOTE in err
+
+
+def test_bib_looks_up_published_versions_in_one_semantic_scholar_batch(cache, capsys):
+    http = FakeHTTP(
+        batch_route(ok([S2_SIMILARITY, dict(ATTENTION, externalIds={})])),
+        OA_SIMILARITY_ROUTE,
+        ("GET", "api.openalex.org/works/doi:10.48550/arXiv.1706", [ok(OA_ATTENTION)]),
+        NEURIPS_BIB_ROUTE,
+        ATTENTION_BIB_ROUTE,
+        arxiv_route(SIMILARITY_LATEST, ATTENTION_LATEST),
+    )
+    code, out, err, _ = run(capsys, ["bib", "2211.14468", "1706.03762"], http)
+    assert code == 0, err
+    assert [c["method"] for c in s2_calls(http)] == ["POST"]
+    keys = [entry.split(",", 1)[0] for entry in out.split("\n\n")]
+    assert keys == ["@inproceedings{oesterheld2023", "@misc{vaswani2017"]
+    (call,) = arxiv_calls(http)
+    assert call["params"]["id_list"] == "2211.14468,1706.03762"
+
+
+def test_a_published_version_without_bibtex_falls_back_to_the_arxiv_entry(
+    cache, capsys
+):
+    http = FakeHTTP(
+        S2_SIMILARITY_ROUTE,
+        OA_SIMILARITY_ROUTE,
+        ("GET", "https://doi.org/10.52202", [DOI_NOT_FOUND]),
+        bib_route("10.48550/arXiv.2211.14468", SIMILARITY_V1_BIB),
+        arxiv_route(SIMILARITY_LATEST),
+    )
+    code, out, err, _ = run(capsys, ["bib", "2211.14468"], http)
+    assert code == 0, err
+    assert out.startswith("@misc{oesterheld2022,") and "version = {2}" in out
+    assert "10.52202/075280-1063" in err and "printed the arXiv entry" in err
+
+
+def test_a_failed_lookup_stops_bib_after_the_entries_before_it(cache, capsys):
+    http = FakeHTTP(
+        bib_route(NASH_DOI, NASH_BIB),
+        S2_DOESNT_KNOW,
+        OPENALEX_FAILS,
+    )
+    code, out, err, _ = run(capsys, ["bib", NASH_DOI, "2211.14468"], http)
+    assert code == 3
+    assert out.startswith("@article{nash1951,")
+    assert "OpenAlex" in err
+    assert "while looking for 2211.14468's version of record" in err
+    assert "--preprint skips this" in err
+
+
+def test_openalex_doi_counts_only_from_its_own_published_page(cache, capsys):
+    proceedings = {
+        "source": {
+            "display_name": "Neural Information Processing Systems",
+            "type": "conference",
+        },
+        "landing_page_url": "https://proceedings.neurips.cc/paper/2017/hash/3f5ee.html",
+        "version": "publishedVersion",
+    }
+    work = dict(OA_ATTENTION_REDEPOSIT, primary_location=proceedings, locations=[])
+    http = FakeHTTP(
+        ("GET", "/paper/arXiv:1706.03762", [ok(dict(ATTENTION, externalIds={}))]),
+        ("GET", "api.openalex.org", [ok(work)]),
+        ATTENTION_BIB_ROUTE,
+        arxiv_route(ATTENTION_LATEST),
+    )
+    code, out, err, _ = run(capsys, ["bib", "1706.03762"], http)
+    assert code == 0, err
+    assert out.startswith("@misc{vaswani2017,")
+    assert "10.65215" not in out + err
+
+
+def test_openalex_doi_counts_from_any_location_that_is_its_page(cache, capsys):
+    arxiv_page = {
+        "source": {"display_name": "arXiv (Cornell University)", "type": "repository"},
+        "landing_page_url": "http://arxiv.org/abs/2211.14468",
+        "version": "submittedVersion",
+    }
+    doi_page = dict(
+        OA_SIMILARITY["primary_location"],
+        landing_page_url="HTTPS://DOI.ORG/10.52202/075280-1063",
+    )
+    work = dict(OA_SIMILARITY, primary_location=arxiv_page, locations=[doi_page])
+    http = FakeHTTP(
+        S2_SIMILARITY_ROUTE,
+        ("GET", "api.openalex.org", [ok(work)]),
+        NEURIPS_BIB_ROUTE,
+        SIMILARITY_LATEST_ROUTE,
+    )
+    code, out, err, _ = run(capsys, ["bib", "2211.14468"], http)
+    assert code == 0, err
+    assert out.startswith("@inproceedings{oesterheld2023,")
+    assert err == PUBLISHED_NOTE
+
+
+@pytest.mark.parametrize("kind", [None, "book series"])
+def test_openalex_doi_counts_only_at_a_journal_or_conference(cache, capsys, kind):
+    location = dict(
+        OA_SIMILARITY["primary_location"],
+        source={"display_name": "Some Source", "type": kind},
+    )
+    http = FakeHTTP(
+        S2_SIMILARITY_ROUTE,
+        (
+            "GET",
+            "api.openalex.org",
+            [ok(dict(OA_SIMILARITY, primary_location=location))],
+        ),
+        *SIMILARITY_PREPRINT_ROUTES,
+    )
+    code, out, err, _ = run(capsys, ["bib", "2211.14468"], http)
+    assert code == 0, err
+    assert out.startswith("@misc{oesterheld2022,")
+
+
+def test_semantic_scholars_doi_doesnt_count_at_an_arxiv_venue(cache, capsys):
+    junk = dict(
+        S2_SIMILARITY,
+        venue="arXiv.org",
+        externalIds={"ArXiv": "2211.14468", "DOI": "10.65215/2q58a426"},
+    )
+    http = FakeHTTP(
+        ("GET", "/paper/arXiv:2211.14468", [ok(junk)]),
+        OPENALEX_HAS_NOTHING,
+        *SIMILARITY_PREPRINT_ROUTES,
+    )
+    code, out, err, _ = run(capsys, ["bib", "2211.14468"], http)
+    assert code == 0, err
+    assert out.startswith("@misc{oesterheld2022,")
+    assert "10.65215" not in out + err
+
+
+@pytest.mark.parametrize(
+    "entry, why",
+    [
+        (
+            (
+                "@article{X, title={Something Else}, author={Oesterheld, Caspar},"
+                " year={2023}}"
+            ),
+            "its title \"Something Else\" isn't arXiv's",
+        ),
+        (
+            (
+                "@article{X, title={Similarity-Based  Cooperative Equilibrium},"
+                " author={Smith, Jane and Oesterheld, Caspar}, year={2023}}"
+            ),
+            "its first author Smith isn't arXiv's Oesterheld",
+        ),
+    ],
+    ids=["title", "first-author"],
+)
+def test_a_version_of_record_unlike_arxivs_latest_version_is_rejected(
+    cache, capsys, entry, why
+):
+    record = dict(
+        S2_SIMILARITY,
+        venue="Journal X",
+        externalIds={"ArXiv": "2211.14468", "DOI": "10.1000/other"},
+    )
+    http = FakeHTTP(
+        ("GET", "/paper/arXiv:2211.14468", [ok(record)]),
+        bib_route("10.1000/other", entry),
+        *SIMILARITY_PREPRINT_ROUTES,
+    )
+    code, out, err, _ = run(capsys, ["bib", "2211.14468"], http)
+    assert code == 0, err
+    assert out.startswith("@misc{oesterheld2022,")
+    assert "rejected 10.1000/other as its version of record" in err
+    assert why in err
+
+
+def test_bib_looks_for_a_version_of_record_again_after_a_week(cache, capsys):
+    preprint = dict(
+        OA_SIMILARITY,
+        doi="https://doi.org/10.48550/arxiv.2211.14468",
+        type="preprint",
+        primary_location={"source": None, "version": "submittedVersion"},
+    )
+    first = FakeHTTP(
+        S2_SIMILARITY_ROUTE,
+        ("GET", "api.openalex.org", [ok(preprint)]),
+        *SIMILARITY_PREPRINT_ROUTES,
+    )
+    assert run(capsys, ["bib", "2211.14468"], first)[1].startswith("@misc{")
+    soon = FakeHTTP(*SIMILARITY_PREPRINT_ROUTES)
+    assert run(capsys, ["bib", "2211.14468"], soon)[1].startswith("@misc{")
+    assert s2_calls(soon) == openalex_calls(soon) == []
+    eight_days_ago = time.time() - 8 * 24 * 3600
+    for f in [*(cache / "s2").glob("*.json"), *(cache / "openalex").glob("*.json")]:
+        os.utime(f, (eight_days_ago, eight_days_ago))
+    later = FakeHTTP(
+        S2_SIMILARITY_ROUTE,
+        OA_SIMILARITY_ROUTE,
+        NEURIPS_BIB_ROUTE,
+        SIMILARITY_LATEST_ROUTE,
+    )
+    code, out, err, _ = run(capsys, ["bib", "2211.14468"], later)
+    assert code == 0, err
+    assert out.startswith("@inproceedings{oesterheld2023,")
+
+
+def test_meta_still_answers_from_a_cache_older_than_a_week(cache, capsys):
+    http = FakeHTTP(("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]))
+    run(capsys, ["meta", "1706.03762"], http)
+    month_ago = time.time() - 30 * 24 * 3600
+    for f in (cache / "s2").glob("*.json"):
+        os.utime(f, (month_ago, month_ago))
+    again = FakeHTTP()
+    code, out, err, _ = run(capsys, ["meta", "1706.03762"], again)
+    assert code == 0, err
+    assert out.startswith("Attention is All you Need\n")
+    assert s2_calls(again) == []
+
+
+def test_help_says_bib_prints_the_published_version_first(capsys):
+    with pytest.raises(SystemExit):
+        paper.main(["-h"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "version of record" in out and "--preprint" in out
 
 
 def test_help_says_an_arxiv_entry_follows_the_latest_version(capsys):

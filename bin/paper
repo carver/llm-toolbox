@@ -30,12 +30,21 @@ bib prints a BibTeX entry per DOI or arXiv id, a blank line between entries,
 from doi.org's content negotiation: Crossref's or DataCite's record as it
 comes, but keyed by the first author's family name in ASCII letters and the
 year (nash1951), with a, b, ... on keys that clash within the call
-(kreps1982a, kreps1982b). An arXiv id (or arXiv DOI) goes through its
-DataCite DOI (10.48550/arXiv.ID); its key keeps the first version's year, but
-its title and authors follow arXiv's latest version, from the arXiv API as
-meta's dates do, and a version = {N} field and a line on stderr say which
-version that is. A DOI whose registration agency serves no BibTeX says so,
-and exits 1 like one doi.org doesn't know, after printing the rest.
+(kreps1982a, kreps1982b). For an arXiv id (or arXiv DOI), bib first looks
+for the paper's version of record: a DOI that isn't arXiv's in Semantic
+Scholar's record, when it names a venue that isn't arXiv, else in OpenAlex's,
+when OpenAlex lists that DOI's own page as the published version at a
+journal or conference. It prints that DOI's entry, keyed by its own year,
+with eprint and archiveprefix fields for the arXiv id, and says so on
+stderr, unless the entry's title or first author isn't arXiv's latest
+version's: then it says which DOI it rejected and why. It looks again once
+the records it read are a week old. --preprint skips the lookup.
+Otherwise the entry comes through the paper's DataCite DOI
+(10.48550/arXiv.ID); its key keeps the first version's year, but its title
+and authors follow arXiv's latest version, from the arXiv API as meta's dates
+do, and a version = {N} field and a line on stderr say which version that
+is. A DOI whose registration agency serves no BibTeX says so, and exits 1
+like one doi.org doesn't know, after printing the rest.
 
 cites lists papers citing ID (default 20), search the top matches for a
 keyword query (default 10), each with year, title, venue, first three authors
@@ -178,6 +187,8 @@ KEY_ENV = "S2_API_KEY"
 KEY_FILE = Path("/home/carver/code/claudedev/.semantic-scholar/api-key")
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_TTL = 24 * 3600  # seconds; arXiv's latest versions are refetched after a day
+# seconds; bib looks for an arXiv paper's version of record again after a week
+VERSION_OF_RECORD_TTL = 7 * 24 * 3600
 ATOM = "{http://www.w3.org/2005/Atom}"
 TIMEOUT = 30
 ATTEMPTS = 6
@@ -302,7 +313,7 @@ class ArxivId(PaperId):
     def s2_id(self) -> str:
         return "arXiv:" + self.unversioned()
 
-    def openalex_path(self) -> str | None:
+    def openalex_path(self) -> str:
         return "/works/doi:10.48550/arXiv." + self.unversioned()
 
     def doi(self) -> str:
@@ -549,13 +560,18 @@ class Client:
         return find_api_key()
 
     def s2(
-        self, path: str, params: dict[str, Any], require: str | None = None
+        self,
+        path: str,
+        params: dict[str, Any],
+        require: str | None = None,
+        max_age: float | None = None,
     ) -> dict[str, Any]:
-        """A Semantic Scholar response's JSON, from the cache when it's there.
+        """A Semantic Scholar response's JSON, from the cache when it's there (and,
+        given `max_age`, younger than that many seconds).
 
         The answer must be an object, holding the key `require` if given."""
         cached = self.s2_cache_file(path, params)
-        if cached.exists():
+        if fresh(cached, max_age):
             return json.loads(cached.read_text(encoding="utf-8"))
         response = self.s2_request("GET", path, params)
         data = json_object("Semantic Scholar", response, require)
@@ -645,15 +661,19 @@ class Client:
     def openalex_key(self) -> ApiKey | None:
         return find_openalex_key()
 
-    def openalex(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        """An OpenAlex response's JSON, from the cache when it's there. The cache key
-        leaves out the mailto and the API key."""
+    def openalex(
+        self, path: str, params: dict[str, Any], max_age: float | None = None
+    ) -> dict[str, Any]:
+        """An OpenAlex response's JSON, from the cache when it's there (and, given
+        `max_age`, younger than that many seconds). The cache key leaves out the mailto
+        and the API key."""
         url = OPENALEX + path
         return self.json_answer(
             "OpenAlex",
             url,
             self.cache_file("openalex", url, params),
             lambda: self.openalex_request(url, params),
+            max_age=max_age,
         )
 
     def crossref(self, path: str) -> dict[str, Any]:
@@ -676,11 +696,13 @@ class Client:
         cached: Path,
         ask: Callable[[], Response],
         sound: Callable[[dict[str, Any]], bool] = lambda answer: True,
+        max_age: float | None = None,
     ) -> dict[str, Any]:
-        """`service`'s JSON object for `url`, from the file `cached` when it's there,
-        else from `ask` and written there. A 404 is NotFound; any other status, or an
-        answer that isn't a JSON object or isn't `sound`, is a RemoteError."""
-        if cached.exists():
+        """`service`'s JSON object for `url`, from the file `cached` when it's there
+        (and younger than `max_age` seconds, if given), else from `ask` and written
+        there. A 404 is NotFound; any other status, or an answer that isn't a JSON
+        object or isn't `sound`, is a RemoteError."""
+        if fresh(cached, max_age):
             return json.loads(cached.read_text(encoding="utf-8"))
         response = ask()
         if response.status == 404:
@@ -993,6 +1015,15 @@ def error_text(response: Response) -> str:
     if isinstance(data, dict):
         return str(data.get("message") or data.get("error") or data)
     return str(data)[:200]
+
+
+def fresh(path: Path, max_age: float | None) -> bool:
+    """Whether the cached file at `path` exists and, given `max_age`, is younger."""
+    try:
+        age = time.time() - path.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    return max_age is None or age < max_age
 
 
 @contextmanager
@@ -1327,17 +1358,22 @@ def meta_paper(client: Client, pid: PaperId, unknown: bool) -> Paper:
         return from_openalex_or_crossref(client, pid, S2DoesntKnow())
 
 
-def prefetch_batch(client: Client, pids: list[PaperId]) -> set[str]:
-    """Fetches, in batches of BATCH_MAX, every id that misses the cache, when two or
-    more do, so the single lookups that follow find them cached. Returns the s2_ids
-    Semantic Scholar doesn't know. Once a batch fails in any way (gives up, is refused,
-    sends something unexpected), its ids and the rest are left to those lookups, which
-    fail the old way if they must; what earlier batches found is kept."""
+def prefetch_batch(
+    client: Client, pids: Sequence[PaperId], max_age: float | None = None
+) -> set[str]:
+    """Fetches, in batches of BATCH_MAX, every id that misses the cache (or, given
+    `max_age`, is cached longer ago than that), when two or more do, so the single
+    lookups that follow find them cached. Returns the s2_ids Semantic Scholar doesn't
+    know. Once a batch fails in any way (gives up, is refused, sends something
+    unexpected), its ids and the rest are left to those lookups, which fail the old
+    way if they must; what earlier batches found is kept."""
     misses = list(
         {
             pid.s2_id(): pid
             for pid in pids
-            if not client.s2_cache_file(pid.s2_path(), {"fields": META_FIELDS}).exists()
+            if not fresh(
+                client.s2_cache_file(pid.s2_path(), {"fields": META_FIELDS}), max_age
+            )
         }.values()
     )
     unknown: set[str] = set()
@@ -1838,28 +1874,30 @@ def sweep_line(row: dict[str, str]) -> str:
 
 def cmd_bib(client: Client, args: argparse.Namespace) -> int:
     """A BibTeX entry per id, keyed lastnameYEAR, a blank line between entries. An
-    arXiv entry follows arXiv's latest version."""
-    pids = [arxiv_form(parse_id(text)) for text in args.ids]
+    arXiv paper's entry is its version of record's, unless --preprint, else the arXiv
+    entry at arXiv's latest version."""
+    asked = [BibId(text, arxiv_form(parse_id(text))) for text in args.ids]
     try:
-        dois = [pid.doi() for pid in pids]  # every id checked before any request
+        for one in asked:
+            one.pid.doi()  # every id checked before any request
     except UsageError as e:
         raise UsageError(f"`paper bib` {e}") from e
-    arxiv_ids = [pid.unversioned() for pid in pids if isinstance(pid, ArxivId)]
-    latest = latest_versions(client, arxiv_ids)
+    failure = None
+    if not args.preprint:
+        asked, failure = look_for_versions_of_record(client, asked)
+    latest = latest_versions(
+        client, [one.arxiv.unversioned() for one in asked if one.arxiv]
+    )
     code = OK
     entries = []
-    failure = None
-    for text, pid, doi in zip(args.ids, pids, dois):
+    for one in asked:
         try:
-            entry = client.bibtex(doi)
-            if isinstance(pid, ArxivId) and (now := latest.get(pid.unversioned())):
-                entry = at_latest_version(entry, pid.unversioned(), now)
-            entries.append(entry)
+            entries.append(bib_entry(client, one, latest))
         except NotFound:
-            print(f"paper: not found: {text}", file=sys.stderr)
+            print(f"paper: not found: {one.text}", file=sys.stderr)
             code = NOT_FOUND
         except NoBibtex as e:
-            print(f"paper: no BibTeX for {text}: {e}", file=sys.stderr)
+            print(f"paper: no BibTeX for {one.text}: {e}", file=sys.stderr)
             code = NOT_FOUND
         except RemoteError as e:
             failure = e  # print what was fetched first, then report it
@@ -1869,6 +1907,174 @@ def cmd_bib(client: Client, args: argparse.Namespace) -> int:
     if failure:
         raise failure
     return code
+
+
+@dataclass(frozen=True)
+class Published:
+    """An arXiv paper's version of record."""
+
+    doi: str
+    venue: str
+
+
+@dataclass
+class BibId:
+    """An id given to bib: as written, as parsed, and, for an arXiv paper, its version
+    of record once one is found."""
+
+    text: str
+    pid: PaperId
+    published: Published | None = None
+
+    @property
+    def arxiv(self) -> "ArxivId | None":
+        return self.pid if isinstance(self.pid, ArxivId) else None
+
+
+def look_for_versions_of_record(
+    client: Client, asked: list[BibId]
+) -> tuple[list[BibId], RemoteError | None]:
+    """Sets each arXiv paper's version of record, asking Semantic Scholar for them all
+    in one batch first. On a remote failure, returns the ids before the one it failed
+    on, whose entries print first, and the failure; else every id and None."""
+    papers = [one.arxiv for one in asked if one.arxiv]
+    unknown = prefetch_batch(client, papers, VERSION_OF_RECORD_TTL)
+    for i, one in enumerate(asked):
+        if not one.arxiv:
+            continue
+        try:
+            one.published = version_of_record(
+                client, one.arxiv, one.arxiv.s2_id() in unknown
+            )
+        except RemoteError as e:
+            return asked[:i], RemoteError(
+                f"{e} (while looking for {one.arxiv.unversioned()}'s version of"
+                " record; --preprint skips this)"
+            )
+    return asked, None
+
+
+def version_of_record(
+    client: Client, pid: "ArxivId", unknown: bool
+) -> Published | None:
+    """The arXiv paper's version of record, if it has one: from Semantic Scholar's
+    record, else from OpenAlex's (`unknown` says the batch found Semantic Scholar
+    doesn't know the paper). Both are read from the cache only when under
+    VERSION_OF_RECORD_TTL old."""
+    gave_up = None
+    if not unknown:
+        try:
+            paper = client.s2(
+                pid.s2_path(),
+                {"fields": META_FIELDS},
+                require="paperId",
+                max_age=VERSION_OF_RECORD_TTL,
+            )
+        except NotFound:
+            pass
+        except GaveUp as e:
+            gave_up = e
+        else:
+            if found := published_in_s2(paper):
+                return found
+    try:
+        work = client.openalex(pid.openalex_path(), {}, max_age=VERSION_OF_RECORD_TTL)
+    except NotFound:
+        return None
+    if gave_up:
+        client.note_fallback(gave_up, "OpenAlex")
+    return published_in_openalex(work)
+
+
+def published_in_s2(paper: Paper) -> Published | None:
+    """The version of record in a Semantic Scholar record: its DOI when that isn't an
+    arXiv DOI and the record names a venue that isn't arXiv."""
+    doi = (paper.get("externalIds") or {}).get("DOI")
+    venue = paper.get("venue") or ""
+    if doi and not ARXIV_DOI.fullmatch(doi) and venue and "arxiv" not in venue.lower():
+        return Published(doi, venue)
+    return None
+
+
+def published_in_openalex(work: dict[str, Any]) -> Published | None:
+    """The version of record in an OpenAlex work: its DOI when that isn't an arXiv DOI
+    and the work lists the DOI's own page as the published version at a journal or
+    conference. That leaves out the re-deposits OpenAlex sometimes lists, such as a
+    2025 DOI for 1706.03762."""
+    doi = (work.get("doi") or "").removeprefix(DOI_ORG)
+    if not doi or ARXIV_DOI.fullmatch(doi):
+        return None
+    for place in [work.get("primary_location"), *(work.get("locations") or [])]:
+        place = place or {}
+        source = place.get("source") or {}
+        if (
+            (place.get("landing_page_url") or "").lower() == (DOI_ORG + doi).lower()
+            and place.get("version") == "publishedVersion"
+            and source.get("type") in ("journal", "conference")
+            and source.get("display_name")
+        ):
+            return Published(doi, source["display_name"])
+    return None
+
+
+def bib_entry(client: Client, one: BibId, latest: dict[str, ArxivVersion]) -> str:
+    """The id's BibTeX entry. For an arXiv paper: its version of record's, when there
+    is one doi.org has BibTeX for and it matches arXiv's latest version (`latest`, by
+    id), else the arXiv entry at that version."""
+    if not one.arxiv:
+        return client.bibtex(one.pid.doi())
+    aid = one.arxiv.unversioned()
+    now = latest.get(aid)
+    if one.published and (entry := published_entry(client, aid, one.published, now)):
+        return entry
+    entry = client.bibtex(one.arxiv.doi())
+    return at_latest_version(entry, aid, now) if now else entry
+
+
+def published_entry(
+    client: Client, aid: str, published: Published, now: ArxivVersion | None
+) -> str | None:
+    """The version of record's entry with the arXiv id in it, or None when doi.org has
+    no BibTeX for its DOI or its title or first author isn't arXiv's latest version's
+    (`now`, when arXiv said). Says which on stderr."""
+    was = f"paper: {aid} was published as {published.doi} ({published.venue})"
+    try:
+        entry = client.bibtex(published.doi)
+    except (NotFound, NoBibtex):
+        print(
+            f"{was}, but doi.org has no BibTeX for it; printed the arXiv entry.",
+            file=sys.stderr,
+        )
+        return None
+    if now and (why := unlike(entry, now)):
+        print(
+            f"paper: {aid}: rejected {published.doi} as its version of record: {why};"
+            " printed the arXiv entry.",
+            file=sys.stderr,
+        )
+        return None
+    print(f"{was}; printed that. --preprint prints the arXiv entry.", file=sys.stderr)
+    return with_fields(entry, [("eprint", aid), ("archiveprefix", "arXiv")])
+
+
+def unlike(entry: str, now: ArxivVersion) -> str | None:
+    """How the entry differs from arXiv's latest version in its title (braces,
+    whitespace and case aside) or its first author's family name, or None."""
+    fields = bib_fields(entry)
+    title = fields.get("title", "")
+    if folded(title) != folded(now.title):
+        return f'its title "{squeezed(title)}" isn\'t arXiv\'s "{now.title}"'
+    if not now.authors:
+        return None
+    theirs = family_name(split_top(fields.get("author", ""), BIB_NAMES_SEPARATOR)[0])
+    ours = family_name(now.authors[0])
+    if ascii_letters(theirs) != ascii_letters(ours):
+        return f"its first author {theirs or '(none)'} isn't arXiv's {ours}"
+    return None
+
+
+def folded(title: str) -> str:
+    return squeezed(title.replace("{", "").replace("}", "")).casefold()
 
 
 def arxiv_form(pid: PaperId) -> PaperId:
@@ -2177,6 +2383,11 @@ def main(
     meta.add_argument("ids", nargs="+", metavar="ID")
     bib = sub.add_parser("bib", help="a BibTeX entry per DOI or arXiv id")
     bib.add_argument("ids", nargs="+", metavar="ID")
+    bib.add_argument(
+        "--preprint",
+        action="store_true",
+        help="the arXiv entry, even for a paper published since",
+    )
     cites = sub.add_parser("cites", help="papers citing ID")
     cites.add_argument("id", metavar="ID")
     cites.add_argument("--limit", type=int, default=20, help="how many (default 20)")

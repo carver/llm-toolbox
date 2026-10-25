@@ -26,6 +26,13 @@ of the repo's config. When either changed since start, finish names the refs and
 keys (never config values: a remote URL can hold a token), exits 1 and keeps the state,
 before folding anything. A fix commit left unfolded (its target is older than the base)
 also fails finish. It does not push.
+
+On a detached HEAD, as in a worktree that will land on main, there is no work branch.
+There the build's target is the branch the main worktree has checked out, when it's
+behind or ahead of the base; otherwise every branch at the base. A target counts
+locally and on every remote (refs/heads/X, refs/remotes/*/X). Another session's merge
+or push moves it, so a moved target doesn't fail finish: it finishes as usual, then
+says "X moved since start: rebase onto it" while HEAD lacks one of its commits.
 """
 
 import argparse
@@ -65,6 +72,55 @@ def work_refs() -> list[str]:
         git("rev-parse", "--symbolic-full-name", "@{u}", check=False).stdout.strip()
     )
     return [ref for ref in refs if ref]
+
+
+def branch_name(ref: str) -> str | None:
+    """X for refs/heads/X or refs/remotes/REMOTE/X; None for any other ref."""
+    if ref.startswith("refs/heads/"):
+        return ref.removeprefix("refs/heads/")
+    if ref.startswith("refs/remotes/"):
+        return ref.removeprefix("refs/remotes/").partition("/")[2] or None
+    return None
+
+
+def main_tree_branch() -> str | None:
+    """The branch the main worktree has checked out; None when it's detached."""
+    first = git("worktree", "list", "--porcelain").stdout.split("\n\n")[0]
+    for line in first.splitlines():
+        if line.startswith("branch "):
+            return line.removeprefix("branch refs/heads/")
+    return None
+
+
+def ancestor(older: str, newer: str) -> bool:
+    return git("merge-base", "--is-ancestor", older, newer, check=False).returncode == 0
+
+
+def target_branches(base: str) -> list[str]:
+    """The branches a detached build will land on: the main worktree's branch when it's
+    behind or ahead of the base, else every branch at the base, local or remote."""
+    main = main_tree_branch()
+    if main and (ancestor(base, main) or ancestor(main, base)):
+        return [main]
+    listed = git("for-each-ref", "--format=%(refname) %(objectname)").stdout
+    return sorted(
+        {
+            name
+            for ref, commit in (line.split() for line in listed.splitlines())
+            if commit == base and (name := branch_name(ref)) and name != "HEAD"
+        }
+    )
+
+
+def behind(branch: str) -> bool:
+    """Whether HEAD lacks a commit of the branch, local or any remote's."""
+    listed = git(
+        "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"
+    ).stdout
+    return any(
+        branch_name(ref) == branch and not ancestor(ref, "HEAD")
+        for ref in listed.splitlines()
+    )
 
 
 def fingerprint(work: list[str]) -> dict[str, dict[str, str]]:
@@ -123,7 +179,16 @@ def start(args: argparse.Namespace) -> int:
         )
         return 1
     base, work = head(), work_refs()
-    save(path, {"base": base, "work_refs": work, "fingerprint": fingerprint(work)})
+    targets = [] if work else target_branches(base)
+    save(
+        path,
+        {
+            "base": base,
+            "work_refs": work,
+            "targets": targets,
+            "fingerprint": fingerprint(work),
+        },
+    )
     print(f"base {base}")
     return 0
 
@@ -188,7 +253,15 @@ def finish(args: argparse.Namespace) -> int:
     base = state["base"]
     if git("status", "--porcelain", "--untracked-files=no").stdout:
         return fail("There are uncommitted changes: commit or stash them first.")
-    if moved := changes(state["fingerprint"], fingerprint(state["work_refs"])):
+    targets = set(state.get("targets", []))
+    moved, moved_targets = [], set()
+    for change in changes(state["fingerprint"], fingerprint(state["work_refs"])):
+        kind, _, name = change.partition(" ")
+        if kind == "refs" and branch_name(name) in targets:
+            moved_targets.add(branch_name(name))
+        else:
+            moved.append(change)
+    if moved:
         return fail(
             "The repo changed outside the work branch since start:",
             *(f"  {name}" for name in moved),
@@ -205,6 +278,9 @@ def finish(args: argparse.Namespace) -> int:
         )
     if "refactor_base" in state:
         report_tests(state["refactor_base"])
+    for branch in sorted(moved_targets):
+        if behind(branch):
+            print(f"{branch} moved since start: rebase onto it")
     path.unlink()
     return 0
 

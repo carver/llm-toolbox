@@ -361,3 +361,132 @@ def test_repointing_a_symbolic_ref_counts_as_a_change(repo):
     done = build_state(repo, "finish")
 
     assert done.returncode == 1 and "refs/remotes/origin/HEAD" in done.stderr
+
+
+def advance(repo, ref):
+    """Move `ref` to a new commit on top of where it is, as another session's merge or push would."""
+    parent = git(repo, "rev-parse", ref).strip()
+    tree = git(repo, "rev-parse", f"{parent}^{{tree}}").strip()
+    new = git(repo, "commit-tree", tree, "-p", parent, "-m", "elsewhere").strip()
+    git(repo, "update-ref", ref, new)
+
+
+def test_in_a_detached_worktree_the_branch_it_lands_on_may_move(repo):
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "checkout", "-q", "--detach")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    advance(repo, "refs/heads/main")
+    advance(repo, "refs/remotes/origin/main")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "main moved since start" in done.stdout and "rebase" in done.stdout
+
+
+def test_a_local_branch_behind_the_base_moves_with_its_remote_twin(repo):
+    old = git(repo, "rev-parse", "HEAD").strip()
+    commit(repo, "b.py", "Upstream")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(repo, "checkout", "-q", "--detach")
+    git(repo, "update-ref", "refs/heads/main", old)  # the local main is behind the base
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    advance(repo, "refs/remotes/origin/main")  # a fetch of another session's push
+    git(repo, "update-ref", "refs/heads/main", "refs/remotes/origin/main")  # a pull
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "main moved since start" in done.stdout
+
+
+def test_in_a_detached_worktree_another_ref_moving_still_fails(repo):
+    git(repo, "checkout", "-q", "--detach")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    git(repo, "branch", "other", "main")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1 and "refs/heads/other" in done.stderr
+
+
+@pytest.fixture
+def worktree(repo, tmp_path):
+    """A detached worktree beside the main tree, which keeps main checked out."""
+    path = tmp_path / "wt"
+    git(repo, "worktree", "add", "-q", "--detach", str(path))
+    return path
+
+
+def test_a_worktree_lands_on_the_main_trees_branch_not_another_at_the_base(
+    repo, worktree
+):
+    git(repo, "branch", "feature")  # at the base too
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    advance(repo, "refs/heads/feature")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 1 and "refs/heads/feature" in done.stderr
+
+
+def test_a_second_build_in_a_worktree_still_lands_on_main(repo, worktree):
+    commit(worktree, "a.py", "First build, not merged yet")
+    build_state(worktree, "start")  # no branch points at this base
+    commit(worktree, "b.py", "Second build")
+    advance(repo, "refs/heads/main")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "main moved since start" in done.stdout
+
+
+def test_main_moving_before_start_still_makes_it_the_target(repo, worktree):
+    advance(repo, "refs/heads/main")  # between `worktree add` and start
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    advance(repo, "refs/heads/main")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "main moved since start" in done.stdout
+
+
+def test_no_rebase_note_once_head_holds_the_moved_branch(repo, worktree):
+    build_state(worktree, "start")
+    advance(repo, "refs/heads/main")
+    commit(worktree, "a.py", "Work")
+    git(worktree, "rebase", "-q", "main")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "moved since start" not in done.stdout
+
+
+def test_a_build_on_a_branch_has_no_targets_beyond_its_branch(repo, tmp_path):
+    path = tmp_path / "topic"
+    git(repo, "worktree", "add", "-q", "-b", "topic", str(path))
+    build_state(path, "start")
+    commit(path, "a.py", "Work")
+    advance(repo, "refs/heads/main")
+
+    done = build_state(path, "finish")
+
+    assert done.returncode == 1 and "refs/heads/main" in done.stderr
+
+
+def test_in_a_detached_build_a_config_change_still_fails(repo, worktree):
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    git(repo, "config", "core.something", "new")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 1 and "core.something" in done.stderr

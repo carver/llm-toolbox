@@ -194,7 +194,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   hashed), `refactor` the refactor base. `finish` folds `fixup!` commits into
   the commits they fix, leaving every other commit separate, then lists the
   commits since the base and the test files changed since the refactor base,
-  and fails naming any ref or config key that moved. `review-prompt BRIEF`
+  and fails naming any ref or config key that moved. In a detached worktree,
+  the branch it lands on (the main tree's) may move: finish then says to
+  rebase onto it. `review-prompt BRIEF`
   prints the review subagent's prompt, with `/code-review`'s two briefs
   copied from its SKILL.md. The state lives in the git dir; `show` prints it.
 

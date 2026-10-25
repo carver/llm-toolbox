@@ -265,10 +265,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   PDF downloads aren't paced. Retries rate limits, 5xx and
   timeouts with backoff for up to 2 minutes, so callers needn't sleep and
   retry. When Semantic Scholar still fails, `meta`, `search` and `cites`
-  answer from OpenAlex under a `source:` line; OpenAlex counts far fewer
-  citations for arXiv papers. When Semantic Scholar doesn't know a paper,
-  `meta` asks OpenAlex, then Crossref for a DOI, and says which answered; it
-  reports not found only when none knows it. `bib` prints a BibTeX entry per
+  answer from OpenAlex under a `source:` line, `meta` then from Crossref for a
+  DOI OpenAlex doesn't have; OpenAlex counts far fewer citations for arXiv
+  papers. When Semantic Scholar doesn't know a paper, `meta` asks OpenAlex,
+  then Crossref for a DOI, and says which answered; it reports not found only
+  when none knows it. `bib` prints a BibTeX entry per
   DOI or arXiv id (through its DataCite DOI) from doi.org's content
   negotiation, keyed by first author and year (`nash1951`), with `a`, `b`, …
   on keys that clash in one call. Sends a Semantic Scholar API key from

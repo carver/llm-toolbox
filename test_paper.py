@@ -2168,6 +2168,47 @@ def test_a_crossref_answer_is_paced_logged_and_cached(cache, capsys):
     assert crossref_calls(again) == []
 
 
+@pytest.mark.parametrize(
+    "openalex, why",
+    [(OPENALEX_HAS_NOTHING, "doesn't know it"), (OPENALEX_FAILS, "failed")],
+    ids=["openalex-doesnt-know", "openalex-fails"],
+)
+def test_meta_asks_crossref_when_semantic_scholar_gives_up_and_openalex_cant_answer(
+    cache, capsys, openalex, why
+):
+    http = FakeHTTP(S2_DOWN, openalex, CROSSREF_NASH_ROUTE)
+    code, out, err, _ = run(capsys, ["meta", NASH_DOI], http)
+    assert code == 0, err
+    title, source, *rest = out.splitlines()
+    assert title == "Non-Cooperative Games"
+    assert source == (
+        "  source: Crossref, because Semantic Scholar gave up after its retries and"
+        f" OpenAlex {why}. Crossref counts only the citations publishers deposit with"
+        " it."
+    )
+    assert rest[0] == "  1951 · The Annals of Mathematics"
+    assert "; answering from Crossref" in err
+    assert "answering from OpenAlex" not in err
+
+
+def test_help_says_meta_asks_crossref_after_a_give_up_too(capsys):
+    with pytest.raises(SystemExit):
+        paper.main(["-h"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "then Crossref for a DOI that OpenAlex doesn't have" in out
+
+
+def test_when_semantic_scholar_gives_up_and_no_one_has_the_doi_meta_exits_3(
+    cache, capsys
+):
+    http = FakeHTTP(S2_DOWN, OPENALEX_HAS_NOTHING, CROSSREF_HAS_NOTHING)
+    code, out, err, _ = run(capsys, ["meta", NASH_DOI], http)
+    assert (code, out) == (3, "")
+    assert "gave up" in err
+    assert "OpenAlex has no record of it" in err
+    assert "Crossref has no record of it" in err
+
+
 def test_a_crossref_answer_without_a_work_exits_3_and_caches_nothing(cache, capsys):
     odd = ("GET", "api.crossref.org", [ok({"status": "ok", "message": ["no work"]})])
     http = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING, odd)

@@ -109,8 +109,9 @@ to 6 attempts and 2 minutes of waiting. Don't sleep and retry yourself.
 
 When Semantic Scholar still fails after those retries, meta, search and cites
 answer from OpenAlex instead, for arXiv ids and DOIs (a Semantic Scholar
-paperId has no OpenAlex form), and later lookups in the same run go straight
-to OpenAlex. A `source:` line in the output says so: OpenAlex counts and
+paperId has no OpenAlex form), meta then Crossref for a DOI that OpenAlex
+doesn't have, and later lookups in the same run skip Semantic Scholar. A
+`source:` line in the output says which answered: OpenAlex counts and
 lists far fewer citations than Semantic Scholar for arXiv papers, so rerun
 later for Semantic Scholar's numbers, and an empty OpenAlex citer list doesn't
 show that nothing cites the paper. OpenAlex and Crossref requests carry
@@ -129,9 +130,9 @@ read, or a DOI has no open-access PDF or no BibTeX; search with no hits exits
 1, and so do grep with no matching line and outline with no heading; cites
 with no citing papers says so and exits 0), 2 usage error, 3 the remote
 refused or failed the request after retries, or sent an unexpected answer,
-including Semantic Scholar failing while OpenAlex fails too or has no record,
-and OpenAlex or Crossref failing for a paper Semantic Scholar doesn't know
-while neither has it: try again later.
+including Semantic Scholar failing while neither OpenAlex nor Crossref
+answers, and OpenAlex or Crossref failing for a paper Semantic Scholar
+doesn't know while neither has it: try again later.
 
 Examples:
     paper meta 2404.00806 10.1145/3442188.3445922
@@ -528,7 +529,7 @@ class Client:
         # Once Semantic Scholar has given up, later cache misses in this run skip it.
         self.s2_gave_up: GaveUp | None = None
         self.openalex_key_refused = False
-        self.warned_fallback = False
+        self.fallback_sources: set[str] = set()  # those named on stderr
         self.warned_log = False
 
     def wait_turn(self, service: str) -> None:
@@ -719,17 +720,21 @@ class Client:
         """OpenAlex's answer, after Semantic Scholar gave up. Says so on stderr once per
         run. OpenAlex failing too, or not knowing the paper, is a RemoteError naming
         both."""
-        if not self.warned_fallback:
-            print(f"paper: {gave_up}; answering from OpenAlex", file=sys.stderr)
-            self.warned_fallback = True
         try:
-            return self.openalex(path, params)
+            answer = self.openalex(path, params)
         except NotFound:
-            raise RemoteError(
-                f"{gave_up}; OpenAlex has no record of it either"
-            ) from None
+            raise gave_up_error(gave_up, ["OpenAlex has no record of it"]) from None
         except RemoteError as e:
-            raise RemoteError(f"{gave_up}; OpenAlex failed too: {e}") from None
+            raise gave_up_error(gave_up, [str(e)]) from None
+        self.note_fallback(gave_up)
+        return answer
+
+    def note_fallback(self, gave_up: GaveUp, source: str = "OpenAlex") -> None:
+        """Says on stderr that Semantic Scholar gave up and `source` answered instead,
+        once per run for each source."""
+        if source not in self.fallback_sources:
+            print(f"paper: {gave_up}; answering from {source}", file=sys.stderr)
+            self.fallback_sources.add(source)
 
     def openalex_request(self, url: str, params: dict[str, Any]) -> Response:
         """One OpenAlex request with mailto and the key, and the key blanked out of its
@@ -1087,6 +1092,12 @@ def openalex_arxiv_id(work: dict[str, Any], doi: str) -> str | None:
     return None
 
 
+def gave_up_error(gave_up: GaveUp, said: list[str]) -> RemoteError:
+    """The error when Semantic Scholar gave up and no other source answered: the give-up
+    and what each source asked said, or the give-up alone when none was asked."""
+    return RemoteError(f"{gave_up}; " + "; ".join(said)) if said else gave_up
+
+
 def from_openalex(client: Client, pid: PaperId, gave_up: GaveUp) -> Paper:
     """The paper from OpenAlex, after Semantic Scholar gave up on it."""
     path = pid.openalex_path()
@@ -1102,8 +1113,8 @@ SOURCE_NOTE = (
 )
 UNKNOWN_NOTE = "source: OpenAlex, because Semantic Scholar doesn't know this paper."
 CROSSREF_NOTE = (
-    "source: Crossref, because Semantic Scholar doesn't know this paper and OpenAlex"
-    " {openalex}. Crossref counts only the citations publishers deposit with it."
+    "source: Crossref, because Semantic Scholar {s2} and OpenAlex {openalex}. Crossref"
+    " counts only the citations publishers deposit with it."
 )
 
 
@@ -1137,34 +1148,77 @@ def first_of(values: Any) -> Any:
     return values[0] if isinstance(values, list) and values else None
 
 
-def from_openalex_or_crossref(client: Client, pid: PaperId) -> Paper:
-    """The paper from OpenAlex, else from Crossref, when Semantic Scholar doesn't know
-    it, with its source note under "source". NotFound when every source that takes the
-    id says so; a RemoteError when none answers and one failed."""
-    failures: list[RemoteError] = []
-    openalex = "doesn't either"
+@dataclass(frozen=True)
+class S2DoesntKnow:
+    """Why meta asks elsewhere: Semantic Scholar doesn't know the paper."""
+
+    s2 = "doesn't know this paper"  # for the Crossref note
+    openalex_note = UNKNOWN_NOTE
+    openalex_missing = "doesn't either"
+
+    def answered(self, client: Client, source: str) -> None:
+        pass  # each block's source line says so
+
+    def unanswered(self, pid: PaperId, said: list[str], failed: bool) -> Exception:
+        if failed:
+            return RemoteError(
+                f"Semantic Scholar doesn't know {pid.value}; " + "; ".join(said)
+            )
+        return NotFound(pid.value)
+
+
+@dataclass(frozen=True)
+class S2GaveUp:
+    """Why meta asks elsewhere: Semantic Scholar gave up after its retries."""
+
+    gave_up: GaveUp
+    s2 = "gave up after its retries"
+    openalex_note = SOURCE_NOTE
+    openalex_missing = "doesn't know it"
+
+    def answered(self, client: Client, source: str) -> None:
+        client.note_fallback(self.gave_up, source)
+
+    def unanswered(self, pid: PaperId, said: list[str], failed: bool) -> Exception:
+        return gave_up_error(self.gave_up, said)
+
+
+def from_openalex_or_crossref(
+    client: Client, pid: PaperId, why: S2DoesntKnow | S2GaveUp
+) -> Paper:
+    """The paper from OpenAlex, else from Crossref, when Semantic Scholar has no
+    answer, with its source note under "source". When neither answers, the error `why`
+    makes of what each said: after a give-up, a RemoteError (the give-up itself when
+    neither takes the id); otherwise NotFound when every source that takes the id says
+    so, and a RemoteError when one failed."""
+    said: list[str] = []  # what each source asked said, for the error
+    failed = False
+    openalex = why.openalex_missing
     if path := pid.openalex_path():
         try:
-            return dict(openalex_paper(client.openalex(path, {})), source=UNKNOWN_NOTE)
+            work = client.openalex(path, {})
         except NotFound:
-            pass
+            said.append("OpenAlex has no record of it")
         except RemoteError as e:
-            failures.append(e)
+            said.append(str(e))
+            failed = True
             openalex = "failed"
+        else:
+            why.answered(client, "OpenAlex")
+            return dict(openalex_paper(work), source=why.openalex_note)
     if path := pid.crossref_path():
         try:
-            note = CROSSREF_NOTE.format(openalex=openalex)
-            return dict(crossref_paper(client.crossref(path)), source=note)
+            work = client.crossref(path)
         except NotFound:
-            pass
+            said.append("Crossref has no record of it")
         except RemoteError as e:
-            failures.append(e)
-    if failures:
-        raise RemoteError(
-            f"Semantic Scholar doesn't know {pid.value}; "
-            + "; ".join(str(e) for e in failures)
-        )
-    raise NotFound(pid.value)
+            said.append(str(e))
+            failed = True
+        else:
+            why.answered(client, "Crossref")
+            note = CROSSREF_NOTE.format(s2=why.s2, openalex=openalex)
+            return dict(crossref_paper(work), source=note)
+    raise why.unanswered(pid, said, failed)
 
 
 # Formatting
@@ -1236,17 +1290,17 @@ def list_block(paper: Paper, show_citation_count: bool = False) -> str:
 
 
 def meta_paper(client: Client, pid: PaperId, unknown: bool) -> Paper:
-    """The paper's metadata from Semantic Scholar, or from OpenAlex once it gives up,
-    or from OpenAlex or Crossref when it doesn't know the paper (as `unknown` says the
-    batch found). A paper from elsewhere carries its source note under "source"."""
+    """The paper's metadata from Semantic Scholar, or from OpenAlex or Crossref when it
+    gives up or doesn't know the paper (as `unknown` says the batch found). A paper
+    from elsewhere carries its source note under "source"."""
     if unknown:
-        return from_openalex_or_crossref(client, pid)
+        return from_openalex_or_crossref(client, pid, S2DoesntKnow())
     try:
         return client.s2(pid.s2_path(), {"fields": META_FIELDS}, require="paperId")
     except GaveUp as e:
-        return dict(from_openalex(client, pid, e), source=SOURCE_NOTE)
+        return from_openalex_or_crossref(client, pid, S2GaveUp(e))
     except NotFound:
-        return from_openalex_or_crossref(client, pid)
+        return from_openalex_or_crossref(client, pid, S2DoesntKnow())
 
 
 def prefetch_batch(client: Client, pids: list[PaperId]) -> set[str]:

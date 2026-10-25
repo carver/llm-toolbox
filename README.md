@@ -272,7 +272,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   when none knows it. `bib` prints a BibTeX entry per
   DOI or arXiv id (through its DataCite DOI) from doi.org's content
   negotiation, keyed by first author and year (`nash1951`), with `a`, `b`, …
-  on keys that clash in one call. Sends a Semantic Scholar API key from
+  on keys that clash in one call; an arXiv entry keeps v1's year in its key
+  but takes its title and authors from arXiv's latest version and gets a
+  `version` field. Sends a Semantic Scholar API key from
   `$S2_API_KEY`, else from `claudedev/.semantic-scholar/api-key`, and an
   OpenAlex key from `$OPENALEX_API_KEY`, else from `claudedev/.openalex/api-key`,
   when there is one. Caches everything

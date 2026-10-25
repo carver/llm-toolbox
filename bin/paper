@@ -30,10 +30,12 @@ bib prints a BibTeX entry per DOI or arXiv id, a blank line between entries,
 from doi.org's content negotiation: Crossref's or DataCite's record as it
 comes, but keyed by the first author's family name in ASCII letters and the
 year (nash1951), with a, b, ... on keys that clash within the call
-(kreps1982a, kreps1982b). An arXiv id goes through its DataCite DOI
-(10.48550/arXiv.ID), whose year is the first version's. A DOI whose
-registration agency serves no BibTeX says so, and exits 1 like one doi.org
-doesn't know, after printing the rest.
+(kreps1982a, kreps1982b). An arXiv id (or arXiv DOI) goes through its
+DataCite DOI (10.48550/arXiv.ID); its key keeps the first version's year, but
+its title and authors follow arXiv's latest version, from the arXiv API as
+meta's dates do, and a version = {N} field and a line on stderr say which
+version that is. A DOI whose registration agency serves no BibTeX says so,
+and exits 1 like one doi.org doesn't know, after printing the rest.
 
 cites lists papers citing ID (default 20), search the top matches for a
 keyword query (default 10), each with year, title, venue, first three authors
@@ -84,8 +86,8 @@ Every answer is cached in $PAPER_CACHE (default
 /home/carver/code/claudedev/cache/paper, or ~/.cache/paper on a machine without
 /home/carver/code/claudedev/cache): Semantic Scholar responses as JSON,
 OpenAlex and Crossref responses likewise in openalex/ and crossref/, BibTeX
-entries in bibtex/, arXiv versions and dates for a day (new versions appear),
-PDFs with their text.
+entries in bibtex/, arXiv's latest version of each paper (its number, dates,
+title and authors) for a day, as new versions appear, PDFs with their text.
 Delete the s2 folder there to refetch Semantic Scholar answers (metadata,
 citations, searches), or a paper's files in pdf/ to fetch its text anew. If
 arXiv can't be reached, meta prints the rest and warns.
@@ -175,7 +177,7 @@ DEFAULT_CACHE = "/home/carver/code/claudedev/cache/paper"
 KEY_ENV = "S2_API_KEY"
 KEY_FILE = Path("/home/carver/code/claudedev/.semantic-scholar/api-key")
 ARXIV_API = "https://export.arxiv.org/api/query"
-ARXIV_TTL = 24 * 3600  # seconds; arXiv dates are refetched after a day
+ARXIV_TTL = 24 * 3600  # seconds; arXiv's latest versions are refetched after a day
 ATOM = "{http://www.w3.org/2005/Atom}"
 TIMEOUT = 30
 ATTEMPTS = 6
@@ -298,14 +300,18 @@ class PaperId:
 
 class ArxivId(PaperId):
     def s2_id(self) -> str:
-        return "arXiv:" + ARXIV_VERSION.sub("", self.value)
+        return "arXiv:" + self.unversioned()
 
     def openalex_path(self) -> str | None:
-        return "/works/doi:10.48550/arXiv." + ARXIV_VERSION.sub("", self.value)
+        return "/works/doi:10.48550/arXiv." + self.unversioned()
 
     def doi(self) -> str:
         """Its DataCite DOI, which names no version."""
-        return "10.48550/arXiv." + ARXIV_VERSION.sub("", self.value)
+        return "10.48550/arXiv." + self.unversioned()
+
+    def unversioned(self) -> str:
+        """The id without its version suffix: 2404.00806 for 2404.00806v2."""
+        return ARXIV_VERSION.sub("", self.value)
 
     def pdf_source(self) -> tuple[str, str]:
         return f"https://arxiv.org/pdf/{self.value}", "arxiv-" + self.value
@@ -763,19 +769,17 @@ class Client:
             response = replace(response, content=blanked)
         return response
 
-    def arxiv_dates(self, ids: list[str]) -> dict[str, "ArxivDates"]:
-        """Version and dates per arXiv id (given without a version), from the cache when
-        under a day old, else from one arXiv API request for all the rest. An id arXiv
-        doesn't return is left out and not cached: the API sometimes answers an empty
-        feed under load."""
-        found: dict[str, ArxivDates] = {}
+    def arxiv_versions(self, ids: list[str]) -> dict[str, "ArxivVersion"]:
+        """The latest version per arXiv id (given without a version), from the cache
+        when under a day old, else from one arXiv API request for all the rest. An id
+        arXiv doesn't return is left out and not cached: the API sometimes answers an
+        empty feed under load."""
+        found: dict[str, ArxivVersion] = {}
         missing = []
         for aid in dict.fromkeys(ids):
-            cached = self.cache / "arxiv" / arxiv_cache_name(aid)
-            if cached.exists() and time.time() - cached.stat().st_mtime < ARXIV_TTL:
-                found[aid] = ArxivDates(
-                    **json.loads(cached.read_text(encoding="utf-8"))
-                )
+            cached = cached_arxiv_version(self.cache / "arxiv" / arxiv_cache_name(aid))
+            if cached:
+                found[aid] = cached
             else:
                 missing.append(aid)
         if not missing:
@@ -1009,13 +1013,28 @@ def write_atomic(path: Path, content: bytes) -> None:
 
 
 @dataclass(frozen=True)
-class ArxivDates:
+class ArxivVersion:
+    """A paper's latest version on arXiv."""
+
     version: int
     submitted: str  # first version, YYYY-MM-DD
     updated: str  # latest version
+    title: str
+    authors: list[str]
 
 
-def parse_arxiv_feed(content: bytes) -> dict[str, ArxivDates]:
+def cached_arxiv_version(path: Path) -> ArxivVersion | None:
+    """The version cached at `path` under a day ago, or None when it's older, missing,
+    or cached before titles and authors were kept."""
+    try:
+        if time.time() - path.stat().st_mtime >= ARXIV_TTL:
+            return None
+        return ArxivVersion(**json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def parse_arxiv_feed(content: bytes) -> dict[str, ArxivVersion]:
     """Each entry of an arXiv API answer, by id without its version suffix."""
     try:
         root = ElementTree.fromstring(content)
@@ -1025,10 +1044,15 @@ def parse_arxiv_feed(content: bytes) -> dict[str, ArxivDates]:
     for entry in root.iter(ATOM + "entry"):
         m = ARXIV_ABS.fullmatch((entry.findtext(ATOM + "id") or "").strip())
         if m:
-            found[m.group(1)] = ArxivDates(
+            found[m.group(1)] = ArxivVersion(
                 version=int(m.group(2)),
                 submitted=(entry.findtext(ATOM + "published") or "")[:10],
                 updated=(entry.findtext(ATOM + "updated") or "")[:10],
+                title=squeezed(entry.findtext(ATOM + "title") or ""),
+                authors=[
+                    squeezed(author.findtext(ATOM + "name") or "")
+                    for author in entry.findall(ATOM + "author")
+                ],
             )
     return found
 
@@ -1251,7 +1275,7 @@ def author_names(paper: Paper, limit: int | None = None) -> str:
     return ", ".join(names)
 
 
-def meta_block(paper: Paper, dates: ArxivDates | None = None) -> str:
+def meta_block(paper: Paper, dates: ArxivVersion | None = None) -> str:
     lines = [paper.get("title") or "(untitled)"]
     if paper.get("source"):
         lines.append("  " + paper["source"])
@@ -1267,7 +1291,7 @@ def meta_block(paper: Paper, dates: ArxivDates | None = None) -> str:
     return "\n".join(lines)
 
 
-def arxiv_line(dates: ArxivDates) -> str:
+def arxiv_line(dates: ArxivVersion) -> str:
     return f"  arXiv: v{dates.version}, submitted {dates.submitted}, updated {dates.updated}"
 
 
@@ -1346,22 +1370,28 @@ def cmd_meta(client: Client, args: argparse.Namespace) -> int:
             failure = e  # print what was fetched first, then report it
             break
     with_ids = [(p, arxiv_id_of(p)) for p in papers]
-    arxiv_ids = [aid for _, aid in with_ids if aid]
-    dates: dict[str, ArxivDates] = {}
-    if arxiv_ids:
-        try:
-            dates = client.arxiv_dates(arxiv_ids)
-        except RemoteError as e:
-            print(f"paper: arXiv dates unavailable: {e}", file=sys.stderr)
-        else:
-            for aid in arxiv_ids:
-                if aid not in dates:
-                    print(f"paper: arXiv has no entry for {aid}", file=sys.stderr)
+    dates = latest_versions(client, [aid for _, aid in with_ids if aid])
     for p, aid in with_ids:
         print(meta_block(p, dates.get(aid) if aid else None))
     if failure:
         raise failure
     return code
+
+
+def latest_versions(client: Client, ids: list[str]) -> dict[str, ArxivVersion]:
+    """arXiv's latest version of each paper, by its id without a version; a warning on
+    stderr for any arXiv can't give."""
+    if not ids:
+        return {}
+    try:
+        found = client.arxiv_versions(ids)
+    except RemoteError as e:
+        print(f"paper: arXiv's latest versions unavailable: {e}", file=sys.stderr)
+        return {}
+    for aid in ids:
+        if aid not in found:
+            print(f"paper: arXiv has no entry for {aid}", file=sys.stderr)
+    return found
 
 
 def cmd_cites(client: Client, args: argparse.Namespace) -> int:
@@ -1807,18 +1837,24 @@ def sweep_line(row: dict[str, str]) -> str:
 
 
 def cmd_bib(client: Client, args: argparse.Namespace) -> int:
-    """A BibTeX entry per id, keyed lastnameYEAR, a blank line between entries."""
-    pids = [parse_id(text) for text in args.ids]
+    """A BibTeX entry per id, keyed lastnameYEAR, a blank line between entries. An
+    arXiv entry follows arXiv's latest version."""
+    pids = [arxiv_form(parse_id(text)) for text in args.ids]
     try:
         dois = [pid.doi() for pid in pids]  # every id checked before any request
     except UsageError as e:
         raise UsageError(f"`paper bib` {e}") from e
+    arxiv_ids = [pid.unversioned() for pid in pids if isinstance(pid, ArxivId)]
+    latest = latest_versions(client, arxiv_ids)
     code = OK
     entries = []
     failure = None
-    for text, doi in zip(args.ids, dois):
+    for text, pid, doi in zip(args.ids, pids, dois):
         try:
-            entries.append(client.bibtex(doi))
+            entry = client.bibtex(doi)
+            if isinstance(pid, ArxivId) and (now := latest.get(pid.unversioned())):
+                entry = at_latest_version(entry, pid.unversioned(), now)
+            entries.append(entry)
         except NotFound:
             print(f"paper: not found: {text}", file=sys.stderr)
             code = NOT_FOUND
@@ -1833,6 +1869,75 @@ def cmd_bib(client: Client, args: argparse.Namespace) -> int:
     if failure:
         raise failure
     return code
+
+
+def arxiv_form(pid: PaperId) -> PaperId:
+    """An arXiv DOI as its arXiv id; any other id as it is."""
+    m = ARXIV_DOI.fullmatch(pid.value) if isinstance(pid, Doi) else None
+    return ArxivId(m.group(1)) if m and ARXIV.fullmatch(m.group(1)) else pid
+
+
+def at_latest_version(entry: str, aid: str, now: ArxivVersion) -> str:
+    """DataCite's entry for an arXiv paper, with the title and authors of arXiv's latest
+    version, `now`, where they differ, and a version field. Says so on stderr."""
+    fields = bib_fields(entry)
+    changed = {}
+    if now.title and "title" in fields and squeezed(fields["title"]) != now.title:
+        changed["title"] = now.title
+    if now.authors and "author" in fields:
+        names = split_top(fields["author"], BIB_NAMES_SEPARATOR)
+        if [given_first(name) for name in names] != now.authors:
+            changed["author"] = merged_authors(names, now.authors)
+    print(
+        f"paper: {aid} is at v{now.version} ({now.updated}); the entry's year is v1's.",
+        file=sys.stderr,
+    )
+    return with_fields(with_values(entry, changed), [("version", str(now.version))])
+
+
+def squeezed(text: str) -> str:
+    return " ".join(text.split())
+
+
+def given_first(name: str) -> str:
+    """A BibTeX name as "First Last", as arXiv lists names."""
+    parts = [part.strip() for part in split_top(name, ",")]
+    return squeezed(f"{parts[1]} {parts[0]}" if len(parts) == 2 else name)
+
+
+def merged_authors(names: list[str], latest: list[str]) -> str:
+    """arXiv's latest author list as a BibTeX author field: each name that matches the
+    BibTeX one in its place kept as it was written, the others "Last, First" when
+    they are two words, else as arXiv gives them, since BibTeX can't tell which of
+    three or more words are the family name."""
+    written = []
+    for i, name in enumerate(latest):
+        if i < len(names) and given_first(names[i]) == name:
+            written.append(names[i].strip())
+        else:
+            words = name.split()
+            written.append(f"{words[1]}, {words[0]}" if len(words) == 2 else name)
+    return " and ".join(written)
+
+
+def with_values(entry: str, values: dict[str, str]) -> str:
+    """The entry with the named fields' values replaced, inside their delimiters."""
+    spans = bib_spans(entry)
+    # From the last field back, so the spans before each stay where they were.
+    for name in sorted(values, key=lambda name: -spans[name][0]):
+        start, end = spans[name]
+        entry = entry[:start] + values[name] + entry[end:]
+    return entry
+
+
+def with_fields(entry: str, fields: list[tuple[str, str]]) -> str:
+    """The entry with `fields` added at its end in its own layout: a line each in a
+    multi-line entry (DataCite's), inline in a one-line entry (Crossref's)."""
+    body = entry[: entry.rindex("}")].rstrip().removesuffix(",")
+    if "\n" in entry:
+        added = "".join(f",\n  {name} = {{{value}}}" for name, value in fields)
+        return body + added + "\n}"
+    return body + "".join(f", {name}={{{value}}}" for name, value in fields) + " }"
 
 
 # BibTeX keys
@@ -1915,25 +2020,31 @@ def is_suffix(word: str) -> bool:
 
 
 def bib_fields(entry: str) -> dict[str, str]:
-    """An entry's fields by lowercased name, each value without its braces or quotes.
-    Reading stops at anything it can't parse."""
+    """An entry's fields by lowercased name, each value without its braces or quotes."""
+    return {name: entry[start:end] for name, (start, end) in bib_spans(entry).items()}
+
+
+def bib_spans(entry: str) -> dict[str, tuple[int, int]]:
+    """Where each field's value lies in the entry, inside its braces or quotes, by
+    lowercased name. Reading stops at anything it can't parse."""
     head = BIB_HEAD.match(entry)
-    fields: dict[str, str] = {}
+    spans: dict[str, tuple[int, int]] = {}
     at = head.end() if head else len(entry)
     while field := BIB_FIELD.match(entry, at):
-        value, at = bib_value(entry, field.end())
-        fields.setdefault(field.group(1).lower(), value)
-    return fields
+        start, end, at = bib_value(entry, field.end())
+        spans.setdefault(field.group(1).lower(), (start, end))
+    return spans
 
 
-def bib_value(text: str, start: int) -> tuple[str, int]:
-    """The field value at `start` without its delimiters, and where it ends. A value is
-    braced ({...}, nesting), quoted ("...", braces inside nesting) or bare (1951, sep)."""
+def bib_value(text: str, start: int) -> tuple[int, int, int]:
+    """Where the field value at `start` begins and ends inside its delimiters, and where
+    it ends after them. A value is braced ({...}, nesting), quoted ("...", braces
+    inside nesting) or bare (1951, sep)."""
     opener = text[start : start + 1]
     if opener not in ("{", '"'):
         bare = BIB_BARE.match(text, start)
         assert bare  # it matches the empty string too
-        return bare.group(), bare.end()
+        return start, bare.end(), bare.end()
     depth = 0
     for i in range(start + 1, len(text)):
         c = text[i]
@@ -1942,8 +2053,8 @@ def bib_value(text: str, start: int) -> tuple[str, int]:
         elif c == "}" and depth:
             depth -= 1
         elif depth == 0 and c == ("}" if opener == "{" else '"'):
-            return text[start + 1 : i], i + 1
-    return text[start + 1 :], len(text)
+            return start + 1, i, i + 1
+    return start + 1, len(text), len(text)
 
 
 def split_top(text: str, separator: str) -> list[str]:

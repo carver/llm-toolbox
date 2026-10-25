@@ -141,14 +141,19 @@ class FakeHTTP:
         raise AssertionError(f"unexpected request {method} {url}")
 
 
-def arxiv_feed(*entries: tuple[str, str, str]) -> "paper.Response":
-    """An arXiv API answer with one entry per (id with version, published, updated)."""
-    xml = "".join(
-        f"<entry><id>http://arxiv.org/abs/{vid}</id>"
-        f"<published>{published}T17:57:34Z</published><updated>{updated}T00:41:52Z</updated>"
-        "<title>t</title></entry>"
-        for vid, published, updated in entries
-    )
+def arxiv_feed(*entries: tuple) -> "paper.Response":
+    """An arXiv API answer with one entry per (id with version, published, updated),
+    each optionally followed by its title and its authors' names."""
+    xml = ""
+    for vid, published, updated, *rest in entries:
+        title, authors = rest or ("t", ())
+        xml += (
+            f"<entry><id>http://arxiv.org/abs/{vid}</id>"
+            f"<published>{published}T17:57:34Z</published>"
+            f"<updated>{updated}T00:41:52Z</updated><title>{title}</title>"
+            + "".join(f"<author><name>{a}</name></author>" for a in authors)
+            + "</entry>"
+        )
     body = (
         f'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">{xml}</feed>'
     )
@@ -821,7 +826,7 @@ def test_an_arxiv_failure_leaves_the_rest_and_warns(cache, capsys):
     assert code == 0
     assert out.startswith("Attention is All you Need\n")
     assert "arXiv: v" not in out
-    assert "arXiv dates unavailable" in err
+    assert "arXiv's latest versions unavailable" in err
 
 
 def test_a_later_semantic_scholar_failure_keeps_the_blocks_already_fetched(
@@ -2312,8 +2317,156 @@ def test_bib_of_an_arxiv_id_asks_doi_org_for_its_datacite_doi(cache, capsys):
     first, *rest = out.splitlines()
     assert first == "@misc{vaswani2017,"
     assert rest == ATTENTION_BIB.splitlines()[1:]
-    (call,) = http.calls
+    (call,) = calls_to(http, "doi.org")
     assert call["url"] == "https://doi.org/10.48550/arXiv.1706.03762"
+
+
+ATTENTION_LATEST = (
+    "1706.03762v7",
+    "2017-06-12",
+    "2023-08-02",
+    "Attention Is All\n  You Need",
+    ("Ashish Vaswani", "Noam Shazeer"),
+)
+SIMILARITY_V1_BIB = """\
+@misc{https://doi.org/10.48550/arxiv.2211.14468,
+  doi = {10.48550/ARXIV.2211.14468},
+  author = {Oesterheld, Caspar and Treutlein, Johannes},
+  title = {Similarity-based Cooperation},
+  publisher = {arXiv},
+  year = {2022}
+}"""
+SIMILARITY_LATEST = (
+    "2211.14468v2",
+    "2022-11-26",
+    "2023-11-12",
+    "Similarity-based cooperative equilibrium",
+    ("Caspar Oesterheld", "Johannes Treutlein", "Roger Grosse"),
+)
+ATTENTION_BIB_ROUTE = bib_route("10.48550/arXiv.1706.03762", ATTENTION_BIB)
+
+
+def arxiv_route(*entries):
+    return ("GET", "export.arxiv.org", [arxiv_feed(*entries)])
+
+
+def test_bib_of_an_arxiv_preprint_gives_its_latest_version(cache, capsys):
+    http = FakeHTTP(ATTENTION_BIB_ROUTE, arxiv_route(ATTENTION_LATEST))
+    code, out, err, _ = run(capsys, ["bib", "1706.03762v5"], http)
+    assert code == 0, err
+    assert out == (
+        "@misc{vaswani2017,\n"
+        "  doi = {10.48550/ARXIV.1706.03762},\n"
+        "  url = {https://arxiv.org/abs/1706.03762},\n"
+        "  author = {Vaswani, Ashish and Shazeer, Noam},\n"
+        "  title = {Attention Is All You Need},\n"
+        "  publisher = {arXiv},\n"
+        "  year = {2017},\n"
+        "  copyright = {arXiv.org perpetual, non-exclusive license},\n"
+        "  version = {7}\n"
+        "}\n"
+    )
+    assert err == "paper: 1706.03762 is at v7 (2023-08-02); the entry's year is v1's.\n"
+
+
+def test_bib_takes_title_and_authors_from_arxivs_latest_version(cache, capsys):
+    http = FakeHTTP(
+        bib_route("10.48550/arXiv.2211.14468", SIMILARITY_V1_BIB),
+        arxiv_route(SIMILARITY_LATEST),
+    )
+    code, out, err, _ = run(capsys, ["bib", "2211.14468"], http)
+    assert code == 0, err
+    assert out == (
+        "@misc{oesterheld2022,\n"
+        "  doi = {10.48550/ARXIV.2211.14468},\n"
+        "  author = {Oesterheld, Caspar and Treutlein, Johannes and Grosse, Roger},\n"
+        "  title = {Similarity-based cooperative equilibrium},\n"
+        "  publisher = {arXiv},\n"
+        "  year = {2022},\n"
+        "  version = {2}\n"
+        "}\n"
+    )
+    assert err == "paper: 2211.14468 is at v2 (2023-11-12); the entry's year is v1's.\n"
+
+
+def test_bib_keeps_datacites_names_and_writes_a_name_it_cant_split_as_arxiv_has_it(
+    cache, capsys
+):
+    datacite = SIMILARITY_V1_BIB.replace(
+        "Oesterheld, Caspar and Treutlein, Johannes", "Bengio, Yoshua and LeCun, Yann"
+    )
+    latest = (*SIMILARITY_LATEST[:3], SIMILARITY_LATEST[3]) + (
+        ("Yoshua Bengio", "Yann Le Cun", "Geoffrey Hinton"),
+    )
+    http = FakeHTTP(
+        bib_route("10.48550/arXiv.2211.14468", datacite),
+        arxiv_route(latest),
+    )
+    code, out, err, _ = run(capsys, ["bib", "2211.14468"], http)
+    assert code == 0, err
+    assert "  author = {Bengio, Yoshua and Yann Le Cun and Hinton, Geoffrey},\n" in out
+    assert out.startswith("@misc{bengio2022,")
+
+
+def test_bib_asks_arxiv_once_for_every_preprint_in_the_call(cache, capsys):
+    http = FakeHTTP(
+        ATTENTION_BIB_ROUTE,
+        bib_route("10.48550/arXiv.2211.14468", SIMILARITY_V1_BIB),
+        arxiv_route(ATTENTION_LATEST, SIMILARITY_LATEST),
+    )
+    code, out, err, _ = run(capsys, ["bib", "1706.03762", "2211.14468"], http)
+    assert code == 0, err
+    (call,) = arxiv_calls(http)
+    assert call["params"]["id_list"] == "1706.03762,2211.14468"
+    assert out.count("version = {") == 2
+
+
+def test_bib_takes_an_arxiv_doi_as_its_arxiv_id(cache, capsys):
+    http = FakeHTTP(ATTENTION_BIB_ROUTE, arxiv_route(ATTENTION_LATEST))
+    code, out, err, _ = run(capsys, ["bib", "10.48550/arXiv.1706.03762"], http)
+    assert code == 0, err
+    assert "  version = {7}\n" in out
+
+
+@pytest.mark.parametrize(
+    "answer, warning",
+    [
+        (status(503), "arXiv's latest versions unavailable"),
+        (arxiv_feed(), "arXiv has no entry for 1706.03762"),
+    ],
+    ids=["arxiv-fails", "arxiv-has-no-entry"],
+)
+def test_bib_without_arxivs_latest_version_prints_datacites_entry_and_warns(
+    cache, capsys, answer, warning
+):
+    http = FakeHTTP(ATTENTION_BIB_ROUTE, ("GET", "export.arxiv.org", [answer]))
+    code, out, err, _ = run(capsys, ["bib", "1706.03762"], http)
+    assert code == 0, err
+    assert out.splitlines() == [
+        "@misc{vaswani2017,",
+        *ATTENTION_BIB.splitlines()[1:],
+    ]
+    assert warning in err
+
+
+def test_arxiv_versions_cached_without_title_and_authors_are_fetched_again(
+    cache, capsys
+):
+    old = {"version": 7, "submitted": "2017-06-12", "updated": "2023-08-02"}
+    (cache / "arxiv").mkdir(parents=True)
+    (cache / "arxiv" / "1706.03762.json").write_text(json.dumps(old))
+    http = FakeHTTP(ATTENTION_BIB_ROUTE, arxiv_route(ATTENTION_LATEST))
+    code, out, err, _ = run(capsys, ["bib", "1706.03762"], http)
+    assert code == 0, err
+    assert len(arxiv_calls(http)) == 1
+    assert "  version = {7}\n" in out
+
+
+def test_help_says_an_arxiv_entry_follows_the_latest_version(capsys):
+    with pytest.raises(SystemExit):
+        paper.main(["-h"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "follow arXiv's latest version" in out and "version = {N}" in out
 
 
 def test_bib_puts_a_blank_line_between_entries_and_suffixes_clashing_keys(

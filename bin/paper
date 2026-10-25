@@ -65,7 +65,8 @@ fetches the open-access PDF OpenAlex lists, if it lists one. For a paper with
 none of these (PMLR, OpenReview), find its paperId with search.
 
 Every answer is cached in $PAPER_CACHE (default
-/home/carver/code/claudedev/cache/paper): Semantic Scholar responses as JSON,
+/home/carver/code/claudedev/cache/paper, or ~/.cache/paper on a machine without
+/home/carver/code/claudedev/cache): Semantic Scholar responses as JSON,
 OpenAlex responses likewise in openalex/, arXiv versions and dates for a day
 (new versions appear), PDFs with their text. Delete the s2 folder there to
 refetch Semantic Scholar answers (metadata, citations, searches), or a
@@ -441,6 +442,15 @@ class Pacer:
         return now
 
 
+def cache_folder() -> Path:
+    """$PAPER_CACHE, else DEFAULT_CACHE where its parent exists, else ~/.cache/paper.
+    The parent, not DEFAULT_CACHE itself, so a first run on the host still creates it."""
+    if env := os.environ.get("PAPER_CACHE"):
+        return Path(env)
+    default = Path(DEFAULT_CACHE)
+    return default if default.parent.is_dir() else Path.home() / ".cache" / "paper"
+
+
 class Client:
     """Fetches, sleeps between retries and extracts PDFs, all swappable in tests."""
 
@@ -454,7 +464,7 @@ class Client:
         self.fetch = fetch
         self.sleep = sleep
         self.extract = extract
-        self.cache = Path(os.environ.get("PAPER_CACHE") or DEFAULT_CACHE)
+        self.cache = cache_folder()
         self.pace = pace or self.wait_turn
         # Once Semantic Scholar has given up, later cache misses in this run skip it.
         self.s2_gave_up: GaveUp | None = None

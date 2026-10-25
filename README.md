@@ -262,7 +262,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `$S2_API_KEY`, else from `claudedev/.semantic-scholar/api-key`, and an
   OpenAlex key from `$OPENALEX_API_KEY`, else from `claudedev/.openalex/api-key`,
   when there is one. Caches everything
-  in `claudedev/cache/paper/` (`$PAPER_CACHE` overrides). Exits 1 when not found or when a URL is not a PDF, 3 when the
+  in `claudedev/cache/paper/`, or `~/.cache/paper/` on a machine without `claudedev/cache/` (`$PAPER_CACHE`
+  overrides). Exits 1 when not found or when a URL is not a PDF, 3 when the
   remote still refuses.
 
 ## Checks

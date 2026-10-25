@@ -305,6 +305,39 @@ def test_meta_answers_a_repeat_from_the_cache(cache, capsys):
     assert any(cache.rglob("*.json"))
 
 
+@pytest.fixture
+def no_paper_cache(monkeypatch, tmp_path):
+    """$PAPER_CACHE unset, the default cache and $HOME under tmp_path; returns both caches."""
+    monkeypatch.delenv("PAPER_CACHE", raising=False)
+    default = tmp_path / "claudedev" / "cache" / "paper"
+    monkeypatch.setattr(paper, "DEFAULT_CACHE", str(default))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    return default, tmp_path / "home" / ".cache" / "paper"
+
+
+def test_meta_caches_in_the_default_cache_when_its_parent_exists(
+    no_paper_cache, capsys
+):
+    default, home_cache = no_paper_cache
+    default.parent.mkdir(parents=True)
+    http = FakeHTTP(("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]))
+    code, _, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert code == 0, err
+    assert any(default.rglob("*.json"))
+    assert not home_cache.exists()
+
+
+def test_meta_caches_in_home_cache_where_the_default_has_no_parent(
+    no_paper_cache, capsys
+):
+    default, home_cache = no_paper_cache
+    http = FakeHTTP(("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]))
+    code, _, err, _ = run(capsys, ["meta", "1706.03762"], http)
+    assert code == 0, err
+    assert any(home_cache.rglob("*.json"))
+    assert not default.parent.exists()
+
+
 def test_meta_rejects_a_pdf_url_before_any_request(cache, capsys):
     http = FakeHTTP()
     code, _, err, _ = run(capsys, ["meta", "https://example.com/a.pdf"], http)

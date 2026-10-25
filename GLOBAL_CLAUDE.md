@@ -36,6 +36,8 @@ Start a background job with `bgrun -o LOG -- CMD`. It prints the job's own PID, 
 
 To make several text replacements in one or more files, pipe blocks to `apply-edits` rather than writing a Python heredoc script: a `--- PATH` line starts each file, then each block is `<<<<<<< SEARCH`, the old text, `=======`, the new text, `>>>>>>> REPLACE`, every marker on its own line. It applies all or nothing, and a miss shows the closest text.
 
+When ruff reports a line too long (E501) in a docstring or a comment, run `rewrap FILE...` rather than rewrapping by hand: it reflows only the paragraphs past the line length, and lists the lines it can't fix.
+
 To see a web page or HTML report you changed, check it for JavaScript errors, or read a page that renders with JavaScript (forms, calendars, endless feeds), use `web-shot` (`-h` for its click, wait, shot, text, links and scroll-all actions), not a one-off Playwright script.
 
 To start a new Rust desktop app, run `new-egui-app DIR` (`-h` for options) rather than copying an earlier app's setup.

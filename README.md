@@ -110,6 +110,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   work too). Each old text must occur exactly once; on a miss nothing is written
   and the closest text in the file is shown as a diff. For edits that would
   otherwise be a heredoc Python script. `apply-edits -h` shows the format.
+- **rewrap**: `rewrap FILE...` reflows each Python docstring paragraph and
+  comment block that holds a line past ruff's line-length (or `--width`), and
+  leaves every other line as it is; ruff format doesn't wrap prose, so E501 in a
+  docstring or comment otherwise means rewrapping by hand. It lists the lines
+  still too long (code, strings, kept examples) and exits 1 while any is left.
+  `--check` reports without writing.
 - **mutate-check**: `mutate-check -- CMD` breaks code briefly with apply-edits
   blocks from stdin, runs CMD (a test run), and puts every file back, also when
   stopped. It exits 0 when CMD failed (the tests catch the break) and 1 when it

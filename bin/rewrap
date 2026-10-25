@@ -1,0 +1,308 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""Reflow Python docstrings and comment blocks that run past the line length.
+
+  rewrap FILE...              rewrite each file in place
+  rewrap --width 100 FILE...  a width of your own
+  rewrap --check FILE...      report, write nothing
+
+ruff format leaves prose alone, so a docstring or comment past the limit fails E501
+until someone rewraps it by hand. rewrap reflows each paragraph that holds a line
+past the width, and only those: every other line stays byte for byte, line endings
+(\\n or \\r\\n) included. Inside a reflowed paragraph, runs of spaces become one.
+
+A docstring (module, class or function) paragraph is a run of non-blank lines at the
+docstring's own indent. Lines indented deeper (examples), list items (`- `, `* `,
+`1. `), fields (`:param x:`), doctest lines (`>>>`) and a section title with its
+underline (`Parameters` over `----------`) stay as they are and end the paragraph
+around them. The opening quotes stay on the first line, a bare opening line stays
+bare, and the closing quotes stay after the last word, all counted in the width. A
+docstring that shares a line with code or a comment is left as it is.
+
+A comment block is a run of lines that hold only a comment, at one indent; a bare
+`#`, a directive (`# noqa`, `# type:`, `# fmt:`, `# ruff:`, `# pragma`, `# pyright:`,
+`# pylint:`, `# mypy:`, `# isort:`, `# %%`) or a line indented deeper after the `#`
+ends the paragraph, and a `# /// script` metadata block stays as it is. String
+literals and comments after code are never touched. If a file's code would come out
+different anyway (its syntax tree, strings' whitespace aside), rewrap leaves the file
+as it is and says so.
+
+The width is ruff's line-length: `.ruff.toml`, `ruff.toml`, or `[tool.ruff]` in
+`pyproject.toml`, in the file's folder or the nearest folder above that has one; 88
+when that config doesn't set it or there is none. --width overrides it.
+
+It prints a line for each file it rewrapped (would rewrap, with --check), then each
+line past the width as `path:line: length > width`, numbered as the file now stands:
+code, strings, comments after code, kept lines, a word longer than the width, and
+with --check the lines it would rewrap too. Width counts characters, so a tab or a
+wide character counts as one, where ruff counts more.
+
+Exit status: 0 nothing is left past the width (and, with --check, nothing to
+rewrap), 1 otherwise, 2 a file can't be read, decoded or parsed, or would change its
+code; the other files are still done.
+"""
+
+import argparse
+import ast
+import io
+import re
+import sys
+import textwrap
+import tokenize
+from pathlib import Path
+from typing import NamedTuple
+
+import tomllib
+
+DEFAULT_WIDTH = 88
+# A list item, a field (`:param x:`) or a doctest line, which stays as it is.
+KEPT = re.compile(r"([-*]|\d+[.)]|>>>|:\w[^:]*:)(\s|$)")
+UNDERLINE = re.compile(r"([-=~^*+#])\1{2,}\s*$")  # a section title's underline
+DIRECTIVE = re.compile(
+    r"#\s*(noqa|type:|fmt:|ruff:|pragma|pyright:|pylint:|mypy:|isort:|%%|!|-\*-)"
+)
+OPENING = re.compile(r"[rRuUbBfF]{0,2}(\"\"\"|''')")
+
+
+class Edit(NamedTuple):
+    start: int  # the first line it replaces, 0-based
+    end: int  # the last line it replaces
+    lines: list[str]  # what replaces them
+
+
+def ruff_width(path: Path) -> int:
+    """ruff's line-length for `path`, from the nearest folder with a ruff config."""
+    for folder in path.resolve().parents:
+        for name in (".ruff.toml", "ruff.toml", "pyproject.toml"):
+            config = folder / name
+            if not config.is_file():
+                continue
+            data = tomllib.loads(config.read_text())
+            if name == "pyproject.toml":
+                if "ruff" not in data.get("tool", {}):
+                    continue
+                data = data["tool"]["ruff"]
+            return data.get("line-length", DEFAULT_WIDTH)
+    return DEFAULT_WIDTH
+
+
+def indent_of(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
+
+
+def fill(words: list[str], first: str, rest: str, width: int) -> list[str]:
+    wrapper = textwrap.TextWrapper(
+        width=width,
+        initial_indent=first,
+        subsequent_indent=rest,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    return wrapper.wrap(" ".join(words))
+
+
+def refilled(lines: list[str], paragraph: list[int], new: list[str]) -> list[Edit]:
+    """The edit replacing `paragraph` with `new`, or none when `new` is what's there."""
+    if new == [lines[n] for n in paragraph]:
+        return []
+    return [Edit(paragraph[0], paragraph[-1], new)]
+
+
+def docstrings(tree: ast.AST, lines: list[str]) -> list[tuple[int, int, int]]:
+    """(first line, last line, indent column) of each triple-quoted docstring alone on
+    its lines, 0-based lines: one that shares a line with code or a comment is left."""
+    spans = []
+    for node in ast.walk(tree):
+        kinds = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        if not isinstance(node, kinds) or not node.body:
+            continue
+        first = node.body[0]
+        if not (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+            and first.end_lineno is not None
+            and first.end_col_offset is not None
+        ):
+            continue
+        start, end = first.lineno - 1, first.end_lineno - 1
+        opening = OPENING.match(lines[start], first.col_offset)
+        closing = lines[end][: first.end_col_offset]
+        if (
+            opening is not None
+            and not lines[start][: first.col_offset].strip()
+            and not lines[end][first.end_col_offset :].strip()
+            and closing.endswith(opening.group(1))
+        ):
+            spans.append((start, end, first.col_offset))
+    return spans
+
+
+def prose(lines: list[str], number: int, indent: str, quotes: str) -> bool:
+    """Whether a docstring line, not its first, is prose at the docstring's indent."""
+    line = lines[number]
+    body = line.removeprefix(indent)
+    title = number + 1 < len(lines) and UNDERLINE.match(lines[number + 1].strip())
+    return bool(
+        body.strip()
+        and indent_of(line) == indent
+        and body.strip() != quotes
+        and not KEPT.match(body)
+        and not UNDERLINE.match(body.strip())
+        and not title
+    )
+
+
+def docstring_edits(
+    lines: list[str], span: tuple[int, int, int], width: int
+) -> list[Edit]:
+    """An edit for each paragraph of one docstring that holds a line past the width."""
+    start, end, column = span
+    indent = lines[start][:column]
+    opening = OPENING.match(lines[start], column)
+    assert opening is not None  # docstrings() checked
+    quotes = opening.group(1)
+    # A bare opening line (`"""` with the text below) stays bare.
+    paragraphs, current = [], [start] if lines[start][opening.end() :].strip() else []
+    for number in range(start + 1, end + 1):
+        if prose(lines, number, indent, quotes):
+            current.append(number)
+        else:
+            paragraphs.append(current)
+            current = []
+    paragraphs.append(current)
+    edits = []
+    for paragraph in filter(None, paragraphs):
+        if all(len(lines[n]) <= width for n in paragraph):
+            continue
+        text = " ".join(lines[n].strip() for n in paragraph)
+        first = indent
+        if paragraph[0] == start:
+            first += opening.group(0)
+            text = text[len(opening.group(0)) :]
+        if words := text.split():
+            edits += refilled(lines, paragraph, fill(words, first, indent, width))
+    return edits
+
+
+def comment_lines(source: str) -> set[int]:
+    """0-based numbers of the lines that hold only a comment."""
+    found = set()
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == tokenize.COMMENT and not token.line[: token.start[1]].strip():
+            found.add(token.start[0] - 1)
+    return found
+
+
+def comment_edits(lines: list[str], width: int) -> list[Edit]:
+    """An edit for each comment paragraph that holds a line past the width."""
+    alone = comment_lines("\n".join(lines) + "\n")
+    edits: list[Edit] = []
+    current: list[int] = []
+
+    def close() -> None:
+        if current and any(len(lines[n]) > width for n in current):
+            indent = indent_of(lines[current[0]])
+            words = " ".join(lines[n].strip()[1:] for n in current).split()
+            new = fill(words, indent + "# ", indent + "# ", width)
+            edits.extend(refilled(lines, current, new))
+        current.clear()
+
+    metadata = False  # inside a `# /// script` block (PEP 723), which isn't prose
+    for number, line in enumerate(lines):
+        stripped = line.strip()
+        if number in alone and stripped.startswith("# ///"):
+            metadata = stripped != "# ///"
+        is_prose = (
+            number in alone
+            and not metadata
+            and not stripped.startswith("# ///")
+            and stripped.startswith("# ")
+            and not DIRECTIVE.match(stripped)
+            and not stripped[2:].startswith(" ")
+            and not KEPT.match(stripped[2:])
+        )
+        if is_prose and current and indent_of(line) != indent_of(lines[current[0]]):
+            close()
+        if is_prose:
+            current.append(number)
+        else:
+            close()
+    close()
+    return edits
+
+
+def code_of(source: str) -> str:
+    """The source's syntax tree with each string's whitespace collapsed: what a reflow
+    of docstrings and comments must leave alone."""
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            node.value = " ".join(node.value.split())
+    return ast.dump(tree)
+
+
+def rewrap(source: str, width: int) -> tuple[str, int]:
+    """The source with its long paragraphs reflowed, and how many it reflowed. Raises
+    ValueError when the result's code differs from the source's."""
+    lines = source.split("\n")
+    edits = comment_edits(lines, width)
+    for span in docstrings(ast.parse(source), lines):
+        edits += docstring_edits(lines, span, width)
+    for edit in sorted(edits, reverse=True):
+        lines[edit.start : edit.end + 1] = edit.lines
+    new = "\n".join(lines)
+    if edits and code_of(new) != code_of(source):
+        raise ValueError("rewrapping would change its code, so it's left as it is")
+    return new, len(edits)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="rewrap",
+        description=__doc__.split("\n\n")[0],
+        epilog=__doc__.split("\n\n", 1)[1],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("files", nargs="+", type=Path)
+    parser.add_argument("--width", type=int, help="the line length (default: ruff's)")
+    parser.add_argument("--check", action="store_true", help="report, write nothing")
+    args = parser.parse_args(argv)
+    status = 0
+    for path in args.files:
+        try:
+            raw = path.read_bytes().decode()
+            crlf = "\r\n" in raw
+            source = raw.replace("\r\n", "\n")
+            width = args.width or ruff_width(path)
+            new, count = rewrap(source, width)
+        except (
+            OSError,
+            UnicodeDecodeError,
+            SyntaxError,
+            tokenize.TokenError,
+            ValueError,
+            tomllib.TOMLDecodeError,
+        ) as error:
+            print(f"{path}: {error}", file=sys.stderr)
+            status = 2
+            continue
+        if count:
+            verb = "would rewrap" if args.check else "rewrapped"
+            print(f"{verb} {path} ({count} paragraph{'s' if count > 1 else ''})")
+            if args.check:
+                status = max(status, 1)
+            else:
+                path.write_bytes((new.replace("\n", "\r\n") if crlf else new).encode())
+        on_disk = source if args.check else new
+        for number, line in enumerate(on_disk.split("\n"), 1):
+            if len(line) > width:
+                print(f"{path}:{number}: {len(line)} > {width}")
+                status = max(status, 1)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

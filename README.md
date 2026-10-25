@@ -266,7 +266,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   timeouts with backoff for up to 2 minutes, so callers needn't sleep and
   retry. When Semantic Scholar still fails, `meta`, `search` and `cites`
   answer from OpenAlex under a `source:` line; OpenAlex counts far fewer
-  citations for arXiv papers. Sends a Semantic Scholar API key from
+  citations for arXiv papers. When Semantic Scholar doesn't know a paper,
+  `meta` asks OpenAlex, then Crossref for a DOI, and says which answered; it
+  reports not found only when none knows it. Sends a Semantic Scholar API key from
   `$S2_API_KEY`, else from `claudedev/.semantic-scholar/api-key`, and an
   OpenAlex key from `$OPENALEX_API_KEY`, else from `claudedev/.openalex/api-key`,
   when there is one. Caches everything

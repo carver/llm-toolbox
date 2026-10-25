@@ -270,6 +270,11 @@ def test_a_long_retry_after_is_capped_by_the_budget(cache, capsys):
 
 
 OPENALEX_HAS_NOTHING = ("GET", "api.openalex.org", [paper.Response(404, {}, b"<html>")])
+CROSSREF_HAS_NOTHING = (
+    "GET",
+    "api.crossref.org",
+    [paper.Response(404, {"Content-Type": "text/plain"}, b"Resource not found.")],
+)
 
 
 def test_a_client_error_is_not_retried(cache, capsys):
@@ -281,7 +286,11 @@ def test_a_client_error_is_not_retried(cache, capsys):
 
 
 def test_meta_prints_a_block_per_id_and_exits_1_for_one_not_found(cache, capsys):
-    http = FakeHTTP(("POST", "/paper/batch", [ok([COLLUSION, None, ATTENTION])]))
+    http = FakeHTTP(
+        ("POST", "/paper/batch", [ok([COLLUSION, None, ATTENTION])]),
+        OPENALEX_HAS_NOTHING,
+        CROSSREF_HAS_NOTHING,
+    )
     code, out, err, _ = run(
         capsys,
         ["meta", S2_ID, "https://doi.org/10.1000/missing", "1706.03762"],
@@ -1868,7 +1877,9 @@ def test_a_single_cache_miss_still_uses_a_get(cache, capsys):
 
 
 def test_a_null_in_the_batch_is_not_found_for_that_id(cache, capsys):
-    http = FakeHTTP(batch_route(ok([ATTENTION, None])))
+    http = FakeHTTP(
+        batch_route(ok([ATTENTION, None])), OPENALEX_HAS_NOTHING, CROSSREF_HAS_NOTHING
+    )
     code, out, err, _ = run(capsys, ["meta", "1706.03762", "10.1000/missing"], http)
     assert code == 1
     assert out.startswith(ATTENTION["title"] + "\n")
@@ -1899,7 +1910,7 @@ def test_a_throttled_batch_falls_back_to_openalex_for_each_id(cache, capsys):
     )
     assert code == 0, err
     assert [c["method"] for c in s2_calls(http)] == ["POST"] * 6
-    assert out.count(paper.SOURCE_LINE) == 2
+    assert out.count("  " + paper.SOURCE_NOTE) == 2
 
 
 def test_batches_hold_at_most_500_ids(cache, capsys):
@@ -2000,6 +2011,200 @@ def test_a_duplicate_id_is_asked_for_once_and_printed_each_time(cache, capsys):
     (call,) = s2_calls(http)
     assert call["json"] == {"ids": ["arXiv:1706.03762", S2_ID]}
     assert out.count(ATTENTION["title"]) == 2
+
+
+# meta when Semantic Scholar doesn't know the paper: OpenAlex, then Crossref
+
+NASH_DOI = "10.2307/1969529"
+S2_DOESNT_KNOW = (
+    "GET",
+    "semanticscholar.org",
+    [status(404, {"error": "Paper not found"})],
+)
+OA_NASH = dict(
+    OA_JOURNAL,
+    id="https://openalex.org/W1980209624",
+    doi="https://doi.org/10.2307/1969529",
+    display_name="Non-Cooperative Games",
+    publication_year=1951,
+    cited_by_count=5200,
+    authorships=[
+        {
+            "author": {"display_name": "John Nash"},
+            "institutions": [{"display_name": "Princeton University"}],
+        }
+    ],
+    primary_location={"source": {"display_name": "Annals of Mathematics"}},
+)
+OA_NASH_ROUTE = ("GET", "api.openalex.org/works/doi:10.2307/1969529", [ok(OA_NASH)])
+CROSSREF_NASH = {
+    "status": "ok",
+    "message-type": "work",
+    "message": {
+        "DOI": "10.2307/1969529",
+        "title": ["Non-Cooperative Games"],
+        "author": [
+            {"given": "John", "family": "Nash", "sequence": "first", "affiliation": []}
+        ],
+        "container-title": ["The Annals of Mathematics"],
+        "issued": {"date-parts": [[1951, 9]]},
+        "is-referenced-by-count": 6600,
+        "page": "286",
+        "volume": "54",
+        "type": "journal-article",
+    },
+}
+CROSSREF_NASH_ROUTE = (
+    "GET",
+    "api.crossref.org/works/10.2307/1969529",
+    [ok(CROSSREF_NASH)],
+)
+OPENALEX_FAILS = ("GET", "api.openalex.org", [status(503)])
+
+
+def crossref_calls(http):
+    return calls_to(http, "api.crossref.org")
+
+
+def test_meta_asks_openalex_for_a_doi_semantic_scholar_doesnt_know(cache, capsys):
+    http = FakeHTTP(S2_DOESNT_KNOW, OA_NASH_ROUTE)
+    code, out, err, _ = run(capsys, ["meta", NASH_DOI], http)
+    assert code == 0, err
+    assert out == (
+        "Non-Cooperative Games\n"
+        "  source: OpenAlex, because Semantic Scholar doesn't know this paper.\n"
+        "  1951 · Annals of Mathematics\n"
+        "  authors: John Nash (Princeton University)\n"
+        "  citations: 5200\n"
+        "  ids: DOI:10.2307/1969529 OpenAlex:W1980209624\n"
+    )
+    assert err == ""
+    assert crossref_calls(http) == []
+
+
+def test_meta_asks_crossref_when_openalex_doesnt_know_the_doi_either(cache, capsys):
+    http = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING, CROSSREF_NASH_ROUTE)
+    code, out, err, _ = run(capsys, ["meta", NASH_DOI], http)
+    assert code == 0, err
+    assert out == (
+        "Non-Cooperative Games\n"
+        "  source: Crossref, because Semantic Scholar doesn't know this paper and"
+        " OpenAlex doesn't either. Crossref counts only the citations publishers"
+        " deposit with it.\n"
+        "  1951 · The Annals of Mathematics\n"
+        "  authors: John Nash\n"
+        "  citations: 6600\n"
+        "  ids: DOI:10.2307/1969529\n"
+    )
+    (call,) = crossref_calls(http)
+    assert call["params"]["mailto"] == "robocarver@worldofmail.com"
+
+
+def test_a_doi_missing_from_the_batch_falls_back_too(cache, capsys):
+    http = FakeHTTP(batch_route(ok([ATTENTION, None])), OA_NASH_ROUTE)
+    code, out, err, _ = run(capsys, ["meta", "1706.03762", NASH_DOI], http)
+    assert code == 0, err
+    titles = [line for line in out.splitlines() if not line.startswith(" ")]
+    assert titles == [ATTENTION["title"], "Non-Cooperative Games"]
+    assert len(s2_calls(http)) == 1
+
+
+def test_meta_says_not_found_only_when_every_source_does(cache, capsys):
+    http = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING, CROSSREF_HAS_NOTHING)
+    code, out, err, _ = run(capsys, ["meta", "10.1080/1386979032000146807"], http)
+    assert (code, out) == (1, "")
+    assert err == "paper: not found: 10.1080/1386979032000146807\n"
+    assert len(openalex_calls(http)) == len(crossref_calls(http)) == 1
+
+
+def test_an_arxiv_id_semantic_scholar_doesnt_know_asks_openalex_not_crossref(
+    cache, capsys
+):
+    http = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING)
+    code, _, err, _ = run(capsys, ["meta", "2404.00806"], http)
+    assert code == 1
+    assert "not found: 2404.00806" in err
+    (call,) = openalex_calls(http)
+    assert "/works/doi:10.48550/arXiv.2404.00806" in call["url"]
+    assert crossref_calls(http) == []
+
+
+def test_crossref_still_answers_when_openalex_fails(cache, capsys):
+    http = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_FAILS, CROSSREF_NASH_ROUTE)
+    code, out, err, _ = run(capsys, ["meta", NASH_DOI], http)
+    assert code == 0, err
+    assert out.splitlines()[1].startswith(
+        "  source: Crossref, because Semantic Scholar doesn't know this paper and"
+        " OpenAlex failed."
+    )
+
+
+def test_a_failed_fallback_is_not_reported_as_not_found(cache, capsys):
+    http = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_FAILS, CROSSREF_HAS_NOTHING)
+    code, out, err, _ = run(capsys, ["meta", NASH_DOI], http)
+    assert (code, out) == (3, "")
+    assert "not found" not in err
+    assert "Semantic Scholar doesn't know" in err and "OpenAlex" in err
+
+
+def test_help_says_meta_asks_openalex_then_crossref_for_unknown_papers(capsys):
+    with pytest.raises(SystemExit):
+        paper.main(["-h"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Semantic Scholar doesn't know a paper" in out
+    assert "then Crossref" in out and "Crossref's at least 0.2 seconds" in out
+
+
+def test_a_crossref_answer_is_paced_logged_and_cached(cache, capsys):
+    paces = []
+    http = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING, CROSSREF_NASH_ROUTE)
+    code, first, err, _ = run(capsys, ["meta", NASH_DOI], http, paces=paces)
+    assert code == 0, err
+    assert paces == ["Semantic Scholar", "OpenAlex", "Crossref"]
+    assert "Crossref" in {line["service"] for line in logged(cache)}
+    again = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING)
+    assert run(capsys, ["meta", NASH_DOI], again)[:2] == (0, first)
+    assert crossref_calls(again) == []
+
+
+def test_a_crossref_answer_without_a_work_exits_3_and_caches_nothing(cache, capsys):
+    odd = ("GET", "api.crossref.org", [ok({"status": "ok", "message": ["no work"]})])
+    http = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING, odd)
+    code, out, err, _ = run(capsys, ["meta", NASH_DOI], http)
+    assert (code, out) == (3, "")
+    assert "Crossref sent an unexpected answer" in err
+    sound = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING, CROSSREF_NASH_ROUTE)
+    assert run(capsys, ["meta", NASH_DOI], sound)[0] == 0
+
+
+def test_crossref_failing_for_a_doi_nobody_else_knows_exits_3_naming_it(cache, capsys):
+    crossref_down = ("GET", "api.crossref.org", [status(503)])
+    http = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING, crossref_down)
+    code, out, err, _ = run(capsys, ["meta", NASH_DOI], http)
+    assert (code, out) == (3, "")
+    assert "not found" not in err
+    assert "Crossref failed" in err
+
+
+def test_an_arxiv_doi_nobody_knows_is_not_sent_to_crossref(cache, capsys):
+    http = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING, CROSSREF_HAS_NOTHING)
+    code, _, err, _ = run(capsys, ["meta", "10.48550/arXiv.2404.00806"], http)
+    assert code == 1
+    assert "not found: 10.48550/arXiv.2404.00806" in err
+    assert len(openalex_calls(http)) == 1
+    assert crossref_calls(http) == []
+
+
+def test_crossref_answers_are_cached_whatever_the_dois_case(cache, capsys):
+    work = {"message": dict(CROSSREF_NASH["message"], DOI="10.1111/1467-937X.00136")}
+    http = FakeHTTP(
+        S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING, ("GET", "api.crossref.org", [ok(work)])
+    )
+    code, first, err, _ = run(capsys, ["meta", "10.1111/1467-937X.00136"], http)
+    assert code == 0, err
+    again = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING, CROSSREF_HAS_NOTHING)
+    assert run(capsys, ["meta", "10.1111/1467-937x.00136"], again)[:2] == (0, first)
+    assert crossref_calls(again) == []
 
 
 # paper sweep: /paper/search/bulk to a TSV file

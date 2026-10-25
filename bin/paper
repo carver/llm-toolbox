@@ -20,6 +20,10 @@ and Semantic Scholar ids, and, for an arXiv paper, its latest version with
 the dates of its first and latest versions (one arXiv API request per call).
 Pass every id to one meta call: the ids missing from the cache go to Semantic
 Scholar as one batch request (up to 500 ids each), not one request apiece.
+When Semantic Scholar doesn't know a paper, meta asks OpenAlex, then Crossref
+for a DOI, and prints the first answer under a `source:` line naming it; only
+when they don't know it either does meta say the paper is not found.
+Crossref counts only the citations publishers deposit with it.
 cites lists papers citing ID (default 20), search the top matches for a
 keyword query (default 10), each with year, title, venue, first three authors
 and ids. text downloads the PDF, extracts it with `pdftotext -layout` and
@@ -67,11 +71,11 @@ none of these (PMLR, OpenReview), find its paperId with search.
 Every answer is cached in $PAPER_CACHE (default
 /home/carver/code/claudedev/cache/paper, or ~/.cache/paper on a machine without
 /home/carver/code/claudedev/cache): Semantic Scholar responses as JSON,
-OpenAlex responses likewise in openalex/, arXiv versions and dates for a day
-(new versions appear), PDFs with their text. Delete the s2 folder there to
-refetch Semantic Scholar answers (metadata, citations, searches), or a
-paper's files in pdf/ to fetch its text anew. If arXiv can't be reached, meta
-prints the rest and warns.
+OpenAlex and Crossref responses likewise in openalex/ and crossref/, arXiv
+versions and dates for a day (new versions appear), PDFs with their text.
+Delete the s2 folder there to refetch Semantic Scholar answers (metadata,
+citations, searches), or a paper's files in pdf/ to fetch its text anew. If
+arXiv can't be reached, meta prints the rest and warns.
 
 Semantic Scholar answers more requests, and 429s less, with an API key. paper
 sends one when $S2_API_KEY is set, else when the file
@@ -82,8 +86,9 @@ anonymous.
 Requests are paced across every paper process that shares the cache, so
 agents running paper in parallel stay under the limits: Semantic Scholar's at
 least 1.1 seconds apart (a key allows about one a second), OpenAlex's at least
-0.15 seconds, the arXiv API's at least 3 seconds apart. Each waits its turn on
-a lock file in the cache. PDF downloads aren't paced.
+0.15 seconds, Crossref's at least 0.2 seconds, the arXiv API's at least 3
+seconds apart. Each waits its turn on a lock file in the cache. PDF downloads
+aren't paced.
 
 Rate limits (HTTP 429, including Semantic Scholar's JSON error object), 5xx
 and timeouts are retried with exponential backoff, honouring Retry-After: up
@@ -95,10 +100,11 @@ paperId has no OpenAlex form), and later lookups in the same run go straight
 to OpenAlex. A `source:` line in the output says so: OpenAlex counts and
 lists far fewer citations than Semantic Scholar for arXiv papers, so rerun
 later for Semantic Scholar's numbers, and an empty OpenAlex citer list doesn't
-show that nothing cites the paper. OpenAlex requests carry
-mailto=robocarver@worldofmail.com, and an API key when $OPENALEX_API_KEY is
-set, else when /home/carver/code/claudedev/.openalex/api-key holds one; it
-goes only to OpenAlex. Without a key, every request from this network shares
+show that nothing cites the paper. OpenAlex and Crossref requests carry
+mailto=robocarver@worldofmail.com. OpenAlex requests also carry an API key
+when $OPENALEX_API_KEY is set, else when
+/home/carver/code/claudedev/.openalex/api-key holds one; it goes only to
+OpenAlex. Without a key, every request from this network shares
 one small daily budget. A key OpenAlex refuses (not yet activated, or
 invalid) is dropped, with a warning. OpenAlex lists at most 200 papers per
 request, so --limit above 200 gets 200.
@@ -108,8 +114,9 @@ read, or a DOI has no open-access PDF; search with no hits exits 1, and so
 do grep with no matching line and outline with no heading; cites with no
 citing papers says so and exits 0), 2 usage error, 3 the remote refused or
 failed the request after retries, or sent an unexpected answer, including
-Semantic Scholar failing while OpenAlex fails too or has no record: try
-again later.
+Semantic Scholar failing while OpenAlex fails too or has no record, and
+OpenAlex or Crossref failing for a paper Semantic Scholar doesn't know while
+neither has it: try again later.
 
 Examples:
     paper meta 2404.00806 10.1145/3442188.3445922
@@ -136,7 +143,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
 from typing import Any
@@ -162,9 +169,11 @@ PACED = {
     "Semantic Scholar": 1.1,
     "arXiv": 3.0,
     "OpenAlex": 0.15,
+    "Crossref": 0.2,
 }  # seconds between requests
 OPENALEX = "https://api.openalex.org"
-OPENALEX_MAILTO = "robocarver@worldofmail.com"
+CROSSREF = "https://api.crossref.org"
+MAILTO = "robocarver@worldofmail.com"  # OpenAlex's and Crossref's polite pools
 OPENALEX_KEY_ENV = "OPENALEX_API_KEY"
 OPENALEX_KEY_FILE = Path("/home/carver/code/claudedev/.openalex/api-key")
 OPENALEX_PAGE_MAX = 200  # OpenAlex refuses a larger per_page
@@ -241,6 +250,10 @@ class PaperId:
         """The OpenAlex work path for this id, or None when OpenAlex can't take it."""
         return None
 
+    def crossref_path(self) -> str | None:
+        """The Crossref work path for this id, or None when Crossref can't take it."""
+        return None
+
     def pdf_source(self) -> tuple[str | None, str]:
         """The PDF's URL and the cache file stem for it. The URL is None when it has to
         be looked up (a DOI's open-access PDF, through OpenAlex)."""
@@ -266,6 +279,12 @@ class Doi(PaperId):
 
     def openalex_path(self) -> str | None:
         return "/works/doi:" + quote(self.value, safe=":/")
+
+    def crossref_path(self) -> str | None:
+        """None for an arXiv DOI: those are DataCite's, never in Crossref."""
+        if ARXIV_DOI.fullmatch(self.value):
+            return None
+        return "/works/" + quote(self.value, safe=":/")
 
     def pdf_source(self) -> tuple[str | None, str]:
         m = ARXIV_DOI.fullmatch(self.value)
@@ -583,20 +602,51 @@ class Client:
         """An OpenAlex response's JSON, from the cache when it's there. The cache key
         leaves out the mailto and the API key."""
         url = OPENALEX + path
-        cached = self.cache_file("openalex", url, params)
+        return self.json_answer(
+            "OpenAlex",
+            url,
+            self.cache_file("openalex", url, params),
+            lambda: self.openalex_request(url, params),
+        )
+
+    def crossref(self, path: str) -> dict[str, Any]:
+        """A Crossref work, the message of its JSON answer, from the cache when it's
+        there. The cache key leaves out the mailto, and DOIs are case-insensitive."""
+        url = CROSSREF + path
+        answer = self.json_answer(
+            "Crossref",
+            url,
+            self.cache_file("crossref", url.lower(), {}),
+            lambda: self.request("Crossref", "GET", url, params={"mailto": MAILTO}),
+            sound=lambda answer: isinstance(answer.get("message"), dict),
+        )
+        return answer["message"]
+
+    def json_answer(
+        self,
+        service: str,
+        url: str,
+        cached: Path,
+        ask: Callable[[], Response],
+        sound: Callable[[dict[str, Any]], bool] = lambda answer: True,
+    ) -> dict[str, Any]:
+        """`service`'s JSON object for `url`, from the file `cached` when it's there,
+        else from `ask` and written there. A 404 is NotFound; any other status, or an
+        answer that isn't a JSON object or isn't `sound`, is a RemoteError."""
         if cached.exists():
             return json.loads(cached.read_text(encoding="utf-8"))
-        response = self.openalex_request(url, params)
+        response = ask()
         if response.status == 404:
             raise NotFound(url)
         if response.status != 200:
-            problem = error_text(response)
-            if self.openalex_key:
-                problem = problem.replace(self.openalex_key.value, "<api key>")
-            raise RemoteError(f"OpenAlex: HTTP {response.status}: {problem}")
-        data = json_object("OpenAlex", response)
-        write_atomic(cached, json.dumps(data).encode())
-        return data
+            raise RemoteError(
+                f"{service}: HTTP {response.status}: {error_text(response)}"
+            )
+        answer = json_object(service, response)
+        if not sound(answer):
+            raise unexpected_answer(service, response)
+        write_atomic(cached, json.dumps(answer).encode())
+        return answer
 
     def fallback(
         self, gave_up: GaveUp, path: str, params: dict[str, Any]
@@ -617,10 +667,10 @@ class Client:
             raise RemoteError(f"{gave_up}; OpenAlex failed too: {e}") from None
 
     def openalex_request(self, url: str, params: dict[str, Any]) -> Response:
-        """One OpenAlex request with mailto and the key. A key OpenAlex refuses (not yet
-        activated, or invalid) is dropped, with a warning, and the request sent again
-        without it."""
-        sent = dict(params, mailto=OPENALEX_MAILTO)
+        """One OpenAlex request with mailto and the key, and the key blanked out of its
+        answer, where an error may echo it. A key OpenAlex refuses (not yet activated,
+        or invalid) is dropped, with a warning, and the request sent again without it."""
+        sent = dict(params, mailto=MAILTO)
         key = None if self.openalex_key_refused else self.openalex_key
         if key:
             sent["api_key"] = key.value
@@ -637,7 +687,10 @@ class Client:
             )
             self.openalex_key_refused = True
             keyless = {k: v for k, v in sent.items() if k != "api_key"}
-            response = self.request("OpenAlex", "GET", url, params=keyless)
+            return self.request("OpenAlex", "GET", url, params=keyless)
+        if key:
+            blanked = response.content.replace(key.value.encode(), b"<api key>")
+            response = replace(response, content=blanked)
         return response
 
     def arxiv_dates(self, ids: list[str]) -> dict[str, "ArxivDates"]:
@@ -820,11 +873,16 @@ def json_object(
     """The response's JSON object, holding the key `require` if given."""
     data = parsed_json(response)
     if not isinstance(data, dict) or (require and not data.get(require)):
-        raise RemoteError(
-            f"{service} sent an unexpected answer: "
-            + response.content[:200].decode(errors="replace")
-        )
+        raise unexpected_answer(service, response)
     return data
+
+
+def unexpected_answer(service: str, response: Response) -> RemoteError:
+    """The error for an answer of the wrong shape, quoting its start."""
+    return RemoteError(
+        f"{service} sent an unexpected answer: "
+        + response.content[:200].decode(errors="replace")
+    )
 
 
 def error_code(response: Response) -> str | None:
@@ -941,7 +999,6 @@ def openalex_paper(work: dict[str, Any]) -> Paper:
             }
             for a in work.get("authorships") or []
         ],
-        "source": "OpenAlex",
     }
 
 
@@ -971,7 +1028,71 @@ SOURCE_NOTE = (
     " counts and lists far fewer citations than Semantic Scholar for arXiv papers;"
     " rerun later for Semantic Scholar's."
 )
-SOURCE_LINE = "  " + SOURCE_NOTE
+UNKNOWN_NOTE = "source: OpenAlex, because Semantic Scholar doesn't know this paper."
+CROSSREF_NOTE = (
+    "source: Crossref, because Semantic Scholar doesn't know this paper and OpenAlex"
+    " {openalex}. Crossref counts only the citations publishers deposit with it."
+)
+
+
+# Crossref
+
+
+def crossref_paper(work: dict[str, Any]) -> Paper:
+    """A Crossref work in the shape the formatting functions take."""
+    issued = ((work.get("issued") or {}).get("date-parts") or [[None]])[0] or [None]
+    return {
+        "title": first_of(work.get("title")),
+        "year": issued[0],
+        "venue": first_of(work.get("container-title")),
+        "citationCount": work.get("is-referenced-by-count"),
+        "externalIds": {"DOI": work["DOI"]} if work.get("DOI") else {},
+        "authors": [
+            {
+                "name": " ".join(p for p in (a.get("given"), a.get("family")) if p)
+                or a.get("name"),
+                "affiliations": [
+                    i["name"] for i in a.get("affiliation") or [] if i.get("name")
+                ],
+            }
+            for a in work.get("author") or []
+        ],
+    }
+
+
+def first_of(values: Any) -> Any:
+    """The first item of a Crossref list field, or None when it's empty or missing."""
+    return values[0] if isinstance(values, list) and values else None
+
+
+def from_openalex_or_crossref(client: Client, pid: PaperId) -> Paper:
+    """The paper from OpenAlex, else from Crossref, when Semantic Scholar doesn't know
+    it, with its source note under "source". NotFound when every source that takes the
+    id says so; a RemoteError when none answers and one failed."""
+    failures: list[RemoteError] = []
+    openalex = "doesn't either"
+    if path := pid.openalex_path():
+        try:
+            return dict(openalex_paper(client.openalex(path, {})), source=UNKNOWN_NOTE)
+        except NotFound:
+            pass
+        except RemoteError as e:
+            failures.append(e)
+            openalex = "failed"
+    if path := pid.crossref_path():
+        try:
+            note = CROSSREF_NOTE.format(openalex=openalex)
+            return dict(crossref_paper(client.crossref(path)), source=note)
+        except NotFound:
+            pass
+        except RemoteError as e:
+            failures.append(e)
+    if failures:
+        raise RemoteError(
+            f"Semantic Scholar doesn't know {pid.value}; "
+            + "; ".join(str(e) for e in failures)
+        )
+    raise NotFound(pid.value)
 
 
 # Formatting
@@ -1006,8 +1127,8 @@ def author_names(paper: Paper, limit: int | None = None) -> str:
 
 def meta_block(paper: Paper, dates: ArxivDates | None = None) -> str:
     lines = [paper.get("title") or "(untitled)"]
-    if paper.get("source") == "OpenAlex":
-        lines.append(SOURCE_LINE)
+    if paper.get("source"):
+        lines.append("  " + paper["source"])
     where = " · ".join(str(x) for x in (paper.get("year"), paper.get("venue")) if x)
     if where:
         lines.append("  " + where)
@@ -1042,12 +1163,18 @@ def list_block(paper: Paper, show_citation_count: bool = False) -> str:
 # Commands
 
 
-def meta_paper(client: Client, pid: PaperId) -> Paper:
-    """The paper's metadata from Semantic Scholar, or from OpenAlex once it gives up."""
+def meta_paper(client: Client, pid: PaperId, unknown: bool) -> Paper:
+    """The paper's metadata from Semantic Scholar, or from OpenAlex once it gives up,
+    or from OpenAlex or Crossref when it doesn't know the paper (as `unknown` says the
+    batch found). A paper from elsewhere carries its source note under "source"."""
+    if unknown:
+        return from_openalex_or_crossref(client, pid)
     try:
         return client.s2(pid.s2_path(), {"fields": META_FIELDS}, require="paperId")
     except GaveUp as e:
-        return from_openalex(client, pid, e)
+        return dict(from_openalex(client, pid, e), source=SOURCE_NOTE)
+    except NotFound:
+        return from_openalex_or_crossref(client, pid)
 
 
 def prefetch_batch(client: Client, pids: list[PaperId]) -> set[str]:
@@ -1085,9 +1212,7 @@ def cmd_meta(client: Client, args: argparse.Namespace) -> int:
     failure = None
     for text, pid in zip(args.ids, pids):
         try:
-            if pid.s2_id() in unknown:
-                raise NotFound(text)
-            papers.append(meta_paper(client, pid))
+            papers.append(meta_paper(client, pid, pid.s2_id() in unknown))
         except NotFound:
             print(f"paper: not found: {text}", file=sys.stderr)
             code = NOT_FOUND

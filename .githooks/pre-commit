@@ -1,16 +1,45 @@
 #!/bin/sh
 # Agents' commits also run the slower agent-pre-commit (llm-toolbox agent-commit-gate).
 if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then if command -v agent-commit-gate >/dev/null; then AGENT_PRE_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/agent-pre-commit"; else AGENT_PRE_COMMIT=1 "$(dirname "$0")/agent-pre-commit"; fi || exit; fi
-# Lint and format-check what's staged, in about a second. Enabled by install.py (core.hooksPath).
-# The test suite is too slow for this; agent-pre-commit runs it.
+# Lint and format-check what's staged, formatting and restaging what it can, in a second or two.
+# Enabled by install.py (core.hooksPath). The test suite is too slow for this; agent-pre-commit runs it.
 set -e
-command -v uv >/dev/null || { echo "pre-commit: needs uv on PATH; install uv: https://docs.astral.sh/uv/" >&2; exit 1; }
+if [ -z "${PRE_COMMIT_IN_UV:-}" ]; then
+  command -v uv >/dev/null || { echo "pre-commit: needs uv on PATH; install uv: https://docs.astral.sh/uv/" >&2; exit 1; }
+  # uv, not a .venv: the repo is shared by machines whose Pythons differ. The rest of the hook runs
+  # in one uv environment, since each uv run takes up to a second on a loaded machine.
+  PRE_COMMIT_IN_UV=1 AGENT_PRE_COMMIT=1 exec uv run -q --no-project --with-requirements requirements-dev.txt sh "$0"
+fi
+export GIT_LITERAL_PATHSPECS=1 # a file name such as a[1].py is a name, not a pattern
 tree=$(mktemp -d)
 trap 'rm -rf "$tree"' EXIT
-# Check the staged snapshot, not the working tree, without touching either.
-git checkout-index -a --prefix="$tree/"
-cd "$tree"
-# uv, not a .venv: the repo is shared by machines whose Pythons differ.
-uv_tools="uv run -q --no-project --with-requirements requirements-dev.txt"
-$uv_tools ruff check --quiet .
-$uv_tools ruff format --check --quiet .
+# Check a snapshot of what's staged, not the working tree.
+check() {
+  rm -rf "$tree/staged"
+  git checkout-index -a --prefix="$tree/staged/"
+  (cd "$tree/staged" && ruff check --quiet . && ruff format --check --quiet .)
+}
+check >/dev/null 2>&1 && exit 0
+# Formatting alone shouldn't refuse a commit. Format the snapshot, without its symlinks, which ruff
+# would write through, and stage the result for each staged file ruff changed that has no unstaged
+# changes. The second check refuses the commit for any other file ruff changed: one with unstaged
+# changes, since staging it would take those along, and every file of a `git commit PATH`, which
+# commits from a temporary index while the real one keeps what it had.
+find "$tree/staged" -type l -exec rm -f {} +
+(cd "$tree/staged" && ruff format --quiet . >/dev/null 2>&1) || : # the second check reports errors
+case ${GIT_INDEX_FILE##*/} in next-index*) path_commit=1 ;; *) path_commit= ;; esac
+git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR | while IFS= read -r file; do
+  formatted="$tree/staged/$file"
+  [ -f "$formatted" ] || continue
+  git show ":$file" | cmp -s - "$formatted" && continue
+  if [ -n "$path_commit" ]; then
+    echo "pre-commit: ruff format would change $file, which a \`git commit PATH\` can't restage; git add it, then commit" >&2
+  elif git diff --quiet -- "$file"; then
+    cp "$formatted" "$file"
+    git add -- "$file"
+    echo "pre-commit: ruff format changed $file; the formatted file is staged" >&2
+  else
+    echo "pre-commit: $file has unstaged changes, so the hook can't stage it formatted; run ruff format on it" >&2
+  fi
+done
+check

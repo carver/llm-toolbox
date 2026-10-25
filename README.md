@@ -273,7 +273,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 ```
 
 It checks what's staged. `install.py` points git at `.githooks`. Its `pre-commit` runs the two ruff checks on
-what's staged; `agent-pre-commit` adds the tests (about 50 seconds), and
+what's staged. When only formatting fails, it formats each staged file that has no unstaged changes,
+stages the result and names the file; any other unformatted file refuses the commit, as does every
+file of a `git commit PATH`. `agent-pre-commit` adds the tests (about 50 seconds), and
 `pre-commit` runs it first when an agent commits. Both run the tools
 through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.

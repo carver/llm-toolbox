@@ -268,13 +268,16 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   answer from OpenAlex under a `source:` line; OpenAlex counts far fewer
   citations for arXiv papers. When Semantic Scholar doesn't know a paper,
   `meta` asks OpenAlex, then Crossref for a DOI, and says which answered; it
-  reports not found only when none knows it. Sends a Semantic Scholar API key from
+  reports not found only when none knows it. `bib` prints a BibTeX entry per
+  DOI or arXiv id (through its DataCite DOI) from doi.org's content
+  negotiation, keyed by first author and year (`nash1951`), with `a`, `b`, …
+  on keys that clash in one call. Sends a Semantic Scholar API key from
   `$S2_API_KEY`, else from `claudedev/.semantic-scholar/api-key`, and an
   OpenAlex key from `$OPENALEX_API_KEY`, else from `claudedev/.openalex/api-key`,
   when there is one. Caches everything
   in `claudedev/cache/paper/`, or `~/.cache/paper/` on a machine without `claudedev/cache/` (`$PAPER_CACHE`
-  overrides). Exits 1 when not found or when a URL is not a PDF, 3 when the
-  remote still refuses.
+  overrides). Exits 1 when not found, when a URL is not a PDF or when a DOI
+  has no BibTeX, 3 when the remote still refuses.
 
 ## Checks
 

@@ -5,6 +5,7 @@
 """Fetch a paper's metadata, citations or full text from Semantic Scholar and arXiv.
 
     paper meta ID...
+    paper bib ID...
     paper cites ID [--limit N]
     paper search QUERY... [--limit N]
     paper sweep QUERY... [--year Y] [--min-citations N] [--fields-of-study LIST]
@@ -24,6 +25,16 @@ When Semantic Scholar doesn't know a paper, meta asks OpenAlex, then Crossref
 for a DOI, and prints the first answer under a `source:` line naming it; only
 when they don't know it either does meta say the paper is not found.
 Crossref counts only the citations publishers deposit with it.
+
+bib prints a BibTeX entry per DOI or arXiv id, a blank line between entries,
+from doi.org's content negotiation: Crossref's or DataCite's record as it
+comes, but keyed by the first author's family name in ASCII letters and the
+year (nash1951), with a, b, ... on keys that clash within the call
+(kreps1982a, kreps1982b). An arXiv id goes through its DataCite DOI
+(10.48550/arXiv.ID), whose year is the first version's. A DOI whose
+registration agency serves no BibTeX says so, and exits 1 like one doi.org
+doesn't know, after printing the rest.
+
 cites lists papers citing ID (default 20), search the top matches for a
 keyword query (default 10), each with year, title, venue, first three authors
 and ids. text downloads the PDF, extracts it with `pdftotext -layout` and
@@ -66,13 +77,15 @@ pdf URL, a DOI (10.1145/... bare or as a doi.org URL), or a 40-character
 Semantic Scholar paperId. text takes arXiv ids and URLs, DOIs or a direct PDF
 URL: an arXiv DOI (10.48550/arXiv....) fetches from arXiv, and any other DOI
 fetches the open-access PDF OpenAlex lists, if it lists one. For a paper with
-none of these (PMLR, OpenReview), find its paperId with search.
+none of these (PMLR, OpenReview), find its paperId with search. bib takes
+DOIs and arXiv ids and URLs.
 
 Every answer is cached in $PAPER_CACHE (default
 /home/carver/code/claudedev/cache/paper, or ~/.cache/paper on a machine without
 /home/carver/code/claudedev/cache): Semantic Scholar responses as JSON,
-OpenAlex and Crossref responses likewise in openalex/ and crossref/, arXiv
-versions and dates for a day (new versions appear), PDFs with their text.
+OpenAlex and Crossref responses likewise in openalex/ and crossref/, BibTeX
+entries in bibtex/, arXiv versions and dates for a day (new versions appear),
+PDFs with their text.
 Delete the s2 folder there to refetch Semantic Scholar answers (metadata,
 citations, searches), or a paper's files in pdf/ to fetch its text anew. If
 arXiv can't be reached, meta prints the rest and warns.
@@ -86,9 +99,9 @@ anonymous.
 Requests are paced across every paper process that shares the cache, so
 agents running paper in parallel stay under the limits: Semantic Scholar's at
 least 1.1 seconds apart (a key allows about one a second), OpenAlex's at least
-0.15 seconds, Crossref's at least 0.2 seconds, the arXiv API's at least 3
-seconds apart. Each waits its turn on a lock file in the cache. PDF downloads
-aren't paced.
+0.15 seconds, Crossref's and doi.org's at least 0.2 seconds, the arXiv API's
+at least 3 seconds apart. Each waits its turn on a lock file in the cache.
+PDF downloads aren't paced.
 
 Rate limits (HTTP 429, including Semantic Scholar's JSON error object), 5xx
 and timeouts are retried with exponential backoff, honouring Retry-After: up
@@ -101,7 +114,9 @@ to OpenAlex. A `source:` line in the output says so: OpenAlex counts and
 lists far fewer citations than Semantic Scholar for arXiv papers, so rerun
 later for Semantic Scholar's numbers, and an empty OpenAlex citer list doesn't
 show that nothing cites the paper. OpenAlex and Crossref requests carry
-mailto=robocarver@worldofmail.com. OpenAlex requests also carry an API key
+mailto=robocarver@worldofmail.com, and doi.org requests carry it in their
+User-Agent, so Crossref, where doi.org sends most of them, answers from its
+polite pool. OpenAlex requests also carry an API key
 when $OPENALEX_API_KEY is set, else when
 /home/carver/code/claudedev/.openalex/api-key holds one; it goes only to
 OpenAlex. Without a key, every request from this network shares
@@ -110,16 +125,17 @@ invalid) is dropped, with a warning. OpenAlex lists at most 200 papers per
 request, so --limit above 200 gets 200.
 
 Exit status: 0 success, 1 not found (or the URL is not a PDF pdftotext can
-read, or a DOI has no open-access PDF; search with no hits exits 1, and so
-do grep with no matching line and outline with no heading; cites with no
-citing papers says so and exits 0), 2 usage error, 3 the remote refused or
-failed the request after retries, or sent an unexpected answer, including
-Semantic Scholar failing while OpenAlex fails too or has no record, and
-OpenAlex or Crossref failing for a paper Semantic Scholar doesn't know while
-neither has it: try again later.
+read, or a DOI has no open-access PDF or no BibTeX; search with no hits exits
+1, and so do grep with no matching line and outline with no heading; cites
+with no citing papers says so and exits 0), 2 usage error, 3 the remote
+refused or failed the request after retries, or sent an unexpected answer,
+including Semantic Scholar failing while OpenAlex fails too or has no record,
+and OpenAlex or Crossref failing for a paper Semantic Scholar doesn't know
+while neither has it: try again later.
 
 Examples:
     paper meta 2404.00806 10.1145/3442188.3445922
+    paper bib 10.2307/1969529 1706.03762 >> refs.bib
     paper cites https://arxiv.org/abs/1706.03762 --limit 50
     paper search detect collusion multi-agent games --limit 5
     less "$(paper text 2404.00806)"
@@ -141,6 +157,8 @@ import statistics
 import subprocess
 import sys
 import time
+import unicodedata
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
@@ -170,10 +188,17 @@ PACED = {
     "arXiv": 3.0,
     "OpenAlex": 0.15,
     "Crossref": 0.2,
+    "doi.org": 0.2,
 }  # seconds between requests
 OPENALEX = "https://api.openalex.org"
 CROSSREF = "https://api.crossref.org"
+DOI_ORG = "https://doi.org/"
 MAILTO = "robocarver@worldofmail.com"  # OpenAlex's and Crossref's polite pools
+# doi.org passes it on to Crossref, whose polite pool takes a mailto here too.
+DOI_ORG_HEADERS = {
+    "Accept": "application/x-bibtex",
+    "User-Agent": f"paper (mailto:{MAILTO})",
+}
 OPENALEX_KEY_ENV = "OPENALEX_API_KEY"
 OPENALEX_KEY_FILE = Path("/home/carver/code/claudedev/.openalex/api-key")
 OPENALEX_PAGE_MAX = 200  # OpenAlex refuses a larger per_page
@@ -215,6 +240,10 @@ class ExtractFailed(Exception):
     """The download was not a PDF, or pdftotext could not read it."""
 
 
+class NoBibtex(Exception):
+    """doi.org knows the DOI, but its registration agency serves no BibTeX for it."""
+
+
 class TransportError(Exception):
     """The request never got an HTTP answer: a timeout or a dropped connection."""
 
@@ -254,6 +283,10 @@ class PaperId:
         """The Crossref work path for this id, or None when Crossref can't take it."""
         return None
 
+    def doi(self) -> str:
+        """The DOI doi.org resolves for this id."""
+        raise UsageError(f"needs a DOI or an arXiv id: {self.value!r}")
+
     def pdf_source(self) -> tuple[str | None, str]:
         """The PDF's URL and the cache file stem for it. The URL is None when it has to
         be looked up (a DOI's open-access PDF, through OpenAlex)."""
@@ -268,6 +301,10 @@ class ArxivId(PaperId):
 
     def openalex_path(self) -> str | None:
         return "/works/doi:10.48550/arXiv." + ARXIV_VERSION.sub("", self.value)
+
+    def doi(self) -> str:
+        """Its DataCite DOI, which names no version."""
+        return "10.48550/arXiv." + ARXIV_VERSION.sub("", self.value)
 
     def pdf_source(self) -> tuple[str, str]:
         return f"https://arxiv.org/pdf/{self.value}", "arxiv-" + self.value
@@ -285,6 +322,9 @@ class Doi(PaperId):
         if ARXIV_DOI.fullmatch(self.value):
             return None
         return "/works/" + quote(self.value, safe=":/")
+
+    def doi(self) -> str:
+        return self.value
 
     def pdf_source(self) -> tuple[str | None, str]:
         m = ARXIV_DOI.fullmatch(self.value)
@@ -648,6 +688,31 @@ class Client:
         write_atomic(cached, json.dumps(answer).encode())
         return answer
 
+    def bibtex(self, doi: str) -> str:
+        """The DOI's BibTeX entry, from doi.org's content negotiation, or from the cache
+        when it's there. NotFound for a DOI doi.org doesn't know; NoBibtex for one whose
+        registration agency serves no BibTeX (it answers 406, or with a landing page)."""
+        url = DOI_ORG + quote(doi, safe=":/")
+        # DOIs are case-insensitive.
+        cached = self.cache_file("bibtex", url.lower(), {}).with_suffix(".bib")
+        if cached.exists():
+            return cached.read_text(encoding="utf-8")
+        response = self.request("doi.org", "GET", url, headers=DOI_ORG_HEADERS)
+        if response.status == 404:
+            raise NotFound(doi)
+        if response.status == 406:
+            raise NoBibtex("doi.org answered HTTP 406")
+        if response.status != 200:
+            raise RemoteError(
+                f"doi.org: HTTP {response.status}: {error_text(response)}"
+            )
+        entry = response.content.decode(errors="replace").strip()
+        if not BIB_HEAD.match(entry):
+            kind = header(response, "Content-Type") or "something else"
+            raise NoBibtex(f"doi.org sent {kind}, not BibTeX")
+        write_atomic(cached, entry.encode())
+        return entry
+
     def fallback(
         self, gave_up: GaveUp, path: str, params: dict[str, Any]
     ) -> dict[str, Any]:
@@ -892,6 +957,13 @@ def error_code(response: Response) -> str | None:
     except ValueError:
         return None
     return str(data.get("code")) if isinstance(data, dict) and "code" in data else None
+
+
+def header(response: Response, name: str) -> str | None:
+    """The response's header `name`, matched without regard to case."""
+    return next(
+        (v for k, v in response.headers.items() if k.lower() == name.lower()), None
+    )
 
 
 def parse_retry_after(headers: dict[str, str]) -> float | None:
@@ -1680,6 +1752,174 @@ def sweep_line(row: dict[str, str]) -> str:
     return f"{head} · citations: {row['citations']} · " + " ".join(i for i in ids if i)
 
 
+def cmd_bib(client: Client, args: argparse.Namespace) -> int:
+    """A BibTeX entry per id, keyed lastnameYEAR, a blank line between entries."""
+    pids = [parse_id(text) for text in args.ids]
+    try:
+        dois = [pid.doi() for pid in pids]  # every id checked before any request
+    except UsageError as e:
+        raise UsageError(f"`paper bib` {e}") from e
+    code = OK
+    entries = []
+    failure = None
+    for text, doi in zip(args.ids, dois):
+        try:
+            entries.append(client.bibtex(doi))
+        except NotFound:
+            print(f"paper: not found: {text}", file=sys.stderr)
+            code = NOT_FOUND
+        except NoBibtex as e:
+            print(f"paper: no BibTeX for {text}: {e}", file=sys.stderr)
+            code = NOT_FOUND
+        except RemoteError as e:
+            failure = e  # print what was fetched first, then report it
+            break
+    if entries:
+        print("\n\n".join(rekeyed(entries)))
+    if failure:
+        raise failure
+    return code
+
+
+# BibTeX keys
+
+# An entry's type and key, as in "@article{Nash_1951,".
+BIB_HEAD = re.compile(r"@\w+\s*\{\s*([^,\s]*)\s*,")
+BIB_FIELD = re.compile(r"\s*,?\s*([A-Za-z][\w-]*)\s*=\s*")
+BIB_BARE = re.compile(r"[^,}\s]*")
+BIB_NAMES_SEPARATOR = r"\s+(?i:and)\s+"  # between the names in an author field
+# Lowercase particles that belong with the family name: de Finetti, van der Waals.
+NAME_PARTICLES = {
+    "de", "del", "della", "der", "di", "da", "du", "la", "le", "van", "von", "den",
+    "ter",
+}  # fmt: skip
+NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}  # generational, matched without a "."
+# LaTeX accents: \" \' \^ and the like, and lettered ones such as \c{c} and \v s.
+LATEX_ACCENT = re.compile(r"\\(?:[^A-Za-z]|[cvuHkrdbt](?=[\s{]))")
+# Letters NFKD doesn't split into a base letter and an accent.
+FOLDS = str.maketrans(
+    {"ß": "ss", "æ": "ae", "Æ": "Ae", "œ": "oe", "Œ": "Oe", "ø": "o", "Ø": "O",
+     "ł": "l", "Ł": "L", "đ": "d", "Đ": "D", "ð": "d", "Ð": "D", "þ": "th", "Þ": "Th"}
+)  # fmt: skip
+
+
+def rekeyed(entries: list[str]) -> list[str]:
+    """The entries with their keys replaced by lastnameYEAR, and keys that clash
+    within the list suffixed a, b, ... in order."""
+    keys = [bib_key(entry) for entry in entries]
+    clashing = {key for key, n in Counter(keys).items() if n > 1}
+    used: Counter[str] = Counter()
+    out = []
+    for entry, key in zip(entries, keys):
+        if key in clashing:
+            used[key] += 1
+            key += letters_for(used[key])
+        head = BIB_HEAD.match(entry)
+        assert head  # Client.bibtex lets through only entries with a head
+        out.append(entry[: head.start(1)] + key + entry[head.end(1) :])
+    return out
+
+
+def letters_for(n: int) -> str:
+    """1 -> a, 26 -> z, 27 -> aa: the suffix of the nth entry sharing a key."""
+    suffix = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        suffix = chr(ord("a") + r) + suffix
+    return suffix
+
+
+def bib_key(entry: str) -> str:
+    """The first author's family name in ASCII letters, lowercased, then the year;
+    "anon" when there's no author, and no year part when there's no year."""
+    fields = bib_fields(entry)
+    first = split_top(fields.get("author", ""), BIB_NAMES_SEPARATOR)[0]
+    year = re.search(r"\d{4}", fields.get("year", ""))
+    return (ascii_letters(family_name(first)) or "anon") + (
+        year.group() if year else ""
+    )
+
+
+def family_name(name: str) -> str:
+    """The family name in one BibTeX name: Last from "Last, First" and "Last, Jr,
+    First"; "von Last" from "First von Last" and "First von Last, Jr", without the
+    generational suffix, so both forms give the same name."""
+    parts = [part.strip() for part in split_top(name, ",")]
+    if len(parts) > 2 or (len(parts) == 2 and not is_suffix(parts[1])):
+        return parts[0]
+    words = [w for w in split_top(parts[0], r"\s+") if w]
+    while len(words) > 1 and is_suffix(words[-1]):
+        words.pop()
+    start = len(words) - 1
+    while start > 0 and words[start - 1] in NAME_PARTICLES:
+        start -= 1
+    return " ".join(words[start:]) if words else ""
+
+
+def is_suffix(word: str) -> bool:
+    return word.rstrip(".").lower() in NAME_SUFFIXES
+
+
+def bib_fields(entry: str) -> dict[str, str]:
+    """An entry's fields by lowercased name, each value without its braces or quotes.
+    Reading stops at anything it can't parse."""
+    head = BIB_HEAD.match(entry)
+    fields: dict[str, str] = {}
+    at = head.end() if head else len(entry)
+    while field := BIB_FIELD.match(entry, at):
+        value, at = bib_value(entry, field.end())
+        fields.setdefault(field.group(1).lower(), value)
+    return fields
+
+
+def bib_value(text: str, start: int) -> tuple[str, int]:
+    """The field value at `start` without its delimiters, and where it ends. A value is
+    braced ({...}, nesting), quoted ("...", braces inside nesting) or bare (1951, sep)."""
+    opener = text[start : start + 1]
+    if opener not in ("{", '"'):
+        bare = BIB_BARE.match(text, start)
+        assert bare  # it matches the empty string too
+        return bare.group(), bare.end()
+    depth = 0
+    for i in range(start + 1, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}" and depth:
+            depth -= 1
+        elif depth == 0 and c == ("}" if opener == "{" else '"'):
+            return text[start + 1 : i], i + 1
+    return text[start + 1 :], len(text)
+
+
+def split_top(text: str, separator: str) -> list[str]:
+    """`text` split at each match of the regex `separator` outside braces. A stray
+    closing brace is ignored."""
+    pattern = re.compile(separator)
+    parts = []
+    depth = start = i = 0
+    while i < len(text):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth = max(depth - 1, 0)
+        elif depth == 0 and (found := pattern.match(text, i)) and found.end() > i:
+            parts.append(text[start:i])
+            start = i = found.end()
+            continue
+        i += 1
+    parts.append(text[start:])
+    return parts
+
+
+def ascii_letters(name: str) -> str:
+    """The name's letters, lowercased and folded to ASCII: M{\\"u}ller and Müller are
+    both muller, Strauß strauss."""
+    plain = LATEX_ACCENT.sub("", name).translate(FOLDS)
+    folded = unicodedata.normalize("NFKD", plain).lower()
+    return re.sub(r"[^a-z]", "", folded)
+
+
 def cmd_stats(client: Client, args: argparse.Namespace) -> int:
     """A line per service summarising the request log over the last --hours."""
     since = time.time() - args.hours * 3600
@@ -1739,6 +1979,7 @@ def stats_line(service: str, entries: list[dict[str, Any]]) -> str:
 
 COMMANDS = {
     "meta": cmd_meta,
+    "bib": cmd_bib,
     "cites": cmd_cites,
     "search": cmd_search,
     "text": cmd_text,
@@ -1769,6 +2010,8 @@ def main(
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     meta = sub.add_parser("meta", help="title, authors, year, venue, citations, ids")
     meta.add_argument("ids", nargs="+", metavar="ID")
+    bib = sub.add_parser("bib", help="a BibTeX entry per DOI or arXiv id")
+    bib.add_argument("ids", nargs="+", metavar="ID")
     cites = sub.add_parser("cites", help="papers citing ID")
     cites.add_argument("id", metavar="ID")
     cites.add_argument("--limit", type=int, default=20, help="how many (default 20)")

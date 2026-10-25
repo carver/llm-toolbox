@@ -2152,7 +2152,8 @@ def test_help_says_meta_asks_openalex_then_crossref_for_unknown_papers(capsys):
         paper.main(["-h"])
     out = " ".join(capsys.readouterr().out.split())
     assert "Semantic Scholar doesn't know a paper" in out
-    assert "then Crossref" in out and "Crossref's at least 0.2 seconds" in out
+    assert "then Crossref" in out
+    assert "Crossref's and doi.org's at least 0.2 seconds" in out
 
 
 def test_a_crossref_answer_is_paced_logged_and_cached(cache, capsys):
@@ -2205,6 +2206,233 @@ def test_crossref_answers_are_cached_whatever_the_dois_case(cache, capsys):
     again = FakeHTTP(S2_DOESNT_KNOW, OPENALEX_HAS_NOTHING, CROSSREF_HAS_NOTHING)
     assert run(capsys, ["meta", "10.1111/1467-937x.00136"], again)[:2] == (0, first)
     assert crossref_calls(again) == []
+
+
+# paper bib: BibTeX from doi.org's content negotiation
+
+NASH_BIB = (
+    " @article{Nash_1951, title={Non-Cooperative Games}, volume={54},"
+    " ISSN={0003-486X}, url={http://dx.doi.org/10.2307/1969529},"
+    " DOI={10.2307/1969529}, number={2}, journal={The Annals of Mathematics},"
+    " publisher={JSTOR}, author={Nash, John}, year={1951}, month=Sept, pages={286} }"
+)
+ATTENTION_BIB = """\
+@misc{https://doi.org/10.48550/arxiv.1706.03762,
+  doi = {10.48550/ARXIV.1706.03762},
+  url = {https://arxiv.org/abs/1706.03762},
+  author = {Vaswani, Ashish and Shazeer, Noam},
+  title = {Attention Is All You Need},
+  publisher = {arXiv},
+  year = {2017},
+  copyright = {arXiv.org perpetual, non-exclusive license}
+}"""
+SEQUENTIAL_BIB = (
+    "@article{Kreps_1982, title={Sequential Equilibria},"
+    " author={Kreps, David M. and Wilson, Robert}, year={1982}}"
+)
+REPUTATION_BIB = (
+    "@article{Kreps_1982, title={Reputation and imperfect information},"
+    " author={Kreps, David M and Wilson, Robert}, year={1982}}"
+)
+DOI_NOT_FOUND = paper.Response(
+    404, {"Content-Type": "text/html"}, b"<title>Error: DOI Not Found</title>"
+)
+
+
+def bibtex(text):
+    return paper.Response(200, {"Content-Type": "application/x-bibtex"}, text.encode())
+
+
+def bib_route(doi, text):
+    return ("GET", "https://doi.org/" + doi, [bibtex(text)])
+
+
+def test_bib_prints_a_dois_entry_keyed_by_family_name_and_year(cache, capsys):
+    http = FakeHTTP(bib_route(NASH_DOI, NASH_BIB))
+    code, out, err, _ = run(capsys, ["bib", NASH_DOI], http)
+    assert code == 0, err
+    assert out == (
+        "@article{nash1951, title={Non-Cooperative Games}, volume={54},"
+        " ISSN={0003-486X}, url={http://dx.doi.org/10.2307/1969529},"
+        " DOI={10.2307/1969529}, number={2}, journal={The Annals of Mathematics},"
+        " publisher={JSTOR}, author={Nash, John}, year={1951}, month=Sept,"
+        " pages={286} }\n"
+    )
+    (call,) = http.calls
+    assert call["url"] == "https://doi.org/10.2307/1969529"
+    assert call["headers"]["Accept"] == "application/x-bibtex"
+    assert "mailto:robocarver@worldofmail.com" in call["headers"]["User-Agent"]
+
+
+def test_bib_of_an_arxiv_id_asks_doi_org_for_its_datacite_doi(cache, capsys):
+    http = FakeHTTP(bib_route("10.48550/arXiv.1706.03762", ATTENTION_BIB))
+    code, out, err, _ = run(capsys, ["bib", "https://arxiv.org/abs/1706.03762v5"], http)
+    assert code == 0, err
+    first, *rest = out.splitlines()
+    assert first == "@misc{vaswani2017,"
+    assert rest == ATTENTION_BIB.splitlines()[1:]
+    (call,) = http.calls
+    assert call["url"] == "https://doi.org/10.48550/arXiv.1706.03762"
+
+
+def test_bib_puts_a_blank_line_between_entries_and_suffixes_clashing_keys(
+    cache, capsys
+):
+    http = FakeHTTP(
+        bib_route("10.2307/1912767", SEQUENTIAL_BIB),
+        bib_route(NASH_DOI, NASH_BIB),
+        ("GET", "https://doi.org/10.1016/0022-0531", [bibtex(REPUTATION_BIB)]),
+    )
+    argv = ["bib", "10.2307/1912767", NASH_DOI, "10.1016/0022-0531(82)90029-1"]
+    code, out, err, _ = run(capsys, argv, http)
+    assert code == 0, err
+    entries = out.split("\n\n")
+    assert [e.split(",", 1)[0] for e in entries] == [
+        "@article{kreps1982a",
+        "@article{nash1951",
+        "@article{kreps1982b",
+    ]
+    assert entries[0].endswith("title={Sequential Equilibria}, author={Kreps, David M."
+                               " and Wilson, Robert}, year={1982}}")  # fmt: skip
+    assert out.endswith("year={1982}}\n")
+
+
+def test_the_27th_entry_sharing_a_key_gets_aa(cache, capsys):
+    http = FakeHTTP(("GET", "https://doi.org/", [bibtex(NASH_BIB)]))
+    dois = [f"10.1000/{n}" for n in range(27)]
+    code, out, err, _ = run(capsys, ["bib", *dois], http)
+    assert code == 0, err
+    keys = [entry.split(",", 1)[0] for entry in out.split("\n\n")]
+    assert keys[0] == "@article{nash1951a"
+    assert keys[25:] == ["@article{nash1951z", "@article{nash1951aa"]
+
+
+@pytest.mark.parametrize(
+    "fields, key",
+    [
+        ("author={Nash, John}, year={1951}", "nash1951"),
+        ('author = "Nash, John", year = 1951', "nash1951"),
+        ("AUTHOR = {Nash, John}, Year = {1951}", "nash1951"),
+        (
+            "author={Caspar Oesterheld and Vincent Conitzer}, year={2023}",
+            "oesterheld2023",
+        ),
+        ('author={M{\\"u}ller, J{\\"o}rg}, year={2003}', "muller2003"),
+        ("author={\\v{S}ediv{\\'y}, Jan}, year={2020}", "sedivy2020"),
+        ("author={Müller-Schäfer, Jörg}, year={2003}", "mullerschafer2003"),
+        ("author={Strauß, Anna and Ødegård, Ola}, year={2010}", "strauss2010"),
+        ("author={Sæther, Kari}, year={2001}", "saether2001"),
+        ("author={Ødegård, Ola}, year={2010}", "odegard2010"),
+        ("author={{OpenAI} and Achiam, Josh}, year={2023}", "openai2023"),
+        ("author={de Finetti, Bruno}, year={1937}", "definetti1937"),
+        ("author={Bruno de Finetti}, year={1937}", "definetti1937"),
+        ("author={Johannes Diderik van der Waals}, year={1873}", "vanderwaals1873"),
+        ("author={Martin Luther King Jr.}, year={1963}", "king1963"),
+        ("author={Martin Luther King, Jr.}, year={1963}", "king1963"),
+        ("author={Robert Wilson III and Kreps, David}, year={1982}", "wilson1982"),
+        ("title={Proceedings}, year={2001}", "anon2001"),
+        ("title={An {author={x}} trap}, author={Nash, John}", "nash"),
+    ],
+)
+def test_bib_keys_are_the_ascii_letters_of_the_family_name_then_the_year(
+    cache, capsys, fields, key
+):
+    http = FakeHTTP(bib_route(NASH_DOI, "@article{Service_Key, " + fields + "}"))
+    code, out, err, _ = run(capsys, ["bib", NASH_DOI], http)
+    assert code == 0, err
+    assert out == "@article{" + key + ", " + fields + "}\n"
+
+
+def test_bib_answers_from_the_cache_whatever_the_dois_case(cache, capsys):
+    first = FakeHTTP(("GET", "doi.org/", [bibtex(NASH_BIB)]))
+    run(capsys, ["bib", "10.1111/1467-937X.00136"], first)
+    again = FakeHTTP(("GET", "doi.org/", [DOI_NOT_FOUND]))
+    code, out, err, _ = run(capsys, ["bib", "10.1111/1467-937x.00136"], again)
+    assert code == 0, err
+    assert out.startswith("@article{nash1951,")
+    assert again.calls == []
+
+
+def test_bib_of_a_missing_doi_says_not_found_keeps_going_and_exits_1(cache, capsys):
+    http = FakeHTTP(
+        ("GET", "doi.org/10.1000/missing", [DOI_NOT_FOUND]),
+        bib_route(NASH_DOI, NASH_BIB),
+    )
+    code, out, err, _ = run(capsys, ["bib", "10.1000/missing", NASH_DOI], http)
+    assert code == 1
+    assert err == "paper: not found: 10.1000/missing\n"
+    assert out.startswith("@article{nash1951,")
+
+
+@pytest.mark.parametrize(
+    "answer, why",
+    [
+        (
+            paper.Response(200, {"content-type": "text/html"}, b"<html>landing"),
+            "doi.org sent text/html",
+        ),
+        (paper.Response(406, {}, b"Not Acceptable"), "HTTP 406"),
+    ],
+    ids=["landing-page", "406"],
+)
+def test_a_doi_without_bibtex_exits_1_naming_it_and_caches_nothing(
+    cache, capsys, answer, why
+):
+    code, out, err, _ = run(
+        capsys, ["bib", NASH_DOI], FakeHTTP(("GET", "doi.org/", [answer]))
+    )
+    assert (code, out) == (1, "")
+    assert "no BibTeX for 10.2307/1969529" in err and why in err
+    again = run(capsys, ["bib", NASH_DOI], FakeHTTP(bib_route(NASH_DOI, NASH_BIB)))
+    assert again[0] == 0 and again[1].startswith("@article{nash1951,")
+
+
+@pytest.mark.parametrize("other", [S2_ID, "https://example.com/a.pdf"])
+def test_bib_refuses_an_id_without_a_doi_before_any_request(cache, capsys, other):
+    http = FakeHTTP(bib_route(NASH_DOI, NASH_BIB))
+    code, out, err, _ = run(capsys, ["bib", NASH_DOI, other], http)
+    assert (code, out) == (2, "")
+    assert "`paper bib`" in err and "DOI" in err and "arXiv" in err
+    assert http.calls == []
+
+
+def test_bib_is_paced_logged_and_cached(cache, capsys):
+    paces = []
+    http = FakeHTTP(bib_route(NASH_DOI, NASH_BIB))
+    code, first, err, _ = run(capsys, ["bib", NASH_DOI], http, paces=paces)
+    assert code == 0, err
+    assert paces == ["doi.org"]
+    assert [line["service"] for line in logged(cache)] == ["doi.org"]
+    assert run(capsys, ["bib", NASH_DOI], FakeHTTP())[:2] == (0, first)
+
+
+def test_bib_prints_the_entries_fetched_before_a_remote_failure(cache, capsys):
+    http = FakeHTTP(
+        bib_route(NASH_DOI, NASH_BIB), ("GET", "doi.org/10.1000/busy", [status(503)])
+    )
+    code, out, err, _ = run(capsys, ["bib", NASH_DOI, "10.1000/busy"], http)
+    assert code == 3
+    assert out.startswith("@article{nash1951,")
+    assert "gave up" in err
+
+
+def test_bib_escapes_a_doi_for_doi_org(cache, capsys):
+    http = FakeHTTP(("GET", "https://doi.org/", [bibtex(NASH_BIB)]))
+    code, _, err, _ = run(capsys, ["bib", SICI], http)
+    assert code == 0, err
+    (call,) = http.calls
+    assert call["url"] == (
+        "https://doi.org/"
+        "10.1002/%28SICI%291097-4571%28199806%2949:8%3C693::AID-ASI4%3E3.0.CO%3B2-0"
+    )
+
+
+def test_help_explains_bib(capsys):
+    with pytest.raises(SystemExit):
+        paper.main(["-h"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "bib prints a BibTeX entry" in out
+    assert "nash1951" in out and "doi.org" in out
 
 
 # paper sweep: /paper/search/bulk to a TSV file

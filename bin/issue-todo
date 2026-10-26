@@ -11,6 +11,9 @@ prints every open issue's open items, leaving out pull requests and ticked items
 
     issue-todo open
     issue-todo show 42
+    issue-todo read 42 43             # body and every comment, which gh splits in two
+    issue-todo claim 42               # refuses while another session holds a claim
+    issue-todo release 42
     issue-todo tick 42 "forecast measure" --note "built in 8d5068e"
     issue-todo tick 42 "Add hub" --undo
     issue-todo tick 42 "Add hub" --dry-run
@@ -21,10 +24,16 @@ contains MATCH, or equals it, in the body or any comment, ticks it, appends ` *N
 and writes that body or comment back, unless it changed since it was read. No match,
 or several, writes nothing and lists the candidates. It calls `gh`, so it acts as
 gh's logged-in user, in the current directory's repo unless --repo names one.
+
+`claim` and `release` keep a claim in the issue's comments, each with a hidden marker
+`<!-- issue-todo claim ID -->` (or `release`), so two sessions don't both take one
+issue. ID is the session's name: --as NAME, else $CLAUDE_CODE_SESSION_ID's first 8
+characters. `claim` refuses while a claim by another ID stands unreleased.
 """
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -128,6 +137,92 @@ def show(repo: str, number: int) -> int:
         print(part.label)
         for i, item in enumerate(listed, 1):
             print(f"  [{'x' if item.done else ' '}] {i}  {short(item.text)}")
+    return 0
+
+
+def read(repo: str, numbers: list[int]) -> int:
+    """Each issue's title, state, body and every comment, each with author and date."""
+    for n, number in enumerate(numbers):
+        issue = json.loads(gh("api", f"repos/{repo}/issues/{number}"))
+        if n:
+            print()
+        print(f"#{issue['number']} {issue['title']} ({issue['state']})")
+        author = (issue.get("user") or {}).get("login", "?")
+        print(f"--- body {author} {(issue.get('created_at') or '')[:10]}".rstrip())
+        print((issue.get("body") or "").rstrip())
+        for part in issue_parts(repo, issue)[1:]:
+            print(f"--- {part.label}")
+            print(part.markdown.rstrip())
+    return 0
+
+
+CLAIM = re.compile(r"<!-- issue-todo (claim|release) (\S+) -->")
+NAME = re.compile(r"\S+")  # what CLAIM reads back
+
+
+def holders(repo: str, number: int) -> dict[str, str]:
+    """The sessions holding a claim on the issue, with each claim's date."""
+    held = {}
+    comments = json.loads(
+        gh("api", "--paginate", f"repos/{repo}/issues/{number}/comments")
+    )
+    for comment in comments:
+        for kind, session in CLAIM.findall(comment.get("body") or ""):
+            if kind == "claim":
+                held.setdefault(session, comment["created_at"][:16].replace("T", " "))
+            else:
+                held.pop(session, None)
+    return held
+
+
+def post_comment(repo: str, number: int, body: str) -> None:
+    gh(
+        "api",
+        "-X",
+        "POST",
+        f"repos/{repo}/issues/{number}/comments",
+        "--input",
+        "-",
+        stdin=json.dumps({"body": body}),
+    )
+
+
+def claim(repo: str, number: int, session: str) -> int:
+    held = holders(repo, number)
+    if session in held:
+        print(f"#{number} is already claimed by {session}, since {held[session]}")
+        return 0
+    if held:
+        for other, since in held.items():
+            print(
+                f"issue-todo: #{number} is claimed by session {other} since {since}, "
+                "and not released",
+                file=sys.stderr,
+            )
+        return 1
+    post_comment(
+        repo,
+        number,
+        f"Taking this (session {session}); `issue-todo release {number}` frees it.\n"
+        f"<!-- issue-todo claim {session} -->",
+    )
+    print(f"#{number} claimed by {session}")
+    return 0
+
+
+def release(repo: str, number: int, session: str) -> int:
+    if session not in holders(repo, number):
+        print(
+            f"issue-todo: {session} has no claim on #{number} to release",
+            file=sys.stderr,
+        )
+        return 1
+    post_comment(
+        repo,
+        number,
+        f"Released (session {session}).\n<!-- issue-todo release {session} -->",
+    )
+    print(f"#{number} released by {session}")
     return 0
 
 
@@ -235,16 +330,42 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument(
         "--dry-run", action="store_true", help="print the new line, write nothing"
     )
+    what = "each issue's title, state, body and every comment, with author and date"
+    r = sub.add_parser("read", parents=[where], help=what, description=what)
+    r.add_argument("numbers", type=int, nargs="+", metavar="number")
+    for name, what in (
+        ("claim", "claim the issue for this session, unless another holds it"),
+        ("release", "release this session's claim on the issue"),
+    ):
+        c = sub.add_parser(name, parents=[common], help=what, description=what)
+        c.add_argument(
+            "--as",
+            dest="name",
+            help="the claimant's name (default: $CLAUDE_CODE_SESSION_ID's first 8 characters)",
+        )
     args = p.parse_args(argv)
+    session = ""
+    if args.cmd in ("claim", "release"):
+        session = args.name or os.environ.get("CLAUDE_CODE_SESSION_ID", "")[:8]
+        if not session:
+            p.error(f"{args.cmd} needs --as NAME outside a Claude Code session")
+        if not NAME.fullmatch(session):
+            p.error(f"a claimant's name is one word, without spaces: {session!r}")
     repo = (
         args.repo
         or gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").strip()
     )
-    if args.cmd == "open":
-        return show_open(repo)
-    if args.cmd == "show":
-        return show(repo, args.number)
-    return tick_one(repo, args.number, args.match, args.note, args.undo, args.dry_run)
+    commands = {
+        "open": lambda: show_open(repo),
+        "show": lambda: show(repo, args.number),
+        "read": lambda: read(repo, args.numbers),
+        "claim": lambda: claim(repo, args.number, session),
+        "release": lambda: release(repo, args.number, session),
+        "tick": lambda: tick_one(
+            repo, args.number, args.match, args.note, args.undo, args.dry_run
+        ),
+    }
+    return commands[args.cmd]()
 
 
 if __name__ == "__main__":

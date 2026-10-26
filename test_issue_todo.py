@@ -229,3 +229,93 @@ def test_show_cuts_a_long_item_to_one_line(fake, capsys):
     tool.main(["show", "7"])
     line = next(line for line in capsys.readouterr().out.splitlines() if "xxx" in line)
     assert line.endswith("…") and len(line) < 120
+
+
+def test_read_prints_the_body_and_every_comment_with_author_and_date(fake, capsys):
+    fake.issue |= {"user": {"login": "jc"}, "created_at": "2026-10-22T10:00:00Z"}
+
+    assert tool.main(["read", "7"]) == 0
+
+    out = capsys.readouterr().out
+    assert out.startswith("#7 Criterion: consistent (open)\n")
+    assert "body jc 2026-10-22" in out and "The forecast question" in out
+    assert "comment 11 alice 2026-10-23\nNo tasks." in out
+    assert out.index("No tasks.") < out.index("Replace the forecast measure")
+
+
+def claim_comment(session, kind="claim"):
+    return {
+        "id": 20 + len(session),
+        "user": {"login": "robo"},
+        "created_at": "2026-10-25T08:04:00Z",
+        "body": f"Claimed.\n<!-- issue-todo {kind} {session} -->",
+    }
+
+
+def test_claim_posts_a_comment_naming_the_session(fake, capsys, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abcd1234-ffff-0000")
+
+    assert tool.main(["claim", "7"]) == 0
+
+    ((path, body),) = fake.patched
+    assert path.endswith("/issues/7/comments")
+    assert "abcd1234" in body and "<!-- issue-todo claim abcd1234 -->" in body
+
+
+def test_claim_refuses_while_another_session_holds_it(fake, capsys, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abcd1234-ffff-0000")
+    fake.comments.append(claim_comment("other999"))
+
+    assert tool.main(["claim", "7"]) == 1
+
+    assert fake.patched == []
+    err = capsys.readouterr().err
+    assert "other999" in err and "2026-10-25" in err
+
+
+def test_a_released_claim_can_be_claimed_again(fake, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abcd1234-ffff-0000")
+    fake.comments += [claim_comment("other999"), claim_comment("other999", "release")]
+
+    assert tool.main(["claim", "7"]) == 0
+    assert len(fake.patched) == 1
+
+
+def test_claiming_your_own_claim_again_posts_nothing(fake, capsys):
+    fake.comments.append(claim_comment("mine0001"))
+
+    assert tool.main(["claim", "7", "--as", "mine0001"]) == 0
+
+    assert fake.patched == [] and "already" in capsys.readouterr().out
+
+
+def test_release_posts_a_release_comment(fake, monkeypatch):
+    fake.comments.append(claim_comment("mine0001"))
+
+    assert tool.main(["release", "7", "--as", "mine0001"]) == 0
+
+    ((_, body),) = fake.patched
+    assert "<!-- issue-todo release mine0001 -->" in body
+
+
+def test_claim_without_a_session_or_a_name_says_so(fake, capsys, monkeypatch):
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+
+    with pytest.raises(SystemExit) as exited:
+        tool.main(["claim", "7"])
+
+    assert exited.value.code == 2
+    assert "--as" in capsys.readouterr().err and fake.patched == []
+
+
+def test_release_without_a_claim_posts_nothing(fake, capsys):
+    assert tool.main(["release", "7", "--as", "mine0001"]) == 1
+
+    assert fake.patched == [] and "no claim" in capsys.readouterr().err
+
+
+def test_a_name_with_a_space_is_refused(fake, capsys):
+    with pytest.raises(SystemExit):
+        tool.main(["claim", "7", "--as", "jc laptop"])
+
+    assert fake.patched == []

@@ -301,7 +301,7 @@ def check_folded() -> bool:
         return True
     gate = shutil.which("agent-commit-gate")
     argv = [gate, "--run", str(hook)] if gate else [str(hook)]
-    print(f"Checking the folded result with {hook.name}...")
+    print(f"Checking the folded result with {hook.name}...", flush=True)
     env = os.environ | {"AGENT_PRE_COMMIT": "1"}
     return subprocess.run(argv, env=env, check=False).returncode == 0
 

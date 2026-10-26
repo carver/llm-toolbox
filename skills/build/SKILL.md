@@ -17,13 +17,13 @@ Write the **brief** to a file. It is the spec the reviewers check the code again
 
 - the repo path, and the goal in the user's words
 - every decision and constraint the user stated, including changes made mid-build
-- the **seams**: the public interfaces the tests go through, per `/tdd`. Agree them with the user now. If the user is offline, pick them and record the choice in `uncertainties.md` (see the `coding` skill)
+- the **seams**: the public interfaces the tests go through, per `/tdd`. Pick them yourself and write them down; this replaces `/tdd`'s step of confirming seams with the user. Ask only when the choice of seam is itself a design fork, such as a new public interface whose shape is open
 - the merge danger, judged per the `coding` skill. Create the branch now if it needs one
 - the skills you loaded for the change, each with its SKILL.md path, so the reviewer can read them without searching
 
 Run `build-state start` in the repo. It records the **base** (HEAD, or `--base REV` when your commits for this change already started) and the **repo fingerprint** in the git dir; `build-state show` prints them again after a context reset.
 
-Done when every design fork is answered, the user has confirmed the seams (or you've recorded them), and the brief would let a reviewer who never saw this chat judge the change.
+Done when every design fork is answered, the brief names the seams, and the brief would let a reviewer who never saw this chat judge the change.
 
 ## 2. Implement
 

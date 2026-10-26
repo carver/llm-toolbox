@@ -51,6 +51,8 @@ S2_ID = "76b411ae47ec3b766ed8a62796e7b3d68bc4ccdf"
             paper.PdfUrl("https://proceedings.mlr.press/v202/x23a/x23a.pdf"),
         ),
         ("  2404.00806  ", paper.ArxivId("2404.00806")),
+        ("arXiv:2505.23836", paper.ArxivId("2505.23836")),
+        ("arxiv:2505.23836v2", paper.ArxivId("2505.23836v2")),
     ],
 )
 def test_parses_every_id_form(text, expected):
@@ -76,6 +78,8 @@ def test_parses_every_id_form(text, expected):
         "https://arxiv.org/html/2404.00806v1",
         "https://doi.org/",
         "ftp://example.com/x.pdf",
+        "arXiv:",
+        "arXiv:10.1145/3442188.3445922",
     ],
 )
 def test_rejects_what_is_not_an_id(bad):

@@ -376,6 +376,8 @@ def cache_stem(prefix: str, key: str, name: str) -> str:
 def parse_id(text: str) -> PaperId:
     """An arXiv id, DOI, S2 paperId or PDF URL, from any form of ID we take."""
     text = text.strip()
+    if text[:6].lower() == "arxiv:" and ARXIV.fullmatch(text[6:]):
+        return ArxivId(text[6:])
     if ARXIV.fullmatch(text):
         return ArxivId(text)
     if DOI.fullmatch(text):

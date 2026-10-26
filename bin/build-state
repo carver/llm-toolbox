@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -290,6 +291,21 @@ def fold_fixups(base: str) -> bool:
     return False
 
 
+def check_folded() -> bool:
+    """Run the repo's agent-pre-commit on HEAD, which the index holds after a fold;
+    through agent-commit-gate when it's on PATH. True when it passes or there's none."""
+    # --git-path is relative to the current directory, which may be a subdirectory.
+    hooks = Path(git("rev-parse", "--git-path", "hooks").stdout.strip()).resolve()
+    hook = hooks / "agent-pre-commit"
+    if not (hook.is_file() and os.access(hook, os.X_OK)):
+        return True
+    gate = shutil.which("agent-commit-gate")
+    argv = [gate, "--run", str(hook)] if gate else [str(hook)]
+    print(f"Checking the folded result with {hook.name}...")
+    env = os.environ | {"AGENT_PRE_COMMIT": "1"}
+    return subprocess.run(argv, env=env, check=False).returncode == 0
+
+
 def report_tests(refactor_base: str) -> None:
     changed = git("diff", "--name-only", refactor_base, "HEAD").stdout.splitlines()
     if tests := [name for name in changed if TEST_FILE.search(name)]:
@@ -328,6 +344,11 @@ def finish(args: argparse.Namespace) -> int:
             *(f"  {marker}" for marker in markers),
         )
     before = head()
+    fixes = ("fixup! ", "squash! ", "amend! ")
+    folding = any(
+        subject.startswith(fixes)
+        for subject in git("log", "--format=%s", f"{base}..HEAD").stdout.splitlines()
+    )
     if not fold_fixups(base):
         return 1
     if (
@@ -341,11 +362,17 @@ def finish(args: argparse.Namespace) -> int:
         )
     print(git("log", "--oneline", "--reverse", f"{base}..HEAD").stdout, end="")
     subjects = git("log", "--format=%s", f"{base}..HEAD").stdout.splitlines()
-    fixes = ("fixup! ", "squash! ", "amend! ")
     if unfolded := [subject for subject in subjects if subject.startswith(fixes)]:
         return fail(
             "These fix commits before the base, so they weren't folded:",
             *(f"  {subject}" for subject in unfolded),
+        )
+    if folding and not check_folded():
+        return fail(
+            "The repo's agent-pre-commit fails on the folded result, and fix commits",
+            "skip it when they're made. Find the commit that caused the failure, which",
+            "may be an earlier one rather than the last, fix it with",
+            "`git commit --fixup=<that commit>`, and run finish again.",
         )
     if "refactor_base" in state:
         report_tests(state["refactor_base"])

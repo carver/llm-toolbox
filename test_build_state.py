@@ -651,3 +651,64 @@ def test_a_worktree_removed_during_the_build_still_may_have_moved_its_branch(
     done = build_state(repo, "finish")
 
     assert done.returncode == 0, done.stderr
+
+
+def agent_check(repo, body):
+    hook = repo / ".git" / "hooks" / "agent-pre-commit"
+    hook.write_text(
+        f'#!/bin/sh\necho checked >> "$(git rev-parse --git-dir)/checked"\n{body}\n'
+    )
+    hook.chmod(0o755)
+    return repo / ".git" / "checked"
+
+
+def test_finish_checks_the_folded_result_when_it_folded_a_fix(repo):
+    checked = agent_check(repo, "exit 0")
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert checked.read_text().split() == ["checked"]
+
+
+def test_a_failing_check_after_folding_keeps_the_build_open(repo):
+    agent_check(
+        repo, "git show :a.py | grep -q bad && { echo a.py is bad; exit 1; }; exit 0"
+    )
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "b.py", "More")
+    commit(repo, "a.py", "bad", f"--fixup={work}")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    assert "a.py is bad" in done.stdout + done.stderr
+    assert "--fixup" in done.stderr and "earlier" in done.stderr
+    assert build_state(repo, "show").returncode == 0
+    assert subjects(repo, "HEAD~2") == ["Work", "More"]  # folded, not undone
+
+
+def test_finish_runs_no_check_without_a_fix_to_fold(repo):
+    checked = agent_check(repo, "exit 0")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+
+    assert build_state(repo, "finish").returncode == 0
+    assert not checked.exists()
+
+
+def test_finish_finds_the_agent_check_from_a_subdirectory(repo):
+    checked = agent_check(repo, "exit 0")
+    (repo / "sub").mkdir()
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+
+    done = build_state(repo / "sub", "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert checked.read_text().split() == ["checked"]

@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Ship a worktree's commits to a repo that pushes: rebase, check, push, verify.
+
+    wt-ship                       rebase onto origin/<main tree's branch>, check, push
+    wt-ship --check 'make test'   run this check instead of the repo's agent-pre-commit
+    wt-ship --remove              then remove this worktree, through the main tree
+    wt-ship --remote up --branch dev
+
+In order, it:
+
+1. refuses uncommitted changes to tracked files;
+2. fetches the remote, and when HEAD lacks REMOTE/BRANCH, rebases onto it, folding
+   fixup! commits (autosquash). A conflict stops it with the rebase in progress:
+   resolve the hunks (`conflicts -h`), `git rebase --continue`, then run it again;
+3. refuses leftover conflict markers in what it would push;
+4. runs the check: --check CMD (through sh), else the repo's agent-pre-commit hook
+   (through agent-commit-gate --run when it's on PATH), else none, and says so;
+5. pushes HEAD to REMOTE/BRANCH. When another session's push wins the race (a
+   non-fast-forward rejection), it fetches, rebases, checks and pushes once more;
+6. fetches again and confirms the remote branch holds HEAD;
+7. prints the range it pushed, a notice for other sessions (which it doesn't send),
+   and whether the main tree's branch is now behind the remote.
+
+BRANCH defaults to the branch the main worktree has checked out. Nothing to push is a
+clean exit. --remove runs `git worktree remove` from the main tree once the push is
+confirmed, so a shell left in the removed folder must cd elsewhere.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+class Stop(Exception):
+    """A step failed; the message says what to do."""
+
+
+def git(*args, check=True):
+    run = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+    if check and run.returncode != 0:
+        raise Stop(f"git {' '.join(args)} failed:\n{run.stdout}{run.stderr}".rstrip())
+    return run
+
+
+def out(*args):
+    return git(*args).stdout.strip()
+
+
+def worktrees():
+    """(path, branch or None) for each worktree, the main one first."""
+    trees = []
+    for block in out("worktree", "list", "--porcelain").split("\n\n"):
+        lines = block.splitlines()
+        path = next(ln[9:] for ln in lines if ln.startswith("worktree "))
+        branch = next(
+            (
+                ln.removeprefix("branch refs/heads/")
+                for ln in lines
+                if ln.startswith("branch ")
+            ),
+            None,
+        )
+        trees.append((path, branch))
+    return trees
+
+
+def is_ancestor(older, newer):
+    return git("merge-base", "--is-ancestor", older, newer, check=False).returncode == 0
+
+
+def rebase(upstream):
+    env = os.environ | {"GIT_SEQUENCE_EDITOR": ":", "GIT_EDITOR": ":"}
+    run = subprocess.run(
+        ["git", "rebase", "-q", "-i", "--autosquash", upstream],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if run.returncode != 0:
+        raise Stop(
+            f"{run.stdout}{run.stderr}".rstrip()
+            + f"\nThe rebase onto {upstream} hit a conflict and is still in progress."
+            "\nResolve each hunk (`conflicts FILE`, `conflicts -h`), `git add` the file,"
+            " `git rebase --continue`, then run wt-ship again."
+        )
+
+
+def markers(upstream):
+    check = git("diff", "--check", upstream, "HEAD", check=False).stdout
+    found = [
+        line.removesuffix(": leftover conflict marker")
+        for line in check.splitlines()
+        if line.endswith(": leftover conflict marker")
+    ]
+    if found:
+        raise Stop(
+            "Leftover conflict markers; resolve them (`conflicts -h`) and amend, or for a"
+            " file that holds them on purpose, set conflict-marker-size in"
+            " .gitattributes:\n  " + "\n  ".join(found)
+        )
+
+
+def run_check(command):
+    if command is None:
+        hook = Path(out("rev-parse", "--git-path", "hooks")) / "agent-pre-commit"
+        hook = (
+            hook
+            if hook.is_absolute()
+            else Path(out("rev-parse", "--show-toplevel")) / hook
+        )
+        if not (hook.is_file() and os.access(hook, os.X_OK)):
+            print(
+                "No check: the repo has no agent-pre-commit hook and no --check was given."
+            )
+            return
+        gate = shutil.which("agent-commit-gate")
+        argv = [gate, "--run", str(hook)] if gate else [str(hook)]
+        env = os.environ | {"AGENT_PRE_COMMIT": "1"}
+        code = subprocess.run(argv, env=env, check=False).returncode
+        name = "agent-pre-commit"
+    else:
+        code = subprocess.run(["sh", "-c", command], check=False).returncode
+        name = repr(command)
+    if code != 0:
+        raise Stop(f"The check {name} failed (exit {code}); nothing was pushed.")
+
+
+# A push that lost a race: refused as a non-fast-forward, or the branch moved mid-push.
+REJECTED = (
+    "[rejected]",
+    "non-fast-forward",
+    "fetch first",
+    "incorrect old value",
+    "cannot lock ref",
+)
+
+
+def rebase_and_check(remote, branch, check):
+    """Fetch, rebase onto the remote branch, refuse markers, check."""
+    git("fetch", "-q", remote, branch)
+    upstream = f"{remote}/{branch}"
+    if not is_ancestor(upstream, "HEAD"):
+        rebase(upstream)
+    markers(upstream)
+    run_check(check)
+    return upstream
+
+
+def ship(args):
+    if git("status", "--porcelain", "--untracked-files=no").stdout:
+        raise Stop("There are uncommitted changes: commit or stash them first.")
+    trees = worktrees()
+    here = os.path.realpath(out("rev-parse", "--show-toplevel"))
+    main_path, main_branch = trees[0]
+    in_main = os.path.realpath(main_path) == here
+    if args.remove and in_main:
+        raise Stop("--remove works only in a linked worktree, not the main tree.")
+    branch = args.branch or main_branch
+    if not branch:
+        raise Stop(
+            "The main tree is on a detached HEAD: say which branch with --branch."
+        )
+    remote = args.remote
+    git("fetch", "-q", remote, branch)
+    upstream = f"{remote}/{branch}"
+    if is_ancestor("HEAD", upstream):
+        print(f"HEAD is already in {upstream}: nothing to push.")
+        return 0
+    rebase_and_check(remote, branch, args.check)
+    old = out("rev-parse", upstream)
+    pushed = git("push", "-q", remote, f"HEAD:{branch}", check=False)
+    if pushed.returncode != 0:
+        if not any(sign in pushed.stderr for sign in REJECTED):
+            raise Stop(f"The push failed:\n{pushed.stderr.strip()}")
+        print(
+            f"Another push won the race, so trying once more:\n{pushed.stderr.strip()}"
+        )
+        rebase_and_check(remote, branch, args.check)
+        old = out("rev-parse", upstream)
+        git("push", "-q", remote, f"HEAD:{branch}")
+    git("fetch", "-q", remote, branch)
+    new = out("rev-parse", "HEAD")
+    if not is_ancestor(new, upstream):
+        raise Stop(f"{upstream} doesn't hold {new[:12]} after the push.")
+    report(old, new, branch, upstream, main_path, main_branch)
+    if args.remove:
+        os.chdir(main_path)
+        git("worktree", "remove", here)
+        print(f"Removed the worktree {here}.")
+    return 0
+
+
+def report(old, new, branch, upstream, main_path, main_branch):
+    subjects = out("log", "--format=%s", "--reverse", f"{old}..{new}").splitlines()
+    files = out("diff", "--name-only", old, new).splitlines()
+    print(f"Pushed {old[:7]}..{new[:7]} to {upstream}.")
+    print("\nNotice for other sessions:")
+    print(
+        f"FYI: pushed {old[:7]}..{new[:7]} to {branch}: {'; '.join(subjects)}. Files: {', '.join(files)}."
+    )
+    if main_branch == branch:
+        local = out("rev-parse", f"refs/heads/{branch}")
+        if local != new and is_ancestor(local, upstream):
+            print(
+                f"\nThe main tree ({main_path}) is behind {upstream}: pull there once it's yours."
+            )
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--remote", default="origin", help="the remote (default origin)"
+    )
+    parser.add_argument(
+        "--branch", help="the branch to push to (default: the main tree's)"
+    )
+    parser.add_argument(
+        "--check", metavar="CMD", help="the check to run before pushing"
+    )
+    parser.add_argument(
+        "--remove",
+        action="store_true",
+        help="remove this worktree once the push is confirmed",
+    )
+    args = parser.parse_args(argv)
+    try:
+        return ship(args)
+    except Stop as error:
+        print(error, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

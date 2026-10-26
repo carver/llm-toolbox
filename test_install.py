@@ -3,6 +3,7 @@
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -500,3 +501,112 @@ def test_an_update_report_that_cannot_run_does_not_fail_the_update(
 
     assert install.update_third_party_skills() == 0
     assert "skills-news" in capsys.readouterr().out
+
+
+def test_links_only_links_tools_and_skills_and_nothing_else(dirs, tools, monkeypatch):
+    skills, skill_dst = dirs
+    make_skill(skills, "new-skill")
+    src, dst = tools
+    make_tool(src, "new-tool")
+    for name in (
+        "link_guidelines",
+        "register_hooks",
+        "set_settings",
+        "install_third_party_skills",
+        "enable_git_hooks",
+        "install_cron",
+        "apply_skill_patches",
+    ):
+        monkeypatch.setattr(install, name, lambda name=name: pytest.fail(f"{name} ran"))
+
+    assert install.main(["--links"]) == 0
+
+    assert (dst / "new-tool").is_symlink() and (skill_dst / "new-skill").is_symlink()
+
+
+def commit_in(path, env):
+    return subprocess.run(
+        ["git", "-C", str(path), "commit", "-q", "--allow-empty", "-m", "x"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+
+def run_git(path, env, *args):
+    subprocess.run(
+        ["git", "-C", str(path), *args], check=True, env=env, capture_output=True
+    )
+
+
+@pytest.fixture
+def hooked(tmp_path):
+    """A repo with the link hooks committed, a stand-in install.py that logs its
+    arguments, and a detached worktree beside it."""
+    repo = tmp_path / "repo"
+    env = without_repo_vars(os.environ) | {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    run_git(tmp_path, env, "init", "-q", str(repo))
+    run_git(repo, env, "config", "core.hooksPath", ".githooks")
+    hooks = repo / ".githooks"
+    hooks.mkdir()
+    for name in ("post-commit", "post-merge"):
+        source = Path(install.__file__).parent / ".githooks" / name
+        (hooks / name).write_bytes(source.read_bytes())
+        (hooks / name).chmod(0o755)
+    ran = tmp_path / "ran"
+    (repo / "install.py").write_text(
+        f"import sys\nopen({str(ran)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+    )
+    run_git(repo, env, "add", ".")
+    assert commit_in(repo, env).returncode == 0
+    worktree = tmp_path / "wt"
+    run_git(repo, env, "worktree", "add", "-q", "--detach", str(worktree))
+    return repo, worktree, env, ran
+
+
+def runs(ran):
+    return ran.read_text().splitlines() if ran.exists() else []
+
+
+def test_a_commit_in_the_main_tree_runs_install_links(hooked):
+    _, _, _, ran = hooked
+    assert runs(ran) == ["--links"]
+
+
+def test_a_commit_in_a_linked_worktree_runs_nothing(hooked):
+    _, worktree, env, ran = hooked
+
+    assert commit_in(worktree, env).returncode == 0
+
+    assert runs(ran) == ["--links"]
+
+
+def test_a_merge_runs_install_links_in_the_main_tree_only(hooked):
+    repo, worktree, env, ran = hooked
+    run_git(repo, env, "checkout", "-q", "-b", "side")
+    assert commit_in(repo, env).returncode == 0  # the main tree's commit: a second run
+    run_git(repo, env, "checkout", "-q", "-")
+    run_git(worktree, env, "merge", "-q", "--ff-only", "side")
+    assert runs(ran) == ["--links", "--links"]
+
+    run_git(repo, env, "merge", "-q", "--ff-only", "side")
+
+    assert runs(ran) == ["--links", "--links", "--links"]
+
+
+def test_links_prints_nothing_when_nothing_changed(dirs, tools, capsys):
+    skills, _ = dirs
+    make_skill(skills, "a-skill")
+    make_tool(tools[0], "a-tool")
+    install.main(["--links"])
+    capsys.readouterr()
+
+    assert install.main(["--links"]) == 0
+
+    assert capsys.readouterr().out == ""

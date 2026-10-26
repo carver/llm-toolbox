@@ -1,0 +1,10 @@
+#!/bin/sh
+# Link a tool or skill as soon as it's committed or pulled, so it's on PATH without a
+# hand-run install.py (install.py --links prints only what it changed). Also run as
+# post-merge, through the link beside this file.
+# Only in the main worktree: a linked worktree's links would point into a folder that
+# `git worktree remove` deletes.
+git_dir=$(cd "$(git rev-parse --git-dir)" && pwd -P)
+common_dir=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)
+[ "$git_dir" = "$common_dir" ] || exit 0
+python3 "$(git rev-parse --show-toplevel)/install.py" --links || :

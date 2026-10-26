@@ -436,7 +436,7 @@ def prune_stale_links():
                 say(f"removed stale link {dst}")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -445,7 +445,16 @@ def main():
         action="store_true",
         help="also update the third-party skills whose upstream changed",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--links",
+        action="store_true",
+        help="only prune stale links and link the tools and skills, printing only what "
+        "changed (the post-commit and post-merge hooks run this)",
+    )
+    args = parser.parse_args(argv)
+    if args.links:
+        prune_stale_links()
+        return 1 if link_skills() + link_tools() else 0
     print("[llm-toolbox]")
     prune_stale_links()
     conflicts = (

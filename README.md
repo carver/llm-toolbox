@@ -36,7 +36,10 @@ workspace `CLAUDE.md` (by default Claude Code skips `AGENTS.md` when any
 `CLAUDE.md` is found). A value already set to something else is reported and
 left alone.
 
-Re-run it after adding or renaming a skill. It is idempotent and only touches
+The repo's post-commit and post-merge hooks run `install.py --links` in the
+main worktree, which prunes stale links and links new tools and skills, so a
+tool or skill is ready once it's committed or pulled. Re-run the whole install
+by hand after a fresh clone or a change to `install.py`. It is idempotent and only touches
 links that point into this repo. If a name already belongs to some other
 skill, it reports the conflict and leaves it alone.
 

@@ -176,8 +176,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   -a` or `commit PATHS` updates the index, so the check sees what is
   committed. A tree that already passed the check, as in an amend that
   changes only the message, skips it; an agent without llm-toolbox, such as
-  a teammate's, runs the check every time. `install.py` also registers it as
-  a Claude Code hook that refuses `git commit --no-verify`.
+  a teammate's, runs the check every time. The check's output shows only when
+  it fails, ending with `COMMIT REFUSED`; a pass prints one line. A fixup!,
+  squash! or amend! commit skips the check (found from the running `git
+  commit`'s arguments), since `build-state finish` checks the folded result.
+  `install.py` also registers it as a Claude Code hook that refuses `git commit
+  --no-verify`, except in a repo with no agent check, such as a scratch repo.
 - **issue-todo**: a GitHub issue's task-list items across its body and every
   comment (`issue-todo show N`), which `gh issue view` splits between two
   commands, and ticking one where it lives (`issue-todo tick N MATCH --note
@@ -207,9 +211,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   stash and other worktrees' branches, and the config with its values hashed),
   `refactor` the refactor base. `finish` refuses leftover conflict markers,
   folds `fixup!` commits into the commits they fix, leaving every other commit
-  separate and the tree as it was, then lists the commits since the base and
-  the test files changed since the refactor base, and fails naming any ref or
-  config key that moved. In a detached worktree, the branch it lands on (the
+  separate and the tree as it was, and runs the repo's `agent-pre-commit` on
+  the result when it folded a fix commit. Then it lists the commits since the
+  base and the test files changed since the refactor base, and fails naming
+  any ref or config key that moved. In a detached worktree, the branch it lands on (the
   main tree's) may move: finish then says to rebase onto it. `review-prompt
   BRIEF` prints the review subagent's prompt for the commit at HEAD, with
   `/code-review`'s two briefs and its standards section copied from its

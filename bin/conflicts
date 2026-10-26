@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""List and resolve git conflict hunks, one hunk or a whole file at a time.
+
+    conflicts FILE...           list each file's hunks, numbered, with both sides
+    conflicts FILE N SIDE       resolve hunk N of FILE
+    conflicts FILE all SIDE     resolve every hunk of FILE the same way
+
+SIDE is ours (the side after <<<<<<<), theirs (the side before >>>>>>>), both (ours,
+then theirs) or base (the ||||||| side, in a diff3 or zdiff3 hunk). Each side's marker
+label is printed with it: in a rebase, ours (HEAD) is the branch being rebased onto
+and theirs is the commit being replayed.
+
+apply-edits can't resolve a hunk, since its own blocks use the ======= line. A
+separator line counts as a marker only inside a hunk, so a reStructuredText underline
+is content. A hunk that never closes, lacks its ======= line or opens inside another
+makes conflicts refuse the file and change nothing. Line endings are kept. It never
+stages a file: once a file has no hunk left it says so, and `git add FILE` is yours.
+"""
+
+import argparse
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+SIDES = ("ours", "theirs", "both", "base")
+MARK = 7  # git's default conflict-marker-size
+
+
+@dataclass
+class Hunk:
+    start: int  # line number of <<<<<<<, from 1
+    end: int  # line number of >>>>>>>
+    ours_label: str
+    theirs_label: str
+    ours: list[str] = field(default_factory=list)
+    base: list[str] | None = None
+    base_label: str = ""
+    theirs: list[str] = field(default_factory=list)
+
+
+class Malformed(Exception):
+    pass
+
+
+def marker(line: str, char: str) -> str | None:
+    """The label after a marker made of `char`, or None when the line isn't one."""
+    body = line.rstrip("\r\n")
+    if body[:MARK] != char * MARK or body[MARK : MARK + 1] not in ("", " "):
+        return None
+    return body[MARK + 1 :]
+
+
+def parse(lines: list[str]) -> list[Hunk | str]:
+    """The file as plain lines and hunks, in order."""
+    parts: list[Hunk | str] = []
+    hunk, section = None, None
+    for number, line in enumerate(lines, start=1):
+        opening = marker(line, "<")
+        if hunk is None:
+            if opening is not None:
+                hunk, section = Hunk(number, 0, opening, ""), "ours"
+            else:
+                parts.append(line)
+            continue
+        if opening is not None:
+            raise Malformed(
+                f"line {number}: a hunk opens inside the one from line {hunk.start}"
+            )
+        if section == "ours" and (base := marker(line, "|")) is not None:
+            hunk.base, hunk.base_label, section = [], base, "base"
+        elif section in ("ours", "base") and marker(line, "=") is not None:
+            section = "theirs"
+        elif (closing := marker(line, ">")) is not None:
+            if section != "theirs":
+                raise Malformed(
+                    f"line {number}: the hunk from line {hunk.start} has no ======="
+                )
+            hunk.end, hunk.theirs_label = number, closing
+            parts.append(hunk)
+            hunk = None
+        elif section == "ours":
+            hunk.ours.append(line)
+        elif section == "base":
+            hunk.base.append(line)
+        else:
+            hunk.theirs.append(line)
+    if hunk is not None:
+        raise Malformed(f"the hunk from line {hunk.start} never closes")
+    return parts
+
+
+def hunks(parts: list[Hunk | str]) -> list[Hunk]:
+    return [part for part in parts if isinstance(part, Hunk)]
+
+
+def side_lines(hunk: Hunk, side: str) -> list[str]:
+    if side == "both":
+        return hunk.ours + hunk.theirs
+    if side == "base":
+        if hunk.base is None:
+            raise Malformed(
+                f"hunk at line {hunk.start} has no base side (not a diff3 hunk)"
+            )
+        return hunk.base
+    return hunk.ours if side == "ours" else hunk.theirs
+
+
+def read_lines(path: Path) -> list[str]:
+    with open(path, newline="") as file:
+        return file.read().splitlines(keepends=True)
+
+
+def show(path: str, parts: list[Hunk | str]) -> None:
+    found = hunks(parts)
+    if not found:
+        print(f"{path}: no conflicts")
+        return
+    for number, hunk in enumerate(found, start=1):
+        print(f"{path}, hunk {number}, lines {hunk.start}-{hunk.end}")
+        sides = [("ours", hunk.ours_label, hunk.ours)]
+        if hunk.base is not None:
+            sides.append(("base", hunk.base_label, hunk.base))
+        sides.append(("theirs", hunk.theirs_label, hunk.theirs))
+        for name, label, lines in sides:
+            print(f"  {name}{f' ({label})' if label else ''}:")
+            for line in lines:
+                print(f"    | {line.rstrip(chr(13) + chr(10))}")
+
+
+def resolve(path: Path, which: str, side: str) -> int:
+    parts = parse(read_lines(path))
+    found = hunks(parts)
+    if which == "all":
+        chosen = set(map(id, found))
+    else:
+        number = int(which)
+        if not 1 <= number <= len(found):
+            print(f"{path}: no hunk {number}; it has {len(found)}", file=sys.stderr)
+            return 1
+        chosen = {id(found[number - 1])}
+    out = []
+    for part in parts:
+        if isinstance(part, str):
+            out.append(part)
+        elif id(part) in chosen:
+            out.extend(side_lines(part, side))
+        else:
+            out.extend(render(part))
+    with open(path, "w", newline="") as file:
+        file.write("".join(out))
+    left = len(found) - len(chosen)
+    if left:
+        print(f"{path}: resolved ({side}); {left} hunk{'s' if left > 1 else ''} left")
+    else:
+        print(f"{path}: resolved ({side}); no conflicts left, so `git add {path}`")
+    return 0
+
+
+def render(hunk: Hunk) -> list[str]:
+    """A hunk back as its marker lines, for the hunks left unresolved."""
+    eol = (
+        "\r\n"
+        if any(line.endswith("\r\n") for line in hunk.ours + hunk.theirs)
+        else "\n"
+    )
+    lines = [f"{'<' * MARK} {hunk.ours_label}".rstrip() + eol, *hunk.ours]
+    if hunk.base is not None:
+        lines += [f"{'|' * MARK} {hunk.base_label}".rstrip() + eol, *hunk.base]
+    lines += [
+        "=" * MARK + eol,
+        *hunk.theirs,
+        f"{'>' * MARK} {hunk.theirs_label}".rstrip() + eol,
+    ]
+    return lines
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("args", nargs="+", metavar="FILE [N|all SIDE]")
+    args = parser.parse_args(argv).args
+    if len(args) == 3 and (args[1] == "all" or args[1].isdigit()):
+        path, which, side = args
+        if side not in SIDES:
+            parser.error(f"SIDE is one of {', '.join(SIDES)}, not {side!r}")
+        try:
+            return resolve(Path(path), which, side)
+        except Malformed as error:
+            print(f"{path}: {error}; changed nothing", file=sys.stderr)
+            return 1
+    code = 0
+    for path in args:
+        try:
+            show(path, parse(read_lines(Path(path))))
+        except Malformed as error:
+            print(f"{path}: {error}", file=sys.stderr)
+            code = 1
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

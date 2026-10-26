@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """Keep /build's bookkeeping: the base commit, the refactor base and the repo fingerprint.
 
-    build-state start       record the base (HEAD) and the repo's fingerprint
+    build-state start [--base REV]
+                            record the base (HEAD, or an earlier REV) and the repo's
+                            fingerprint
     build-state refactor    record the refactor base (HEAD), before applying review fixes
     build-state show        print the recorded bases
     build-state finish      fold fixups into the commits they fix, check the fingerprint,
                             print the commits since the base and the test files changed
                             since the refactor base
     build-state review-prompt BRIEF
-                            print the review subagent's prompt: the base, the commits,
-                            the brief as its spec, the standards sources, and
-                            code-review's Standards and Spec briefs, copied verbatim
-                            from its SKILL.md (fails when they can't be found there)
+                            print the review subagent's prompt for the commit at HEAD:
+                            the base, the commits, the brief as its spec, the standards
+                            sources, and code-review's standards section and its
+                            Standards and Spec briefs, copied verbatim from its
+                            SKILL.md (fails when they can't be found there)
 
 The state lives in the worktree's git dir, as build-state.json; finish removes it.
 
 finish folds only fixup!, squash! and amend! commits (`git commit --fixup=SHA`), each
 into the commit it names, with an autosquash rebase onto the base. Every other commit
 stays as it is, in order, so logically separate commits stay separate. It refuses
-uncommitted changes, and on a conflict aborts the rebase and leaves the branch as it was.
+uncommitted changes and leftover conflict markers since the base. On a conflict it aborts
+the rebase, and when the folded tree differs from the tree before, it resets to that;
+either way the branch is as it was.
 
-The fingerprint is every ref except the work branch and its upstream (a symbolic ref, such
-as origin/HEAD, by the ref it points to), and every entry
+The fingerprint is every ref except the work branch and its upstream, the stash, and the
+branches checked out in other linked worktrees at start or at finish, which other sessions
+move (a symbolic ref, such as origin/HEAD, counts by the ref it points to), and every entry
 of the repo's config. When either changed since start, finish names the refs and config
 keys (never config values: a remote URL can hold a token), exits 1 and keeps the state,
 before folding anything. A fix commit left unfolded (its target is older than the base)
@@ -123,9 +129,27 @@ def behind(branch: str) -> bool:
     )
 
 
+def other_worktree_branches() -> set[str]:
+    """The branches checked out in linked worktrees other than this one: other sessions
+    commit there. The main worktree's branch isn't one; a detached build lands on it."""
+    here = git("rev-parse", "--show-toplevel").stdout.strip()
+    trees = git("worktree", "list", "--porcelain").stdout.split("\n\n")[1:]
+    branches = set()
+    for tree in trees:
+        lines = tree.splitlines()
+        path = next((ln[9:] for ln in lines if ln.startswith("worktree ")), None)
+        if path and os.path.realpath(path) != os.path.realpath(here):
+            branches.update(
+                ln.removeprefix("branch refs/heads/")
+                for ln in lines
+                if ln.startswith("branch ")
+            )
+    return branches
+
+
 def fingerprint(work: list[str]) -> dict[str, dict[str, str]]:
-    """Every ref but the work refs, and every config entry with its values hashed: a
-    value, such as a remote URL, can hold a token."""
+    """Every ref but the work refs and the stash, and every config entry with its values
+    hashed: a value, such as a remote URL, can hold a token."""
     common = git("rev-parse", "--git-common-dir").stdout.strip()
     listed = git("config", "--file", f"{common}/config", "--list").stdout
     values: dict[str, list[str]] = {}
@@ -143,7 +167,11 @@ def fingerprint(work: list[str]) -> dict[str, dict[str, str]]:
     for line in listed.splitlines():
         name, commit, *target = line.split()
         refs[name] = f"-> {target[0]}" if target else commit
-    return {"config": config, "refs": {n: s for n, s in refs.items() if n not in work}}
+    ignored = {*work, "refs/stash"}
+    return {
+        "config": config,
+        "refs": {n: s for n, s in refs.items() if n not in ignored},
+    }
 
 
 def changes(
@@ -178,7 +206,20 @@ def start(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    base, work = head(), work_refs()
+    work = work_refs()
+    if args.base is None:
+        base = head()
+    else:
+        found = git(
+            "rev-parse", "--verify", "-q", f"{args.base}^{{commit}}", check=False
+        )
+        if found.returncode != 0:
+            return fail(f"No commit {args.base}.")
+        base = found.stdout.strip()
+        if not ancestor(base, "HEAD"):
+            return fail(
+                f"{args.base} isn't an ancestor of HEAD, so it can't be the base."
+            )
     targets = [] if work else target_branches(base)
     save(
         path,
@@ -186,6 +227,7 @@ def start(args: argparse.Namespace) -> int:
             "base": base,
             "work_refs": work,
             "targets": targets,
+            "others": sorted(other_worktree_branches()),
             "fingerprint": fingerprint(work),
         },
     )
@@ -215,6 +257,16 @@ def show(args: argparse.Namespace) -> int:
 def fail(*lines: str) -> int:
     print("\n".join(lines), file=sys.stderr)
     return 1
+
+
+def conflict_markers(base: str) -> list[str]:
+    """`file:line` for each leftover conflict marker the commits since the base add."""
+    check = git("diff", "--check", base, "HEAD", check=False).stdout
+    return [
+        line.removesuffix(": leftover conflict marker")
+        for line in check.splitlines()
+        if line.endswith(": leftover conflict marker")
+    ]
 
 
 def fold_fixups(base: str) -> bool:
@@ -254,20 +306,39 @@ def finish(args: argparse.Namespace) -> int:
     if git("status", "--porcelain", "--untracked-files=no").stdout:
         return fail("There are uncommitted changes: commit or stash them first.")
     targets = set(state.get("targets", []))
+    others = set(state.get("others", [])) | other_worktree_branches()
     moved, moved_targets = [], set()
     for change in changes(state["fingerprint"], fingerprint(state["work_refs"])):
         kind, _, name = change.partition(" ")
-        if kind == "refs" and branch_name(name) in targets:
-            moved_targets.add(branch_name(name))
-        else:
+        branch = branch_name(name) if kind == "refs" else None
+        if branch in targets:
+            moved_targets.add(branch)
+        elif branch not in others:
             moved.append(change)
     if moved:
         return fail(
             "The repo changed outside the work branch since start:",
             *(f"  {name}" for name in moved),
         )
+    if markers := conflict_markers(base):
+        return fail(
+            "Leftover conflict markers since the base: resolve them (`conflicts -h`).",
+            "A file that holds markers on purpose, such as a test fixture, sets",
+            "conflict-marker-size in .gitattributes (`git help attributes`).",
+            *(f"  {marker}" for marker in markers),
+        )
+    before = head()
     if not fold_fixups(base):
         return 1
+    if (
+        git("rev-parse", "HEAD^{tree}").stdout
+        != git("rev-parse", f"{before}^{{tree}}").stdout
+    ):
+        git("reset", "-q", "--hard", before)
+        return fail(
+            "Folding the fixups changed the tree, so the branch is back as it was:",
+            f"  {before}. Fold them by hand and compare with `git diff {before[:12]}`.",
+        )
     print(git("log", "--oneline", "--reverse", f"{base}..HEAD").stdout, end="")
     subjects = git("log", "--format=%s", f"{base}..HEAD").stdout.splitlines()
     fixes = ("fixup! ", "squash! ", "amend! ")
@@ -293,11 +364,19 @@ HEADING = re.compile(r"^(#|\*\*)")
 AXIS_HEADING = re.compile(r"^\*\*(Standards|Spec) sub-agent prompt\*\*")
 SOURCES_HEADING = "### 3. Identify the standards sources"
 REVIEW_PROMPT = """\
-Review the changes in {top} since {base}. Report only: edit no files and make no commits.
+Review the changes in {top} since {base}, up to {sha}. Report only: edit no files and \
+make no commits.
 
-Diff: `git diff {base}...HEAD`. Commits:
+Diff: `git diff {base}...{sha}`. Commits:
 {commits}
+Read the files as of that commit, with `git show {sha}:PATH`: the work tree can move on \
+while you review.
+
 Spec: {brief}. Read it in full.
+
+You may run the repo's own build and check commands; writing outputs git ignores is \
+fine. To see whether a test catches a break, use `mutate-check -- CMD` (`mutate-check \
+-h`), which puts the code back, rather than a scripted edit.
 
 Run two separate reviews and report them under the headings `## Standards` and `## Spec`. \
 Don't merge or rerank findings across the two.
@@ -306,7 +385,9 @@ Don't merge or rerank findings across the two.
 
 Standards sources: {sources}, and any other file in the repo that documents how code \
 should be written. A repo's own standards win where they conflict with the global ones. \
-Read `{sources_heading}` in {skill} for the smell baseline and its rules, and apply it.
+Apply the smell baseline and its rules, from code-review's SKILL.md, verbatim:
+
+{sources_section}
 
 Brief, verbatim: "{standards}"
 
@@ -330,6 +411,20 @@ def code_review_briefs(text: str) -> dict[str, str]:
     return briefs
 
 
+def section(text: str, heading: str) -> str:
+    """The section under `heading`, without it, up to the next heading of its level or
+    higher."""
+    level = len(heading.split(" ", 1)[0])
+    body = text.split(heading, 1)[1].split("\n")
+    kept = []
+    for line in body[1:]:
+        hashes = len(line) - len(line.lstrip("#"))
+        if 0 < hashes <= level and line[hashes : hashes + 1] == " ":
+            break
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def review_prompt(args: argparse.Namespace) -> int:
     if (state := load(state_file())) is None:
         return 1
@@ -350,7 +445,7 @@ def review_prompt(args: argparse.Namespace) -> int:
             f"No {' or '.join(missing)} in {skill}: code-review's layout changed,",
             "so update review_prompt in build-state.",
         )
-    base = state["base"]
+    base, sha = state["base"], head()
     top = Path(git("rev-parse", "--show-toplevel").stdout.strip())
     sources = [
         GLOBAL_STANDARDS,
@@ -360,11 +455,11 @@ def review_prompt(args: argparse.Namespace) -> int:
         REVIEW_PROMPT.format(
             top=top,
             base=base,
-            commits=git("log", "--oneline", "--reverse", f"{base}..HEAD").stdout,
+            sha=sha,
+            commits=git("log", "--oneline", "--reverse", f"{base}..{sha}").stdout,
             brief=args.brief.resolve(),
             sources=", ".join(sources),
-            sources_heading=SOURCES_HEADING,
-            skill=skill,
+            sources_section=section(text, SOURCES_HEADING),
             standards=briefs["Standards"],
             spec=briefs["Spec"],
         ),
@@ -383,6 +478,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     start_command.add_argument(
         "--force", action="store_true", help="replace a build that is still open"
+    )
+    start_command.add_argument(
+        "--base", metavar="REV", help="record REV as the base instead of HEAD"
     )
     start_command.set_defaults(run=start)
     commands.add_parser("refactor", help="record the refactor base").set_defaults(

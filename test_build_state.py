@@ -139,7 +139,8 @@ def test_review_prompt_carries_the_build_and_both_code_review_briefs(repo, tmp_p
 
     assert shown.returncode == 0, shown.stderr
     prompt = shown.stdout
-    assert str(repo) in prompt and f"git diff {base}...HEAD" in prompt
+    head = git(repo, "rev-parse", "HEAD").strip()
+    assert str(repo) in prompt and f"git diff {base}...{head}" in prompt
     assert "Parse dates" in prompt and "Note the house rules" in prompt
     assert str(brief) in prompt
     assert f'"{STANDARDS_BRIEF}"' in prompt and f'"{SPEC_BRIEF}"' in prompt
@@ -490,3 +491,163 @@ def test_in_a_detached_build_a_config_change_still_fails(repo, worktree):
     done = build_state(worktree, "finish")
 
     assert done.returncode == 1 and "core.something" in done.stderr
+
+
+def test_start_base_records_an_earlier_commit(repo):
+    base = git(repo, "rev-parse", "HEAD").strip()
+    commit(repo, "a.py", "Work done before start")
+
+    started = build_state(repo, "start", "--base", "HEAD~1")
+
+    assert started.returncode == 0, started.stderr
+    assert build_state(repo, "show").stdout.splitlines() == [f"base {base}"]
+
+
+def test_start_base_refuses_a_commit_head_doesnt_hold(repo):
+    git(repo, "checkout", "-q", "-b", "side")
+    side = commit(repo, "b.py", "Elsewhere")
+    git(repo, "checkout", "-q", "main")
+
+    refused = build_state(repo, "start", "--base", side)
+
+    assert refused.returncode == 1 and "ancestor" in refused.stderr
+    assert build_state(repo, "show").returncode == 1
+
+
+def test_a_stash_doesnt_trip_finish(repo):
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    (repo / "a.py").write_text("in progress\n")
+    git(repo, "stash", "-q")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+
+
+def test_another_worktrees_branch_may_move(repo, tmp_path):
+    other = tmp_path / "other"
+    git(repo, "worktree", "add", "-q", "-b", "prose", str(other))
+    git(repo, "update-ref", "refs/remotes/origin/prose", "prose")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    commit(other, "b.py", "Another session's work")
+    advance(repo, "refs/remotes/origin/prose")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+
+
+def test_a_worktree_added_during_the_build_may_move_its_branch(repo, tmp_path):
+    build_state(repo, "start")
+    other = tmp_path / "other"
+    git(repo, "worktree", "add", "-q", "-b", "prose", str(other))
+    commit(other, "b.py", "Another session's work")
+    commit(repo, "a.py", "Work")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+
+
+def test_finish_refuses_a_leftover_conflict_marker(repo):
+    build_state(repo, "start")
+    commit(repo, "a.py", "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> abc (Work)")
+    before = git(repo, "rev-parse", "HEAD").strip()
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    assert "conflict marker" in done.stderr and "a.py" in done.stderr
+    assert git(repo, "rev-parse", "HEAD").strip() == before
+    assert build_state(repo, "show").returncode == 0  # the build stays open
+
+
+def test_finish_ignores_other_whitespace_errors(repo):
+    build_state(repo, "start")
+    commit(repo, "a.py", "trailing space   ")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+
+
+def test_finish_fails_when_folding_changes_the_tree(repo):
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "b.py", "More")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+    before = git(repo, "rev-parse", "HEAD").strip()
+    # A rebase that alters the last commit stands in for a fold gone wrong.
+    hooks = repo / ".git" / "hooks"
+    (hooks / "post-rewrite").write_text(
+        '#!/bin/sh\n[ "$1" = rebase ] || exit 0\n'
+        "echo extra >> b.py && git add b.py && git commit -q --amend --no-edit\n"
+    )
+    (hooks / "post-rewrite").chmod(0o755)
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1 and "tree" in done.stderr
+    assert git(repo, "rev-parse", "HEAD").strip() == before
+    assert build_state(repo, "show").returncode == 0
+
+
+def review_prompt_for(repo, tmp_path):
+    (tmp_path / "brief.md").write_text("Parse dates.\n")
+    skill = code_review_skill(tmp_path)
+    return build_state(
+        repo, "review-prompt", str(tmp_path / "brief.md"), "--skill", str(skill)
+    )
+
+
+def test_review_prompt_pins_the_commit_under_review(repo, tmp_path):
+    base = git(repo, "rev-parse", "HEAD").strip()
+    build_state(repo, "start")
+    reviewed = commit(repo, "parser.py", "Parse dates")
+
+    prompt = review_prompt_for(repo, tmp_path).stdout
+
+    assert f"git diff {base}...{reviewed}" in prompt
+    assert f"git show {reviewed}:" in prompt
+    assert "...HEAD" not in prompt
+
+
+def test_review_prompt_quotes_the_standards_sources_section(repo, tmp_path):
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+
+    prompt = review_prompt_for(repo, tmp_path).stdout
+
+    assert (
+        "Search the repo for every file that documents how code should be written."
+        in prompt
+    )
+    assert "Spawn both sub-agents" not in prompt  # the quote stops at the next section
+    assert "Read `### 3" not in prompt
+
+
+def test_review_prompt_names_mutate_check_and_allows_the_repos_build(repo, tmp_path):
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+
+    prompt = review_prompt_for(repo, tmp_path).stdout
+
+    assert "mutate-check" in prompt
+    assert "build" in prompt and "ignore" in prompt
+
+
+def test_a_worktree_removed_during_the_build_still_may_have_moved_its_branch(
+    repo, tmp_path
+):
+    other = tmp_path / "other"
+    git(repo, "worktree", "add", "-q", "-b", "prose", str(other))
+    build_state(repo, "start")
+    commit(other, "b.py", "Another session's work, merged and its worktree gone")
+    git(repo, "worktree", "remove", str(other))
+    commit(repo, "a.py", "Work")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr

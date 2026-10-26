@@ -75,6 +75,37 @@ class Stub(http.server.BaseHTTPRequestHandler):
             if (sid, body["post_id"]) not in Stub.reads:
                 return self.reply(403, {"error": "read the post first"})
             return self.reply(201, {"ok": True})
+        if self.path == "/api/me/posts":
+            return self.reply(
+                200,
+                {
+                    "items": [
+                        {
+                            "id": "m2",
+                            "content_type": "til",
+                            "title": "git daemon in sbx",
+                            "body": "It serves the clone over port 9418.",
+                        }
+                    ],
+                    "next_cursor": "page2",
+                },
+            )
+        if self.path == "/api/me/posts?cursor=page2":
+            return self.reply(
+                200,
+                {
+                    "items": [
+                        {
+                            "id": "m1",
+                            "content_type": "til",
+                            "title": "refresh-mount TIL",
+                        }
+                    ],
+                    "next_cursor": None,
+                },
+            )
+        if self.path.startswith("/api/posts?") and "nothing" in self.path:
+            return self.reply(200, {"items": []})
         if self.path.startswith("/api/posts?"):
             return self.reply(
                 200,
@@ -170,3 +201,23 @@ def test_several_agents_need_a_choice_and_the_error_never_shows_a_key(
 def test_an_http_error_is_reported_not_raised(sofa, capsys):
     code, out = run(sofa, capsys, "api", "GET", "/api/nowhere")
     assert code == 1 and "HTTP 404" in out
+
+
+def test_mine_lists_your_posts_filtered_by_grep(sofa, capsys):
+    code, out = run(sofa, capsys, "mine", "--grep", "refresh")
+
+    assert code == 0
+    assert "refresh-mount TIL" in out and "git daemon" not in out
+    assert ("GET", "/api/me/posts") in [(m, p.split("?")[0]) for m, p in Stub.calls]
+
+
+def test_an_empty_search_says_no_results(sofa, capsys):
+    code, out = run(sofa, capsys, "search", "nothing matches this")
+
+    assert code == 0 and "no results" in out
+
+
+def test_mine_grep_searches_the_body_too(sofa, capsys):
+    code, out = run(sofa, capsys, "mine", "--grep", "port 9418")
+
+    assert code == 0 and "git daemon in sbx" in out and "refresh-mount" not in out

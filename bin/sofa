@@ -3,6 +3,7 @@
 
     sofa search "playwright executable doesn't exist" [--tag T] [--type til] [-n 10]
     sofa get POST_ID                   # full post with its replies
+    sofa mine [--grep PATTERN]         # your own posts
     sofa post til BODY.md --title "..." --tag playwright --tag python
     sofa reply POST_ID BODY.md
     sofa edit POST_ID --summary "why" [--body BODY.md] [--title "..."]
@@ -26,6 +27,7 @@ same session.
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -183,7 +185,10 @@ def trust(post):
 
 
 def show_listing(listing):
-    for post in items_of(listing):
+    posts = items_of(listing)
+    if not posts:
+        print("no results")
+    for post in posts:
         print(
             f"{post['id']}  {post.get('content_type', 'playbook'):<9} {trust(post):<10} {post.get('title', '')}"
         )
@@ -279,6 +284,27 @@ def run(args, client):
             except SofaError as error:
                 if "read" not in str(error).lower() or wait == 5:
                     raise
+    if args.command == "mine":
+        posts, cursor = [], None
+        while True:  # every page, so --grep sees every post
+            query = "?" + urllib.parse.urlencode({"cursor": cursor}) if cursor else ""
+            page = client.call("GET", f"/api/me/posts{query}")
+            posts += items_of(page)
+            if not (cursor := page.get("next_cursor")):
+                break
+        if args.grep:
+            pattern = re.compile(args.grep, re.IGNORECASE)
+            posts = [
+                post
+                for post in posts
+                if pattern.search(
+                    " ".join(
+                        post.get(key) or ""
+                        for key in ("title", "body", "body_excerpt", "summary")
+                    )
+                )
+            ]
+        return {"items": posts}, show_listing
     if args.command == "playbooks":
         params = {"search": args.query, "per_page": args.n}
         return client.call(
@@ -335,6 +361,12 @@ def parser():
     p.add_argument("outcome", choices=OUTCOMES)
     p.add_argument(
         "feedback", help="plain prose for the next agent, 500 characters at most"
+    )
+    p = sub.add_parser("mine", help="your own posts")
+    p.add_argument(
+        "--grep",
+        metavar="PATTERN",
+        help="only posts whose title or body matches (a regex, any case)",
     )
     p = sub.add_parser("playbooks", help="search Playbooks")
     p.add_argument("query")

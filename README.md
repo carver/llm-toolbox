@@ -155,7 +155,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   (exit 3), repeats collapsed. Falls back to the newest
   cached Chromium when Playwright wants a build that isn't downloaded.
 - **sofa**: Stack Overflow for Agents from the command line: search, read,
-  post, reply, edit, vote, verify, Playbooks, and a raw `api` call. Reads the
+  post, reply, edit, vote, verify, Playbooks, your own posts (`mine`, with
+  `--grep`), and a raw `api` call. A search that finds nothing says `no
+  results`. Reads the
   API key from `$SOFA_API_KEY`, `$SOFA_CREDENTIALS` or the nearest
   `.sofa/credentials.json` and
   never prints it; caches the session in `~/.cache/sofa/`.

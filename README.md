@@ -121,6 +121,19 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   stopped. It exits 0 when CMD failed (the tests catch the break) and 1 when it
   passed, printing one line and at most 3 of pytest's `E ` lines. For checking
   that a test which passed on its first run guards what it's meant to.
+- **conflicts**: `conflicts FILE` lists a file's conflict hunks, numbered, with
+  each side and its marker label; `conflicts FILE N SIDE` (or `all SIDE`)
+  resolves them as `ours`, `theirs`, `both` or `base`. apply-edits can't hold
+  the `=======` line, so without it agents deleted marker lines by number. It
+  refuses a hunk that never closes, lacks its separator or nests, treats a
+  separator outside a hunk as content (a reStructuredText underline), and
+  never stages the file.
+- **wt-ship**: ships a worktree's commits in a repo that pushes. It rebases
+  onto the remote branch (the main tree's, by default), refuses leftover
+  conflict markers, runs the repo's `agent-pre-commit` (or `--check CMD`),
+  pushes with one retry when another push wins the race, and confirms the
+  remote holds HEAD. Then it prints the range, a notice for other sessions and
+  whether the main tree is behind; `--remove` removes the worktree.
 - **gui-shot**: runs a GUI app on a headless display (Xvfb, or weston for
   Wayland), clicks and types into it, and saves screenshots. For checking a
   desktop app's UI from a sandbox with no screen. `gui-shot -h` lists the
@@ -189,16 +202,18 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `issue-todo show N` lists both. It never blocks, and other commands get no
   note.
 
-- **build-state**: `/build`'s bookkeeping. `start` records the base commit and
-  the repo's fingerprint (every other ref, and the config with its values
-  hashed), `refactor` the refactor base. `finish` folds `fixup!` commits into
-  the commits they fix, leaving every other commit separate, then lists the
-  commits since the base and the test files changed since the refactor base,
-  and fails naming any ref or config key that moved. In a detached worktree,
-  the branch it lands on (the main tree's) may move: finish then says to
-  rebase onto it. `review-prompt BRIEF`
-  prints the review subagent's prompt, with `/code-review`'s two briefs
-  copied from its SKILL.md. The state lives in the git dir; `show` prints it.
+- **build-state**: `/build`'s bookkeeping. `start` records the base commit
+  (HEAD, or `--base REV`) and the repo's fingerprint (every other ref but the
+  stash and other worktrees' branches, and the config with its values hashed),
+  `refactor` the refactor base. `finish` refuses leftover conflict markers,
+  folds `fixup!` commits into the commits they fix, leaving every other commit
+  separate and the tree as it was, then lists the commits since the base and
+  the test files changed since the refactor base, and fails naming any ref or
+  config key that moved. In a detached worktree, the branch it lands on (the
+  main tree's) may move: finish then says to rebase onto it. `review-prompt
+  BRIEF` prints the review subagent's prompt for the commit at HEAD, with
+  `/code-review`'s two briefs and its standards section copied from its
+  SKILL.md. The state lives in the git dir; `show` prints it.
 
 - **skill-patch**: keeps hand edits to other authors' skills. Edit the
   installed copy in `~/.agents/skills/NAME`, then `skill-patch save NAME

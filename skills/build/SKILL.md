@@ -19,8 +19,9 @@ Write the **brief** to a file. It is the spec the reviewers check the code again
 - every decision and constraint the user stated, including changes made mid-build
 - the **seams**: the public interfaces the tests go through, per `/tdd`. Agree them with the user now. If the user is offline, pick them and record the choice in `uncertainties.md` (see the `coding` skill)
 - the merge danger, judged per the `coding` skill. Create the branch now if it needs one
+- the skills you loaded for the change, each with its SKILL.md path, so the reviewer can read them without searching
 
-Run `build-state start` in the repo. It records the **base** (HEAD) and the **repo fingerprint** in the git dir; `build-state show` prints them again after a context reset.
+Run `build-state start` in the repo. It records the **base** (HEAD, or `--base REV` when your commits for this change already started) and the **repo fingerprint** in the git dir; `build-state show` prints them again after a context reset.
 
 Done when every design fork is answered, the user has confirmed the seams (or you've recorded them), and the brief would let a reviewer who never saw this chat judge the change.
 
@@ -32,7 +33,7 @@ Done when `git log <base>..HEAD` shows your commits and the repo's checks pass.
 
 ## 3. Review
 
-Spawn one review subagent in the foreground, and wait for its report before doing anything else. Its prompt is what `build-state review-prompt BRIEF` prints: `<base>` as the fixed point, the brief file as the spec, and `/code-review`'s Standards and Spec briefs with their standards sources and smell baseline, reported under separate headings. Append any ask this change needs, such as a sweep for leftovers of a rename.
+Spawn one review subagent in the foreground, and wait for its report before doing anything else. Its prompt is what `build-state review-prompt BRIEF` prints: `<base>` as the fixed point, the brief file as the spec, and `/code-review`'s Standards and Spec briefs with their standards sources and smell baseline, reported under separate headings. Append any ask this change needs, such as a sweep for leftovers of a rename. The prompt pins the commit under review; don't rebase or rewrite the tree until the report is in, since the reviewer runs the tests in it.
 
 ## 4. Triage
 

@@ -35,22 +35,33 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HOOK_NAME = "agent-pre-commit"
 COMMENT = f"# Agents' commits also run the slower {HOOK_NAME} (llm-toolbox agent-commit-gate)."
-# The hook is shared, so an agent without llm-toolbox runs the check directly, every time.
+# The hook is shared, so an agent without llm-toolbox runs the check directly, every time,
+# and its refusal still ends with the line --run prints.
 LINE = (
     'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
     "if command -v agent-commit-gate >/dev/null; then "
-    f'AGENT_PRE_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}"; '
-    f'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}"; fi || exit; fi'
+    f'AGENT_PRE_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}" || exit; '
+    f'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}" || '
+    f'{{ echo "COMMIT REFUSED: {HOOK_NAME} failed" >&2; exit 1; }}; fi; fi'
 )
-# Earlier versions of LINE, which --install replaces.
-# The line before --run, which --install replaces.
-OLD_LINE = (
-    'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
-    f'AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}" || exit; fi'
+# Earlier versions of LINE, which --install replaces: before --run, then before the
+# refusal line.
+OLD_LINES = (
+    (
+        'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
+        f'AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}" || exit; fi'
+    ),
+    (
+        'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
+        "if command -v agent-commit-gate >/dev/null; then "
+        f'AGENT_PRE_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}"; '
+        f'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}"; fi || exit; fi'
+    ),
 )
 # In the git dir: the last tree and agent check that passed together.
 PASS_RECORD = "agent-pre-commit-passed"
@@ -125,9 +136,24 @@ def segments(command):
     return parts
 
 
-def commit_args(command):
-    """The arguments of each `git commit` in a shell command. Heredoc bodies are
-    skipped; arguments stop at the first redirection."""
+def git_subcommand(words):
+    """(the words after git's own options, the -C directories among those options),
+    for a git command line without its leading `git`."""
+    rest, directories = list(words), []
+    while rest and rest[0].startswith("-"):
+        option = rest.pop(0)
+        if option in GIT_VALUE and rest:
+            value = rest.pop(0)
+            if option == "-C":
+                directories.append(value)
+    return rest, directories
+
+
+def commits(command):
+    """(arguments, directory) for each `git commit` in a shell command: the directory
+    it runs in, relative to the command's own, from a `cd DIR` before it and `git -C
+    DIR`. Heredoc bodies are skipped; arguments stop at the first redirection."""
+    directory = Path()
     for segment in segments(strip_heredocs(command)):
         try:
             words = shlex.split(segment)
@@ -135,12 +161,13 @@ def commit_args(command):
             words = segment.split()
         while words and ASSIGNMENT.match(words[0]):
             words = words[1:]
+        if len(words) == 2 and words[0] == "cd":
+            directory = directory / words[1]
+            continue
         if not words or Path(words[0]).name != "git":
             continue
-        rest = words[1:]
-        while rest and rest[0].startswith("-"):
-            if rest.pop(0) in GIT_VALUE and rest:
-                rest.pop(0)
+        rest, directories = git_subcommand(words[1:])
+        here = directory.joinpath(*directories)
         if rest[:1] != ["commit"]:
             continue
         args = []
@@ -148,7 +175,89 @@ def commit_args(command):
             if REDIRECT.match(word):
                 break
             args.append(word)
-        yield args
+        yield args, here
+
+
+FIX_SUBJECT = ("fixup!", "squash!", "amend!")
+
+
+def is_fix_commit(args):
+    """Whether a `git commit` with these arguments makes a fixup!, squash! or amend!
+    commit, which build-state finish folds and checks."""
+    words, subject = iter(args), None
+    for word in words:
+        if word == "--":
+            break
+        if word.startswith(("--fixup", "--squash")):
+            return True
+        if word == "--message":
+            message = next(words, "")
+        elif word.startswith("--message="):
+            message = word.removeprefix("--message=")
+        elif word.startswith("--"):
+            if word in COMMIT_LONG_VALUE:
+                next(words, None)
+            continue
+        elif word.startswith("-") and len(word) > 1:
+            # A cluster such as -am: the first letter that takes a value takes the
+            # rest of the word, or the next word when it's last.
+            message = None
+            for j, letter in enumerate(word[1:], start=1):
+                if letter in COMMIT_SHORT_VALUE or letter in COMMIT_SHORT_ATTACHED:
+                    value = word[j + 1 :] or (
+                        next(words, "") if letter in COMMIT_SHORT_VALUE else ""
+                    )
+                    if letter == "m":
+                        message = value
+                    break
+            if message is None:
+                continue
+        else:
+            continue
+        subject = message if subject is None else subject  # the first -m is the subject
+    return subject is not None and subject.startswith(FIX_SUBJECT)
+
+
+def process_args(pid):
+    """(parent pid, argv) of a process: from /proc on Linux, else ps (whose args are
+    joined by spaces, so a quoted word may split)."""
+    proc = Path(f"/proc/{pid}")
+    if proc.is_dir():
+        try:
+            argv = (proc / "cmdline").read_bytes().split(b"\0")
+            stat = (proc / "stat").read_text()
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+            return ppid, [arg.decode(errors="replace") for arg in argv if arg]
+        except (OSError, ValueError, IndexError):
+            return None
+    run = subprocess.run(
+        ["ps", "-o", "ppid=,args=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    fields = run.stdout.strip().split()
+    if run.returncode != 0 or not fields:
+        return None
+    return int(fields[0]), fields[1:]
+
+
+def running_commit_args():
+    """The arguments of the `git commit` this hook runs under, found by walking up the
+    process tree a few levels; None when there's none to be found."""
+    pid = os.getppid()
+    for _ in range(6):
+        found = process_args(pid)
+        if found is None:
+            return None
+        pid, argv = found
+        if argv and Path(argv[0]).name == "git":
+            rest, _ = git_subcommand(argv[1:])
+            if rest[:1] == ["commit"]:
+                return rest[1:]
+        if pid <= 1:
+            return None
+    return None
 
 
 def skips_hooks(args):
@@ -201,8 +310,8 @@ def install(repo):
     if LINE in text:
         print(f"{pre}: already installed")
         return None
-    if OLD_LINE in text:
-        pre.write_text(text.replace(OLD_LINE, LINE))
+    if old := next((line for line in OLD_LINES if line in text), None):
+        pre.write_text(text.replace(old, LINE))
         print(f"{pre}: upgraded")
         return None
     lines = text.splitlines()
@@ -228,7 +337,15 @@ def run_check(path):
     hook = Path(path)
     if not (hook.is_file() and os.access(hook, os.X_OK)):
         print(f"{path}: no executable agent check", file=sys.stderr)
+        print(f"COMMIT REFUSED: no {HOOK_NAME} to run", file=sys.stderr)
         return 1
+    if (args := running_commit_args()) is not None and is_fix_commit(args):
+        print(
+            f"{HOOK_NAME}: skipped for a fix commit; build-state finish runs it on the "
+            "folded result",
+            file=sys.stderr,
+        )
+        return 0
     tree = git_out("write-tree")
     record = git_out("rev-parse", "--git-path", PASS_RECORD)
     key = None
@@ -241,8 +358,21 @@ def run_check(path):
             )
             return 0
     clean = subprocess.run(["git", "diff", "--quiet"], check=False).returncode == 0
+    started = time.monotonic()
     # `path` as given: Path() would drop a leading ./ and send it to a PATH lookup.
-    code = subprocess.run([path], check=False).returncode
+    # Its output shows only when it fails: agents filtered a noisy pass with greps,
+    # and the greps hid failed commits.
+    run = subprocess.run(
+        [path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False
+    )
+    code = run.returncode
+    if code == 0:
+        print(
+            f"{HOOK_NAME}: passed ({time.monotonic() - started:.0f}s)", file=sys.stderr
+        )
+    else:
+        sys.stderr.write(run.stdout.decode(errors="replace"))
+        print(f"COMMIT REFUSED: {HOOK_NAME} failed (exit {code})", file=sys.stderr)
     if code == 0 and clean and key:
         try:
             Path(record).write_text(key)
@@ -278,15 +408,30 @@ def main(argv=None):
     if event.get("tool_name") != "Bash":
         return 0
     command = event.get("tool_input", {}).get("command", "")
-    if any(skips_hooks(args) for args in commit_args(command)):
+    cwd = Path(event.get("cwd") or ".")
+    if any(
+        skips_hooks(args) and has_agent_check(cwd / directory)
+        for args, directory in commits(command)
+    ):
         print(
             "Commit blocked: --no-verify (-n) skips the pre-commit hook, which runs "
             f"this repo's checks, {HOOK_NAME} included. Fix what they report and "
-            "commit without it.",
+            "commit without it. An amend that changes only the message already skips "
+            f"{HOOK_NAME}, since its tree passed.",
             file=sys.stderr,
         )
         return 2
     return 0
+
+
+def has_agent_check(directory):
+    """Whether the repo at `directory` has an agent check, or can't be told: a scratch
+    repo without one may skip its hooks."""
+    hooks = hooks_dir(directory) if directory.is_dir() else None
+    if hooks is None:
+        return True
+    agent = hooks / HOOK_NAME
+    return agent.is_file() and os.access(agent, os.X_OK)
 
 
 if __name__ == "__main__":

@@ -310,3 +310,153 @@ def test_an_agent_check_that_runs_pre_commit_does_not_loop(repo):
     install(repo)
     assert commit(repo, "--allow-empty").returncode == 0
     assert ran(repo) == ["agent", "fast", "fast"]
+
+
+def test_a_passing_agent_check_prints_one_line(installed):
+    hook(installed, "agent-pre-commit", "echo lots of noisy output\necho .......")
+
+    run = commit(installed)
+
+    assert run.returncode == 0
+    assert "noisy" not in run.stderr + run.stdout
+    assert "agent-pre-commit: passed" in run.stderr
+
+
+def test_a_failing_agent_check_ends_with_commit_refused(installed):
+    (installed / "a").write_text("bad\n")
+    git(installed, "add", "a")
+
+    run = commit(installed)
+
+    assert run.stderr.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")
+    assert run.stderr.index("a is bad") < run.stderr.index("COMMIT REFUSED")
+
+
+@pytest.mark.parametrize("flag", ["--fixup=HEAD", "--squash=HEAD"])
+def test_a_fix_commit_skips_the_agent_check(installed, flag):
+    assert commit(installed).returncode == 0
+    (installed / "a").write_text("bad\n")
+    git(installed, "add", "a")
+
+    run = commit(installed, flag)
+
+    assert run.returncode == 0, run.stderr
+    assert (
+        "skipped for a fix commit" in run.stderr and "build-state finish" in run.stderr
+    )
+    assert ran(installed) == ["agent", "fast", "fast"]
+
+
+def test_a_fixup_subject_given_with_m_skips_the_agent_check(installed):
+    assert commit(installed).returncode == 0
+    (installed / "a").write_text("bad\n")
+    git(installed, "add", "a")
+    env = without_repo_vars(os.environ)
+    env["PATH"] = os.pathsep.join([str(SCRIPT.parent), env["PATH"]])
+    env["AI_AGENT"] = "test-agent"
+
+    run = git(installed, "commit", "-q", "-m", "fixup! x", env=env, check=False)
+
+    assert run.returncode == 0, run.stderr
+    assert ran(installed) == ["agent", "fast", "fast"]
+
+
+def run_hook_in(monkeypatch, capsys, command, cwd):
+    event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(cwd)}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    code = gate.main([])
+    return code, capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit --no-verify -m x",
+        "cd scratch && git commit -n -m x",
+        "git -C scratch commit -n -m x",
+    ],
+)
+def test_no_verify_passes_in_a_repo_without_an_agent_check(
+    monkeypatch, capsys, tmp_path, command
+):
+    scratch = tmp_path / "scratch"
+    git(tmp_path, "init", "-q", str(scratch))
+    cwd = scratch if command.startswith("git commit") else tmp_path
+
+    code, err = run_hook_in(monkeypatch, capsys, command, cwd)
+
+    assert code == 0, err
+
+
+def test_no_verify_is_still_refused_where_there_is_an_agent_check(
+    monkeypatch, capsys, installed
+):
+    code, err = run_hook_in(monkeypatch, capsys, "git commit -n -m x", installed)
+
+    assert code == 2 and "--no-verify" in err
+    assert "amend" in err  # a message-only amend already skips the check
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-am", "fixup! x"],
+        ["--message=fixup! x"],
+        ["-m", "x", "--fixup=HEAD"],
+        ["-a", "-m", "squash! x"],
+    ],
+)
+def test_fix_commit_forms(args):
+    assert gate.is_fix_commit(args)
+
+
+@pytest.mark.parametrize(
+    "args", [["-m", "x", "-m", "fixup! later paragraph"], ["-am", "x"], []]
+)
+def test_ordinary_commits_are_not_fix_commits(args):
+    assert not gate.is_fix_commit(args)
+
+
+def test_a_cd_carries_across_segments(monkeypatch, capsys, tmp_path):
+    scratch = tmp_path / "a" / "scratch"
+    scratch.parent.mkdir()
+    git(tmp_path, "init", "-q", str(scratch))
+
+    code, err = run_hook_in(
+        monkeypatch, capsys, "cd a; ls && cd scratch && git commit -n -m x", tmp_path
+    )
+
+    assert code == 0, err
+
+
+def test_the_missing_agent_check_refusal_ends_with_commit_refused(tmp_path, capsys):
+    code = gate.run_check(str(tmp_path / "nowhere"))
+
+    assert code == 1
+    assert (
+        capsys.readouterr().err.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")
+    )
+
+
+def test_install_upgrades_the_line_without_the_refusal(repo):
+    hook(repo, "agent-pre-commit", "exit 0")
+    pre = hook(repo, "pre-commit", f"{gate.COMMENT}\n{gate.OLD_LINES[1]}\necho fast")
+
+    assert install(repo).returncode == 0
+
+    assert pre.read_text().splitlines() == [
+        "#!/bin/sh",
+        gate.COMMENT,
+        gate.LINE,
+        "echo fast",
+    ]
+
+
+def test_without_the_gate_a_refusal_still_ends_with_commit_refused(installed):
+    (installed / "a").write_text("bad\n")
+    git(installed, "add", "a")
+
+    run = commit(installed, gate_on_path=False)
+
+    assert run.returncode != 0
+    assert run.stderr.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")

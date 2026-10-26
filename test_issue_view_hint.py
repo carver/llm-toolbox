@@ -114,3 +114,40 @@ def test_an_event_without_a_command_string_is_ignored(monkeypatch, capsys, tool_
     }
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
     assert (hint.main([]), capsys.readouterr().out) == (0, "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit -q -F - <<'EOF'\n`gh issue view N --comments` leaves out the body\nEOF",
+        "echo 'run gh issue view 42 --comments'",
+    ],
+)
+def test_a_gh_issue_view_mentioned_in_text_gets_no_note(monkeypatch, capsys, command):
+    code, out = run_hook(monkeypatch, capsys, command)
+    assert code == 0 and out == ""
+
+
+def test_the_note_names_issue_todo_read(monkeypatch, capsys):
+    _, out = run_hook(monkeypatch, capsys, "gh issue view 42 --comments")
+    assert "issue-todo read 42" in out
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "GH_REPO=a/b gh issue view 42 --comments",
+        "cat <<< hi\ngh issue view 42 --comments",
+        "timeout 30 gh issue view 42 --comments",
+    ],
+)
+def test_a_call_after_a_prefix_or_a_here_string_still_counts(
+    monkeypatch, capsys, command
+):
+    _, out = run_hook(monkeypatch, capsys, command)
+    assert "issue-todo read 42" in out
+
+
+def test_a_quoted_repo_reaches_the_note(monkeypatch, capsys):
+    _, out = run_hook(monkeypatch, capsys, 'gh issue view 42 --comments -R "a/b"')
+    assert "--repo ''" not in out and "a/b" in out

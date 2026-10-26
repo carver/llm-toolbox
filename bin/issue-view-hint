@@ -7,8 +7,10 @@
 `gh issue view N` prints the issue's body without its comments, and `--comments` its
 comments without the body, so a to-do list split between them reads as part of the
 list. When a Bash command ran `gh issue view` and what it printed holds a task-list
-box (`- [ ]`, `- [x]`), this adds a note for the agent beside the result, naming
-`issue-todo show N`. Otherwise it says nothing, and it never blocks. install.py
+box (`- [ ]`, `- [x]`), or the call had --comments, this adds a note for the agent
+beside the result, naming `issue-todo read N` and `issue-todo show N`. A mention in a
+quoted string or a heredoc, such as a commit message, isn't a call. Otherwise it says
+nothing, and it never blocks. install.py
 registers it in ~/.claude/settings.json.
 
     issue-view-hint < hook-input.json    # as Claude Code calls it
@@ -22,6 +24,38 @@ import sys
 ISSUE_VIEW = re.compile(
     r"\bgh\s+issue\s+(?:(?:-R|--repo)(?:\s+|=)\S+\s+)?view\b[^|;&\n]*"
 )
+HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")  # not <<<
+QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
+
+
+def without_heredocs(command: str) -> str:
+    """The command without heredoc bodies, whose lines are data."""
+    kept, closing = [], []
+    for line in command.split("\n"):
+        if closing:
+            if line.strip() == closing[0]:
+                closing.pop(0)
+            continue
+        kept.append(line)
+        closing += [m.group(2) for m in HEREDOC.finditer(line)]
+    return "\n".join(kept)
+
+
+def find_call(command: str) -> re.Match[str] | None:
+    """The first `gh issue view` call in the command. One that starts inside a quoted
+    string or a heredoc, such as a commit message that names it, is text, not a call."""
+    code = without_heredocs(command)
+    quoted = [match.span() for match in QUOTED.finditer(code)]
+    return next(
+        (
+            call
+            for call in ISSUE_VIEW.finditer(code)
+            if not any(start < call.start() < end for start, end in quoted)
+        ),
+        None,
+    )
+
+
 REPO = re.compile(r"(?:-R|--repo)(?:\s+|=)(\S+)")
 NUMBER = re.compile(r"(?:^|\s)#?(\d+)\b|/issues/(\d+)")
 COMMENTS = re.compile(r"(?:^|\s)(?:--comments|-c)\b")
@@ -33,12 +67,13 @@ def note(call: str) -> str:
     number = NUMBER.search(call.split("view", 1)[1])
     issue = next((g for g in number.groups() if g), "N") if number else "N"
     repo = REPO.search(call)
-    show = f"issue-todo show {issue}" + (f" --repo {repo.group(1)}" if repo else "")
+    flag = f" --repo {repo.group(1)}" if repo else ""
     return (
         "`gh issue view` prints an issue's body without its comments, and with --comments "
         "the comments without the body, so a to-do list split between them reads as part "
-        f"of the list. `{show}` lists the task-list items of the body and every comment, "
-        "and `issue-todo tick N MATCH --note TEXT` ticks one where it lives."
+        f"of the list. `issue-todo read {issue}{flag}` prints the body and every comment, "
+        f"`issue-todo show {issue}{flag}` lists the task-list items of both, and "
+        "`issue-todo tick N MATCH --note TEXT` ticks one where it lives."
     )
 
 
@@ -47,7 +82,8 @@ def main(argv: list[str] | None = None) -> int:
         event = json.load(sys.stdin)
         command = event["tool_input"]["command"]
         printed = event["tool_response"].get("stdout") or ""
-        call = ISSUE_VIEW.search(command) if event.get("tool_name") == "Bash" else None
+        bash = event.get("tool_name") == "Bash"
+        call = find_call(command) if bash else None
     except (ValueError, KeyError, TypeError, AttributeError):
         return 0  # not a Bash event this hook can read: say nothing
     # Box-free output says nothing, except under --comments, where the to-dos may be in the body

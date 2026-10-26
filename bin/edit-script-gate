@@ -279,6 +279,10 @@ def is_edit_script(command: str) -> bool:
 
 
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if any(arg in ("-h", "--help") for arg in argv):
+        print(__doc__)
+        return 0
     event = json.load(sys.stdin)
     if event.get("tool_name") != "Bash":
         return 0

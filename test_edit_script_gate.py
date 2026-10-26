@@ -199,3 +199,19 @@ def test_a_path_that_only_looks_like_tmp_is_refused(monkeypatch, capsys, command
     code, _ = run_hook(monkeypatch, capsys, command)
 
     assert code == 2
+
+
+@pytest.mark.parametrize("flag", ["-h", "--help"])
+def test_help_prints_the_docstring(flag):
+    import subprocess
+
+    shown = subprocess.run(
+        [str(SCRIPT), flag],
+        capture_output=True,
+        text=True,
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert shown.returncode == 0, shown.stderr
+    assert "apply-edits" in shown.stdout and "Traceback" not in shown.stderr

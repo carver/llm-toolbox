@@ -17,6 +17,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from paperkit import figures
+
 
 class DuplicateKey(ValueError):
     pass
@@ -124,8 +126,6 @@ class Ledger:
         size: tuple[float, float] = (6.5, 3),
     ) -> None:
         """Draws `data` with draw(ax, data) on a figure of `size` inches, to <figures>/<key>.svg."""
-        from paperkit import figures  # matplotlib, only once there is a figure to draw
-
         self._claim(key)  # before drawing over another entry's file
         sha = figures.render(self.figures / f"{key}.svg", draw, data, size)
         self._add(key, "figure", how, path=f"{key}.svg", sha=sha)

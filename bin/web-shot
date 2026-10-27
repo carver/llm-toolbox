@@ -38,6 +38,7 @@ Examples:
 import argparse
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,11 +52,18 @@ ARITY = {
     "scroll-all": (0, 0),
 }  # (min, max) arguments
 INSTALL = "uv run --with playwright playwright install chromium"
-SCROLL_PAUSE_MS = 700
-SCROLL_STABLE_ROUNDS = (
-    5  # page height unchanged this many times in a row means the feed is done
-)
+# After a scroll, no request in flight this long means the page has loaded what it asked for; a page
+# that never stops polling is measured after the cap anyway.
+SCROLL_QUIET_MS = 300
+SCROLL_ROUND_CAP_MS = 2000
+SCROLL_POLL_MS = 50
+# The feed is done once its height is unchanged this many rounds in a row, and for this long, for a
+# loader that fetches a while after the scroll.
+SCROLL_STABLE_ROUNDS = 3
+SCROLL_DONE_MS = 2000
 SCROLL_MAX_ROUNDS = 400
+# Requests that stay open as long as the page does
+UNENDING = {"eventsource", "websocket", "media"}
 LINKS_JS = """pattern => [...document.querySelectorAll('a[href]')]
   .map(a => [a.innerText.trim().replace(/\\s+/g, ' '), a.href])
   .filter(([text, href]) => !pattern || new RegExp(pattern, 'i').test(text + ' ' + href))"""
@@ -103,14 +111,56 @@ def collapse(lines):
     return [line if n == 1 else f"{line} (x{n})" for line, n in counts.items()]
 
 
-def scroll_all(tab):
-    height, stable = -1, 0
+class Network:
+    """The requests in flight on a tab, and when one last started or ended. `clock` gives seconds."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.in_flight = 0
+        self.quiet_since = (
+            clock()
+        )  # when a request last started or ended, or a settle began
+
+    def started(self, request):
+        if request.resource_type not in UNENDING:
+            self.in_flight += 1
+            self.quiet_since = self.clock()
+
+    def ended(self, request):
+        if request.resource_type not in UNENDING:
+            self.in_flight = max(0, self.in_flight - 1)
+            self.quiet_since = self.clock()
+
+    def settle(self, tab):
+        """Waits until no request has been in flight for SCROLL_QUIET_MS, counting from now, or until
+        SCROLL_ROUND_CAP_MS passes."""
+        self.quiet_since = max(self.quiet_since, self.clock())
+        waited = 0
+        while waited < SCROLL_ROUND_CAP_MS:
+            if (
+                not self.in_flight
+                and (self.clock() - self.quiet_since) * 1000 >= SCROLL_QUIET_MS
+            ):
+                return
+            tab.wait_for_timeout(SCROLL_POLL_MS)
+            waited += SCROLL_POLL_MS
+
+
+def scroll_all(tab, network):
+    height, stable = tab.evaluate("document.body.scrollHeight"), 0
+    grew = network.clock()
     for _ in range(SCROLL_MAX_ROUNDS):
         tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        tab.wait_for_timeout(SCROLL_PAUSE_MS)
+        network.settle(tab)
         new_height = tab.evaluate("document.body.scrollHeight")
-        stable = stable + 1 if new_height == height else 0
-        if stable >= SCROLL_STABLE_ROUNDS:
+        if new_height == height:
+            stable += 1
+        else:
+            stable, grew = 0, network.clock()
+        if (
+            stable >= SCROLL_STABLE_ROUNDS
+            and (network.clock() - grew) * 1000 >= SCROLL_DONE_MS
+        ):
             return
         height = new_height
 
@@ -160,6 +210,10 @@ def run(page, actions, out, size, cookies):
         url = page_url(page)
         context.add_cookies([{"name": n, "value": v, "url": url} for n, v in cookies])
         tab = context.new_page()
+        network = Network()
+        tab.on("request", network.started)
+        tab.on("requestfinished", network.ended)
+        tab.on("requestfailed", network.ended)
         tab.on("pageerror", lambda error: errors.append(f"page error: {error}"))
         tab.on(
             "console",
@@ -186,7 +240,7 @@ def run(page, actions, out, size, cookies):
                 ):
                     print(f"{text} -> {href}", flush=True)
             elif action.verb == "scroll-all":
-                scroll_all(tab)
+                scroll_all(tab, network)
             else:
                 path = out / f"{action.args[0]}.png"
                 if len(action.args) == 2:

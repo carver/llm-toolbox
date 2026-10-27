@@ -16,6 +16,78 @@ web_shot = importlib.util.module_from_spec(spec)
 loader.exec_module(web_shot)
 
 
+class Request:
+    def __init__(self, resource_type="fetch"):
+        self.resource_type = resource_type
+
+
+class Feed:
+    """A stand-in for a tab: a feed whose scroll handler fetches the next page, `pages` times, each fetch
+    starting `delay_ms` after the scroll and taking `fetch_ms`. Its clock moves only in wait_for_timeout;
+    with `polls` set, a request is always in flight."""
+
+    def __init__(self, pages=0, fetch_ms=200, delay_ms=0, polls=False):
+        self.now, self.height, self.left = 0, 1000, pages
+        self.fetch_ms, self.delay_ms = fetch_ms, delay_ms
+        self.network = web_shot.Network(clock=lambda: self.now / 1000)
+        self.fetch = None  # (request, when it ends)
+        self.starts = None  # when a scroll's delayed fetch starts
+        if polls:
+            self.network.started(Request())
+
+    def evaluate(self, js):
+        if js.startswith("window.scrollTo"):
+            if self.left and self.fetch is None and self.starts is None:
+                self.starts = self.now + self.delay_ms
+                self.start_due()
+            return None
+        return self.height
+
+    def start_due(self):
+        if self.starts is not None and self.now >= self.starts:
+            self.starts, self.fetch = None, (Request(), self.now + self.fetch_ms)
+            self.network.started(self.fetch[0])
+
+    def wait_for_timeout(self, ms):
+        self.now += ms
+        self.start_due()
+        if self.fetch and self.now >= self.fetch[1]:
+            self.network.ended(self.fetch[0])
+            self.fetch, self.left, self.height = None, self.left - 1, self.height + 400
+
+
+def test_scroll_all_ends_within_three_seconds_on_a_page_that_is_done():
+    feed = Feed()
+    web_shot.scroll_all(feed, feed.network)
+    assert feed.now <= 3000
+
+
+def test_scroll_all_waits_out_a_fetch_slower_than_its_quiet_window():
+    feed = Feed(pages=2, fetch_ms=5000)
+    web_shot.scroll_all(feed, feed.network)
+    assert feed.left == 0
+
+
+def test_scroll_all_waits_for_a_loader_that_starts_its_fetch_late():
+    """A debounced or throttled scroll handler fetches the next page a while after the scroll."""
+    feed = Feed(pages=2, delay_ms=1500)
+    web_shot.scroll_all(feed, feed.network)
+    assert feed.left == 0
+
+
+def test_an_open_event_stream_does_not_hold_up_scroll_all():
+    feed = Feed()
+    feed.network.started(Request("eventsource"))
+    web_shot.scroll_all(feed, feed.network)
+    assert feed.now <= 3000
+
+
+def test_scroll_all_ends_on_a_page_that_never_stops_polling():
+    feed = Feed(polls=True)
+    web_shot.scroll_all(feed, feed.network)
+    assert feed.now <= 7000
+
+
 def test_parses_actions():
     assert web_shot.parse_action(
         "click #legend button[data-series=human]"

@@ -25,6 +25,13 @@ Bare markers, without SEARCH and REPLACE, work too. So does the rest of Aider's
 SEARCH/REPLACE format: a bare path on the line before a block instead of `--- PATH`,
 and ``` fences around blocks, which are skipped. A marker may end in spaces.
 
+In a Python file (.py, .pyi, or a script whose #! line runs python or `uv run
+--script`), an old text not found as it is still matches where it differs only in
+whitespace Python ignores: spacing between tokens, and line breaks inside brackets, as
+when a formatter wrapped a call. Line breaks outside brackets, the indentation after
+them, strings and comments must match as they are. Such a match must be unique too,
+and the output says which blocks matched this way. Other files match exactly.
+
 A line that is exactly one of the markers can't appear inside a block; edit such a
 line another way. Files keep their line endings (\\n or \\r\\n). A symlink is edited
 through to its target.
@@ -34,9 +41,12 @@ input, a missing or unreadable file).
 """
 
 import difflib
+import io
 import os
+import re
 import sys
 import tempfile
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -174,11 +184,13 @@ def read(path: Path) -> str:
         raise UsageError(f"can't read {path} as text: {e}") from e
 
 
-def applied(edits: FileEdits, text: str) -> tuple[str, list[str]]:
-    """The file's text with its blocks applied, and what went wrong with any that missed.
-    Blocks come with \\n line breaks; a file with \\r\\n ones gets those."""
+def applied(edits: FileEdits, text: str) -> tuple[str, list[str], list[int]]:
+    """The file's text with its blocks applied, what went wrong with any that missed, and
+    the numbers of the blocks that matched only across whitespace Python ignores. Blocks
+    come with \\n line breaks; a file with \\r\\n ones gets those."""
     crlf = "\r\n" in text
-    problems = []
+    python = is_python(edits.path, text)
+    problems, loose = [], []
     for block in edits.blocks:
         old, new = (block.old, block.new)
         if crlf:
@@ -187,14 +199,163 @@ def applied(edits: FileEdits, text: str) -> tuple[str, list[str]]:
         if count == 1:
             text = replaced(text, old, new)
             continue
+        spans = loose_spans(block.old, text) if count == 0 and python else []
+        if len(spans) == 1:
+            start, end = spans[0]
+            text = text[:start] + new + text[end:]
+            loose.append(block.number)
+            continue
         first = next(line.strip() for line in block.old.splitlines() if line.strip())
         name = f"{edits.path} block {block.number} ({first!r})"
-        if count == 0:
+        if len(spans) > 1:
+            at = ", ".join(str(line_of(text, start)) for start, _ in spans)
+            problems.append(
+                f"{name}: found {len(spans)} times (ignoring Python's insignificant "
+                f"whitespace), at lines {at}; add context."
+            )
+        elif count == 0:
             problems.append(f"{name}: old text not found.\n{closest(block.old, text)}")
         else:
             at = ", ".join(str(n) for n in line_numbers(text, old))
             problems.append(f"{name}: found {count} times, at lines {at}; add context.")
-    return text, problems
+    return text, problems, loose
+
+
+def is_python(path: Path, text: str) -> bool:
+    if path.suffix in (".py", ".pyi"):
+        return True
+    first = text.split("\n", 1)[0]
+    return first.startswith("#!") and (
+        "python" in first or ("uv run" in first and "--script" in first)
+    )
+
+
+@dataclass
+class Token:
+    start: int
+    end: int
+    depth: int  # brackets open after it
+    statement_ends: bool = (
+        False  # a NEWLINE token follows it: the gap after it ends a statement
+    )
+
+
+QUIET = {
+    tokenize.NL,
+    tokenize.NEWLINE,
+    tokenize.INDENT,
+    tokenize.DEDENT,
+    tokenize.ENCODING,
+    tokenize.ENDMARKER,
+}
+FSTRING_START = getattr(tokenize, "FSTRING_START", None)  # Python 3.12 splits f-strings
+FSTRING_END = getattr(tokenize, "FSTRING_END", None)
+
+
+def tokens(text: str) -> list[Token] | None:
+    """Python source's tokens as offsets into it, an f-string as one token; None when the
+    source doesn't tokenize."""
+    lines = [0] + [i + 1 for i, c in enumerate(text) if c == "\n"]
+
+    def offset(position: tuple[int, int]) -> int:
+        return lines[position[0] - 1] + position[1]
+
+    found: list[Token] = []
+    depth, fstrings, opened = 0, 0, 0
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text, newline="").readline):
+            if token.type == FSTRING_START:
+                opened = offset(token.start) if fstrings == 0 else opened
+                fstrings += 1
+            elif fstrings:
+                if token.type == FSTRING_END:
+                    fstrings -= 1
+                    if fstrings == 0:
+                        found.append(Token(opened, offset(token.end), depth))
+            elif token.type == tokenize.NEWLINE and found:
+                found[-1].statement_ends = True
+            elif token.type not in QUIET:
+                if token.type == tokenize.OP:
+                    depth += (token.string in "([{") - (token.string in ")]}")
+                found.append(Token(offset(token.start), offset(token.end), depth))
+    except (tokenize.TokenError, SyntaxError):
+        return None
+    return found
+
+
+def blank_run(text: str, at: int) -> int:
+    """The index past the whitespace (backslash continuations included) starting at `at`."""
+    while at < len(text):
+        if text[at] in " \t\r\n":
+            at += 1
+        elif text[at] == "\\" and text.startswith(("\n", "\r\n"), at + 1):
+            at += 2
+        else:
+            break
+    return at
+
+
+def indentation(gap: str) -> str:
+    return gap[gap.rfind("\n") + 1 :].replace("\r", "")
+
+
+def fits(gap: str, blank: str, after: Token, before: str, following: str) -> bool:
+    """Whether the old text's whitespace `blank` may stand for the source's `gap` between
+    the token `after` (whose text ends with `before`) and the next (starting `following`):
+    a statement break must stay one, at the same indentation; inside a statement, a line
+    break needs open brackets (or a backslash), and two words need a space."""
+    if after.statement_ends:
+        return "\n" in blank and indentation(blank) == indentation(gap)
+    bare = blank.replace("\\\n", "").replace("\\\r\n", "")
+    if "\n" in bare and after.depth <= 0:
+        return False
+    words = re.match(r"\w", before[-1:]) and re.match(r"\w", following[:1])
+    return bool(blank) or not words
+
+
+def match_end(text: str, found: list[Token], k: int, old: str) -> int | None:
+    """Where in `text` the old text ends, if it matches from token `k` on, ignoring
+    whitespace Python ignores."""
+    j = 0
+    for at in range(k, len(found)):
+        token = found[at]
+        part = text[token.start : token.end]
+        if not old.startswith(part, j):
+            return None
+        j += len(part)
+        if j == len(old):
+            return token.end
+        if at + 1 == len(found):
+            return None
+        following = found[at + 1]
+        gap, past = text[token.end : following.start], blank_run(old, j)
+        if not fits(
+            gap, old[j:past], token, part, text[following.start : following.end]
+        ):
+            return None
+        j = past
+    return None
+
+
+def loose_spans(old: str, text: str) -> list[tuple[int, int]]:
+    """Where in `text` (Python) the old text occurs, ignoring whitespace Python ignores:
+    each match's start and end. An old text that starts indented matches only a line
+    that starts with that indentation, which the match takes in."""
+    found = tokens(text)
+    old = old.rstrip()
+    lead = old[: len(old) - len(old.lstrip(" \t"))]
+    body = old[len(lead) :]
+    if found is None or not body:
+        return []
+    spans = []
+    for k, token in enumerate(found):
+        line = text.rfind("\n", 0, token.start) + 1
+        if lead and text[line : token.start] != lead:
+            continue
+        end = match_end(text, found, k, body)
+        if end is not None:
+            spans.append((line if lead else token.start, end))
+    return spans
 
 
 def replaced(text: str, old: str, new: str) -> str:
@@ -210,10 +371,14 @@ def replaced(text: str, old: str, new: str) -> str:
     return text[:at] + new + text[end:]
 
 
+def line_of(text: str, index: int) -> int:
+    return text.count("\n", 0, index) + 1
+
+
 def line_numbers(text: str, part: str) -> list[int]:
     numbers, start = [], 0
     while (index := text.find(part, start)) >= 0:
-        numbers.append(text.count("\n", 0, index) + 1)
+        numbers.append(line_of(text, index))
         start = index + len(part)
     return numbers
 
@@ -267,25 +432,31 @@ def main() -> int:
         return USAGE
     results, problems = [], []
     for edits, text in zip(files, texts, strict=True):
-        new_text, missed = applied(edits, text)
-        results.append((edits, new_text))
+        new_text, missed, loose = applied(edits, text)
+        results.append((edits, new_text, loose))
         problems += missed
     if problems:
         print("\n".join(problems) + "\nNothing was written.", file=sys.stderr)
         return MISSED
     temps = []
     try:
-        for edits, text in results:
+        for edits, text, _ in results:
             temps.append((staged(edits.path, text), edits.path.resolve()))
     except OSError as e:
         for temp, _ in temps:
             os.unlink(temp)
         print(f"apply-edits: {e}\nNothing was written.", file=sys.stderr)
         return USAGE
-    for (temp, target), (edits, _) in zip(temps, results, strict=True):
+    for (temp, target), (edits, _, loose) in zip(temps, results, strict=True):
         os.replace(temp, target)
         count = len(edits.blocks)
-        print(f"{edits.path}: {count} edit{'' if count == 1 else 's'}")
+        note = (
+            f" (block {', '.join(map(str, loose))} matched across whitespace that doesn't "
+            "change the Python)"
+            if loose
+            else ""
+        )
+        print(f"{edits.path}: {count} edit{'' if count == 1 else 's'}{note}")
     return 0
 
 

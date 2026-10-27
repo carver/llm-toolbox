@@ -310,3 +310,186 @@ def test_a_path_with_no_blocks_is_left_alone(repo: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == "src/a.py: 1 edit\n"
+
+
+WRAPPED = (
+    "def f(path, figure):\n"
+    '    (path / "demo.py").write_text(\n'
+    '        DEMO + (EXTRA if figure else "")\n'
+    "    )\n"
+    '    return "a  b"\n'
+)
+
+
+def test_a_python_block_matches_a_call_the_formatter_wrapped(tmp_path: Path) -> None:
+    (tmp_path / "f.py").write_text(WRAPPED)
+    result = apply(
+        tmp_path,
+        "--- f.py\n<<<<<<< SEARCH\n"
+        '    (path / "demo.py").write_text(DEMO + (EXTRA if figure else ""))\n'
+        "=======\n"
+        '    (path / "demo.py").write_text(DEMO)\n'
+        ">>>>>>> REPLACE\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_text() == (
+        'def f(path, figure):\n    (path / "demo.py").write_text(DEMO)\n    return "a  b"\n'
+    )
+    assert "whitespace" in result.stdout
+
+
+def test_a_script_run_by_uv_counts_as_python(tmp_path: Path) -> None:
+    (tmp_path / "tool").write_text(
+        "#!/usr/bin/env -S uv run --quiet --script\nprint(f(a,\n      b))\n"
+    )
+    result = apply(
+        tmp_path,
+        "--- tool\n<<<<<<< SEARCH\nprint(f(a, b))\n=======\nprint(g)\n>>>>>>> REPLACE\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "tool").read_text().endswith("\nprint(g)\n")
+
+
+@pytest.mark.parametrize(
+    "source, old",
+    [
+        (
+            "if x:\n    y()\nz()\n",
+            "if x:\n    y()\n    z()",
+        ),  # indentation makes a block
+        ("a = 1\nb = 2\n", "a = 1 b = 2"),  # a line break ends a statement
+        (WRAPPED, '    return "a b"'),  # strings as they are
+        ("x = 1  # a  note\n", "x = 1  # a note"),  # comments too
+    ],
+)
+def test_whitespace_that_changes_the_python_still_misses(
+    tmp_path: Path, source: str, old: str
+) -> None:
+    (tmp_path / "f.py").write_text(source)
+    result = apply(
+        tmp_path, f"--- f.py\n<<<<<<< SEARCH\n{old}\n=======\nnew\n>>>>>>> REPLACE\n"
+    )
+    assert result.returncode == 1
+    assert (tmp_path / "f.py").read_text() == source
+
+
+def test_other_files_still_match_exactly(tmp_path: Path) -> None:
+    (tmp_path / "notes.md").write_text("Some text\nwrapped here.\n")
+    result = apply(
+        tmp_path,
+        "--- notes.md\n<<<<<<< SEARCH\nSome text wrapped here.\n=======\nnew\n>>>>>>> REPLACE\n",
+    )
+    assert result.returncode == 1
+
+
+def test_a_loose_match_found_twice_needs_more_context(tmp_path: Path) -> None:
+    (tmp_path / "f.py").write_text("x = f(a,\n      b)\ny = 1\nx = f(a,\n  b)\n")
+    result = apply(
+        tmp_path,
+        "--- f.py\n<<<<<<< SEARCH\nx = f(a, b)\n=======\nx = 0\n>>>>>>> REPLACE\n",
+    )
+    assert result.returncode == 1
+    assert "found 2 times" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "source, old",
+    [
+        # the first line's indentation places the code: 4 spaces would move it out of `if b:`
+        ("if a:\n    if b:\n        f(x,\n          y)\n", "    f(x, y)"),
+        # an indented statement isn't one that sits mid-line
+        ("a = 1; b = f(x,\n y)\n", "    b = f(x, y)"),
+        # an f-string's nested quotes and brackets stay inside it (Python 3.12)
+        ('x = f"{d["a b"]}"\n', 'x = f"{d["a  b"]}"'),
+        ('x = f"{d["("]}"\na = 1\nb = 2\n', "a = 1 b = 2"),
+        # two tokens aren't one
+        ("y = a ** f(b,\n  c)\n", "y = a * * f(b, c)"),
+        # a string's own text, whatever its prefix, quotes or escapes
+        ('x = rb"a  b"\n', 'x = rb"a b"'),
+        ('x = "\\"("\ny = 1\nz = 2\n', "y = 1 z = 2"),
+        ('x = """a\n"(" b"""\ny = 1\nz = 2\n', "y = 1 z = 2"),
+    ],
+)
+def test_whitespace_that_changes_python_misses_whatever_the_tokens(
+    tmp_path: Path, source: str, old: str
+) -> None:
+    (tmp_path / "f.py").write_text(source)
+    result = apply(
+        tmp_path, f"--- f.py\n<<<<<<< SEARCH\n{old}\n=======\nnew\n>>>>>>> REPLACE\n"
+    )
+    assert result.returncode == 1, (tmp_path / "f.py").read_text()
+    assert (tmp_path / "f.py").read_text() == source
+
+
+def test_a_backslash_continuation_is_a_line_break_python_ignores(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "f.py").write_text("x = 1 + \\\n    2\ny = 3\n")
+    result = apply(
+        tmp_path,
+        "--- f.py\n<<<<<<< SEARCH\nx = 1 + 2\n=======\nx = 3\n>>>>>>> REPLACE\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_text() == "x = 3\ny = 3\n"
+
+
+def test_a_loose_match_keeps_a_crlf_files_line_endings(tmp_path: Path) -> None:
+    (tmp_path / "f.py").write_bytes(
+        b"def f():\r\n    return g(a,\r\n             b)\r\n"
+    )
+    result = apply(
+        tmp_path,
+        "--- f.py\n<<<<<<< SEARCH\n    return g(a, b)\n=======\n    return 0\n>>>>>>> REPLACE\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_bytes() == b"def f():\r\n    return 0\r\n"
+
+
+def test_a_stub_file_is_python_too(tmp_path: Path) -> None:
+    (tmp_path / "f.pyi").write_text("def f(a: int,\n      b: int) -> int: ...\n")
+    result = apply(
+        tmp_path,
+        "--- f.pyi\n<<<<<<< SEARCH\ndef f(a: int, b: int) -> int: ...\n=======\ndef f() -> int: ...\n"
+        ">>>>>>> REPLACE\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_a_loose_match_found_twice_names_both_lines(tmp_path: Path) -> None:
+    (tmp_path / "f.py").write_text("x = f(a,\n      b)\ny = 1\nx = f(a,\n  b)\n")
+    result = apply(
+        tmp_path,
+        "--- f.py\n<<<<<<< SEARCH\nx = f(a, b)\n=======\nx = 0\n>>>>>>> REPLACE\n",
+    )
+    assert "at lines 1, 4" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "source, old",
+    [
+        ("x = 1\n", "x =\n1"),  # a line break outside brackets splits the statement
+        ("def f():\n    return x\n", "    returnx"),  # two words need their space
+        ('print(f"{x = }")\n', 'print(f"{x=}")'),  # an f-string prints its own spacing
+    ],
+)
+def test_whitespace_python_reads_still_misses(
+    tmp_path: Path, source: str, old: str
+) -> None:
+    (tmp_path / "f.py").write_text(source)
+    result = apply(
+        tmp_path, f"--- f.py\n<<<<<<< SEARCH\n{old}\n=======\nnew\n>>>>>>> REPLACE\n"
+    )
+    assert result.returncode == 1
+    assert (tmp_path / "f.py").read_text() == source
+
+
+def test_an_old_text_with_a_backslash_continuation_matches_the_joined_line(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "f.py").write_text("x = 1 + 2\n")
+    result = apply(
+        tmp_path,
+        "--- f.py\n<<<<<<< SEARCH\nx = 1 + \\\n    2\n=======\nx = 3\n>>>>>>> REPLACE\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_text() == "x = 3\n"

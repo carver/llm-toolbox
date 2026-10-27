@@ -111,7 +111,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   from Aider-style `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` blocks
   under `--- PATH` lines on stdin (bare markers and Aider's bare path lines
   work too). Each old text must occur exactly once; on a miss nothing is written
-  and the closest text in the file is shown as a diff. For edits that would
+  and the closest text in the file is shown as a diff. In a Python file, an old
+  text not found as it is still matches across whitespace Python ignores (a
+  call a formatter wrapped, say), never across a statement break, indentation,
+  a string or a comment that differs. For edits that would
   otherwise be a heredoc Python script. `apply-edits -h` shows the format.
 - **rewrap**: `rewrap FILE...` reflows each Python docstring paragraph and
   comment block that holds a line past ruff's line-length (or `--width`), and

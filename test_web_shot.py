@@ -220,7 +220,8 @@ def test_cookies_are_sent_with_the_page(tmp_path):
             pass
 
     server = http.server.HTTPServer(("127.0.0.1", 0), EchoCookie)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # A 10 ms shutdown poll, not the default half second
+    threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
     try:
         run = subprocess.run(
             [

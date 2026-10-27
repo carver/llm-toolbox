@@ -100,6 +100,6 @@ def test_wayland_run_takes_a_shot(tmp_path):
 def test_app_that_never_opens_a_window_times_out(tmp_path):
     if not have("Xvfb", "xdotool", "import"):
         pytest.skip("x11 tools missing")
-    result = run_tool("--timeout", "2", "--", "sleep", "30", tmp_path=tmp_path)
+    result = run_tool("--timeout", "0.5", "--", "sleep", "30", tmp_path=tmp_path)
     assert result.returncode == 1
     assert "timed out" in result.stderr

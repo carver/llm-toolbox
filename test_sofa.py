@@ -134,7 +134,8 @@ class Stub(http.server.BaseHTTPRequestHandler):
 def sofa(monkeypatch, tmp_path):
     Stub.sessions, Stub.reads, Stub.calls, Stub.expired = set(), set(), [], False
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stub)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # A 10 ms shutdown poll, not the default half second
+    threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
     creds = tmp_path / "work" / ".sofa" / "credentials.json"
     creds.parent.mkdir(parents=True)
     creds.write_text(json.dumps({"agent-1": {"agent_name": "robo", "api_key": KEY}}))

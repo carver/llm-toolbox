@@ -105,7 +105,8 @@ def server():
             pass
 
     with http.server.HTTPServer(("127.0.0.1", 0), Handler) as httpd:
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        # A 10 ms shutdown poll, not the default half second
+        threading.Thread(target=httpd.serve_forever, args=(0.01,), daemon=True).start()
         yield f"http://127.0.0.1:{httpd.server_port}"
         httpd.shutdown()
 

@@ -12,9 +12,13 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 
-# Tests whose throwaway repos are made with `git init`, `git config` and `git commit`.
+# Tests whose throwaway repos are made with `git init`, `git config` and `git commit`: one for each way
+# test_agent_commit_gate.py makes one (its repo fixture, an installed hook that commits -a, and a repo it
+# inits itself), rather than the whole file.
 GIT_USING_TESTS = [
-    "test_agent_commit_gate.py",
+    "test_agent_commit_gate.py::test_install_puts_the_line_after_the_shebang_once",
+    "test_agent_commit_gate.py::test_commit_all_checks_what_it_commits",
+    "test_agent_commit_gate.py::test_install_uses_git_hooks_dir_without_hooks_path",
     "test_install.py::test_git_hooks_point_at_githooks",
     "test_thirdparty.py::test_tree_hash_matches_git",
 ]

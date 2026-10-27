@@ -538,3 +538,92 @@ def test_an_agent_builds_in_a_linked_worktree(tmp_path):
     result = build_paper(tmp_path / "repo-wt-paper", env={"AI_AGENT": "claude-code"})
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "repo-wt-paper" / "paper" / "build" / "DRAFT-paper.pdf").exists()
+
+
+# Two pages, each with words of its own.
+TWO_PAGES = """#import "build/paperkit.typ": *
+#show: paper.with(abstract: [The first page's abstract.])
+= Introduction
+Collusion without communication, cited as #n("demo.same").
+#pagebreak()
+= Results
+The second page holds the results, #pct("demo.same"), and collusion again.
+#block(width: 2.2cm, text(hyphenate: true)[Supracompetitive incomprehensibilities])
+"""
+
+
+@pytest.fixture(scope="module")
+def two_pages(tmp_path_factory):
+    project = make_project(
+        tmp_path_factory.mktemp("two") / "repo", TWO_PAGES, toml=None, origin=False
+    )
+    build_paper(project)
+    return project
+
+
+def test_find_names_each_page_holding_the_text_and_its_picture(two_pages):
+    result = build_paper(two_pages, "find", "COLLUSION")
+    assert (result.returncode, result.stdout) == (
+        0,
+        "page 1  paper/build/pages/page-01.png\npage 2  paper/build/pages/page-02.png\n",
+    )
+
+
+def test_find_ignores_case_and_whitespace(two_pages):
+    result = build_paper(two_pages, "find", "the  second\npage HOLDS")
+    assert result.stdout == "page 2  paper/build/pages/page-02.png\n"
+
+
+def test_find_finds_a_word_hyphenated_across_a_line_break(two_pages):
+    text = json.loads((two_pages / "paper" / "build" / "pages.json").read_text())[1]
+    assert "-\n" in text  # the fixture's narrow block does break a word
+    assert build_paper(two_pages, "find", "incomprehensibilities").stdout.startswith(
+        "page 2 "
+    )
+
+
+def test_find_finds_a_number_the_build_filled_in(two_pages):
+    assert build_paper(two_pages, "find", "results, 50%").stdout.startswith("page 2 ")
+
+
+def test_find_with_no_page_holding_the_text_exits_1(two_pages):
+    result = build_paper(two_pages, "find", "antitrust")
+    assert result.returncode == 1
+    assert "no page" in result.stderr
+
+
+def test_find_before_any_build_says_so(tmp_path):
+    project = make_project(tmp_path / "repo", TWO_PAGES, toml=None, origin=False)
+    result = build_paper(project, "find", "collusion")
+    assert result.returncode == 1
+    assert "no build yet" in result.stderr
+
+
+def test_keys_prints_each_matching_key_s_value_and_rate_on_one_line(two_pages):
+    result = build_paper(two_pages, "keys", "demo.", "demo-t")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "demo-table   1 rows",
+        "demo.pooled  7/12    58%",
+        "demo.same    5/10    50% (24–76%)",
+    ]
+
+
+def test_keys_how_adds_how_each_was_computed_and_its_logs(two_pages):
+    result = build_paper(two_pages, "keys", "--how", "demo.same")
+    assert result.stdout == (
+        "demo.same  5/10  50% (24–76%)  how: cartel answers / replies; from paper.data.demo.demo"
+        " logs/demo.jsonl\n"
+    )
+
+
+def test_keys_how_lines_up_how_whether_or_not_a_key_has_a_rate(two_pages):
+    lines = build_paper(two_pages, "keys", "--how", "demo").stdout.splitlines()
+    assert len(lines) == 4  # the figure, the pooled count, the rate and the table
+    assert len({line.index("how: ") for line in lines}) == 1
+
+
+def test_keys_with_no_match_exits_1(two_pages):
+    result = build_paper(two_pages, "keys", "nothing.")
+    assert result.returncode == 1
+    assert "no key starts with nothing." in result.stderr

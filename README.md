@@ -333,7 +333,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   swallows) always run; `paper/paper.toml` turns on the rest (a page cap, the
   abstract's length, required sections, the template, the `citations.md`
   check, pushed logs, the PDF's size), each off without its key. `watch`
-  recompiles the draft on each save and rebuilds it on each commit. It runs
+  recompiles the draft on each save and rebuilds it on each commit. `find
+  TEXT` lists the pages of the last build whose text holds TEXT (ignoring case
+  and whitespace), with each page's PNG; `keys PREFIX...` prints each ledger
+  key starting with a PREFIX, its value and rate on one line (`--how` adds how
+  it was computed and its logs). It runs
   inside the project's own uv environment, so a data source can import the
   project's code, with paperkit's pinned dependencies added. `vendor` copies
   paperkit into the project (`paperkit/`, with a `bin/build-paper` that runs

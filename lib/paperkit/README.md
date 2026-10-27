@@ -16,7 +16,11 @@ Builds a paper written in [Typst](https://typst.app/docs/) whose numbers, tables
 build-paper           # the draft: paper/build/DRAFT-paper.pdf, and paper/build/pages/page-NN.png
 build-paper --final   # the submission: paper/<final_name>.pdf, only when every check passes
 build-paper watch     # the draft now, recompiled on each save and rebuilt on each commit (below)
+build-paper find TEXT # the pages of the last build holding TEXT, with their PNGs
+build-paper keys PREFIX...  # each ledger key starting with a PREFIX: its value and rate (--how: how, and its logs)
 ```
+
+`find` ignores case and whitespace, so a phrase matches across the PDF's line breaks, and a word hyphenated at a line's end matches whole. `keys` reads `build/numbers.json`, one line a key, where `build/numbers.md` lists the whole ledger.
 
 `build-paper` is llm-toolbox's `bin/build-paper` (or a project's own, below). It runs paperkit inside the project's own uv environment (`uv run`, so a data source can import the project's code), with paperkit's pinned dependencies (`requirements.txt`) added. The project is the git repository holding the working directory. paperkit started as a copy of the paper build in apart-research-collusion-sprint-2026 (`paper/`, at 1f78fba).
 
@@ -166,6 +170,7 @@ An agent builds the paper in a worktree of its own (`git worktree add --detach .
 | `typeset.py` | compiling with Typst and querying the result |
 | `watch.py` | `build-paper watch` |
 | `vendor.py` | `build-paper vendor` |
+| `lookup.py` | `build-paper find` and `keys` |
 | `git.py` | the repository: its commit, its changes, what's pushed |
 | `lib.typ` | the Typst functions paper.typ uses, and the draft marks |
 | `template.typ` | the default template |

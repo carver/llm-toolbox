@@ -5,12 +5,14 @@ paper.typ imports paperkit's lib.typ from build/paperkit.typ, which every compil
 paperkit's default template beside it as build/paperkit-template.typ. lib.typ imports the template paper.toml
 names, else that default."""
 
+import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import typst
+from pypdf import PdfReader
 
 from paperkit.atomic import write_atomic
 from paperkit.config import Config
@@ -52,6 +54,12 @@ class Typeset:
     height: float  # the page's height (pt)
     top: float  # its top margin (pt)
     bottom: float  # its bottom margin (pt)
+    texts: list[str]  # each page's text, as the PDF holds it, line by line
+
+
+def page_texts(pdf: bytes) -> list[str]:
+    """Each page's text, from the PDF."""
+    return [page.extract_text() for page in PdfReader(io.BytesIO(pdf)).pages]
 
 
 def plain(node: Any) -> str:
@@ -129,6 +137,7 @@ def typeset(paper_dir: Path, inputs: dict[str, str], config: Config) -> Typeset:
         typeset = Typeset(
             pdf=pdf,
             pngs=pngs if isinstance(pngs, list) else [pngs],
+            texts=page_texts(pdf),
             warnings=[warning.message for warning in warnings],
             abstract=" ".join(plain(abstract[0]["value"]).split()) if abstract else "",
             missing=[

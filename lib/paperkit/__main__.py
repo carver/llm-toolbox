@@ -5,11 +5,17 @@ import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from paperkit.build import BuildError, Report, build
 from paperkit.config import ConfigError
 from paperkit.data import Source
 from paperkit.git import Repo
+from paperkit.lookup import shown
+
+if (
+    TYPE_CHECKING
+):  # the build imports Typst and matplotlib, which find, keys and vendor don't need
+    from paperkit.build import Report
 
 SHOWN_CHANGES = 12  # build/changes.md lists them all
 
@@ -20,16 +26,7 @@ def project_paper() -> Path:
     return (repo.root if repo else Path.cwd()) / "paper"
 
 
-def shown(path: Path) -> str:
-    """`path` from the working directory when it is under it."""
-    return (
-        str(path.relative_to(Path.cwd()))
-        if path.is_relative_to(Path.cwd())
-        else str(path)
-    )
-
-
-def status(report: Report, final: bool) -> str:
+def status(report: "Report", final: bool) -> str:
     """The block a build ends with: the paper's measures, what changed, its problems and its warnings."""
     config = report.config
     folder = shown(report.pages[0].parent) if report.pages else "no pages"
@@ -117,7 +114,8 @@ def build_main(
         "data sources in paper/data/, compile it, and check it against the rules paper/paper.toml turns on. "
         "Writes paper/build/DRAFT-paper.pdf, a PNG of each page in paper/build/pages/, and the ledger in "
         "paper/build/numbers.json and numbers.md (paperkit's README.md). Other commands, each with its "
-        "own -h: `build-paper watch` rebuilds the draft as the paper changes; `build-paper vendor` copies "
+        "own -h: `build-paper watch` rebuilds the draft as the paper changes; `build-paper find TEXT` lists "
+        "the pages holding TEXT; `build-paper keys PREFIX...` prints ledger keys; `build-paper vendor` copies "
         "paperkit into the project, and `vendor --check` lists where that copy differs from the toolbox's.",
     )
     parser.add_argument(
@@ -140,6 +138,8 @@ def build_main(
     if refusal := main_tree_refusal(paper_dir, args.here):
         print(refusal, file=sys.stderr)
         return 1
+    from paperkit.build import BuildError, build
+
     try:
         report = build(paper_dir, sources, final=args.final)
     except ConfigError as error:
@@ -165,6 +165,10 @@ def main(
         from paperkit.watch import main as watch_main
 
         return watch_main(argv[1:], paper_dir)
+    if argv[:1] in (["find"], ["keys"]):
+        from paperkit.lookup import find_main, keys_main
+
+        return (find_main if argv[0] == "find" else keys_main)(argv[1:], paper_dir)
     if argv[:1] == ["vendor"]:
         from paperkit.vendor import main as vendor_main
 

@@ -40,6 +40,7 @@ from paperkit.config import load as load_config
 from paperkit.data import Source, registered
 from paperkit.git import Repo
 from paperkit.ledger import DuplicateKey, Ledger, Provenance, display
+from paperkit.lookup import PAGE_TEXTS
 from paperkit.typeset import BuildError, typeset
 
 __all__ = [
@@ -192,12 +193,15 @@ def stamp(repo: Repo | None) -> str:
     return f"commit {repo.head()[:7]}{dirty} · built {built}"
 
 
-def write_pages(folder: Path, pngs: list[bytes]) -> list[Path]:
+def write_pages(folder: Path, pngs: list[bytes], texts: list[str]) -> list[Path]:
+    """A picture of each page in `folder`, and each page's text in <folder>/../pages.json, for
+    `build-paper find`."""
     shutil.rmtree(folder, ignore_errors=True)
     folder.mkdir(parents=True)
     pages = [folder / f"page-{number:02}.png" for number in range(1, len(pngs) + 1)]
     for page, png in zip(pages, pngs, strict=True):
         write_atomic(page, png)
+    write_atomic(folder.parent / PAGE_TEXTS, json.dumps(texts, ensure_ascii=False))
     return pages
 
 
@@ -334,7 +338,7 @@ def _build(
     return Report(
         config=config,
         pdf=pdf,
-        pages=write_pages(out / "pages", page.pngs),
+        pages=write_pages(out / "pages", page.pngs, page.texts),
         body_pages=body_pages(page),
         abstract=page.abstract,
         abstract_words=len(page.abstract.split()),

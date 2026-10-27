@@ -40,9 +40,13 @@ def main() -> int:
         return 1
     path = os.environ.get("PYTHONPATH")
     env = os.environ | {"PYTHONPATH": f"{lib}{os.pathsep}{path}" if path else str(lib)}
+    # No __pycache__ in the project (paperkit/, paper/data/), which --final would find uncommitted
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     requirements = lib / "paperkit" / "requirements.txt"
     command = ["uv", "run", "-q", "--with-requirements", str(requirements)]
-    os.execvpe("uv", [*command, "python", "-m", "paperkit", *argv], env)
+    # -P: no working directory on the import path, where a project's own paperkit/ would shadow the
+    # toolbox's for `vendor`
+    os.execvpe("uv", [*command, "python", "-P", "-m", "paperkit", *argv], env)
 
 
 if __name__ == "__main__":

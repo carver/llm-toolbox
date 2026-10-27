@@ -18,7 +18,16 @@ build-paper --final   # the submission: paper/<final_name>.pdf, only when every 
 build-paper watch     # the draft now, recompiled on each save and rebuilt on each commit (below)
 ```
 
-`build-paper` is llm-toolbox's `bin/build-paper`. It runs paperkit inside the project's own uv environment (`uv run`, so a data source can import the project's code), with paperkit's pinned dependencies (`requirements.txt`) added. The project is the git repository holding the working directory. paperkit started as a copy of the paper build in apart-research-collusion-sprint-2026 (`paper/`, at 1f78fba).
+`build-paper` is llm-toolbox's `bin/build-paper` (or a project's own, below). It runs paperkit inside the project's own uv environment (`uv run`, so a data source can import the project's code), with paperkit's pinned dependencies (`requirements.txt`) added. The project is the git repository holding the working directory. paperkit started as a copy of the paper build in apart-research-collusion-sprint-2026 (`paper/`, at 1f78fba).
+
+## Sharing the build
+
+```bash
+build-paper vendor           # copy paperkit into the project as paperkit/, and write bin/build-paper there
+build-paper vendor --check   # list the files where the project's copy differs from the toolbox's (exit 1)
+```
+
+A collaborator without llm-toolbox builds with the project's `bin/build-paper`, which runs its copy. While a project has `paperkit/`, llm-toolbox's `build-paper` builds with that copy too, never the toolbox's, so everyone builds with the same code; run `vendor` again to update the copy. A project without one always gets the toolbox's current paperkit.
 
 ## Writing
 
@@ -152,6 +161,7 @@ Only one build of a tree runs at a time: a build holds `build/.lock`, and anothe
 | `ledger.py`, `figures.py` | the ledger, and drawing its figures |
 | `typeset.py` | compiling with Typst and querying the result |
 | `watch.py` | `build-paper watch` |
+| `vendor.py` | `build-paper vendor` |
 | `git.py` | the repository: its commit, its changes, what's pushed |
 | `lib.typ` | the Typst functions paper.typ uses, and the draft marks |
 | `template.typ` | the default template |

@@ -4,11 +4,14 @@ build, from a pushed commit whose links all resolve, writes the submission."""
 
 import http.server
 import json
+import os
+import subprocess
 import threading
 
 import pytest
 
-from paperkit_testing import build_paper, git, make_project, pdf_text, write_log
+from conftest import without_repo_vars
+from paperkit_testing import LIB, build_paper, git, make_project, pdf_text, write_log
 
 # A paper with one problem of every kind: a missing number, an interval asked of a pooled count, a false
 # claim, a claim on a missing key, a TODO, an unreferenced figure, Limitations before References, no LLM
@@ -384,3 +387,88 @@ def test_a_project_template_named_in_paper_toml_lays_the_paper_out(tmp_path):
     result = build_paper(project)
     assert result.returncode == 0, result.stderr
     assert "MY TEMPLATE" in pdf_text(project / "paper" / "build" / "DRAFT-paper.pdf")
+
+
+def test_vendor_copies_paperkit_and_a_launcher_into_the_project(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    assert build_paper(project, "vendor").returncode == 0
+    copied = {
+        p.relative_to(project / "paperkit")
+        for p in (project / "paperkit").rglob("*.py")
+    }
+    assert copied == {
+        p.relative_to(LIB / "paperkit") for p in (LIB / "paperkit").rglob("*.py")
+    }
+    assert (project / "paperkit" / "lib.typ").read_bytes() == (
+        LIB / "paperkit" / "lib.typ"
+    ).read_bytes()
+    check = build_paper(project, "vendor", "--check")
+    assert (check.returncode, check.stdout) == (
+        0,
+        "paperkit/ and bin/build-paper match the toolbox's\n",
+    )
+
+
+def test_the_vendored_launcher_builds_the_paper_with_the_project_s_copy(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    marked = (
+        (project / "paperkit" / "__main__.py")
+        .read_text()
+        .replace(
+            "    print(status(report, args.final))",
+            "    print('VENDORED COPY')\n    print(status(report, args.final))",
+        )
+    )
+    (project / "paperkit" / "__main__.py").write_text(marked)
+    env = {k: v for k, v in without_repo_vars(os.environ).items() if k != "AI_AGENT"}
+    own = subprocess.run(
+        [str(project / "bin" / "build-paper")],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert own.returncode == 0, own.stderr
+    assert own.stdout.startswith("VENDORED COPY\npaper/build/DRAFT-paper.pdf: ")
+    toolbox = build_paper(
+        project
+    )  # the toolbox's launcher also takes the project's copy
+    assert toolbox.stdout.startswith("VENDORED COPY\n")
+    # No bytecode caches, which --final would count as uncommitted changes in a repo not ignoring them
+    assert not list(project.rglob("__pycache__"))
+
+
+def test_vendor_check_lists_the_drift_and_vendor_again_updates_the_copy(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    (project / "paperkit" / "build.py").write_text("# edited\n")
+    (project / "paperkit" / "extra.py").write_text("")
+    (project / "paperkit" / "template.typ").unlink()
+    check = build_paper(project, "vendor", "--check")
+    assert check.returncode == 1
+    assert check.stdout.splitlines() == [
+        "paperkit/extra.py: only in the project",
+        "paperkit/template.typ: missing from the project",
+        "paperkit/build.py: differs",
+    ]
+    assert build_paper(project, "vendor").returncode == 0
+    assert build_paper(project, "vendor", "--check").returncode == 0
+
+
+def test_vendor_leaves_a_build_paper_it_didnt_write_alone(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    (project / "bin").mkdir()
+    (project / "bin" / "build-paper").write_text("#!/bin/sh\necho mine\n")
+    result = build_paper(project, "vendor")
+    assert result.returncode != 0
+    assert "the project's own" in result.stderr
+    assert (project / "bin" / "build-paper").read_text() == "#!/bin/sh\necho mine\n"
+    assert not (project / "paperkit").exists()
+
+
+def test_vendor_check_without_a_copy_is_drift(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    check = build_paper(project, "vendor", "--check")
+    assert (check.returncode, check.stdout) == (1, "paperkit/: not in the project\n")

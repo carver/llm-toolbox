@@ -97,7 +97,8 @@ def build_main(
         "data sources in paper/data/, compile it, and check it against the rules paper/paper.toml turns on. "
         "Writes paper/build/DRAFT-paper.pdf, a PNG of each page in paper/build/pages/, and the ledger in "
         "paper/build/numbers.json and numbers.md (paperkit's README.md). Other commands, each with its "
-        "own -h: `build-paper watch` rebuilds the draft as the paper changes.",
+        "own -h: `build-paper watch` rebuilds the draft as the paper changes; `build-paper vendor` copies "
+        "paperkit into the project, and `vendor --check` lists where that copy differs from the toolbox's.",
     )
     parser.add_argument(
         "--final",
@@ -132,6 +133,10 @@ def main(
         from paperkit.watch import main as watch_main
 
         return watch_main(argv[1:], paper_dir)
+    if argv[:1] == ["vendor"]:
+        from paperkit.vendor import main as vendor_main
+
+        return vendor_main(argv[1:], paper_dir.parent)
     return build_main(argv, paper_dir, sources)
 
 

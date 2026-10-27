@@ -175,7 +175,7 @@ class DraftBuilds:
         subject = self.repo.git("log", "-1", "--format=%h %s").stdout.strip()
         self.say(f"full build at HEAD {subject}")
         self.process = subprocess.Popen(
-            [sys.executable, "-m", "paperkit"], cwd=self.repo.root
+            [sys.executable, "-P", "-m", "paperkit"], cwd=self.repo.root
         )
 
     def ours(self, pid: int) -> bool:

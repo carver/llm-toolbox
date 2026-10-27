@@ -335,7 +335,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   check, pushed logs, the PDF's size), each off without its key. `watch`
   recompiles the draft on each save and rebuilds it on each commit. It runs
   inside the project's own uv environment, so a data source can import the
-  project's code, with paperkit's pinned dependencies added. Started as a copy
+  project's code, with paperkit's pinned dependencies added. `vendor` copies
+  paperkit into the project (`paperkit/`, with a `bin/build-paper` that runs
+  it) for collaborators without llm-toolbox, and `vendor --check` lists where
+  that copy has drifted from the toolbox's; while a project has its own copy,
+  this `build-paper` runs that copy too. Started as a copy
   of apart-research-collusion-sprint-2026's `paper/` build.
 
 ## Checks

@@ -73,6 +73,7 @@ def test_inherited_git_dir_never_reaches_the_tests_repos(tmp_path):
             "-q",
             "-p",
             "no:cacheprovider",
+            "-n0",  # one process, so the sentinel check sees every git call
             *GIT_USING_TESTS,
         ],
         cwd=HERE,

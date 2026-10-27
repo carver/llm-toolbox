@@ -360,11 +360,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 .githooks/agent-pre-commit
 ```
 
-It checks what's staged. `install.py` points git at `.githooks`. Its `pre-commit` runs the two ruff checks on
-what's staged. When only formatting fails, it formats each staged file that has no unstaged changes,
+It checks what's staged, running the tests in parallel (`pytest.ini`; `pytest -n0 FILE` runs one file
+without the few seconds of starting the workers). `install.py` points git at `.githooks`. Its
+`pre-commit` runs the two ruff checks on what's staged. When only formatting fails, it formats each staged file that has no unstaged changes,
 stages the result and names the file; any other unformatted file refuses the commit, as does every
-file of a `git commit PATH`. `agent-pre-commit` adds the tests (about two and a half
-minutes, most of it build-paper's Typst builds), and
+file of a `git commit PATH`. `agent-pre-commit` adds the tests (about half a minute, most of it build-paper's builds), and
 `pre-commit` runs it first when an agent commits. Both run the tools
 through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.

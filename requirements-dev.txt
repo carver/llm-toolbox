@@ -1,4 +1,5 @@
 pytest==9.1.1
+pytest-xdist==3.8.0  # the tests run in parallel (pytest.ini)
 ruff==0.16.10
 # paperkit (lib/paperkit/): the same pins as its requirements.txt (test_paperkit_ledger.py checks)
 matplotlib==3.11.2

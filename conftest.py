@@ -5,7 +5,10 @@ Every test is kept away from the repository pytest was started in: `git rebase
 test's throwaway repo, or the production code under test, would inherit them and
 write to the real repository instead. `shell_and_child` starts a wrapper shell and
 its job, for the process tools' tests, and `started_child` finds a process's child
-by an argument it was started with."""
+by an argument it was started with.
+
+The commit hook runs the suite in a copy of the index outside any git checkout, so a test
+that needs a repository makes its own rather than reading this one's."""
 
 import os
 import re

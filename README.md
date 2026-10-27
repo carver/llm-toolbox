@@ -361,7 +361,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 ```
 
 It checks what's staged, running the tests in parallel (`pytest.ini`; `pytest -n0 FILE` runs one file
-without the few seconds of starting the workers). `install.py` points git at `.githooks`. Its
+without the few seconds of starting the workers) in a copy of the index outside any git checkout, so a
+test that passes in the repo but reads its git state fails there. `install.py` points git at `.githooks`. Its
 `pre-commit` runs the two ruff checks on what's staged. When only formatting fails, it formats each staged file that has no unstaged changes,
 stages the result and names the file; any other unformatted file refuses the commit, as does every
 file of a `git commit PATH`. `agent-pre-commit` adds the tests (about half a minute, most of it build-paper's builds), and

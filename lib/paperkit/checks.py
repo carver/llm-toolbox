@@ -22,23 +22,20 @@ DOI = (
     "http://dx.doi.org/",
 )
 USER_AGENT = "Mozilla/5.0 (paper link check; paperkit)"
-EMBEDDED = re.compile(
-    r"#[A-Za-z_][\w-]*"
-)  # the start of an embedded expression: #n, #todo, #sym
+# The start of an embedded expression: #n, #todo, #sym
+EMBEDDED = re.compile(r"#[A-Za-z_][\w-]*")
 FIELD = re.compile(r"\.[A-Za-z_][\w-]*")  # a field or method after it: .dash, .len
 CLOSING = {"(": ")", "[": "]"}
 CITES = re.compile(r"#(?:n|pct|ci)\(")
-STRING = re.compile(
-    r'"[^"\n]*"'
-)  # a key, or quoted words, whose words aren't the sentence's own
+# A key, or quoted words, whose words aren't the sentence's own
+STRING = re.compile(r'"[^"\n]*"')
 RAW = re.compile(r"`[^`\n]*`")  # raw text, printed as written
 HASH_DIGITS = re.compile(r"(?<!\\)#(\d+)")
-BIB_KEY = re.compile(
-    r"^\s*@\w+\s*\{\s*([^,\s]+)\s*,", re.MULTILINE
-)  # a refs.bib entry's key
-READ_IN_FULL = (
-    "full text"  # citations.md's read column for a source someone has read in full
-)
+LINE_NUMBER = re.compile(r"\bline \d+\b")  # in a problem's detail
+# A refs.bib entry's key
+BIB_KEY = re.compile(r"^\s*@\w+\s*\{\s*([^,\s]+)\s*,", re.MULTILINE)
+# citations.md's read column for a source someone has read in full
+READ_IN_FULL = "full text"
 NOT_READ_IN_FULL = {  # the column's other values, as a problem words them
     "abstract": "only its abstract was read",
     "catalogue": "only its catalogue was read",
@@ -57,6 +54,11 @@ WORDING = re.compile(  # words whose truth rests on the numbers beside them, not
 class Problem:
     check: str
     detail: str
+
+    def identity(self) -> tuple[str, str]:
+        """The problem as one build's is compared with another's: an edit above it moves its line number,
+        not it."""
+        return self.check, LINE_NUMBER.sub("line N", self.detail)
 
 
 def body_pages(page: Typeset) -> int | None:

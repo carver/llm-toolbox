@@ -17,9 +17,8 @@ matplotlib.use("svg")
 import matplotlib.pyplot as plt
 
 plt.rcParams["svg.fonttype"] = "none"  # text stays text
-plt.rcParams["svg.hashsalt"] = (
-    "paper"  # element ids don't change from one run to the next
-)
+# Element ids don't change from one run to the next
+plt.rcParams["svg.hashsalt"] = "paper"
 
 
 def use_fonts(fonts: Path | None, family: str | None) -> None:

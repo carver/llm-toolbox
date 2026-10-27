@@ -9,9 +9,8 @@ from typing import Any
 
 from paperkit.ledger import display
 
-PAGE_TEXTS = (
-    "pages.json"  # in build/: each page's text, from the last build that compiled
-)
+# In build/: each page's text, from the last build that compiled
+PAGE_TEXTS = "pages.json"
 
 
 def squeezed(text: str) -> str:

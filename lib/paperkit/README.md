@@ -145,7 +145,7 @@ A build over `page_cap` adds a report for cutting it back: each line of the PDF 
 
 `citations_read_check` reads the first table in `citations.md` with `key` and `read` columns: a source the paper cites passes when its row says `full text` (`abstract`, `catalogue`, `secondhand` and `not checked` are the other values it names).
 
-A draft lists what fails and exits 0. `--final` exits 1 on any problem and writes nothing; only a clean one writes the unmarked `<final_name>.pdf` and `<final_name>-numbers.json`, which get committed together.
+The status block a build ends with marks `[new]` each problem the last build that compiled didn't have (a draft against the last draft, a final build against the last final one, kept in `build/problems-built.json` and `problems-built-final.json`; a problem whose line number moved isn't new), and says how many are new, so a new problem doesn't hide among old ones. A draft lists what fails and exits 0. `--final` exits 1 on any problem and writes nothing; only a clean one writes the unmarked `<final_name>.pdf` and `<final_name>-numbers.json`, which get committed together.
 
 Each draft page carries a DRAFT watermark and a footer with the commit and build time, so a draft can't pass for the submission. Each build lists the ledger entries that changed since the last build that compiled, all of them in `build/changes.md`.
 

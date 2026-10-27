@@ -45,4 +45,5 @@ def test_every_output_of_a_build_is_renamed_into_place(tmp_path, monkeypatch):
         "paper/build/pages/page-01.png",
         "paper/build/figures/demo-figure.svg",
         "paper/build/pages.json",
+        "paper/build/problems-built.json",
     } <= replaced

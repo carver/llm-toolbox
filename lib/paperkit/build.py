@@ -56,6 +56,9 @@ __all__ = [
 ]
 
 DRAFT_NAME = "DRAFT-paper"
+# In build/: the problems of the last draft, and of the last final build, that compiled. One record each,
+# since only a final build checks links and the tree
+PROBLEMS_BUILT = {False: "problems-built.json", True: "problems-built-final.json"}
 
 
 @dataclass
@@ -74,10 +77,11 @@ class Report:
     size: int
     changed: list[str]  # the ledger's entries that changed since the last build
     problems: list[Problem] = field(default_factory=list)
-    warnings: list[str] = field(
-        default_factory=list
-    )  # a draft and a final build both print them
+    # A draft and a final build both print them
+    warnings: list[str] = field(default_factory=list)
     over_cap: OverCap | None = None  # what to cut, when the paper runs past page_cap
+    # The problems the last build that compiled didn't have; None when there was no such build
+    new: list[Problem] | None = None
 
 
 _reading: list[set[str]] = []  # the .jsonl files the running data source has opened
@@ -90,9 +94,8 @@ def _record_reads(event: str, args: tuple[Any, ...]) -> None:
             _reading[-1].add(os.path.abspath(path))
 
 
-sys.addaudithook(
-    _record_reads
-)  # audit hooks can't be removed; this one records only while a source runs
+# Audit hooks can't be removed; this one records only while a source runs
+sys.addaudithook(_record_reads)
 
 
 def fill(
@@ -144,6 +147,22 @@ def changes(before: dict[str, dict], after: dict[str, dict]) -> list[str]:
                 else f"{key}: changed"
             )
     return lines
+
+
+def new_problems(record: Path, problems: list[Problem]) -> list[Problem] | None:
+    """The problems the last build that compiled, recorded in `record`, didn't have (None with no record),
+    and records these for the next build."""
+    before = (
+        {Problem(*p).identity() for p in json.loads(record.read_text())}
+        if record.exists()
+        else None
+    )
+    write_atomic(
+        record, json.dumps([[p.check, p.detail] for p in problems], ensure_ascii=False)
+    )
+    if before is None:
+        return None
+    return [problem for problem in problems if problem.identity() not in before]
 
 
 def markdown(entries: dict[str, dict]) -> str:
@@ -282,10 +301,8 @@ def _build(
     figures.use_fonts(paper_dir / "fonts", config.figure_font)
     sources = registered(paper_dir) if sources is None else sources
     ledger, problems = fill(sources, out / "figures", repo, config)
-    numbers, built = (
-        out / "numbers.json",
-        out / "numbers-built.json",
-    )  # built: the last build that compiled
+    # built: the last build that compiled
+    numbers, built = out / "numbers.json", out / "numbers-built.json"
     out.mkdir(parents=True, exist_ok=True)
     # Every output through write_atomic: a watch, a viewer or another build may be reading it
     ledger_json = json.dumps(ledger.entries, indent=1, ensure_ascii=False) + "\n"
@@ -314,9 +331,8 @@ def _build(
     )
     if config.citations_read_check:
         citations = paper_dir / "citations.md"
-        table = (
-            citations.read_text() if citations.exists() else ""
-        )  # no file: every citation is unread
+        # No file: every citation is unread
+        table = citations.read_text() if citations.exists() else ""
         bib = "".join(path.read_text() for path in sorted(paper_dir.glob("*.bib")))
         problems += unread_citations(page.cites, bib, table)
     if final:
@@ -329,6 +345,7 @@ def _build(
         )
         problems += broken_links(page) + unshipped(repo, read, config)
 
+    new = new_problems(out / PROBLEMS_BUILT[final], problems)
     pdf = None
     if not final:
         pdf = out / f"{DRAFT_NAME}.pdf"
@@ -354,4 +371,5 @@ def _build(
         problems=problems,
         warnings=unclaimed_wording(paper_text),
         over_cap=over_cap(page, paper_text, config.page_cap),
+        new=new,
     )

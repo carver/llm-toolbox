@@ -18,9 +18,8 @@ def write_atomic(path: Path, data: bytes | str) -> None:
             temp.flush()
             umask = os.umask(0)
             os.umask(umask)
-            os.chmod(
-                temp.name, 0o666 & ~umask
-            )  # a temporary file is private; the output isn't
+            # A temporary file is private; the output isn't
+            os.chmod(temp.name, 0o666 & ~umask)
             os.replace(temp.name, path)
         except BaseException:
             os.unlink(temp.name)

@@ -13,9 +13,8 @@ from paperkit.fit import report as fit_report
 from paperkit.git import Repo
 from paperkit.lookup import shown
 
-if (
-    TYPE_CHECKING
-):  # the build imports Typst and matplotlib, which find, keys and vendor don't need
+# The build imports Typst and matplotlib, which find, keys and vendor don't need
+if TYPE_CHECKING:
     from paperkit.build import Report
 
 SHOWN_CHANGES = 12  # build/changes.md lists them all
@@ -70,8 +69,16 @@ def status(report: "Report", final: bool) -> str:
         verdict = (
             "nothing written" if final else "a draft lists them; --final refuses them"
         )
-        lines += ["", f"{len(report.problems)} problems ({verdict}):"]
-        lines += [f"  {problem.check}: {problem.detail}" for problem in report.problems]
+        new = (
+            f", {len(report.new)} new since the last build"
+            if report.new is not None
+            else ""
+        )
+        lines += ["", f"{len(report.problems)} problems{new} ({verdict}):"]
+        lines += [
+            f"  {'[new] ' if report.new and problem in report.new else ''}{problem.check}: {problem.detail}"
+            for problem in report.problems
+        ]
         if report.over_cap:
             lines += ["", *fit_report(report.over_cap)]
     elif final and report.pdf:

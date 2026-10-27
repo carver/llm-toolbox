@@ -335,7 +335,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   check, pushed logs, the PDF's size), each off without its key. A build over
   the page cap also reports the PDF's lines past it, each with the
   `paper.typ` line it comes from, the blank space at the bottom of each page,
-  and the short last lines of paragraphs. `watch`
+  and the short last lines of paragraphs. The status block marks each
+  problem that's new since the last build, and counts them. `watch`
   recompiles the draft on each save and rebuilds it on each commit. `find
   TEXT` lists the pages of the last build whose text holds TEXT (ignoring case
   and whitespace), with each page's PNG; `keys PREFIX...` prints each ledger

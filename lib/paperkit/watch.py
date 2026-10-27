@@ -66,23 +66,19 @@ class Watch:
         self.commit = ""  # the HEAD the last full build was asked for
         self.wanted = False  # a full build to start once none runs
         self.building = False
-        self.other: int | None = (
-            None  # the pid of another process's build of the paper, while it runs
-        )
-        self.built_over: Hashable = (
-            None  # the sources when the running full build started
-        )
+        # The pid of another process's build of the paper, while it runs
+        self.other: int | None = None
+        # The sources when the running full build started
+        self.built_over: Hashable = None
         # the sources the last live compile read; None: compile at the next poll
         self.compiled: Hashable = None
         self.retry = False  # a live compile failed during the running full build
         self.seen: Hashable = None  # the sources at the last poll
         self.edited = 0.0  # when the sources last changed
-        self.missing: frozenset[str] = (
-            frozenset()
-        )  # the keys the last live compile found missing
-        self.tried: set[str] = (
-            set()
-        )  # keys a full build ran over while the text cited them
+        # The keys the last live compile found missing
+        self.missing: frozenset[str] = frozenset()
+        # Keys a full build ran over while the text cited them
+        self.tried: set[str] = set()
 
     def poll(self) -> None:
         commit = self.head()
@@ -100,9 +96,8 @@ class Watch:
             self.say(f"paused: another build is running (pid {other})")
         elif other is None and self.other is not None:
             self.say("resumed")
-            self.build_ended(
-                stale=True
-            )  # its PDF may hold text this watch never saw it build
+            # Its PDF may hold text this watch never saw it build
+            self.build_ended(stale=True)
         self.other = other
         if self.missing - self.tried and self.now() - self.edited >= self.settle:
             self.wanted = True
@@ -132,9 +127,8 @@ class Watch:
             )
             return
         if self.building:
-            self.tried |= (
-                result.missing
-            )  # the running build tries every key the ledger can hold
+            # The running build tries every key the ledger can hold
+            self.tried |= result.missing
         self.missing = result.missing
         shown = f": {', '.join(sorted(result.missing))}" if result.missing else ""
         self.say(f"live: recompiled, {len(result.missing)} missing{shown}")
@@ -201,9 +195,8 @@ def source_stamps(paper_dir: Path) -> tuple[tuple[str, int], ...]:
     """The files a live compile reads outside build/, with when each last changed."""
     stamps = []
     for file in sorted([*paper_dir.glob("*.typ"), *paper_dir.glob("*.bib")]):
-        with contextlib.suppress(
-            FileNotFoundError
-        ):  # a save can replace a file between glob and stat
+        # A save can replace a file between glob and stat
+        with contextlib.suppress(FileNotFoundError):
             stamps.append((file.name, file.stat().st_mtime_ns))
     return tuple(stamps)
 

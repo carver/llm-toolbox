@@ -16,16 +16,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # Typst, which the status block doesn't need
     from paperkit.typeset import Typeset
 
-DRAFT_MARKS = (
-    "DRAFT",
-    "not for submission",
-)  # lib.typ's watermark lines; its footer starts with both
+# lib.typ's watermark lines; its footer starts with both
+DRAFT_MARKS = ("DRAFT", "not for submission")
 INK = 160  # a pixel darker than this is ink; the watermark (88% grey) isn't
 FOUND = 0.45  # the share of a PDF line a paper.typ line must hold to be its source
 SHORT = 0.25  # a paragraph's last line under this share of the page's typical line is a widow
-PLACED_ALONE = (
-    12  # a PDF line with fewer letters than this is found with the line before it
-)
+# A PDF line with fewer letters than this is found with the line before it
+PLACED_ALONE = 12
 AHEAD = 80  # paper.typ lines past the last one found to look in first
 SHOWN = 60  # characters of each PDF line the report shows
 
@@ -37,21 +34,18 @@ class Placed:
     page: int
     text: str
     line: int | None
-    lines: int = (
-        1  # how many PDF lines in a row this stands for, all from that paper.typ line
-    )
+    # How many PDF lines in a row this stands for, all from that paper.typ line
+    lines: int = 1
 
 
 @dataclass(frozen=True)
 class OverCap:
     body_pages: int
     cap: int
-    past: list[
-        Placed
-    ]  # what lands past the cap, a run of lines from one paper.typ line at a time
-    blank: list[
-        tuple[int, float]
-    ]  # each page before References, and the blank space at its bottom (pt)
+    # What lands past the cap, a run of lines from one paper.typ line at a time
+    past: list[Placed]
+    # Each page before References, and the blank space at its bottom (pt)
+    blank: list[tuple[int, float]]
     widows: list[Placed]  # short last lines of paragraphs
 
 
@@ -69,10 +63,8 @@ class TypLines:
 
         self.lines = code_lines(typ)
         self.squeezed = [letters(line) for line in self.lines]
-        paragraph, self.paragraphs = (
-            0,
-            [],
-        )  # each line's paragraph: blank lines part them
+        # Each line's paragraph: blank lines part them
+        paragraph, self.paragraphs = 0, []
         for line in self.lines:
             paragraph += not line.strip()
             self.paragraphs.append(paragraph)

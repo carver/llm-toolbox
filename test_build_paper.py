@@ -5,6 +5,7 @@ build, from a pushed commit whose links all resolve, writes the submission."""
 import http.server
 import json
 import os
+import re
 import subprocess
 import threading
 
@@ -122,10 +123,15 @@ def clean(tmp_path, server):
 
 
 def problems(out: str) -> list[str]:
-    """The problem lines of a build's status block."""
-    _, _, listed = out.partition(" problems (")
-    lines = listed.split("\n")[1:]
-    return [line.strip() for line in lines[: lines.index("") if "" in lines else None]]
+    """The problem lines of a build's status block, without their [new] marks."""
+    lines = out.split("\n")
+    start = next(
+        (i for i, line in enumerate(lines) if re.match(r"\d+ problems[ ,]", line)),
+        len(lines),
+    )
+    listed = lines[start + 1 :]
+    listed = listed[: listed.index("") if "" in listed else None]
+    return [line.strip().removeprefix("[new] ") for line in listed]
 
 
 def test_a_draft_is_named_draft_has_a_picture_of_every_page_and_exits_0(flawed):
@@ -163,9 +169,8 @@ def test_a_draft_lists_every_problem(flawed):
         "citation: @calvano2020 is cited, but citations.md says only its catalogue was read",
         "source: broken: RuntimeError: its log is missing",
     } <= set(found)
-    assert not [
-        line for line in found if line.startswith("link:")
-    ]  # only --final checks links
+    # Only --final checks links
+    assert not [line for line in found if line.startswith("link:")]
 
 
 def test_a_broken_source_is_reported_and_the_others_still_fill_the_ledger(flawed):
@@ -209,9 +214,8 @@ def test_without_paper_toml_only_the_framework_s_checks_run(tmp_path, server):
     entry = json.loads((project / "paper" / "build" / "numbers.json").read_text())[
         "demo.same"
     ]
-    assert entry["source"]["logs"] == [
-        "logs/demo.jsonl"
-    ]  # recorded without logs_dir too
+    # Recorded without logs_dir too
+    assert entry["source"]["logs"] == ["logs/demo.jsonl"]
 
 
 def test_a_key_paper_toml_doesnt_know_is_an_error(tmp_path):
@@ -249,9 +253,8 @@ def test_a_clean_final_build_writes_the_submission_and_its_ledger(clean):
         "Wrote paper/submission.pdf and submission-numbers.json beside it."
         in result.stdout
     )
-    assert (
-        "  pages before References  1 (cap 8)\n" in result.stdout
-    )  # References starts page 2
+    # References starts page 2
+    assert "  pages before References  1 (cap 8)\n" in result.stdout
     assert (
         f"Built from commit {git(clean, 'rev-parse', 'HEAD').strip()}".encode()
         in pdf.read_bytes()
@@ -432,9 +435,8 @@ def test_the_vendored_launcher_builds_the_paper_with_the_project_s_copy(tmp_path
     )
     assert own.returncode == 0, own.stderr
     assert own.stdout.startswith("VENDORED COPY\npaper/build/DRAFT-paper.pdf: ")
-    toolbox = build_paper(
-        project
-    )  # the toolbox's launcher also takes the project's copy
+    # The toolbox's launcher also takes the project's copy
+    toolbox = build_paper(project)
     assert toolbox.stdout.startswith("VENDORED COPY\n")
     # No bytecode caches, which --final would count as uncommitted changes in a repo not ignoring them
     assert not list(project.rglob("__pycache__"))
@@ -712,3 +714,40 @@ def test_a_build_within_the_cap_has_no_over_cap_report(tmp_path):
     result = build_paper(project)
     assert result.returncode == 0, result.stderr
     assert "Past the page cap" not in result.stdout
+
+
+MARKED = '#import "build/paperkit.typ": *\n#show: paper.with(abstract: [x])\n= Introduction\n#todo[say why]\n'
+
+
+def test_the_status_block_marks_each_problem_new_since_the_last_build(tmp_path):
+    project = make_project(tmp_path / "repo", MARKED, toml=None, origin=False)
+    first = build_paper(project)
+    # No last build to compare with
+    assert "1 problems (a draft lists them" in first.stdout
+    assert "[new]" not in first.stdout
+    paper = project / "paper" / "paper.typ"
+    paper.write_text(paper.read_text() + 'It holds #n("demo.same"); and more.\n')
+    second = build_paper(project)
+    assert "2 problems, 1 new since the last build (a draft lists them" in second.stdout
+    assert "\n  todo: 1 TODO markers\n" in second.stdout
+    assert '\n  [new] semicolon: line 5: #n("demo.same"); drops its' in second.stdout
+    paper.write_text(
+        paper.read_text().replace("= Introduction\n", "= Introduction\nMore text.\n")
+    )
+    third = build_paper(project)  # the semicolon moved to line 6: the same problem
+    assert "2 problems, 0 new since the last build" in third.stdout
+    assert "[new]" not in third.stdout
+
+
+def test_a_draft_between_two_final_builds_leaves_the_second_s_problems_unmarked(
+    tmp_path,
+):
+    project = make_project(tmp_path / "repo", MARKED, toml=None, origin=False)
+    (project / "paper" / "notes.txt").write_text("uncommitted\n")
+    build_paper(project, "--final")  # todo, and dirty: a draft doesn't check the tree
+    draft = build_paper(project)
+    # No draft before it to compare with
+    assert "1 problems (a draft lists them" in draft.stdout
+    final = build_paper(project, "--final")
+    assert "2 problems, 0 new since the last build" in final.stdout
+    assert "[new]" not in final.stdout

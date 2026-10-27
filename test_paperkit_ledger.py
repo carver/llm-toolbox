@@ -152,9 +152,8 @@ def test_a_figure_is_drawn_to_an_svg_that_keeps_its_text(tmp_path):
     svg = (tmp_path / "pilot-ladder.svg").read_text()
     assert entry["kind"] == "figure"
     assert entry["path"] == "pilot-ladder.svg"
-    assert (
-        ">arm label</text>" in svg
-    )  # text, not glyph outlines, so Typst sets it in the paper's font
+    # Text, not glyph outlines, so Typst sets it in the paper's font
+    assert ">arm label</text>" in svg
 
 
 def pins(path: Path) -> set[str]:

@@ -33,24 +33,20 @@ class Typeset:
     pngs: list[bytes]
     warnings: list[str]
     abstract: str
-    missing: list[
-        str
-    ]  # "key: why", for each number, table, figure or text the ledger couldn't supply
-    claims: list[
-        tuple[bool | None, str]
-    ]  # whether each claim holds (None: a key is missing), and its text
+    # "key: why", for each number, table, figure or text the ledger couldn't supply
+    missing: list[str]
+    # Whether each claim holds (None: a key is missing), and its text
+    claims: list[tuple[bool | None, str]]
     todos: int
-    references: (
-        tuple[int, float] | None
-    )  # the page and height (pt) just before the References heading
+    # The page and height (pt) just before the References heading
+    references: tuple[int, float] | None
     figures: list[str]  # each figure's label, or its caption when it has none
     refs: set[str]  # the labels referenced
     cites: set[str]  # the bibliography keys cited, by @key or #cite
     headings: list[str]
     links: list[str]
-    misplaced: list[
-        tuple[str, str, str]
-    ]  # each figure drawn under another section: name, written, drawn
+    # Each figure drawn under another section: name, written, drawn
+    misplaced: list[tuple[str, str, str]]
     height: float  # the page's height (pt)
     top: float  # its top margin (pt)
     bottom: float  # its bottom margin (pt)

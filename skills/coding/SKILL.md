@@ -24,6 +24,7 @@ Make it work, then make it good. While implementing, the quality you own is the 
   - Avoid spawning an interpreter when another option works: each one pays its imports again, often most of a second. When a test needs one, have it import only the light module it uses.
   - Wait for a condition by polling it: a fixed sleep costs its full length on every run.
   - Build an expensive fixture (a git repo, a rendered figure) once per module, and copy it into each test.
+  - To find what's slow, start with a sampling profiler (py-spy for Python), which disturbs what it measures far less than cProfile or strace; compare timings with `hyperfine`, not repeated runs by hand.
 
 Review holds the code to [standards.md](standards.md), in the same order, and a refactor pass applies what it finds. `/build` runs that sequence.
 

@@ -48,8 +48,17 @@ def demo(ledger: Ledger) -> None:
     ledger.rate("demo.same", opus, lambda row: row["cartel"], how="cartel answers / replies")
     ledger.pooled("demo.pooled", rows, lambda row: row["cartel"], how="both models")
     ledger.table("demo-table", ["arm", "cartel"], [["same", f"{hits}/{len(opus)}"]], how="per arm")
+"""
+
+# A source that draws demo-figure, one bar labelled bar-label, for make_project(figure=True). Drawing a
+# figure loads matplotlib, which takes most of a second, so only the tests of figures draw one.
+FIGURE_SOURCE = """from paperkit import Ledger, source
+
+
+@source("figure")
+def figure(ledger: Ledger) -> None:
     ledger.figure(
-        "demo-figure", lambda ax, d: ax.bar(list(d), list(d.values())), {"same": hits}, how="bars"
+        "demo-figure", lambda ax, d: ax.bar(list(d), list(d.values())), {"bar-label": 3}, how="bars"
     )
 """
 
@@ -113,15 +122,19 @@ def make_project(
     read: str = "full text",
     origin: bool = True,
     broken: bool = False,
+    figure: bool = False,
 ) -> Path:
     """A git repo at `root` holding the paper `text` (with {url} filled in), its paper.toml, the demo
-    source (and the broken one) and its log, committed, and pushed to a bare origin beside it."""
+    source (with the figure source, and the broken one) and its log, committed, and pushed to a bare
+    origin beside it."""
     paper = root / "paper"
     (paper / "data").mkdir(parents=True)
     (paper / "paper.typ").write_text(text.format(url=url))
     if toml is not None:
         (paper / "paper.toml").write_text(toml)
     (paper / "data" / "demo.py").write_text(DEMO_SOURCE)
+    if figure:
+        (paper / "data" / "figure.py").write_text(FIGURE_SOURCE)
     if broken:
         (paper / "data" / "broken.py").write_text(BROKEN_SOURCE)
     (paper / "refs.bib").write_text(BIB)

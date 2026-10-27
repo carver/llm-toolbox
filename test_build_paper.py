@@ -33,7 +33,7 @@ Prior work #cite(<calvano2020>, form: "prose"). Pooled: #n("demo.pooled"), #ci("
 See @tab-demo and #link("{url}/gone")[a dead link], #link("http://127.0.0.1:9/")[a closed port] and
 #link("https://example.com/a b")[a malformed link].
 #figure(data-table("demo-table"), caption: [A table.]) <tab-demo>
-#figure(data-figure("demo-figure"), caption: [A figure.]) <fig-demo>
+#figure(rect(width: 50%, height: 1cm), caption: [A figure.]) <fig-demo>
 = Limitations
 #for _ in range(9) {{ pagebreak() }}
 #unnumbered[Code and Data]
@@ -51,7 +51,7 @@ Prior work @calvano2020.
 #claim("half or more land on the cartel", ("demo.same",), r => r >= 0.5)
 See @tab-demo, @fig-demo and #link("{url}/ok")[a live link].
 #figure(data-table("demo-table"), caption: [A table.]) <tab-demo>
-#figure(data-figure("demo-figure"), caption: [A figure.]) <fig-demo>
+#figure(rect(width: 50%, height: 1cm), caption: [A figure.]) <fig-demo>
 #unnumbered[Code and Data]
 #unnumbered[LLM Usage Statement]
 #pagebreak()
@@ -145,6 +145,27 @@ def test_a_draft_is_named_draft_has_a_picture_of_every_page_and_exits_0(flawed):
     assert len(pages) == 10  # Code and Data and References share the last
     assert all(page.read_bytes().startswith(b"\x89PNG") for page in pages)
     assert not (project / "paper" / "submission.pdf").exists()
+
+
+# A paper that sets the figure source's figure: the only build here that draws one.
+FIGURED = """#import "build/paperkit.typ": *
+#show: paper.with(abstract: [x])
+#figure(data-figure("demo-figure"), caption: [The demo bars.]) <fig-bars>
+See @fig-bars.
+"""
+
+
+def test_a_figure_a_data_source_draws_is_set_in_the_paper(tmp_path):
+    project = make_project(
+        tmp_path / "repo", FIGURED, toml=None, origin=False, figure=True
+    )
+    result = build_paper(project)
+    assert result.returncode == 0, result.stderr
+    svg = project / "paper" / "build" / "figures" / "demo-figure.svg"
+    assert "<svg" in svg.read_text()
+    # The bar's label: an SVG's text stays text, so it is in the PDF only if the figure is
+    assert "bar-label" in pdf_text(project / "paper" / "build" / "DRAFT-paper.pdf")
+    assert "demo-figure" in build_paper(project, "keys", "demo-").stdout
 
 
 def test_numbers_are_filled_in_from_the_project_s_data_source(flawed):
@@ -622,7 +643,7 @@ def test_keys_how_adds_how_each_was_computed_and_its_logs(two_pages):
 
 def test_keys_how_lines_up_how_whether_or_not_a_key_has_a_rate(two_pages):
     lines = build_paper(two_pages, "keys", "--how", "demo").stdout.splitlines()
-    assert len(lines) == 4  # the figure, the pooled count, the rate and the table
+    assert len(lines) == 3  # the pooled count, the rate and the table
     assert len({line.index("how: ") for line in lines}) == 1
 
 

@@ -339,7 +339,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   paperkit into the project (`paperkit/`, with a `bin/build-paper` that runs
   it) for collaborators without llm-toolbox, and `vendor --check` lists where
   that copy has drifted from the toolbox's; while a project has its own copy,
-  this `build-paper` runs that copy too. Started as a copy
+  this `build-paper` runs that copy too. With `$AI_AGENT` set, it refuses to
+  build in a repo's main worktree, where the user's `watch` runs, and names
+  the `git worktree add` command to use instead (`--here` overrides). Every
+  output is written to a temporary file and renamed into place, so a
+  concurrent reader never sees half of one. Started as a copy
   of apart-research-collusion-sprint-2026's `paper/` build.
 
 ## Checks

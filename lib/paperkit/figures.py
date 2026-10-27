@@ -3,12 +3,15 @@ body, in the paper's font when paper.toml names one (`figure_font`). The same fi
 file, so a build can tell when one changed."""
 
 import hashlib
+import io
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import matplotlib
 from matplotlib import font_manager
+
+from paperkit.atomic import write_atomic
 
 matplotlib.use("svg")
 import matplotlib.pyplot as plt
@@ -36,8 +39,10 @@ def render[T](
     fig, ax = plt.subplots(figsize=size)
     try:
         draw(ax, data)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, bbox_inches="tight", metadata={"Date": None})
+        svg = io.BytesIO()
+        fig.savefig(svg, format="svg", bbox_inches="tight", metadata={"Date": None})
     finally:
         plt.close(fig)
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(path, svg.getvalue())
+    return hashlib.sha256(svg.getvalue()).hexdigest()[:12]

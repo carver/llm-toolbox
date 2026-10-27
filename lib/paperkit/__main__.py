@@ -1,6 +1,7 @@
 """build-paper: builds the project's paper/paper.typ as a draft, or with --final the submission (README.md)."""
 
 import argparse
+import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -88,6 +89,25 @@ def status(report: Report, final: bool) -> str:
     return "\n".join(lines)
 
 
+def main_tree_refusal(paper_dir: Path, here: bool) -> str | None:
+    """Why an agent shouldn't build here: in a repo's main worktree, where the user's `build-paper watch`
+    runs, two builds can collide (a half-written numbers.json, a viewer that reloads mid-write)."""
+    repo = Repo.of(paper_dir)
+    if (
+        here
+        or not os.environ.get("AI_AGENT")
+        or repo is None
+        or not repo.is_main_worktree()
+    ):
+        return None
+    return (
+        f"build-paper: {repo.root} is the repo's main worktree, and $AI_AGENT is set. An agent builds the "
+        "paper in a worktree of its own, so its build can't collide with the user's `build-paper watch` "
+        f"here:\n  git worktree add --detach ../{repo.root.name}-wt-paper\nthen build there. --here builds "
+        "here anyway."
+    )
+
+
 def build_main(
     argv: list[str], paper_dir: Path, sources: Mapping[str, Source] | None
 ) -> int:
@@ -107,7 +127,19 @@ def build_main(
         "paper.toml's logs_dir, the logs pushed); only then writes the unmarked paper/<final_name>.pdf and "
         "its ledger",
     )
+    parser.add_argument(
+        "--here",
+        action="store_true",
+        help="build even in the repo's main worktree when $AI_AGENT is set (an agent builds in a "
+        "worktree of its own by default, so its build can't collide with the user's `build-paper watch`)",
+    )
     args = parser.parse_args(argv)
+    if not (paper_dir / "paper.typ").is_file():
+        print(f"build-paper: no paper/paper.typ in {paper_dir.parent}", file=sys.stderr)
+        return 1
+    if refusal := main_tree_refusal(paper_dir, args.here):
+        print(refusal, file=sys.stderr)
+        return 1
     try:
         report = build(paper_dir, sources, final=args.final)
     except ConfigError as error:

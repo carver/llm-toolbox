@@ -197,7 +197,7 @@ def write_pages(folder: Path, pngs: list[bytes]) -> list[Path]:
     folder.mkdir(parents=True)
     pages = [folder / f"page-{number:02}.png" for number in range(1, len(pngs) + 1)]
     for page, png in zip(pages, pngs, strict=True):
-        page.write_bytes(png)
+        write_atomic(page, png)
     return pages
 
 
@@ -281,8 +281,10 @@ def _build(
         out / "numbers-built.json",
     )  # built: the last build that compiled
     out.mkdir(parents=True, exist_ok=True)
-    numbers.write_text(json.dumps(ledger.entries, indent=1, ensure_ascii=False) + "\n")
-    (out / "numbers.md").write_text(markdown(ledger.entries))
+    # Every output through write_atomic: a watch, a viewer or another build may be reading it
+    ledger_json = json.dumps(ledger.entries, indent=1, ensure_ascii=False) + "\n"
+    write_atomic(numbers, ledger_json)
+    write_atomic(out / "numbers.md", markdown(ledger.entries))
 
     inputs = {
         "draft": "false" if final else "true",
@@ -293,10 +295,11 @@ def _build(
     changed = changes(
         json.loads(built.read_text()) if built.exists() else {}, ledger.entries
     )
-    (out / "changes.md").write_text(
-        "# Changes since the last build\n\n" + "".join(f"- {c}\n" for c in changed)
+    write_atomic(
+        out / "changes.md",
+        "# Changes since the last build\n\n" + "".join(f"- {c}\n" for c in changed),
     )
-    shutil.copy(numbers, built)
+    write_atomic(built, ledger_json)
     paper_text = (paper_dir / "paper.typ").read_text()
     problems += (
         rules(page, config)
@@ -325,7 +328,7 @@ def _build(
         pdf = out / f"{DRAFT_NAME}.pdf"
     elif not problems:
         pdf = paper_dir / f"{config.final_name}.pdf"
-        shutil.copy(numbers, paper_dir / f"{config.final_name}-numbers.json")
+        write_atomic(paper_dir / f"{config.final_name}-numbers.json", ledger_json)
     if pdf:
         write_atomic(pdf, page.pdf)
     return Report(

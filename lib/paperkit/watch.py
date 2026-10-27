@@ -4,6 +4,7 @@ and rebuilds it in full each time the repo's HEAD moves or the text cites a key 
 import argparse
 import contextlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -175,7 +176,10 @@ class DraftBuilds:
         subject = self.repo.git("log", "-1", "--format=%h %s").stdout.strip()
         self.say(f"full build at HEAD {subject}")
         self.process = subprocess.Popen(
-            [sys.executable, "-P", "-m", "paperkit"], cwd=self.repo.root
+            # --here: the watch is the user's own, so its builds are too, wherever it runs
+            [sys.executable, "-P", "-m", "paperkit", "--here"],
+            cwd=self.repo.root,
+            env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"},
         )
 
     def ours(self, pid: int) -> bool:

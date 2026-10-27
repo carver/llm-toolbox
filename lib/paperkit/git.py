@@ -61,3 +61,10 @@ class Repo:
                 "log", "--format=%h", f"{upstream}..HEAD", "--", path
             ).stdout.strip()
         ]
+
+    def is_main_worktree(self) -> bool:
+        """Whether this is the repository's main worktree, not one `git worktree add` made: its git dir
+        is the common one."""
+        found = self.git("rev-parse", "--absolute-git-dir", "--git-common-dir")
+        git_dir, common = found.stdout.splitlines()[:2]
+        return Path(git_dir).resolve() == (self.root / common).resolve()

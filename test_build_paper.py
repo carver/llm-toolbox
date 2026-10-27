@@ -472,3 +472,69 @@ def test_vendor_check_without_a_copy_is_drift(tmp_path):
     project = make_project(tmp_path / "repo", CLEAN, origin=False)
     check = build_paper(project, "vendor", "--check")
     assert (check.returncode, check.stdout) == (1, "paperkit/: not in the project\n")
+
+
+def test_an_agent_s_build_in_the_main_worktree_is_refused_naming_the_worktree_to_use(
+    tmp_path,
+):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    result = build_paper(project, env={"AI_AGENT": "claude-code"})
+    assert result.returncode == 1
+    assert "git worktree add --detach ../repo-wt-paper" in result.stderr
+    assert "--here" in result.stderr
+    assert not (project / "paper" / "build" / "DRAFT-paper.pdf").exists()
+
+
+def test_a_build_in_a_repo_with_no_paper_says_so(tmp_path):
+    (tmp_path / "repo").mkdir()
+    git(tmp_path / "repo", "init", "-q")
+    for env in ({}, {"AI_AGENT": "claude-code"}):
+        result = build_paper(tmp_path / "repo", env=env)
+        assert result.returncode == 1
+        assert (
+            result.stderr == f"build-paper: no paper/paper.typ in {tmp_path / 'repo'}\n"
+        )
+
+
+def test_watch_is_not_refused_in_the_main_worktree_and_its_builds_run(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    env = without_repo_vars(os.environ) | {"AI_AGENT": "claude-code"}
+    watch = subprocess.Popen(
+        [str(LIB.parent / "bin" / "build-paper"), "watch"],
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    numbers = project / "paper" / "build" / "numbers.json"
+    try:
+        for _ in range(300):  # up to a minute, for its first full build
+            if numbers.exists():
+                break
+            try:
+                watch.wait(timeout=0.2)
+                break  # it exited: refused
+            except subprocess.TimeoutExpired:
+                pass
+        assert watch.poll() is None, watch.communicate()[0].decode()
+        # Its full build, which runs with $AI_AGENT too, wasn't refused either
+        assert numbers.exists()
+    finally:
+        os.killpg(watch.pid, 15)  # SIGTERM, to the watch and its build
+        watch.wait(timeout=10)
+
+
+def test_here_lets_an_agent_build_in_the_main_worktree(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    result = build_paper(project, "--here", env={"AI_AGENT": "claude-code"})
+    assert result.returncode == 0, result.stderr
+    assert (project / "paper" / "build" / "DRAFT-paper.pdf").exists()
+
+
+def test_an_agent_builds_in_a_linked_worktree(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    git(project, "worktree", "add", "-q", "--detach", str(tmp_path / "repo-wt-paper"))
+    result = build_paper(tmp_path / "repo-wt-paper", env={"AI_AGENT": "claude-code"})
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "repo-wt-paper" / "paper" / "build" / "DRAFT-paper.pdf").exists()

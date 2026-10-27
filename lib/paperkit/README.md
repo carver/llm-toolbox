@@ -147,7 +147,11 @@ Each draft page carries a DRAFT watermark and a footer with the commit and build
 
 `watch` keeps `build/DRAFT-paper.pdf` current while you write. A save of any `.typ` or `.bib` in `paper/` recompiles it within a second or two, from the numbers and figures of the last full build, and prints Typst's error when it can't. A full build runs in the background each time HEAD moves, and when the text cites a key the ledger lacks, once the text has been still for five seconds (`--settle`). Open the PDF in a viewer that reloads a changed file, such as Skim, VS Code or Zathura; macOS Preview doesn't.
 
-Only one build of a tree runs at a time: a build holds `build/.lock`, and another waits for it, so a watch's builds and another build can't clear each other's figures. A watch says when another process's build pauses it. Whether a lock taken on a host is seen by a build inside a sandbox that mounts the repo, or the other way round, is untested.
+Only one build of a tree runs at a time: a build holds `build/.lock`, and another waits for it, so a watch's builds and another build can't clear each other's figures. A watch says when another process's build pauses it. Whether a lock taken on a host is seen by a build inside a sandbox that mounts the repo, or the other way round, is untested. Every output (the ledger, the PDF, the page images, the figures) is written to a temporary file beside it and renamed into place, so a reader never sees half of one.
+
+## Agents build in a worktree
+
+An agent builds the paper in a worktree of its own (`git worktree add --detach ../<repo>-wt-paper`), never in the repo's main worktree, where the user's `build-paper watch` runs: builds from a sandbox and from the host collided there, leaving a corrupt `numbers-built.json`, and the lock didn't stop them. So when `$AI_AGENT` is set, a build in the main worktree is refused with that command; `--here` builds there anyway. `watch` is the user's, so it isn't refused.
 
 ## Files
 

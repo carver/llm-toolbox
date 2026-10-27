@@ -172,6 +172,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   untrusted text. `--tools` opts named tools back in. A refused call says why,
   including the reason `claude -p` gives only in its JSON output.
   `claude-json` is a link to it that keeps the old `-s SCHEMA` form.
+- **pre-commit-run**: runs the pre-commit framework from a repo's pre-commit
+  hook. A person sees its output as it runs; an agent (`AI_AGENT` set) sees it
+  only on a failure, and every refusal ends with `COMMIT REFUSED`. It refuses
+  first when `.pre-commit-config.yaml` has unstaged changes, which pre-commit
+  won't run with (`PRE_COMMIT_VERSION` picks the version). `pre-commit-run
+  --install REPO` copies it into `REPO/bin/` and adds its call to the repo's
+  hook, for a new project or an old one.
 - **agent-commit-gate**: gives agents' commits a repo's slow checks.
   `agent-commit-gate --install REPO...` adds a line to the top of the repo's
   pre-commit hook: when `$AI_AGENT` is set, as Claude Code sets it, the hook

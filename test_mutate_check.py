@@ -1,6 +1,7 @@
 """mutate-check breaks code briefly with apply-edits blocks and says whether a command
 caught it, always putting the code back."""
 
+import os
 import signal
 import subprocess
 import sys
@@ -166,12 +167,13 @@ def test_a_file_the_command_deletes_is_put_back(repo: Path) -> None:
     assert [p.name for p in repo.iterdir() if p.name.startswith(".")] == []
 
 
-def test_a_child_ignoring_term_is_killed(repo: Path) -> None:
+def test_a_child_ignoring_term_is_killed_once_the_grace_ends(repo: Path) -> None:
     proc = subprocess.Popen(
         [str(SCRIPT), "--", "sh", "-c", "trap '' TERM; touch started; sleep 30"],
         stdin=subprocess.PIPE,
         cwd=repo,
         text=True,
+        env=os.environ | {"MUTATE_CHECK_GRACE": "0.2"},
     )
     assert proc.stdin is not None
     proc.stdin.write(BREAK)
@@ -182,6 +184,6 @@ def test_a_child_ignoring_term_is_killed(repo: Path) -> None:
         time.sleep(0.05)
 
     proc.send_signal(signal.SIGTERM)
-    proc.wait(timeout=10)
+    proc.wait(timeout=2)
 
     assert (repo / "calc.py").read_text() == CODE

@@ -97,14 +97,16 @@ def restore(originals: dict[Path, Original]) -> list[str]:
 
 def run(command: list[str]) -> tuple[int, str]:
     """The command's exit status and output. Stopped, it stops the command too, killing it
-    if it ignores SIGTERM for 5 seconds."""
+    if it ignores SIGTERM for 5 seconds ($MUTATE_CHECK_GRACE, which the tests shorten)."""
+    # Read before the command starts, so a bad value stops here rather than mid-stop
+    grace = float(os.environ.get("MUTATE_CHECK_GRACE", "5"))
     child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
         output, _ = child.communicate()
     except Stopped:
         child.terminate()
         try:
-            child.wait(timeout=5)
+            child.wait(timeout=grace)
         except subprocess.TimeoutExpired:
             child.kill()
             child.wait()

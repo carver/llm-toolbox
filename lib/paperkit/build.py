@@ -44,6 +44,7 @@ from paperkit.git import Repo
 from paperkit.ledger import DuplicateKey, Ledger, Provenance, display
 from paperkit.lookup import PAGE_TEXTS
 from paperkit.typeset import BuildError, Typeset, typeset
+from paperkit.vendor import edit_warnings
 
 __all__ = [
     "DRAFT_NAME",
@@ -385,7 +386,7 @@ def _build(
         size=len(page.pdf),
         changed=changed,
         problems=problems,
-        warnings=unclaimed_wording(paper_text),
+        warnings=unclaimed_wording(paper_text) + edit_warnings(paper_dir.parent),
         over_cap=over_cap(page, paper_text, config.page_cap),
         new=new,
     )

@@ -31,10 +31,12 @@ build-paper keys PREFIX...  # each ledger key starting with a PREFIX: its value 
 
 ```bash
 build-paper vendor           # copy paperkit into the project as paperkit/, and write bin/build-paper there
-build-paper vendor --check   # list the files where the project's copy differs from the toolbox's (exit 1)
+build-paper vendor --check   # list the files edited in the project, then those behind the toolbox's (exit 1)
 ```
 
 A collaborator without llm-toolbox builds with the project's `bin/build-paper`, which runs its copy. While a project has `paperkit/`, llm-toolbox's `build-paper` builds with that copy too, never the toolbox's, so everyone builds with the same code; run `vendor` again to update the copy. A project without one always gets the toolbox's current paperkit.
+
+The project's copy runs no tests of its own: llm-toolbox's tests cover the version it was vendored from. `paperkit/VENDORED` records that version's commit and a hash of each file vendor wrote. A collaborator can still patch the copy; each build then lists every file edited, added or removed since vendoring among its warnings, which never refuse a draft or `--final`, with a reminder to upstream the change. `vendor` refuses to replace a copy holding an edit the toolbox doesn't have yet (a file removed in the project holds nothing to lose, so it doesn't count), so the flow is: port the edit into llm-toolbox's `lib/paperkit/`, where its tests run, or undo it in the project, then vendor again. Hashes ignore line endings, so a checkout that writes CRLF edits nothing. A copy vendored before there were manifests, or whose manifest can't be read (a build warns of that), has nothing to tell edits from an older version, so `vendor` replaces it and names the files that differed from the toolbox's.
 
 ## Writing
 

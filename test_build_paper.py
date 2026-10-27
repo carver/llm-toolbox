@@ -2,6 +2,7 @@
 every problem and exits 0, each optional rule runs only when paper.toml sets it, and only a clean --final
 build, from a pushed commit whose links all resolve, writes the submission."""
 
+import hashlib
 import http.server
 import json
 import os
@@ -495,9 +496,175 @@ def test_the_vendored_launcher_builds_the_paper_with_the_project_s_copy(tmp_path
     assert not list(project.rglob("__pycache__"))
 
 
-def test_vendor_check_lists_the_drift_and_vendor_again_updates_the_copy(tmp_path):
+def manifest(project: Path) -> dict:
+    return json.loads((project / "paperkit" / "VENDORED").read_text())
+
+
+def vendored_older(project: Path, name: str, text: str | None = None) -> None:
+    """Makes the copy look vendored from a toolbox whose `name` differed: its manifest's hash of it no longer
+    matches the toolbox's, and with `text` the copy's file holds that older text, as vendor wrote it."""
+    record = manifest(project)
+    if text is None:
+        record["files"][name] = "0" * 64
+    else:
+        (project / name).write_text(text)
+        record["files"][name] = hashlib.sha256(text.encode()).hexdigest()
+    (project / "paperkit" / "VENDORED").write_text(json.dumps(record))
+
+
+def toolbox_commit() -> str:
+    """The toolbox's commit, or how vendor names it when the toolbox is no git checkout (as in the commit
+    hook's copy of the index)."""
+    run = subprocess.run(
+        ["git", "-C", str(LIB), "rev-parse", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return run.stdout.strip() if run.returncode == 0 else "an unknown commit"
+
+
+def test_vendor_records_the_toolbox_commit_and_a_hash_of_each_file_it_wrote(tmp_path):
     project = make_project(tmp_path / "repo", CLEAN, origin=False)
     build_paper(project, "vendor")
+    record = manifest(project)
+    assert record["from"].startswith(
+        f"llm-toolbox {toolbox_commit()}"
+    )  # perhaps "with uncommitted changes"
+    launcher = (project / "bin" / "build-paper").read_bytes()
+    assert record["files"]["bin/build-paper"] == hashlib.sha256(launcher).hexdigest()
+    assert "paperkit/build.py" in record["files"]
+    assert "paperkit/VENDORED" not in record["files"]
+
+
+def test_a_build_with_an_edited_copy_warns_to_upstream_each_edit(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    assert "upstream" not in build_paper(project).stdout
+    with (project / "paperkit" / "fit.py").open("a") as fit:
+        fit.write("# a collaborator's fix\n")
+    (project / "paperkit" / "extra.py").write_text("")
+    result = build_paper(project)
+    assert result.returncode == 0, result.stderr
+    since = f"since it was vendored from {manifest(project)['from']}"
+    upstream = "upstream the change to llm-toolbox's lib/paperkit/ and vendor again"
+    assert (
+        f"  paperkit/extra.py: added {since}; {upstream}" in result.stdout.splitlines()
+    )
+    assert (
+        f"  paperkit/fit.py: edited {since}; {upstream}" in result.stdout.splitlines()
+    )
+
+
+def test_vendor_refuses_to_replace_a_local_edit_and_offers_no_way_round(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    (project / "paperkit" / "fit.py").write_text("# a collaborator's fix\n")
+    result = build_paper(project, "vendor")
+    assert result.returncode == 1
+    assert "paperkit/fit.py" in result.stderr and "upstream" in result.stderr
+    assert (project / "paperkit" / "fit.py").read_text() == "# a collaborator's fix\n"
+    assert "--force" not in build_paper(project, "vendor", "-h").stdout
+
+
+def test_vendor_replaces_a_copy_whose_edits_are_already_upstream(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    vendored_older(
+        project, "paperkit/build.py"
+    )  # the copy now holds what the toolbox does
+    assert build_paper(project, "vendor").returncode == 0
+    built = (project / "paperkit" / "build.py").read_bytes()
+    assert (
+        manifest(project)["files"]["paperkit/build.py"]
+        == hashlib.sha256(built).hexdigest()
+    )
+
+
+def test_vendor_check_tells_edits_in_the_project_from_a_copy_behind_the_toolbox(
+    tmp_path,
+):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    vendored_older(project, "paperkit/typeset.py", "# an older typeset\n")
+    (project / "paperkit" / "build.py").write_text("# edited\n")
+    (project / "paperkit" / "extra.py").write_text("")
+    (project / "paperkit" / "template.typ").unlink()
+    check = build_paper(project, "vendor", "--check")
+    assert check.returncode == 1
+    assert check.stdout.splitlines() == [
+        "paperkit/build.py: edited in the project",
+        "paperkit/extra.py: added in the project",
+        "paperkit/template.typ: removed in the project",
+        "paperkit/typeset.py: behind the toolbox's",
+    ]
+
+
+def test_an_edited_copy_still_builds_the_final_paper(clean):
+    build_paper(clean, "vendor")
+    with (clean / "paperkit" / "fit.py").open("a") as fit:
+        fit.write("# a collaborator's fix\n")
+    git(clean, "add", "-A")
+    git(clean, "commit", "-q", "-m", "vendor, and a fix")
+    git(clean, "push", "-q", "origin", "main")
+    result = build_paper(clean, "--final")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (clean / "paper" / "submission.pdf").exists()
+    assert "paperkit/fit.py: edited since it was vendored" in result.stdout
+
+
+def test_a_broken_manifest_is_a_warning_and_vendor_replaces_the_copy(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    (project / "paperkit" / "VENDORED").write_text(
+        "<<<<<<< HEAD\n"
+    )  # a merge conflict, say
+    result = build_paper(project)
+    assert result.returncode == 0, result.stderr
+    assert any(
+        line.startswith("  paperkit/VENDORED: unreadable")
+        for line in result.stdout.splitlines()
+    )
+    assert build_paper(project, "vendor").returncode == 0
+    assert "upstream" not in build_paper(project).stdout
+
+
+def test_line_endings_a_checkout_changed_are_no_edit(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    fit = project / "paperkit" / "fit.py"
+    fit.write_bytes(
+        fit.read_bytes().replace(b"\n", b"\r\n")
+    )  # git's autocrlf, on Windows
+    assert "upstream" not in build_paper(project).stdout
+    assert build_paper(project, "vendor").returncode == 0
+
+
+def test_vendor_restores_a_file_removed_in_the_project(tmp_path):
+    """A removal holds nothing to upstream, so it doesn't stop vendor: the launcher, say."""
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    (project / "bin" / "build-paper").unlink()
+    (project / "paperkit" / "fit.py").unlink()
+    assert build_paper(project, "vendor").returncode == 0
+    assert (project / "bin" / "build-paper").exists() and (
+        project / "paperkit" / "fit.py"
+    ).exists()
+
+
+def test_a_refused_vendor_says_an_edit_can_also_be_undone(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    (project / "paperkit" / "notes.py").write_text("# a file the toolbox never had\n")
+    result = build_paper(project, "vendor")
+    assert result.returncode == 1
+    assert "paperkit/notes.py" in result.stderr and "undo" in result.stderr
+
+
+def test_vendor_check_without_a_manifest_compares_with_the_toolbox(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    (project / "paperkit" / "VENDORED").unlink()
     (project / "paperkit" / "build.py").write_text("# edited\n")
     (project / "paperkit" / "extra.py").write_text("")
     (project / "paperkit" / "template.typ").unlink()
@@ -508,8 +675,19 @@ def test_vendor_check_lists_the_drift_and_vendor_again_updates_the_copy(tmp_path
         "paperkit/template.typ: missing from the project",
         "paperkit/build.py: differs",
     ]
-    assert build_paper(project, "vendor").returncode == 0
-    assert build_paper(project, "vendor", "--check").returncode == 0
+
+
+def test_vendor_replaces_a_copy_without_a_manifest_naming_what_differed(tmp_path):
+    project = make_project(tmp_path / "repo", CLEAN, origin=False)
+    build_paper(project, "vendor")
+    (project / "paperkit" / "VENDORED").unlink()  # vendored before there were manifests
+    (project / "paperkit" / "fit.py").write_text("# maybe an edit\n")
+    result = build_paper(project, "vendor")
+    assert result.returncode == 0, result.stderr
+    assert "paperkit/fit.py" in result.stdout
+    assert (project / "paperkit" / "fit.py").read_bytes() == (
+        LIB / "paperkit" / "fit.py"
+    ).read_bytes()
 
 
 def test_vendor_leaves_a_build_paper_it_didnt_write_alone(tmp_path):

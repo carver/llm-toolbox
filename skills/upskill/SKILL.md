@@ -19,6 +19,7 @@ Walk the whole transcript, first turn to last. Your context holds only a subagen
 - **Repetition**: the same command sequence, lookup or explanation done more than once.
 - **Missing context**: anything you learned by trial, by asking the user, or by digging through code, that a doc could have told you. That includes hidden dependencies: files that must change together with nothing pointing from one to the other.
 - **Hungry tools**: a CLI, MCP server or script of ours whose output costs more tokens than the agent used. `session-digest`'s biggest outputs are the place to start.
+- **Skipped checks**: grep the raw session logs (`session-digest` names them) for `--no-verify` and `git commit -n`. `agent-commit-gate` allows them in a repo without an agent check, scratch repos included. For each, see whether the repo's hooks would have caught something and whether that commit reached a shared branch (a push, or a merge into main). Skipping the hooks in a throwaway test repo is fine. Skipping them on code that then landed on main is a finding, even when nothing broke.
 
 Done when every failed tool call and hook error, in the main session and in each subagent, and every user correction is accounted for, either as a finding or dismissed with a reason.
 

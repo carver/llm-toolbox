@@ -14,8 +14,10 @@ HERE = Path(__file__).parent
 
 # Tests whose throwaway repos are made with `git init`, `git config` and `git commit`: one for each way
 # test_agent_commit_gate.py makes one (its repo fixture, an installed hook that commits -a, and a repo it
-# inits itself), rather than the whole file.
+# inits itself), rather than the whole file, and one whose module-wide template repo is made by a git()
+# that relies on conftest alone to strip GIT_*.
 GIT_USING_TESTS = [
+    "test_build_state.py::test_finish_folds_each_fixup_into_its_own_commit_and_keeps_the_rest",
     "test_agent_commit_gate.py::test_install_puts_the_line_after_the_shebang_once",
     "test_agent_commit_gate.py::test_commit_all_checks_what_it_commits",
     "test_agent_commit_gate.py::test_install_uses_git_hooks_dir_without_hooks_path",

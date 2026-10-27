@@ -1,6 +1,7 @@
 """bin/build-state, run against a throwaway repo."""
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -9,12 +10,20 @@ import pytest
 SCRIPT = Path(__file__).resolve().parent / "bin" / "build-state"
 
 
+@pytest.fixture(scope="module")
+def template(tmp_path_factory):
+    """A repo on main with one commit, made once: each test copies it."""
+    repo = tmp_path_factory.mktemp("template")
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.name", "t")
+    git(repo, "config", "user.email", "t@example.com")
+    commit(repo, "README", "start")
+    return repo
+
+
 @pytest.fixture
-def repo(tmp_path):
-    git(tmp_path, "init", "-q", "-b", "main")
-    git(tmp_path, "config", "user.name", "t")
-    git(tmp_path, "config", "user.email", "t@example.com")
-    commit(tmp_path, "README", "start")
+def repo(template, tmp_path):
+    shutil.copytree(template, tmp_path, symlinks=True, dirs_exist_ok=True)
     return tmp_path
 
 

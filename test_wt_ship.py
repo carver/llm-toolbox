@@ -1,5 +1,6 @@
 """wt-ship, against a bare remote, a main tree and a detached worktree beside it."""
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -33,20 +34,35 @@ def configure(cwd):
     git(cwd, "config", "user.email", "t@example.com")
 
 
-@pytest.fixture
-def setup(tmp_path):
-    origin = tmp_path / "origin.git"
-    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
-    main = tmp_path / "repo"
-    git(tmp_path, "clone", "-q", str(origin), str(main))
+@pytest.fixture(scope="module")
+def template(tmp_path_factory):
+    """A bare origin, a clone that pushed one commit with a worktree beside it, and a second clone, made
+    once: each test copies them."""
+    folder = tmp_path_factory.mktemp("template")
+    origin = folder / "origin.git"
+    git(folder, "init", "-q", "--bare", "-b", "main", str(origin))
+    main = folder / "repo"
+    git(folder, "clone", "-q", str(origin), str(main))
     configure(main)
     commit(main, "README", "start\n", "start")
     git(main, "push", "-q", "origin", "main")
-    wt = tmp_path / "repo-wt-topic"
-    git(main, "worktree", "add", "-q", "--detach", str(wt))
-    other = tmp_path / "other"
-    git(tmp_path, "clone", "-q", str(origin), str(other))
+    git(main, "worktree", "add", "-q", "--detach", str(folder / "repo-wt-topic"))
+    other = folder / "other"
+    git(folder, "clone", "-q", str(origin), str(other))
     configure(other)
+    return folder
+
+
+@pytest.fixture
+def setup(template, tmp_path):
+    shutil.copytree(template, tmp_path, symlinks=True, dirs_exist_ok=True)
+    origin, main, wt, other = (
+        tmp_path / name for name in ("origin.git", "repo", "repo-wt-topic", "other")
+    )
+    for clone in (main, other):
+        git(clone, "remote", "set-url", "origin", str(origin))
+    # The copies still name the template's paths
+    git(main, "worktree", "repair", str(wt))
     return origin, main, wt, other
 
 

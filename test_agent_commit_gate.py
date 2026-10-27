@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -77,13 +78,24 @@ def git(repo, *args, env=None, check=True):
     )
 
 
+def make_repo(path):
+    git(path, "init", "-q")
+    git(path, "config", "core.hooksPath", ".githooks")
+    git(path, "config", "user.name", "t")
+    git(path, "config", "user.email", "t@t")
+    (path / ".githooks").mkdir()
+    return path
+
+
+@pytest.fixture(scope="module")
+def template(tmp_path_factory):
+    """A repo whose hooks live in .githooks, made once: each test copies it."""
+    return make_repo(tmp_path_factory.mktemp("template"))
+
+
 @pytest.fixture
-def repo(tmp_path):
-    git(tmp_path, "init", "-q")
-    git(tmp_path, "config", "core.hooksPath", ".githooks")
-    git(tmp_path, "config", "user.name", "t")
-    git(tmp_path, "config", "user.email", "t@t")
-    (tmp_path / ".githooks").mkdir()
+def repo(template, tmp_path):
+    shutil.copytree(template, tmp_path, symlinks=True, dirs_exist_ok=True)
     return tmp_path
 
 
@@ -198,9 +210,10 @@ def test_install_refuses_a_repo_without_an_agent_check(repo):
     assert not (repo / ".githooks" / "pre-commit").exists()
 
 
-@pytest.fixture
-def installed(repo):
-    """A repo whose agent check fails when the committed `a` says `bad`."""
+@pytest.fixture(scope="module")
+def installed_template(tmp_path_factory):
+    """A repo whose agent check fails when the committed `a` says `bad`, made once: each test copies it."""
+    repo = make_repo(tmp_path_factory.mktemp("installed"))
     hook(
         repo,
         "agent-pre-commit",
@@ -213,6 +226,12 @@ def installed(repo):
     (repo / "a").write_text("good\n")
     git(repo, "add", "a")
     return repo
+
+
+@pytest.fixture
+def installed(installed_template, tmp_path):
+    shutil.copytree(installed_template, tmp_path, symlinks=True, dirs_exist_ok=True)
+    return tmp_path
 
 
 def ran(repo):

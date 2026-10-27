@@ -64,13 +64,16 @@ def without_repo_vars(env):
 AGENT_VARS = ("AI_AGENT", "AGENT_PRE_COMMIT")
 
 
-@pytest.fixture(autouse=True)
-def no_inherited_repo(monkeypatch):
-    for name in list(os.environ):
-        if redirects_git(name):
-            monkeypatch.delenv(name)
-    for name in AGENT_VARS:
-        monkeypatch.delenv(name, raising=False)
+@pytest.fixture(scope="session", autouse=True)
+def no_inherited_repo():
+    """Session-wide, so module-wide fixtures that make repos run without these too."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        for name in list(os.environ):
+            if redirects_git(name):
+                monkeypatch.delenv(name)
+        for name in AGENT_VARS:
+            monkeypatch.delenv(name, raising=False)
+        yield
 
 
 def started_child(parent: int, arg: str) -> int:

@@ -38,6 +38,7 @@ from paperkit.checks import (
 from paperkit.config import Config
 from paperkit.config import load as load_config
 from paperkit.data import Source, registered
+from paperkit.fit import OverCap, over_cap
 from paperkit.git import Repo
 from paperkit.ledger import DuplicateKey, Ledger, Provenance, display
 from paperkit.lookup import PAGE_TEXTS
@@ -76,6 +77,7 @@ class Report:
     warnings: list[str] = field(
         default_factory=list
     )  # a draft and a final build both print them
+    over_cap: OverCap | None = None  # what to cut, when the paper runs past page_cap
 
 
 _reading: list[set[str]] = []  # the .jsonl files the running data source has opened
@@ -351,4 +353,5 @@ def _build(
         changed=changed,
         problems=problems,
         warnings=unclaimed_wording(paper_text),
+        over_cap=over_cap(page, paper_text, config.page_cap),
     )

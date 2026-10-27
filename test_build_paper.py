@@ -627,3 +627,88 @@ def test_keys_with_no_match_exits_1(two_pages):
     result = build_paper(two_pages, "keys", "nothing.")
     assert result.returncode == 1
     assert "no key starts with nothing." in result.stderr
+
+
+def over_cap_paper() -> str:
+    """Three sentences on page 1, then a page break, a heading and five on page 2 (paper.typ lines 10-14),
+    the References heading partway down it. Line 13 repeats line 4 word for word, and line 6 and line 14
+    each end their paragraph on a short line. Line 16 is a paragraph of one short line, no widow."""
+    lines = [
+        '#import "build/paperkit.typ": *',
+        "#show: paper.with(abstract: [x])",
+        "= Introduction",
+    ]
+    for n in ("one", "two", "three"):
+        lines.append(
+            f"Sentence {n} opens the paper with words of its own, about {n} apples and {n} rivers, long "
+            "enough to wrap onto a second line of the page."
+        )
+    lines += ["", "#pagebreak()", "= Results"]
+    for n in ("four", "five", "six"):
+        lines.append(
+            f"Sentence {n} lands past the cap, with words of its own about {n} lamps and {n} bridges, long "
+            "enough to wrap onto a second line."
+        )
+    lines.append(lines[3])
+    lines.append(
+        "A last sentence ends the paragraph on a word or two, after enough text to fill most of the line "
+        "before it, widow."
+    )
+    lines += ["", "A short one.", "", '#references("refs.bib")']
+    return "\n".join(lines) + "\n"
+
+
+@pytest.fixture(scope="module")
+def over_cap(tmp_path_factory):
+    root = tmp_path_factory.mktemp("over") / "repo"
+    return build_paper(
+        make_project(root, over_cap_paper(), toml="page_cap = 1\n", origin=False)
+    )
+
+
+def report_lines(out: str, heading: str) -> list[str]:
+    """The over-cap report's lines under `heading`, up to the next heading."""
+    lines = out.split("\n")
+    start = next(i for i, line in enumerate(lines) if line.startswith(heading))
+    rest = lines[start + 1 :]
+    end = next(
+        (i for i, line in enumerate(rest) if not line.startswith("  ")), len(rest)
+    )
+    return rest[:end]
+
+
+def test_a_build_over_the_cap_lists_what_lands_past_it_by_paper_typ_line(over_cap):
+    past = report_lines(
+        over_cap.stdout, "Past the page cap (2 pages before References, cap 1):"
+    )
+    assert past[0] == '  page 2  paper.typ:9  "2. Results"'
+    assert past[1].startswith(
+        '  page 2  paper.typ:10  "Sentence four lands past the cap'
+    )
+    numbers = [int(line.split("paper.typ:")[1].split()[0]) for line in past]
+    assert numbers == sorted(numbers) and set(numbers) == {*range(9, 15), 16}
+
+
+def test_the_over_cap_report_gives_the_blank_space_at_the_bottom_of_each_page(over_cap):
+    (blank,) = report_lines(
+        over_cap.stdout, "Blank space at the bottom of each page before References:"
+    )
+    assert blank.startswith("  page 1 ") and blank.endswith(" pt")
+    space = float(blank.removeprefix("  page 1 ").removesuffix(" pt"))
+    assert 400 < space < 650  # page 1 holds a heading and three sentences, of 648 pt
+
+
+def test_the_over_cap_report_lists_short_last_lines_of_paragraphs(over_cap):
+    assert report_lines(over_cap.stdout, "Short last lines of paragraphs:") == [
+        '  page 1  paper.typ:6  "the page."',
+        '  page 2  paper.typ:14  "before it, widow."',
+    ]
+
+
+def test_a_build_within_the_cap_has_no_over_cap_report(tmp_path):
+    project = make_project(
+        tmp_path / "repo", over_cap_paper(), toml="page_cap = 2\n", origin=False
+    )
+    result = build_paper(project)
+    assert result.returncode == 0, result.stderr
+    assert "Past the page cap" not in result.stdout

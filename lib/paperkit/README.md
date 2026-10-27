@@ -141,6 +141,8 @@ figure_font = "Old Standard TT"             # the figures' font (put its files i
 
 A key paperkit doesn't know is an error, so a misspelt rule can't go quietly unchecked.
 
+A build over `page_cap` adds a report for cutting it back: each line of the PDF past the cap, with the `paper.typ` line it comes from (`paper.typ:41`; found by matching the PDF's line against paper.typ's, which works because the paper keeps one sentence per line), the blank space at the bottom of each page before References, and the short last lines of paragraphs, each with its `paper.typ` line, where a few words cut save a line.
+
 `citations_read_check` reads the first table in `citations.md` with `key` and `read` columns: a source the paper cites passes when its row says `full text` (`abstract`, `catalogue`, `secondhand` and `not checked` are the other values it names).
 
 A draft lists what fails and exits 0. `--final` exits 1 on any problem and writes nothing; only a clean one writes the unmarked `<final_name>.pdf` and `<final_name>-numbers.json`, which get committed together.
@@ -171,6 +173,7 @@ An agent builds the paper in a worktree of its own (`git worktree add --detach .
 | `watch.py` | `build-paper watch` |
 | `vendor.py` | `build-paper vendor` |
 | `lookup.py` | `build-paper find` and `keys` |
+| `fit.py` | the over-cap report |
 | `git.py` | the repository: its commit, its changes, what's pushed |
 | `lib.typ` | the Typst functions paper.typ uses, and the draft marks |
 | `template.typ` | the default template |

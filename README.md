@@ -332,7 +332,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   paper gets (no missing key, failing `#claim` or `#todo`, no `;` or `#` Typst
   swallows) always run; `paper/paper.toml` turns on the rest (a page cap, the
   abstract's length, required sections, the template, the `citations.md`
-  check, pushed logs, the PDF's size), each off without its key. `watch`
+  check, pushed logs, the PDF's size), each off without its key. A build over
+  the page cap also reports the PDF's lines past it, each with the
+  `paper.typ` line it comes from, the blank space at the bottom of each page,
+  and the short last lines of paragraphs. `watch`
   recompiles the draft on each save and rebuilds it on each commit. `find
   TEXT` lists the pages of the last build whose text holds TEXT (ignoring case
   and whitespace), with each page's PNG; `keys PREFIX...` prints each ledger

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from paperkit.config import ConfigError
 from paperkit.data import Source
+from paperkit.fit import report as fit_report
 from paperkit.git import Repo
 from paperkit.lookup import shown
 
@@ -71,6 +72,8 @@ def status(report: "Report", final: bool) -> str:
         )
         lines += ["", f"{len(report.problems)} problems ({verdict}):"]
         lines += [f"  {problem.check}: {problem.detail}" for problem in report.problems]
+        if report.over_cap:
+            lines += ["", *fit_report(report.over_cap)]
     elif final and report.pdf:
         name = config.final_name
         lines += [

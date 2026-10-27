@@ -19,6 +19,11 @@ Make it work, then make it good. While implementing, the quality you own is the 
 
 - Red / Green testing
 - Great coverage: e2e and property testing when appropriate (like python hypothesis)
+- Fast tests, so the whole suite runs on every commit:
+  - Run them in parallel from the start (pytest: `pytest-xdist` with `-n auto --maxprocesses=8` in `addopts`; `-n0` for one file).
+  - Avoid spawning an interpreter when another option works: each one pays its imports again, often most of a second. When a test needs one, have it import only the light module it uses.
+  - Wait for a condition by polling it: a fixed sleep costs its full length on every run.
+  - Build an expensive fixture (a git repo, a rendered figure) once per module, and copy it into each test.
 
 Review holds the code to [standards.md](standards.md), in the same order, and a refactor pass applies what it finds. `/build` runs that sequence.
 
@@ -50,7 +55,7 @@ Use CI tools that check lint and tests on main and new pull requests.
 
 A pre-commit hook ends every refusal with a `COMMIT REFUSED: <why>` line, and for an agent (`$AI_AGENT` set) prints nothing on a pass, so its output never needs filtering: agents grep a noisy pass, and the grep hides a refused commit. A person committing still sees the checks run. For the pre-commit framework, `pre-commit-run --install REPO` adds a hook that does this, and also refuses first when `.pre-commit-config.yaml` has unstaged changes, which pre-commit won't run with. A pre-commit hook must finish in under 5 seconds all-in. Anything slower, like end-to-end tests or a from-scratch dev install, goes in CI; create a CI workflow if the repo has none.
 
-Your commits get a slower gate too: when `$AI_AGENT` is set, the repo's pre-commit hook first runs `agent-pre-commit`, an executable beside it (same hooks directory), and fails the commit when it fails. Put the checks CI runs in it, the test suite first, so CI failures show up at your commit instead of after the push. Add one to a repo that has CI and no `agent-pre-commit`, then run `agent-commit-gate --install REPO` to add the line that calls it to the pre-commit hook. Never skip it with `--no-verify`.
+Your commits get a slower gate too: when `$AI_AGENT` is set, the repo's pre-commit hook first runs `agent-pre-commit`, an executable beside it (same hooks directory), and fails the commit when it fails. Put the checks CI runs in it, the test suite first, so CI failures show up at your commit instead of after the push. Run independent checks (tests, type checker, linters) at once, each into a log of its own shown when it ends, and have the hook's exit trap kill the background ones, which ignore Ctrl-C and would outlive it. Add one to a repo that has CI and no `agent-pre-commit`, then run `agent-commit-gate --install REPO` to add the line that calls it to the pre-commit hook. Never skip it with `--no-verify`.
 
 CI builds the dev environment from scratch the documented way (e.g. a fresh venv with `pip install -e '.[dev]'`) before running the checks. When you change packaging, dependencies or dev tooling, run that same from-scratch install yourself before committing. Code that only ever ran from the source tree can hide an uninstallable package.
 

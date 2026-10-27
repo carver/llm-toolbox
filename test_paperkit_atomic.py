@@ -35,7 +35,7 @@ def test_every_output_of_a_build_is_renamed_into_place(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "replace", recording)
     paper_dir = write_minimal(tmp_path / "paper", PAPER)
-    build(paper_dir, sources={"demo": demo})
+    build(paper_dir, sources={"demo": demo}, pictures=True)
     assert {
         "paper/build/numbers.json",
         "paper/build/numbers.md",

@@ -15,7 +15,7 @@ sys.path.insert(0, str(LIB))
 from paperkit.__main__ import main
 from paperkit.config import Config
 from paperkit.git import Repo
-from paperkit.watch import LiveCompile, Watch, live_compile
+from paperkit.watch import DraftBuilds, LiveCompile, Watch, live_compile
 
 SETTLE = 5.0
 
@@ -64,6 +64,11 @@ class Script:
         """The running full build ends; the next poll sees it."""
         self.building = False
         self.poll()
+
+
+def test_a_watch_with_pages_has_its_full_builds_draw_them():
+    assert DraftBuilds(None, print, pictures=True).command()[-1] == "--pages"
+    assert "--pages" not in DraftBuilds(None, print).command()
 
 
 def test_the_start_brings_a_full_build_and_a_live_compile():
@@ -338,6 +343,23 @@ def test_a_repo_with_no_commit_yet_reads_as_no_head(tmp_path):
     repo = Repo.of(tmp_path)
     assert repo is not None
     assert repo.head() == ""
+
+
+def test_watch_pages_has_its_full_builds_draw_them(tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    asked = []
+
+    class Stop(Exception):
+        pass
+
+    def builds(repo, say, pictures=False):
+        asked.append(pictures)
+        raise Stop
+
+    monkeypatch.setattr("paperkit.watch.DraftBuilds", builds)
+    with pytest.raises(Stop):
+        main(["watch", "--pages"], write_minimal(tmp_path / "paper"))
+    assert asked == [True]
 
 
 def test_watch_outside_a_repo_fails_with_why(tmp_path, capsys):

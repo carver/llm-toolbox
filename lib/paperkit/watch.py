@@ -161,17 +161,24 @@ def live_compile(paper_dir: Path, repo: Repo | None, config: Config) -> LiveComp
 class DraftBuilds:
     """Full draft builds, each in a fresh process, so a commit that changes the paper's code takes effect."""
 
-    def __init__(self, repo: Repo, say: Callable[[str], None]) -> None:
+    def __init__(
+        self, repo: Repo, say: Callable[[str], None], pictures: bool = False
+    ) -> None:
         self.repo = repo
         self.say = say
+        self.pictures = pictures
         self.process: subprocess.Popen[bytes] | None = None
+
+    def command(self) -> list[str]:
+        # --here: the watch is the user's own, so its builds are too, wherever it runs
+        flags = ["--pages"] if self.pictures else []
+        return [sys.executable, "-P", "-m", "paperkit", "--here", *flags]
 
     def start(self) -> None:
         subject = self.repo.git("log", "-1", "--format=%h %s").stdout.strip()
         self.say(f"full build at HEAD {subject}")
         self.process = subprocess.Popen(
-            # --here: the watch is the user's own, so its builds are too, wherever it runs
-            [sys.executable, "-P", "-m", "paperkit", "--here"],
+            self.command(),
             cwd=self.repo.root,
             env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"},
         )
@@ -229,6 +236,11 @@ def main(argv: list[str], paper_dir: Path) -> int:
         metavar="SECONDS",
         help="how long the text must be still before a missing key brings a full build (default 5)",
     )
+    parser.add_argument(
+        "--pages",
+        action="store_true",
+        help="have each full build draw a PNG of each page in paper/build/pages/ (build-paper -h)",
+    )
     args = parser.parse_args(argv)
     repo = Repo.of(paper_dir)
     if repo is None:
@@ -238,7 +250,7 @@ def main(argv: list[str], paper_dir: Path) -> int:
         )
         return 1
     config = load_config(paper_dir)
-    builds = DraftBuilds(repo, say)
+    builds = DraftBuilds(repo, say, pictures=args.pages)
 
     def others() -> int | None:
         holder = lock_holder(paper_dir / "build")

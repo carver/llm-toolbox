@@ -3,8 +3,9 @@ the framework's rules and the ones paper.toml turns on (checks.py).
 
 A draft goes to build/DRAFT-paper.pdf, with a watermark and a footer naming the commit on every page. A final
 build checks more (every link resolves, nothing uncommitted, every log it read pushed) and writes the unmarked
-<paper dir>/<final_name>.pdf and its ledger only when every check passes. Both write a PNG of each page to
-build/pages/, and the ledger to build/numbers.json (which paper.typ reads) and build/numbers.md."""
+<paper dir>/<final_name>.pdf and its ledger only when every check passes. Both write the ledger to
+build/numbers.json (which paper.typ reads) and build/numbers.md, and, when asked (`pictures`), a PNG of each
+page to build/pages/."""
 
 import fcntl
 import json
@@ -42,7 +43,7 @@ from paperkit.fit import OverCap, over_cap
 from paperkit.git import Repo
 from paperkit.ledger import DuplicateKey, Ledger, Provenance, display
 from paperkit.lookup import PAGE_TEXTS
-from paperkit.typeset import BuildError, typeset
+from paperkit.typeset import BuildError, Typeset, typeset
 
 __all__ = [
     "DRAFT_NAME",
@@ -65,7 +66,8 @@ PROBLEMS_BUILT = {False: "problems-built.json", True: "problems-built-final.json
 class Report:
     config: Config
     pdf: Path | None  # None when a final build fails: no unmarked PDF is written then
-    pages: list[Path]
+    page_count: int
+    pages: list[Path]  # the picture of each page, when the build drew them (--pages)
     body_pages: int | None
     abstract: str
     abstract_words: int
@@ -214,15 +216,21 @@ def stamp(repo: Repo | None) -> str:
     return f"commit {repo.head()[:7]}{dirty} · built {built}"
 
 
-def write_pages(folder: Path, pngs: list[bytes], texts: list[str]) -> list[Path]:
-    """A picture of each page in `folder`, and each page's text in <folder>/../pages.json, for
-    `build-paper find`."""
+def write_pages(folder: Path, page: Typeset, pictures: bool) -> list[Path]:
+    """Each page's text in <folder>/../pages.json, for `build-paper find`, and with `pictures` a picture of
+    each page in `folder`. Without them, the last pictures move to <folder>.old, kept but plainly stale."""
+    write_atomic(folder.parent / PAGE_TEXTS, json.dumps(page.texts, ensure_ascii=False))
+    if not pictures:
+        if folder.exists():
+            old = folder.with_name(folder.name + ".old")
+            shutil.rmtree(old, ignore_errors=True)
+            folder.rename(old)
+        return []
     shutil.rmtree(folder, ignore_errors=True)
     folder.mkdir(parents=True)
-    pages = [folder / f"page-{number:02}.png" for number in range(1, len(pngs) + 1)]
-    for page, png in zip(pages, pngs, strict=True):
-        write_atomic(page, png)
-    write_atomic(folder.parent / PAGE_TEXTS, json.dumps(texts, ensure_ascii=False))
+    pages = [folder / f"page-{n:02}.png" for n in range(1, len(page.pngs) + 1)]
+    for path, png in zip(pages, page.pngs, strict=True):
+        write_atomic(path, png)
     return pages
 
 
@@ -283,18 +291,25 @@ def _read_pid(lock: IO[str]) -> int | None:
 
 
 def build(
-    paper_dir: Path, sources: Mapping[str, Source] | None = None, final: bool = False
+    paper_dir: Path,
+    sources: Mapping[str, Source] | None = None,
+    final: bool = False,
+    pictures: bool = False,
 ) -> Report:
     """Builds <paper_dir>/paper.typ from `sources` (every data source in <paper_dir>/data/ by default), once
     no other build of it runs, under the rules <paper_dir>/paper.toml turns on. Raises BuildError when Typst
     can't compile it, and ConfigError for a paper.toml it can't read; every other problem is in the report."""
     config = load_config(paper_dir)
     with build_lock(paper_dir / "build"):
-        return _build(paper_dir, sources, final, config)
+        return _build(paper_dir, sources, final, config, pictures)
 
 
 def _build(
-    paper_dir: Path, sources: Mapping[str, Source] | None, final: bool, config: Config
+    paper_dir: Path,
+    sources: Mapping[str, Source] | None,
+    final: bool,
+    config: Config,
+    pictures: bool,
 ) -> Report:
     out, repo = paper_dir / "build", Repo.of(paper_dir)
     shutil.rmtree(out / "figures", ignore_errors=True)
@@ -357,7 +372,8 @@ def _build(
     return Report(
         config=config,
         pdf=pdf,
-        pages=write_pages(out / "pages", page.pngs, page.texts),
+        page_count=len(page.texts),
+        pages=write_pages(out / "pages", page, pictures),
         body_pages=body_pages(page),
         abstract=page.abstract,
         abstract_words=len(page.abstract.split()),

@@ -44,7 +44,8 @@ def find_main(argv: list[str], paper_dir: Path) -> int:
     parser = argparse.ArgumentParser(
         prog="build-paper find",
         description="List each page of the last build whose text holds TEXT, ignoring case and whitespace "
-        "(so a phrase matches across line breaks): its number, and the PNG of it in paper/build/pages/.",
+        "(so a phrase matches across line breaks): its number, and the PNG of it in paper/build/pages/ when "
+        "that build drew one (--pages).",
     )
     parser.add_argument("text", metavar="TEXT")
     args = parser.parse_args(argv)
@@ -57,8 +58,9 @@ def find_main(argv: list[str], paper_dir: Path) -> int:
         print(f"build-paper find: no page holds {args.text!r}", file=sys.stderr)
         return 1
     for number in numbers:
+        picture = paper_dir / "build" / "pages" / f"page-{number:02}.png"
         print(
-            f"page {number}  {shown(paper_dir / 'build' / 'pages' / f'page-{number:02}.png')}"
+            f"page {number}  {shown(picture)}" if picture.exists() else f"page {number}"
         )
     return 0
 

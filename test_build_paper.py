@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -135,16 +136,46 @@ def problems(out: str) -> list[str]:
     return [line.strip().removeprefix("[new] ") for line in listed]
 
 
-def test_a_draft_is_named_draft_has_a_picture_of_every_page_and_exits_0(flawed):
+def test_a_draft_is_named_draft_draws_no_page_pictures_unless_asked_and_exits_0(flawed):
     project, result = flawed
     assert result.returncode == 0, result.stderr
     draft = project / "paper" / "build" / "DRAFT-paper.pdf"
-    assert result.stdout.startswith("paper/build/DRAFT-paper.pdf: ")
+    # Code and Data and References share the last page
+    assert result.stdout.startswith(
+        "paper/build/DRAFT-paper.pdf: 10 pages (no pictures of them; "
+    )
+    assert "--pages" in result.stdout.splitlines()[0]
     assert draft.read_bytes().startswith(b"%PDF")
-    pages = sorted((project / "paper" / "build" / "pages").glob("page-*.png"))
-    assert len(pages) == 10  # Code and Data and References share the last
-    assert all(page.read_bytes().startswith(b"\x89PNG") for page in pages)
+    assert not (project / "paper" / "build" / "pages").exists()
     assert not (project / "paper" / "submission.pdf").exists()
+
+
+def pictures(folder: Path) -> list[Path]:
+    return sorted(folder.glob("page-*.png"))
+
+
+def test_pages_draws_a_picture_of_every_page(two_pages):
+    pages = pictures(two_pages / "paper" / "build" / "pages")
+    assert [page.name for page in pages] == ["page-01.png", "page-02.png"]
+    assert all(page.read_bytes().startswith(b"\x89PNG") for page in pages)
+
+
+def test_a_build_without_pages_keeps_the_last_pictures_as_pages_old(tmp_path):
+    project = make_project(tmp_path / "repo", TWO_PAGES, toml=None, origin=False)
+    build = project / "paper" / "build"
+    build_paper(project, "--pages")
+    first = [page.read_bytes() for page in pictures(build / "pages")]
+    build_paper(project)
+    assert not (build / "pages").exists()
+    assert [page.read_bytes() for page in pictures(build / "pages.old")] == first
+    build_paper(project)  # no pages/ to move this time: pages.old stays
+    assert len(pictures(build / "pages.old")) == 2
+    result = build_paper(project, "find", "second page")
+    assert result.stdout == "page 2\n"  # no picture to name
+    build_paper(project, "--pages")
+    again = build_paper(project)  # moves these pictures over the older pages.old
+    assert again.returncode == 0, again.stderr
+    assert len(pictures(build / "pages.old")) == 2
 
 
 # A paper that sets the figure source's figure: the only build here that draws one.
@@ -581,7 +612,7 @@ def two_pages(tmp_path_factory):
     project = make_project(
         tmp_path_factory.mktemp("two") / "repo", TWO_PAGES, toml=None, origin=False
     )
-    build_paper(project)
+    build_paper(project, "--pages")
     return project
 
 

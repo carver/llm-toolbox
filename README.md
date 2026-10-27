@@ -326,9 +326,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **build-paper**: builds a project's Typst paper, `paper/paper.typ`, with
   paperkit (`lib/paperkit/`, whose README says how to write one): fills in its
   numbers, tables and figures from the data sources in `paper/data/`, compiles
-  it, and checks it. The draft goes to `paper/build/DRAFT-paper.pdf`, with a
-  PNG of each page; `--final` writes the unmarked submission only when every
-  check passes, every link resolves and the tree is clean. The checks every
+  it, and checks it. The draft goes to `paper/build/DRAFT-paper.pdf` (with a
+  PNG of each page under `--pages`); `--final` writes the unmarked submission
+  only when every check passes, every link resolves and the tree is clean. The checks every
   paper gets (no missing key, failing `#claim` or `#todo`, no `;` or `#` Typst
   swallows) always run; `paper/paper.toml` turns on the rest (a page cap, the
   abstract's length, required sections, the template, the `citations.md`
@@ -339,8 +339,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   problem that's new since the last build, and counts them. `watch`
   recompiles the draft on each save and rebuilds it on each commit. `find
   TEXT` lists the pages of the last build whose text holds TEXT (ignoring case
-  and whitespace), with each page's PNG; `keys PREFIX...` prints each ledger
-  key starting with a PREFIX, its value and rate on one line (`--how` adds how
+  and whitespace), with each page's PNG when that build drew them; `keys
+  PREFIX...` prints each ledger key starting with a PREFIX, its value and rate on one line (`--how` adds how
   it was computed and its logs). It runs
   inside the project's own uv environment, so a data source can import the
   project's code, with paperkit's pinned dependencies added. `vendor` copies

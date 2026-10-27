@@ -13,10 +13,13 @@ Builds a paper written in [Typst](https://typst.app/docs/) whose numbers, tables
 | `paper/build/` | the build's output; don't commit it (add `paper/build/` to `.gitignore`) |
 
 ```bash
-build-paper           # the draft: paper/build/DRAFT-paper.pdf, and paper/build/pages/page-NN.png
+build-paper           # the draft: paper/build/DRAFT-paper.pdf
+build-paper --pages   # also a picture of each page, paper/build/pages/page-NN.png (a build without
+                      # --pages moves the last ones to paper/build/pages.old/; until 2026-10-27 every
+                      # build drew them)
 build-paper --final   # the submission: paper/<final_name>.pdf, only when every check passes
 build-paper watch     # the draft now, recompiled on each save and rebuilt on each commit (below)
-build-paper find TEXT # the pages of the last build holding TEXT, with their PNGs
+build-paper find TEXT # the pages of the last build holding TEXT, with their PNGs when it drew them
 build-paper keys PREFIX...  # each ledger key starting with a PREFIX: its value and rate (--how: how, and its logs)
 ```
 

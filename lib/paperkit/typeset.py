@@ -7,7 +7,9 @@ names, else that default."""
 
 import io
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +32,8 @@ class BuildError(RuntimeError):
 @dataclass(frozen=True)
 class Typeset:
     pdf: bytes
-    pngs: list[bytes]
+    # Typst's page images, which `pngs` renders when first asked for
+    render: Callable[[], bytes | list[bytes] | None]
     warnings: list[str]
     abstract: str
     # "key: why", for each number, table, figure or text the ledger couldn't supply
@@ -51,6 +54,14 @@ class Typeset:
     top: float  # its top margin (pt)
     bottom: float  # its bottom margin (pt)
     texts: list[str]  # each page's text, as the PDF holds it, line by line
+
+    @cached_property
+    def pngs(self) -> list[bytes]:
+        """A picture of each page, rendered on first use: a third of a build, which most builds skip."""
+        pngs = self.render()
+        if pngs is None:
+            raise BuildError("Typst returned no page images")
+        return pngs if isinstance(pngs, list) else [pngs]
 
 
 def page_texts(pdf: bytes) -> list[str]:
@@ -118,9 +129,8 @@ def typeset(paper_dir: Path, inputs: dict[str, str], config: Config) -> Typeset:
 
     try:
         pdf, warnings = compiler.compile_with_warnings(format="pdf")
-        pngs = compiler.compile(format="png", ppi=PPI)
-        if not isinstance(pdf, bytes) or pngs is None:
-            raise BuildError("Typst returned no PDF, or no page images")
+        if not isinstance(pdf, bytes):
+            raise BuildError("Typst returned no PDF")
         abstract = query("<abstract>")
         references = query("<references>")
         figures = query("figure")
@@ -132,7 +142,7 @@ def typeset(paper_dir: Path, inputs: dict[str, str], config: Config) -> Typeset:
         )
         typeset = Typeset(
             pdf=pdf,
-            pngs=pngs if isinstance(pngs, list) else [pngs],
+            render=lambda: compiler.compile(format="png", ppi=PPI),
             texts=page_texts(pdf),
             warnings=[warning.message for warning in warnings],
             abstract=" ".join(plain(abstract[0]["value"]).split()) if abstract else "",

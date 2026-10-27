@@ -29,15 +29,19 @@ def project_paper() -> Path:
 def status(report: "Report", final: bool) -> str:
     """The block a build ends with: the paper's measures, what changed, its problems and its warnings."""
     config = report.config
-    folder = shown(report.pages[0].parent) if report.pages else "no pages"
+    pictures = (
+        f"pictures of each page in {shown(report.pages[0].parent)}"
+        if report.pages
+        else "no pictures of them; --pages draws them"
+    )
     head = (
-        f"{shown(report.pdf)}: {len(report.pages)} pages"
+        f"{shown(report.pdf)}: {report.page_count} pages"
         if report.pdf
         else "Final build refused"
     )
     cap = f" (cap {config.page_cap})" if config.page_cap is not None else ""
     size = f" (cap {config.max_pdf_mb:g} MB)" if config.max_pdf_mb is not None else ""
-    lines = [f"{head} (pictures of each page in {folder})"]
+    lines = [f"{head} ({pictures})"]
     if report.body_pages is not None or config.page_cap is not None:
         lines.append(f"  pages before References  {report.body_pages}{cap}")
     if config.abstract_words is not None:
@@ -122,8 +126,8 @@ def build_main(
         prog="build-paper",
         description="Build the project's paper/paper.typ: fill in its numbers, tables and figures from the "
         "data sources in paper/data/, compile it, and check it against the rules paper/paper.toml turns on. "
-        "Writes paper/build/DRAFT-paper.pdf, a PNG of each page in paper/build/pages/, and the ledger in "
-        "paper/build/numbers.json and numbers.md (paperkit's README.md). Other commands, each with its "
+        "Writes paper/build/DRAFT-paper.pdf and the ledger in paper/build/numbers.json and numbers.md "
+        "(paperkit's README.md); with --pages, a PNG of each page in paper/build/pages/. Other commands, each with its "
         "own -h: `build-paper watch` rebuilds the draft as the paper changes; `build-paper find TEXT` lists "
         "the pages holding TEXT; `build-paper keys PREFIX...` prints ledger keys; `build-paper vendor` copies "
         "paperkit into the project, and `vendor --check` lists where that copy differs from the toolbox's.",
@@ -141,6 +145,12 @@ def build_main(
         help="build even in the repo's main worktree when $AI_AGENT is set (an agent builds in a "
         "worktree of its own by default, so its build can't collide with the user's `build-paper watch`)",
     )
+    parser.add_argument(
+        "--pages",
+        action="store_true",
+        help="draw a PNG of each page in paper/build/pages/ (a third of a small paper's build time); "
+        "a build without it moves the last ones to paper/build/pages.old/",
+    )
     args = parser.parse_args(argv)
     if not (paper_dir / "paper.typ").is_file():
         print(f"build-paper: no paper/paper.typ in {paper_dir.parent}", file=sys.stderr)
@@ -151,7 +161,7 @@ def build_main(
     from paperkit.build import BuildError, build
 
     try:
-        report = build(paper_dir, sources, final=args.final)
+        report = build(paper_dir, sources, final=args.final, pictures=args.pages)
     except ConfigError as error:
         print(f"build-paper: {error}", file=sys.stderr)
         return 1

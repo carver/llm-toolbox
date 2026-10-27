@@ -1,2 +1,7 @@
 pytest==9.1.1
 ruff==0.16.10
+# paperkit (lib/paperkit/): the same pins as its requirements.txt (test_paperkit_ledger.py checks)
+matplotlib==3.11.2
+pillow==12.3.0
+pypdf==6.19.0
+typst==0.15.0

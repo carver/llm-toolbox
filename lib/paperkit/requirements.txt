@@ -1,0 +1,5 @@
+# paperkit's own dependencies, which bin/build-paper adds to the project's uv environment (uv run --with-requirements).
+matplotlib==3.11.2
+pillow==12.3.0
+pypdf==6.19.0
+typst==0.15.0

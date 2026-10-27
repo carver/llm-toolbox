@@ -48,6 +48,10 @@ A new user-level skill or tool goes in llm-toolbox (`skills/` or `bin/`), then r
 
 Before scraping a site, look for its data source: an official API or MCP endpoint (often linked as "use with your AI assistant"), an applicant-tracking-system API such as Greenhouse's `boards-api`, or JSON embedded in the page. These return complete, structured data and usually skip the bot checks that block scripted page fetches.
 
+## Profiling
+
+To find what's slow, start with a sampling profiler (`py-spy` for Python, `--subprocesses` for the interpreters it spawns): it disturbs what it measures far less than cProfile, `strace -f` or a hand-built timing loop. Compare timings with `hyperfine`, not repeated runs by hand. Reach for deterministic tracing only for what sampling can't tell, such as an exact call count.
+
 ## Claude from code
 
 Claude runs on my subscription; there is no `ANTHROPIC_API_KEY`, so don't reach for the Anthropic SDK. When a script or cron job needs an answer from Claude, pipe the prompt to `claude-fresh --json SCHEMA` for typed data, or `claude-fresh --text` for prose (llm-toolbox/bin, on PATH; `-h` for options). It locks the call down for untrusted text.

@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Build the project's Typst paper, paper/paper.typ, with paperkit (lib/paperkit/README.md).
+
+Runs `python -m paperkit` inside the project's own uv environment (`uv run`, so a data source in
+paper/data/ can import the project's code), with paperkit's pinned dependencies added
+(`--with-requirements paperkit/requirements.txt`). The project is the git repository holding the
+working directory, or the working directory outside one. When the project has its own copy,
+paperkit/ at its root (`build-paper vendor`), that copy runs, never the toolbox's; `vendor`
+itself always runs the toolbox's. `build-paper -h` lists the options and the other commands.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+TOOLBOX_LIB = Path(__file__).resolve().parent.parent / "lib"
+
+
+def project_root() -> Path:
+    found = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return Path(found.stdout.strip()) if found.returncode == 0 else Path.cwd()
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    root = project_root()
+    vendored = (root / "paperkit" / "__main__.py").is_file() and argv[:1] != ["vendor"]
+    lib = root if vendored else TOOLBOX_LIB
+    if shutil.which("uv") is None:
+        print(
+            "build-paper: needs uv on PATH: https://docs.astral.sh/uv/", file=sys.stderr
+        )
+        return 1
+    path = os.environ.get("PYTHONPATH")
+    env = os.environ | {"PYTHONPATH": f"{lib}{os.pathsep}{path}" if path else str(lib)}
+    requirements = lib / "paperkit" / "requirements.txt"
+    command = ["uv", "run", "-q", "--with-requirements", str(requirements)]
+    os.execvpe("uv", [*command, "python", "-m", "paperkit", *argv], env)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -7,8 +7,8 @@ until its key is set; a key paperkit doesn't know is an error, so a misspelt rul
     after_references = ["Limitations"] # sections that must come after References (appendices)
     template = "apart.typ"             # the project's own template, from paper/ (else paperkit's)
     citations_read_check = true        # every cited source's row in citations.md says `full text`
-    logs_dir = "logs"                  # record the files under it each number came from; --final
-                                       # needs each one pushed to `upstream`
+    logs_dir = "logs"                  # --final needs each log under it that a number came from
+                                       # pushed to `upstream`
     upstream = "origin/main"           # the branch --final checks the logs against
     final_name = "paper"               # --final writes paper/<final_name>.pdf and its ledger
     max_pdf_mb = 25                    # the PDF's size cap, in MB

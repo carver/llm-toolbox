@@ -1,0 +1,158 @@
+# paperkit
+
+Builds a paper written in [Typst](https://typst.app/docs/) whose numbers, tables and figures come from code, never typed by hand, and checks it. A project keeps its paper in `paper/`:
+
+| file | what |
+|---|---|
+| `paper/paper.typ` | the paper |
+| `paper/paper.toml` | which optional rules the build checks (below); optional |
+| `paper/data/*.py` | the data sources, which fill the ledger |
+| `paper/*.bib` | the references |
+| `paper/citations.md` | what each source supports and how much of it was read, for `citations_read_check` |
+| `paper/fonts/` | fonts for Typst and the figures; optional |
+| `paper/build/` | the build's output; don't commit it (add `paper/build/` to `.gitignore`) |
+
+```bash
+build-paper           # the draft: paper/build/DRAFT-paper.pdf, and paper/build/pages/page-NN.png
+build-paper --final   # the submission: paper/<final_name>.pdf, only when every check passes
+build-paper watch     # the draft now, recompiled on each save and rebuilt on each commit (below)
+```
+
+`build-paper` is llm-toolbox's `bin/build-paper`. It runs paperkit inside the project's own uv environment (`uv run`, so a data source can import the project's code), with paperkit's pinned dependencies (`requirements.txt`) added. The project is the git repository holding the working directory. paperkit started as a copy of the paper build in apart-research-collusion-sprint-2026 (`paper/`, at 1f78fba).
+
+## Writing
+
+Start `paper.typ` with paperkit's functions and the layout:
+
+```typst
+#import "build/paperkit.typ": *
+#show: paper.with(
+  title: [The title],
+  authors: ((name: [Ada Lovelace], affiliation: [Analytical Engines]),),
+  abstract: [...],
+)
+```
+
+Every build writes `build/paperkit.typ` (this folder's `lib.typ`) and the default template beside it, so paper.typ compiles from a fresh checkout after one build.
+
+Write one sentence per line, so diffs and merges go sentence by sentence. Never type a number from the data. Cite it by its key, and the build fills it in:
+
+| in paper.typ | renders | for |
+|---|---|---|
+| `#n("exp1.same.hits")` | 43/48 | a count, or a plain value |
+| `#pct("exp1.same.hits")` | 90% | a count as a whole percent |
+| `#ci("exp1.same.hits")` | 90% (78–96%) | one cell's rate with its 95% Wilson interval |
+| `#claim("text", (keys...), test)` | nothing, when it holds | wording that depends on the numbers |
+| `#data-table("exp1-table")` | a table | inside `#figure(...)`, captioned and labelled |
+| `#data-figure("exp1-figure", width: 100%)` | the figure | the same |
+| `#data-text("exp1.prompt")` | the text, verbatim | prompts in an appendix |
+| `#todo[...]` | red TODO | anything still to write |
+| `#references("refs.bib")` | the References section | where the body ends, for `page_cap` |
+
+`build/numbers.md` lists every key with its value, how it was computed and the logs it came from, then each table's rows.
+
+Point to a section with `@label` (`= Methods <sec-methods>`): it prints "Section 3", with no period of its own, so a sentence can end with it. A subsection, or an unnumbered section, prints its title, and `@label[the scope]` prints those words; either links to the heading.
+
+An interval belongs to one cell: rows drawn from one distribution. A count pooled across cells has no interval, and `#ci` on it shows a red marker. Name the fields one cell's rows share in paper.toml (`cell = ["model", "prompt_hash"]`), and a rate over rows that differ in one of them is refused.
+
+Put a `#claim` beside any sentence whose wording the data could make false: "most", "fell", "every model". The test gets each key's rate (or a plain value's value), in order:
+
+```typst
+#claim("the new prompt raises the hit rate", ("exp1.new.hits", "exp1.base.hits"), (new, base) => new > base)
+```
+
+A draft marks a failing claim in red. `--final` refuses it.
+
+## Data sources
+
+Each module in `paper/data/` registers sources. A source is a function that fills a ledger:
+
+```python
+from paperkit import Ledger, source
+
+
+@source("exp1")
+def exp1(ledger: Ledger) -> None:
+    rows = load_rows("logs/exp1/results.jsonl")  # the project's own reader
+    ledger.rate(
+        "exp1.same.hits", cell_rows, lambda row: row["hit"], how="hits / replies"
+    )  # one cell
+    ledger.pooled(
+        "exp1.hits", rows, lambda row: row["hit"], how="all models"
+    )  # no interval
+    ledger.table("exp1-table", header, rows_of_strings, how="...")
+    ledger.figure(
+        "exp1-figure", draw, data, how="..."
+    )  # draw(ax, data) with matplotlib
+    ledger.value("exp1.calls", len(rows), how="calls")
+    ledger.text("exp1.prompt", prompt, how="the prompt, verbatim")
+```
+
+The modules are imported as `paper.data.NAME`, with the project root on the import path. The build runs each source into its own ledger and refuses two that claim one key. A source that raises adds nothing, and its keys show as missing. It records which logs (`.jsonl` files) each source opened, for `numbers.md` and `keys --how`. Figures come out as SVG with their text left as text, in `figure_font`.
+
+## Templates
+
+paperkit's `template.typ` is a plain article. A project's own template, named by `template` in paper.toml, is a `.typ` file in `paper/` that exports three functions: `paper(..args, body)`, the layout, taking whatever named arguments paper.typ passes (`abstract` among them); `unnumbered(title)`, a section heading with no number; and `appendix(body)`, which numbers its sections as appendices. paperkit adds the draft marks, the abstract's word count and the cross-reference rules around it. lib.typ sets the draft marks as the page's `background` and `footer`, so a template that sets its own `footer` (page numbers, say) hides the draft stamp with the commit and build time, as its own `background` would hide the watermark.
+
+## What a build checks
+
+Always:
+
+- every number, table, figure and text in the ledger
+- every claim holds
+- no `#todo` markers
+- no call followed straight by a semicolon (`#n("key");`): Typst ends the call there and drops the `;`, so write `\;`
+- no `#` before a digit (`(#39)`): Typst prints the number without the `#`, so write `\#39`
+- every figure referenced in the text, and drawn under the section it's written in (a float that doesn't fit on its page moves on, past the next section's heading; a figure without a caption isn't checked)
+- in `--final`: every link in the PDF resolves (a network failure counts), and there are no uncommitted changes
+
+It also warns, without refusing anything, about a sentence that cites the ledger and holds a word such as "every", "none", "most" or "fell" with no `#claim` later in its paragraph.
+
+`paper/paper.toml` turns on the rest. Without its key, a check doesn't run:
+
+```toml
+page_cap = 8                                # pages before References, the title block included
+abstract_words = [150, 250]                 # the abstract's length, in words
+required_sections = ["Code and Data"]       # headings the paper must have
+after_references = ["Limitations"]          # headings that must come after References (appendices)
+template = "mytemplate.typ"                 # the project's template, in paper/ (else paperkit's)
+citations_read_check = true                 # each cited source's row in citations.md reads `full text`
+logs_dir = "logs"                           # have --final refuse a log under it that a number came
+                                            # from, when it isn't pushed to `upstream`
+upstream = "origin/main"                    # the default
+final_name = "paper"                        # --final writes paper/<final_name>.pdf (the default)
+max_pdf_mb = 25                             # the PDF's size cap
+cell = ["model", "prompt_hash"]             # the fields one cell's rows share
+figure_font = "Old Standard TT"             # the figures' font (put its files in paper/fonts/)
+```
+
+A key paperkit doesn't know is an error, so a misspelt rule can't go quietly unchecked.
+
+`citations_read_check` reads the first table in `citations.md` with `key` and `read` columns: a source the paper cites passes when its row says `full text` (`abstract`, `catalogue`, `secondhand` and `not checked` are the other values it names).
+
+A draft lists what fails and exits 0. `--final` exits 1 on any problem and writes nothing; only a clean one writes the unmarked `<final_name>.pdf` and `<final_name>-numbers.json`, which get committed together.
+
+Each draft page carries a DRAFT watermark and a footer with the commit and build time, so a draft can't pass for the submission. Each build lists the ledger entries that changed since the last build that compiled, all of them in `build/changes.md`.
+
+## Watching
+
+`watch` keeps `build/DRAFT-paper.pdf` current while you write. A save of any `.typ` or `.bib` in `paper/` recompiles it within a second or two, from the numbers and figures of the last full build, and prints Typst's error when it can't. A full build runs in the background each time HEAD moves, and when the text cites a key the ledger lacks, once the text has been still for five seconds (`--settle`). Open the PDF in a viewer that reloads a changed file, such as Skim, VS Code or Zathura; macOS Preview doesn't.
+
+Only one build of a tree runs at a time: a build holds `build/.lock`, and another waits for it, so a watch's builds and another build can't clear each other's figures. A watch says when another process's build pauses it. Whether a lock taken on a host is seen by a build inside a sandbox that mounts the repo, or the other way round, is untested.
+
+## Files
+
+| file | what |
+|---|---|
+| `__main__.py` | the command line |
+| `build.py` | a build: the sources into the ledger, Typst, the checks, the outputs |
+| `checks.py` | the rules |
+| `config.py` | paper.toml |
+| `data.py` | `@source` and finding the project's sources |
+| `ledger.py`, `figures.py` | the ledger, and drawing its figures |
+| `typeset.py` | compiling with Typst and querying the result |
+| `watch.py` | `build-paper watch` |
+| `git.py` | the repository: its commit, its changes, what's pushed |
+| `lib.typ` | the Typst functions paper.typ uses, and the draft marks |
+| `template.typ` | the default template |
+| `requirements.txt` | the pinned dependencies `build-paper` adds |

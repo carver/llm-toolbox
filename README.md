@@ -323,6 +323,21 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   overrides). Exits 1 when not found, when a URL is not a PDF or when a DOI
   has no BibTeX, 3 when the remote still refuses.
 
+- **build-paper**: builds a project's Typst paper, `paper/paper.typ`, with
+  paperkit (`lib/paperkit/`, whose README says how to write one): fills in its
+  numbers, tables and figures from the data sources in `paper/data/`, compiles
+  it, and checks it. The draft goes to `paper/build/DRAFT-paper.pdf`, with a
+  PNG of each page; `--final` writes the unmarked submission only when every
+  check passes, every link resolves and the tree is clean. The checks every
+  paper gets (no missing key, failing `#claim` or `#todo`, no `;` or `#` Typst
+  swallows) always run; `paper/paper.toml` turns on the rest (a page cap, the
+  abstract's length, required sections, the template, the `citations.md`
+  check, pushed logs, the PDF's size), each off without its key. `watch`
+  recompiles the draft on each save and rebuilds it on each commit. It runs
+  inside the project's own uv environment, so a data source can import the
+  project's code, with paperkit's pinned dependencies added. Started as a copy
+  of apart-research-collusion-sprint-2026's `paper/` build.
+
 ## Checks
 
 ```bash
@@ -332,7 +347,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 It checks what's staged. `install.py` points git at `.githooks`. Its `pre-commit` runs the two ruff checks on
 what's staged. When only formatting fails, it formats each staged file that has no unstaged changes,
 stages the result and names the file; any other unformatted file refuses the commit, as does every
-file of a `git commit PATH`. `agent-pre-commit` adds the tests (about 50 seconds), and
+file of a `git commit PATH`. `agent-pre-commit` adds the tests (about two and a half
+minutes, most of it build-paper's Typst builds), and
 `pre-commit` runs it first when an agent commits. Both run the tools
 through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.

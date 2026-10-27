@@ -77,16 +77,14 @@ class Report:
     )  # a draft and a final build both print them
 
 
-# While a source runs: the folder whose files count as its logs, and the files under it the source opened
-_reading: list[tuple[str, set[str]]] = []
+_reading: list[set[str]] = []  # the .jsonl files the running data source has opened
 
 
 def _record_reads(event: str, args: tuple[Any, ...]) -> None:
     if event == "open" and _reading and isinstance(args[0], str | os.PathLike):
-        path, mode = os.path.abspath(os.fspath(args[0])), args[1]
-        logs, read = _reading[-1]
-        if path.startswith(logs + os.sep) and (mode is None or "r" in str(mode)):
-            read.add(path)
+        path, mode = os.fspath(args[0]), args[1]
+        if str(path).endswith(".jsonl") and (mode is None or "r" in str(mode)):
+            _reading[-1].add(os.path.abspath(path))
 
 
 sys.addaudithook(
@@ -99,16 +97,14 @@ def fill(
     out: Path,
     repo: Repo | None,
     config: Config,
-    logs: Path | None,
 ) -> tuple[Ledger, list[Problem]]:
     """Runs each source into a ledger of its own and merges them, each entry stamped with its source and the
-    files under `logs` it read. A source that fails, or claims a key another has, adds nothing and is a
+    logs (.jsonl files) it read. A source that fails, or claims a key another has, adds nothing and is a
     problem."""
     ledger, problems = Ledger(out, config.cell), []
     for name, function in sources.items():
         part = Ledger(out, config.cell)
-        # No logs folder: a path no file is under, so nothing is recorded
-        _reading.append((os.path.abspath(logs) if logs else "\0", set()))
+        _reading.append(set())
         try:
             function(part)
         except Exception as error:  # noqa: BLE001  (a source can fail any way; its keys then show missing)
@@ -117,7 +113,7 @@ def fill(
             )
             continue
         finally:
-            _, read = _reading.pop()
+            read = _reading.pop()
         opened = tuple(sorted(repo.relative(path) if repo else path for path in read))
         try:
             ledger.merge(
@@ -278,13 +274,8 @@ def _build(
     out, repo = paper_dir / "build", Repo.of(paper_dir)
     shutil.rmtree(out / "figures", ignore_errors=True)
     figures.use_fonts(paper_dir / "fonts", config.figure_font)
-    logs = (
-        (repo.root if repo else paper_dir.parent) / config.logs_dir
-        if config.logs_dir
-        else None
-    )
     sources = registered(paper_dir) if sources is None else sources
-    ledger, problems = fill(sources, out / "figures", repo, config, logs)
+    ledger, problems = fill(sources, out / "figures", repo, config)
     numbers, built = (
         out / "numbers.json",
         out / "numbers-built.json",

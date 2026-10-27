@@ -340,10 +340,13 @@ def broken_links(page: Typeset) -> list[Problem]:
 
 def unshipped(repo: Repo | None, logs: list[str], config: Config) -> list[Problem]:
     """What keeps the build from matching a commit anyone can check out: uncommitted changes, and, when
-    paper.toml names a logs_dir, logs the numbers came from that aren't committed or pushed to its upstream."""
+    paper.toml names a logs_dir, the logs under it the numbers came from that aren't committed or pushed to
+    its upstream."""
     if repo is None:
         return [Problem("git", "the paper isn't in a git repository")]
-    unpushed = repo.unpushed(logs, config.upstream) if config.logs_dir else []
+    folder = config.logs_dir.rstrip("/") + "/" if config.logs_dir else None
+    checked = [log for log in logs if folder and log.startswith(folder)]
+    unpushed = repo.unpushed(checked, config.upstream) if checked else []
     return [
         *(Problem("dirty", path) for path in repo.dirty()),
         *(Problem("unpushed", log) for log in unpushed),

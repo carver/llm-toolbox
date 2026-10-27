@@ -721,3 +721,152 @@ def test_finish_finds_the_agent_check_from_a_subdirectory(repo):
 
     assert done.returncode == 0, done.stderr
     assert checked.read_text().split() == ["checked"]
+
+
+def test_review_prompt_recommends_a_coding_standards_file_when_the_repo_has_none(
+    repo, tmp_path
+):
+    build_state(repo, "start")
+    commit(repo, "a.py", "Add a")
+    brief = tmp_path / "brief.md"
+    brief.write_text("The brief.\n")
+    skill = code_review_skill(tmp_path)
+    without = build_state(repo, "review-prompt", str(brief), "--skill", str(skill))
+    assert without.returncode == 0, without.stderr
+    assert "CODING_STANDARDS.md" in without.stderr
+    assert (
+        "CODING_STANDARDS.md" not in without.stdout
+    )  # the reviewer's prompt is unchanged
+    commit(repo, "CODING_STANDARDS.md", "The house rules")
+    again = build_state(repo, "review-prompt", str(brief), "--skill", str(skill))
+    assert again.stderr == ""
+
+
+def trees(repo, count):
+    return git(repo, "log", "--format=%T", f"-{count}").split()
+
+
+def test_reword_replaces_one_commits_message_and_keeps_every_tree(repo, tmp_path):
+    commit(repo, "a", "first")
+    second = commit(repo, "b", "second")
+    commit(repo, "c", "third")
+    before = trees(repo, 4)
+    message = tmp_path / "message"
+    message.write_text("second, reworded\n\nWith a body.\n")
+    result = build_state(repo, "reword", second, str(message))
+    assert result.returncode == 0, result.stderr
+    assert trees(repo, 4) == before
+    assert subjects(repo, "HEAD~3") == ["first", "second, reworded", "third"]
+    assert git(repo, "log", "-1", "--format=%b", "HEAD~1").strip() == "With a body."
+
+
+def test_reword_takes_the_message_from_stdin_and_rewords_head_too(repo):
+    commit(repo, "a", "first")
+    result = subprocess.run(
+        [str(SCRIPT), "reword", "HEAD"],
+        cwd=repo,
+        input="first, reworded\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert subjects(repo, "HEAD~1") == ["first, reworded"]
+
+
+def test_reword_refuses_with_uncommitted_changes(repo, tmp_path):
+    sha = commit(repo, "a", "first")
+    (repo / "a").write_text("unsaved work\n")
+    message = tmp_path / "message"
+    message.write_text("reworded\n")
+    result = build_state(repo, "reword", sha, str(message))
+    assert result.returncode == 1
+    assert "uncommitted" in result.stderr.lower()
+    assert subjects(repo, "HEAD~1") == ["first"]
+    assert (repo / "a").read_text() == "unsaved work\n"
+
+
+def test_reword_refuses_a_pushed_commit(repo, tmp_path):
+    sha = commit(repo, "a", "first")
+    git(tmp_path, "init", "-q", "--bare", str(tmp_path / "origin.git"))
+    git(repo, "remote", "add", "origin", str(tmp_path / "origin.git"))
+    git(repo, "push", "-q", "origin", "main")
+    message = tmp_path / "message"
+    message.write_text("reworded\n")
+    result = build_state(repo, "reword", sha, str(message))
+    assert result.returncode == 1
+    assert "pushed" in result.stderr
+    assert subjects(repo, "HEAD~1") == ["first"]
+
+
+def test_reword_refuses_a_commit_outside_heads_history(repo, tmp_path):
+    git(repo, "checkout", "-q", "-b", "other")
+    elsewhere = commit(repo, "a", "on another branch")
+    git(repo, "checkout", "-q", "main")
+    message = tmp_path / "message"
+    message.write_text("reworded\n")
+    result = build_state(repo, "reword", elsewhere, str(message))
+    assert result.returncode == 1
+    assert "HEAD" in result.stderr
+
+
+def test_reword_refuses_when_merges_follow_the_commit(repo, tmp_path):
+    first = commit(repo, "a", "first")
+    git(repo, "checkout", "-q", "-b", "side")
+    commit(repo, "b", "on the side")
+    git(repo, "checkout", "-q", "main")
+    commit(repo, "c", "on main")
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    message = tmp_path / "message"
+    message.write_text("reworded\n")
+    result = build_state(repo, "reword", first, str(message))
+    assert result.returncode == 1
+    assert "merge" in result.stderr.lower()
+
+
+def test_reword_keeps_a_first_line_that_starts_with_a_hash(repo, tmp_path):
+    sha = commit(repo, "a", "first")
+    commit(repo, "b", "second")
+    message = tmp_path / "message"
+    message.write_text("#123: fix the bug\n")
+    assert build_state(repo, "reword", sha, str(message)).returncode == 0
+    assert subjects(repo, "HEAD~2")[0] == "#123: fix the bug"
+
+
+def test_reword_refuses_while_a_later_fixup_names_the_commit(repo, tmp_path):
+    sha = commit(repo, "a", "first")
+    commit(repo, "a", "fixup! first")
+    message = tmp_path / "message"
+    message.write_text("reworded\n")
+    result = build_state(repo, "reword", sha, str(message))
+    assert result.returncode == 1
+    assert "fixup!" in result.stderr
+    assert subjects(repo, "HEAD~2") == ["first", "fixup! first"]
+
+
+def test_reword_works_whatever_the_rebase_config(repo, tmp_path):
+    sha = commit(repo, "a", "first")
+    commit(repo, "b", "second")
+    git(repo, "config", "rebase.abbreviateCommands", "true")
+    git(repo, "config", "rebase.autoSquash", "true")
+    message = tmp_path / "message"
+    message.write_text("reworded\n")
+    result = build_state(repo, "reword", sha, str(message))
+    assert result.returncode == 0, result.stderr
+    assert subjects(repo, "HEAD~2") == ["reworded", "second"]
+
+
+def test_reword_leaves_a_rebase_in_progress_alone(repo, tmp_path):
+    sha = commit(repo, "a", "first")
+    commit(repo, "a", "second")
+    git(repo, "checkout", "-q", "-b", "other", "HEAD~2")
+    commit(repo, "a", "conflicting")
+    subprocess.run(
+        ["git", "rebase", "-q", "main"], cwd=repo, capture_output=True, check=False
+    )
+    message = tmp_path / "message"
+    message.write_text("reworded\n")
+    result = build_state(repo, "reword", sha, str(message))
+    assert result.returncode == 1
+    assert "rebase" in result.stderr
+    assert (repo / ".git" / "rebase-merge").exists()  # still the user's, in progress

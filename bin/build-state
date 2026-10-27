@@ -14,7 +14,12 @@
                             the base, the commits, the brief as its spec, the standards
                             sources, and code-review's standards section and its
                             Standards and Spec briefs, copied verbatim from its
-                            SKILL.md (fails when they can't be found there)
+                            SKILL.md (fails when they can't be found there); on stderr,
+                            a nudge to write a CODING_STANDARDS.md when the repo has none
+    build-state reword SHA [FILE]
+                            replace commit SHA's message with FILE's text (stdin
+                            without FILE), keeping every tree; refuses with
+                            uncommitted changes, merges after SHA, or SHA pushed
 
 The state lives in the worktree's git dir, as build-state.json; finish removes it.
 
@@ -49,6 +54,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # tests/x.py, test/x.py, spec/x.rb, test_x.py, x_test.go, x.test.ts, x.spec.js
@@ -474,6 +480,12 @@ def review_prompt(args: argparse.Namespace) -> int:
         )
     base, sha = state["base"], head()
     top = Path(git("rev-parse", "--show-toplevel").stdout.strip())
+    if not (top / "CODING_STANDARDS.md").is_file():
+        print(
+            f"build-state: {top} has no CODING_STANDARDS.md. Consider writing one: the rules a "
+            "reviewer holds this repo's code to, beside the global standards.",
+            file=sys.stderr,
+        )
     sources = [
         GLOBAL_STANDARDS,
         *(str(top / n) for n in REPO_STANDARDS if (top / n).is_file()),
@@ -492,6 +504,97 @@ def review_prompt(args: argparse.Namespace) -> int:
         ),
         end="",
     )
+    return 0
+
+
+# The sequence editor a reword's rebase runs: turns the named commit's `pick` into `reword`
+REWORD_TODO = """\
+import sys
+from pathlib import Path
+todo, sha = Path(sys.argv[1]), sys.argv[2]
+lines = todo.read_text().splitlines(keepends=True)
+for i, line in enumerate(lines):
+    words = line.split()
+    if words[:1] == ["pick"] and sha.startswith(words[1]):
+        lines[i] = "reword" + line[len("pick"):]
+todo.write_text("".join(lines))
+"""
+
+
+def reword(args: argparse.Namespace) -> int:
+    message = args.file.read_text() if args.file else sys.stdin.read()
+    if not message.strip():
+        return fail("No message: give it in FILE or on stdin.")
+    git_dir = Path(git("rev-parse", "--absolute-git-dir").stdout.strip())
+    if any((git_dir / name).exists() for name in ("rebase-merge", "rebase-apply")):
+        return fail("A rebase is in progress: finish or abort it before rewording.")
+    if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        return fail("Uncommitted changes: commit or stash them before rewording.")
+    sha = git(
+        "rev-parse", "--verify", "--quiet", f"{args.sha}^{{commit}}", check=False
+    ).stdout.strip()
+    if not sha or not ancestor(sha, "HEAD"):
+        return fail(f"{args.sha} isn't in HEAD's history.")
+    if git("branch", "-r", "--contains", sha).stdout.strip():
+        return fail(
+            f"{args.sha} is already pushed: rewording it would rewrite shared history."
+        )
+    parent = git(
+        "rev-parse", "--verify", "--quiet", f"{sha}~1", check=False
+    ).stdout.strip()
+    if git(
+        "rev-list", "--merges", f"{parent}..HEAD" if parent else "HEAD"
+    ).stdout.strip():
+        return fail(
+            f"Merges after {args.sha}: a rebase would flatten them, so reword by hand."
+        )
+    subject = git("log", "-1", "--format=%s", sha).stdout.strip()
+    later = git("log", "--format=%s", f"{sha}..HEAD").stdout.splitlines()
+    names = {f"{kind}! {subject}" for kind in ("fixup", "squash", "amend")}
+    if naming := [s for s in later if s in names]:
+        return fail(
+            f"A later commit, {naming[0]!r}, names this one by its subject, which rewording would",
+            "break: fold it first (build-state finish), then reword.",
+        )
+    count = int(git("rev-list", "--count", f"{sha}..HEAD").stdout)
+    before = head()
+    with tempfile.TemporaryDirectory() as scratch:
+        text, editor = Path(scratch, "message"), Path(scratch, "todo.py")
+        text.write_text(message)
+        editor.write_text(REWORD_TODO)
+        env = os.environ | {
+            "GIT_SEQUENCE_EDITOR": f'"{sys.executable}" "{editor}" "$@" {sha} #',
+            "GIT_EDITOR": f'cp "{text}"',
+        }
+        rebase = subprocess.run(
+            [
+                "git",
+                # whole command words in the todo, and a message kept as given, # lines too
+                *(
+                    "-c",
+                    "rebase.abbreviateCommands=false",
+                    "-c",
+                    "commit.cleanup=whitespace",
+                ),
+                *("rebase", "-q", "-i", "--no-autosquash", parent or "--root"),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    if rebase.returncode != 0:
+        git(
+            "rebase", "--abort", check=False
+        )  # ours: reword refused to start during another
+        return fail("git rebase failed, and was aborted:", rebase.stderr.strip())
+    reworded = git("log", "-1", "--format=%B", f"HEAD~{count}").stdout
+    if reworded.strip() != message.strip():
+        git("reset", "-q", "--keep", before)
+        return fail(
+            f"The rebase didn't reword {args.sha}; HEAD is back at {before[:12]}."
+        )
+    print(f"Reworded {sha[:12]}; HEAD is now {head()[:12]}.")
     return 0
 
 
@@ -527,6 +630,10 @@ def main(argv: list[str] | None = None) -> int:
         help=f"code-review's SKILL.md, for its two briefs (default {CODE_REVIEW})",
     )
     prompt_command.set_defaults(run=review_prompt)
+    reword_command = commands.add_parser("reword", help="replace a commit's message")
+    reword_command.add_argument("sha", metavar="SHA")
+    reword_command.add_argument("file", nargs="?", type=Path, metavar="FILE")
+    reword_command.set_defaults(run=reword)
     args = parser.parse_args(argv)
     return args.run(args)
 

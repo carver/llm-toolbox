@@ -234,7 +234,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   main tree's) may move: finish then says to rebase onto it. `review-prompt
   BRIEF` prints the review subagent's prompt for the commit at HEAD, with
   `/code-review`'s two briefs and its standards section copied from its
-  SKILL.md. The state lives in the git dir; `show` prints it.
+  SKILL.md, and says on stderr when the repo has no `CODING_STANDARDS.md`.
+  `reword SHA [FILE]` replaces a commit's message (FILE, or stdin), keeping
+  every tree; it refuses during a rebase, with uncommitted changes, with merges
+  after the commit, a later `fixup!` naming it, or the commit already pushed.
+  The state lives in the git dir; `show` prints it.
 
 - **skill-patch**: keeps hand edits to other authors' skills. Edit the
   installed copy in `~/.agents/skills/NAME`, then `skill-patch save NAME

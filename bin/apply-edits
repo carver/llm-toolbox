@@ -28,12 +28,13 @@ and ``` fences around blocks, which are skipped. A marker may end in spaces.
 In a Python file (.py, .pyi, or a script whose #! line runs python or `uv run
 --script`), an old text not found as it is still matches where it differs only in
 formatting that doesn't change the program, as when `ruff format` ran after the old
-text was written: spacing between tokens, line breaks inside brackets, and trailing
-commas. Line breaks outside brackets, the indentation after them, strings and comments
-must match as they are. A match that takes more than whitespace needs a file that
-parses, and counts only where the old text in its place leaves the same syntax tree, so
-`(x,)` never matches `(x)`. Such a match must be unique too, and the output says which
-blocks matched this way. Other files match exactly.
+text was written: spacing between tokens, line breaks inside brackets, trailing commas,
+and the spelling of a string or number with the same value (quotes, escapes, a u
+prefix, letter case). Line breaks outside brackets, the indentation after them and
+comments must match as they are. A match that takes more than whitespace needs a file
+that parses, and counts only where the old text in its place leaves the same syntax
+tree, so `(x,)` never matches `(x)`. Such a match must be unique too, and the output
+says which blocks matched this way. Other files match exactly.
 
 A line that is exactly one of the markers can't appear inside a block; edit such a
 line another way. Files keep their line endings (\\n or \\r\\n). A symlink is edited
@@ -52,6 +53,7 @@ import sys
 import tempfile
 import tokenize
 import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -259,40 +261,44 @@ FSTRING_END = getattr(tokenize, "FSTRING_END", None)
 
 
 def tokens(text: str) -> list[Token] | None:
-    """Python source's tokens as offsets into it, an f-string as one token; None when the
-    source doesn't tokenize."""
+    """Python source's tokens, as `scan` yields them; None when the source doesn't
+    tokenize."""
+    try:
+        return list(scan(text))
+    except (tokenize.TokenError, SyntaxError):
+        return None
+
+
+def scan(text: str) -> Iterator[Token]:
+    """Python source's tokens as offsets into it, an f-string as one STRING, each yielded
+    once it's whole. Raises tokenize.TokenError or SyntaxError where the source stops
+    tokenizing, so the tokens before that come out first."""
     lines = [0] + [i + 1 for i, c in enumerate(text) if c == "\n"]
 
     def offset(position: tuple[int, int]) -> int:
         return lines[position[0] - 1] + position[1]
 
-    found: list[Token] = []
+    last: Token | None = None
     depth, fstrings, opened = 0, 0, 0
-    try:
-        for token in tokenize.generate_tokens(io.StringIO(text, newline="").readline):
-            if token.type == FSTRING_START:
-                opened = offset(token.start) if fstrings == 0 else opened
-                fstrings += 1
-            elif fstrings:
-                if token.type == FSTRING_END:
-                    fstrings -= 1
-                    if fstrings == 0:
-                        found.append(
-                            Token(opened, offset(token.end), depth, tokenize.STRING)
-                        )
-            elif token.type == tokenize.NEWLINE and found:
-                found[-1].ends_line = True
-            elif token.type == tokenize.NL and depth == 0 and found:
-                found[-1].ends_line |= found[-1].kind == tokenize.COMMENT
-            elif token.type not in QUIET:
-                if token.type == tokenize.OP:
-                    depth += (token.string in "([{") - (token.string in ")]}")
-                found.append(
-                    Token(offset(token.start), offset(token.end), depth, token.type)
-                )
-    except (tokenize.TokenError, SyntaxError):
-        return None
-    return found
+    for token in tokenize.generate_tokens(io.StringIO(text, newline="").readline):
+        if token.type == FSTRING_START:
+            opened = offset(token.start) if fstrings == 0 else opened
+            fstrings += 1
+        elif fstrings:
+            if token.type == FSTRING_END:
+                fstrings -= 1
+                if fstrings == 0:
+                    last = Token(opened, offset(token.end), depth, tokenize.STRING)
+                    yield last
+        elif token.type == tokenize.NEWLINE and last:
+            last.ends_line = True
+        elif token.type == tokenize.NL and depth == 0 and last:
+            last.ends_line |= last.kind == tokenize.COMMENT
+        elif token.type not in QUIET:
+            if token.type == tokenize.OP:
+                depth += (token.string in "([{") - (token.string in ")]}")
+            last = Token(offset(token.start), offset(token.end), depth, token.type)
+            yield last
 
 
 def blank_run(text: str, at: int) -> int:
@@ -316,7 +322,8 @@ def match_end(
 ) -> tuple[int, bool] | None:
     """Where in `text` the old text ends, if it matches from token `k` on ignoring
     formatting that doesn't change the Python, and whether that took more than whitespace
-    (a comma on one side only), when the caller must check the Python is the same.
+    (a comma on one side only, or a literal spelled another way), when the caller must
+    check the Python is the same.
 
     Inside a statement the old text may break a line only inside brackets or after a
     backslash. Where the file's line ends outside brackets, the old text's must too, at
@@ -328,8 +335,10 @@ def match_end(
     while True:
         token = found[at] if at < len(found) else None
         part = text[token.start : token.end] if token else ""
-        if token and old.startswith(part, j) and not (j and glued(old[j - 1 : j + 1])):
-            j += len(part)
+        spelled = spelling_end(old, j, token, part) if token else None
+        if spelled and not (j and glued(old[j - 1 : j + 1])):
+            relaxed |= old[j:spelled] != part
+            j = spelled
         elif last and old.startswith(",", j):  # a comma only the old text has
             j, token, relaxed = j + 1, None, True
         elif last and part == ",":  # a comma only the file has
@@ -354,6 +363,25 @@ def match_end(
             return last.end, relaxed
 
 
+def spelling_end(old: str, at: int, token: Token, part: str) -> int | None:
+    """Where the old text's spelling of the file's token (its text `part`) ends, when one
+    starts at `at`: the same text, or for a string or number, a literal with the same
+    value, however its quotes, escapes, prefix or letter case are written."""
+    if old.startswith(part, at):
+        return at + len(part)
+    if token.kind not in (tokenize.STRING, tokenize.NUMBER):
+        return None
+    try:
+        first = next(scan(old[at:]), None)
+    except (tokenize.TokenError, SyntaxError):
+        return None
+    if first is None or first.kind != token.kind:
+        return None
+    value = syntax_tree(part)
+    same = value is not None and syntax_tree(old[at : at + first.end]) == value
+    return at + first.end if same else None
+
+
 def glued(pair: str) -> bool:
     """Whether two characters are both word characters, so a token boundary between them
     would vanish."""
@@ -362,13 +390,17 @@ def glued(pair: str) -> bool:
 
 def syntax_tree(source: str) -> str | None:
     """The syntax tree Python reads from the source, dumped, or None when it doesn't
-    parse."""
+    parse. A string's u prefix, which changes nothing, is left out."""
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # invalid escapes and the like
-            return ast.dump(ast.parse(source))
+            tree = ast.parse(source)
     except (SyntaxError, ValueError, RecursionError):
         return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant):
+            node.kind = None
+    return ast.dump(tree)
 
 
 def loose_spans(old: str, text: str) -> list[tuple[int, int]]:

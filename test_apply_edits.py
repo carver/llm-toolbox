@@ -612,3 +612,53 @@ def test_other_files_keep_their_commas(tmp_path: Path) -> None:
     result = loose(tmp_path, "notes.md", source, "f(\n    a\n)")
     assert result.returncode == 1
     assert (tmp_path / "notes.md").read_text() == source
+
+
+@pytest.mark.parametrize(
+    "source, old",
+    [
+        ('x = "a"\n', "x = 'a'"),
+        ('y = "it\'s"\n', "y = 'it\\'s'"),
+        ("z = f\"{d['k']} {x!r}\"\n", "z = f'{d[\"k\"]} {x!r}'"),
+        ('w = "b"\n', "w = u'b'"),
+        ("v = 0xFF + 1e5\n", "v = 0XFF + 1E5"),
+    ],
+    ids=["quotes", "escapes", "f-string", "u prefix", "number case"],
+)
+def test_a_literal_ruff_respelled_matches(
+    tmp_path: Path, source: str, old: str
+) -> None:
+    result = loose(tmp_path, "f.py", source, old)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_text() == "new\n"
+
+
+@pytest.mark.parametrize(
+    "source, old",
+    [
+        ('x = "a"\n', "x = b'a'"),  # bytes aren't text
+        ('x = "a"\n', "x = 'A'"),
+        ("x = 1\n", "x = 1.0"),
+    ],
+)
+def test_a_literal_with_another_value_still_misses(
+    tmp_path: Path, source: str, old: str
+) -> None:
+    result = loose(tmp_path, "f.py", source, old)
+    assert result.returncode == 1
+    assert (tmp_path / "f.py").read_text() == source
+
+
+def test_a_block_that_differs_from_the_formatted_code_shows_the_closest_text(
+    tmp_path: Path,
+) -> None:
+    result = loose(
+        tmp_path, "f.py", FORMATTED, AS_WRITTEN.replace("advice e8", "advice e9")
+    )
+    assert result.returncode == 1
+    assert "f.py block 1 ('rows.append(" in result.stderr
+    assert (
+        "old text not found" in result.stderr
+        and "closest is lines 4-5" in result.stderr
+    )
+    assert (tmp_path / "f.py").read_text() == FORMATTED

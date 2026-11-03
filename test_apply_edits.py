@@ -360,6 +360,11 @@ def test_a_script_run_by_uv_counts_as_python(tmp_path: Path) -> None:
         ("a = 1\nb = 2\n", "a = 1 b = 2"),  # a line break ends a statement
         (WRAPPED, '    return "a b"'),  # strings as they are
         ("x = 1  # a  note\n", "x = 1  # a note"),  # comments too
+        # the indentation after a comment line too
+        (
+            "if a:\n    x = f(1,\n      2)\n# c\ny = 2\n",
+            "    x = f(1, 2)\n# c\n    y = 2",
+        ),
     ],
 )
 def test_whitespace_that_changes_the_python_still_misses(
@@ -493,3 +498,25 @@ def test_an_old_text_with_a_backslash_continuation_matches_the_joined_line(
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert (tmp_path / "f.py").read_text() == "x = 3\n"
+
+
+def test_a_comment_line_between_statements_matches_loosely(tmp_path: Path) -> None:
+    (tmp_path / "f.py").write_text("f(a,\n  b)\n# note\ny = 2\n")
+    result = apply(
+        tmp_path,
+        "--- f.py\n<<<<<<< SEARCH\nf(a, b)\n# note\ny = 2\n=======\nz = 1\n>>>>>>> REPLACE\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_text() == "z = 1\n"
+
+
+def test_a_comment_in_brackets_runs_to_the_end_of_its_line(tmp_path: Path) -> None:
+    source = "f(\n    a,  # note\n    b,\n)\n"
+    (tmp_path / "f.py").write_text(source)
+    # the old text's comment takes in the `b,` after it
+    old = "f(\n    a,  # note b,\n)"
+    result = apply(
+        tmp_path, f"--- f.py\n<<<<<<< SEARCH\n{old}\n=======\nnew\n>>>>>>> REPLACE\n"
+    )
+    assert result.returncode == 1, (tmp_path / "f.py").read_text()
+    assert (tmp_path / "f.py").read_text() == source

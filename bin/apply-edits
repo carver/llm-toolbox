@@ -235,9 +235,10 @@ class Token:
     start: int
     end: int
     depth: int  # brackets open after it
-    statement_ends: bool = (
-        False  # a NEWLINE token follows it: the gap after it ends a statement
-    )
+    kind: int  # tokenize's token type
+    # Its line ends outside brackets: it ends a statement, or it's a comment on a line of
+    # its own. The old text must break the line there, at the same indentation.
+    ends_line: bool = False
 
 
 QUIET = {
@@ -271,13 +272,19 @@ def tokens(text: str) -> list[Token] | None:
                 if token.type == FSTRING_END:
                     fstrings -= 1
                     if fstrings == 0:
-                        found.append(Token(opened, offset(token.end), depth))
+                        found.append(
+                            Token(opened, offset(token.end), depth, tokenize.STRING)
+                        )
             elif token.type == tokenize.NEWLINE and found:
-                found[-1].statement_ends = True
+                found[-1].ends_line = True
+            elif token.type == tokenize.NL and depth == 0 and found:
+                found[-1].ends_line |= found[-1].kind == tokenize.COMMENT
             elif token.type not in QUIET:
                 if token.type == tokenize.OP:
                     depth += (token.string in "([{") - (token.string in ")]}")
-                found.append(Token(offset(token.start), offset(token.end), depth))
+                found.append(
+                    Token(offset(token.start), offset(token.end), depth, token.type)
+                )
     except (tokenize.TokenError, SyntaxError):
         return None
     return found
@@ -303,11 +310,14 @@ def fits(gap: str, blank: str, after: Token, before: str, following: str) -> boo
     """Whether the old text's whitespace `blank` may stand for the source's `gap` between
     the token `after` (whose text ends with `before`) and the next (starting `following`):
     a statement break must stay one, at the same indentation; inside a statement, a line
-    break needs open brackets (or a backslash), and two words need a space."""
-    if after.statement_ends:
+    break needs open brackets (or a backslash), a comment needs one after it, and two
+    words need a space."""
+    if after.ends_line:
         return "\n" in blank and indentation(blank) == indentation(gap)
     bare = blank.replace("\\\n", "").replace("\\\r\n", "")
     if "\n" in bare and after.depth <= 0:
+        return False
+    if "\n" not in bare and after.kind == tokenize.COMMENT:
         return False
     words = re.match(r"\w", before[-1:]) and re.match(r"\w", following[:1])
     return bool(blank) or not words

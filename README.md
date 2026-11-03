@@ -113,12 +113,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   work too). Each old text must occur exactly once; on a miss nothing is written
   and the closest text in the file is shown as a diff. In a Python file, an old
   text not found as it is still matches across formatting that doesn't change
-  the program, so a block written before `ruff format` ran still applies:
-  whitespace Python ignores (a call ruff wrapped), trailing commas, and a
-  string's quotes or escapes. It never matches across a statement break,
-  indentation, a comment or a value that differs, and a match beyond
-  whitespace needs the file, with the old text in place, to parse to the same
-  syntax tree. For edits that would otherwise be a heredoc Python script.
+  the program, as when `ruff format` ran after the block was written:
+  whitespace Python ignores (a call ruff wrapped), trailing commas,
+  parentheses that change nothing, and how a string or number is spelled
+  (quotes, escapes, a u prefix, letter case). A docstring ruff trimmed or a
+  comment it respaced still misses. A match never crosses a statement break,
+  indentation, a comment or a value that differs, and one beyond whitespace
+  needs the file, with the old text in place, to parse to the same syntax
+  tree. For edits that would otherwise be a heredoc Python script.
   `apply-edits -h` shows the format.
 - **rewrap**: `rewrap FILE...` reflows each Python docstring paragraph and
   comment block that holds a line past ruff's line-length (or `--width`), and

@@ -662,3 +662,110 @@ def test_a_block_that_differs_from_the_formatted_code_shows_the_closest_text(
         and "closest is lines 4-5" in result.stderr
     )
     assert (tmp_path / "f.py").read_text() == FORMATTED
+
+
+@pytest.mark.parametrize(
+    "source, old",
+    [
+        # ruff wrapped a long condition in parentheses
+        (
+            "cond = (\n    first(a)\n    and second(b)\n    or third(c)\n)\nx = 1\n",
+            "cond = first(a) and second(b) or third(c)\nx = 1",
+        ),
+        ("x = (\n    a\n    and b\n)\n", "x = a and b"),
+        # ruff took out parentheses that did nothing
+        ("if a:\n    pass\nq = 1\n", "if (a):\n    pass\nq = (1)"),
+        ("def f():\n    return a + b\n", "def f():\n    return (a +\n            b)"),
+        # its own parenthesis closes before the comma both sides have
+        (
+            "assert (\n    r.code\n    == 1\n), (\n    tmp / 'f'\n).read_text()\n",
+            "assert r.code == 1, (tmp / 'f').read_text()",
+        ),
+    ],
+    ids=[
+        "added",
+        "added at the end",
+        "removed",
+        "removed with a line break",
+        "added before a comma",
+    ],
+)
+def test_parentheses_ruff_added_or_removed_match(
+    tmp_path: Path, source: str, old: str
+) -> None:
+    result = loose(tmp_path, "f.py", source, old)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_text() == "new\n"
+
+
+@pytest.mark.parametrize(
+    "source, old",
+    [
+        ("y = x * (a + b)\n", "y = x * a + b"),
+        ("y = x * a + b\n", "y = x * (a + b)"),
+        ("f((a, b))\n", "f(a, b)"),  # one tuple isn't two arguments
+    ],
+)
+def test_parentheses_that_change_the_python_still_miss(
+    tmp_path: Path, source: str, old: str
+) -> None:
+    result = loose(tmp_path, "f.py", source, old)
+    assert result.returncode == 1, (tmp_path / "f.py").read_text()
+    assert (tmp_path / "f.py").read_text() == source
+
+
+def test_a_block_inside_parentheses_ruff_added_matches_once(tmp_path: Path) -> None:
+    result = loose(tmp_path, "f.py", "x = (\n    a\n    and b\n)\n", "a and b")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_text() == "x = (\n    new\n)\n"
+
+
+def test_indentation_still_counts_in_a_formatter_match(tmp_path: Path) -> None:
+    source = "if x:\n    f(\n        a,\n    )\nz()\n"
+    result = loose(tmp_path, "f.py", source, "if x:\n    f(a)\n    z()")
+    assert result.returncode == 1
+    assert (tmp_path / "f.py").read_text() == source
+
+
+@pytest.mark.parametrize(
+    "source, old, after",
+    [
+        (
+            (
+                "def f(base):\n    if base:\n        (\n            hunk.base,\n"
+                '            section,\n        ) = [], "base"\n    return section\n'
+            ),
+            '        hunk.base, section = [], "base"',
+            "def f(base):\n    if base:\n        new\n    return section\n",
+        ),
+        ("(\n    a,\n    b,\n) = c\n", "a, b = c", "new\n"),
+    ],
+    ids=["indented", "top level"],
+)
+def test_a_statement_ruff_opened_with_a_parenthesis_matches(
+    tmp_path: Path, source: str, old: str, after: str
+) -> None:
+    indent = old[: len(old) - len(old.lstrip())]
+    result = loose(tmp_path, "f.py", source, old, f"{indent}new")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_text() == after
+
+
+@pytest.mark.parametrize(
+    "source, old",
+    [
+        # a comment after code isn't one on a line of its own
+        ("x = f(\n    a,\n)  # about x\ny = 2\n", "x = f(a)\n# about x\ny = 2"),
+        # nor is a comment line at another indentation
+        (
+            "if a:\n    x = f(\n        b,\n    )\n    # inside\ny = 2\n",
+            "if a:\n    x = f(b)\n# inside\ny = 2",
+        ),
+    ],
+)
+def test_comment_lines_still_count_in_a_formatter_match(
+    tmp_path: Path, source: str, old: str
+) -> None:
+    result = loose(tmp_path, "f.py", source, old)
+    assert result.returncode == 1, (tmp_path / "f.py").read_text()
+    assert (tmp_path / "f.py").read_text() == source

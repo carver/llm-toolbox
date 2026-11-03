@@ -29,12 +29,13 @@ In a Python file (.py, .pyi, or a script whose #! line runs python or `uv run
 --script`), an old text not found as it is still matches where it differs only in
 formatting that doesn't change the program, as when `ruff format` ran after the old
 text was written: spacing between tokens, line breaks inside brackets, trailing commas,
-and the spelling of a string or number with the same value (quotes, escapes, a u
-prefix, letter case). Line breaks outside brackets, the indentation after them and
-comments must match as they are. A match that takes more than whitespace needs a file
-that parses, and counts only where the old text in its place leaves the same syntax
-tree, so `(x,)` never matches `(x)`. Such a match must be unique too, and the output
-says which blocks matched this way. Other files match exactly.
+parentheses that change nothing, and the spelling of a string or number with the same
+value (quotes, escapes, a u prefix, letter case). Line breaks outside brackets, the
+indentation after them and comments must match as they are. A match that takes more
+than whitespace needs a file that parses, and counts only where the old text in its
+place leaves the same syntax tree, so `(x,)` never matches `(x)`, and `x * (a + b)`
+never matches `x * a + b`. Such a match must be unique too, and the output says which
+blocks matched this way. Other files match exactly.
 
 A line that is exactly one of the markers can't appear inside a block; edit such a
 line another way. Files keep their line endings (\\n or \\r\\n). A symlink is edited
@@ -321,46 +322,75 @@ def match_end(
     text: str, found: list[Token], k: int, old: str
 ) -> tuple[int, bool] | None:
     """Where in `text` the old text ends, if it matches from token `k` on ignoring
-    formatting that doesn't change the Python, and whether that took more than whitespace
-    (a comma on one side only, or a literal spelled another way), when the caller must
-    check the Python is the same.
+    formatting that doesn't change the Python, and whether that took more than whitespace:
+    a comma or parenthesis only one side has, or a literal spelled another way. Then the
+    caller must check that the Python is the same.
 
-    Inside a statement the old text may break a line only inside brackets or after a
-    backslash. Where the file's line ends outside brackets, the old text's must too, at
-    the same indentation. A comment needs a line break after it, and two words need a
-    space between them."""
-    at, j, relaxed = k, 0, False
-    last: Token | None = None  # the last file token taken
-    pending = False  # the old text has yet to break the line after `last`
+    Inside a statement the old text may break a line only inside its own brackets or
+    after a backslash, and where the file's line ends outside brackets, the old text's
+    must too, at the same indentation. A comment needs a line break after it, and two
+    words need a space between them.
+
+    A match starts with a token both sides have, except at the start of a statement,
+    where ruff may have put parentheses around the targets of an assignment. Either way
+    it takes at least one."""
+    at, j, relaxed, taken = k, 0, False, False
+    at_statement_start = k == 0 or found[k - 1].ends_line
+    # Parentheses open that only the file, or only the old text, has.
+    file_open = old_open = 0
+    # Since the last token taken, the indentation after the file's last line end, and
+    # after the old text's last line break outside its brackets; None for none.
+    file_break: str | None = None
+    old_break: str | None = None
     while True:
         token = found[at] if at < len(found) else None
         part = text[token.start : token.end] if token else ""
-        spelled = spelling_end(old, j, token, part) if token else None
-        if spelled and not (j and glued(old[j - 1 : j + 1])):
-            relaxed |= old[j:spelled] != part
-            j = spelled
-        elif last and old.startswith(",", j):  # a comma only the old text has
-            j, token, relaxed = j + 1, None, True
-        elif last and part == ",":  # a comma only the file has
-            relaxed = True
+        spelled_end = spelling_end(old, j, token, part) if token else None
+        was_at, comment = at, False
+        if token and spelled_end and not (j and glued(old[j - 1 : j + 1])):
+            if file_break != old_break:
+                return None
+            file_break = old_break = None
+            relaxed |= old[j:spelled_end] != part
+            j, at, taken = spelled_end, at + 1, True
+            comment = token.kind == tokenize.COMMENT
+        elif not (taken or at_statement_start):
+            return None
+        # What only one side has: first the closing of a parenthesis only it opened,
+        # then a comma or an opening parenthesis.
+        elif part == ")" and file_open:
+            at, file_open, relaxed = at + 1, file_open - 1, True
+        elif old[j] == ")" and old_open:
+            j, old_open, relaxed = j + 1, old_open - 1, True
+        elif old[j] in ",(":
+            j, old_open, relaxed = j + 1, old_open + (old[j] == "("), True
+        elif part in (",", "("):
+            at, file_open, relaxed = at + 1, file_open + (part == "("), True
         else:
             return None
-        if token:
-            if pending:
-                return None
-            at, last = at + 1, token
-            pending = token.ends_line or token.kind == tokenize.COMMENT
-        assert last is not None  # a match starts with a token both sides have
-        past = blank_run(old, j)
-        if "\n" in old[j:past].replace("\\\n", ""):
-            gap = text[last.end : found[at].start if at < len(found) else len(text)]
-            same = indentation(old[j:past]) == indentation(gap)
-            if not (last.depth > 0 or pending and same):
-                return None
-            pending = False
-        j = past
+        if at > was_at and found[at - 1].ends_line:
+            after = found[at].start if at < len(found) else len(text)
+            file_break = indentation(text[found[at - 1].end : after])
+        blank_end = blank_run(old, j)
+        blank = old[j:blank_end]
+        if "\n" in blank.replace("\\\n", ""):
+            depth = (found[at - 1].depth if at else 0) - file_open + old_open
+            if depth <= 0:
+                old_break = indentation(blank)
+        elif comment and blank_end < len(old):
+            return None  # the old text's comment runs on past the file's
+        j = blank_end
         if j == len(old):
-            return last.end, relaxed
+            break
+    while file_open and at < len(found):  # the file's own parentheses close after
+        part = text[found[at].start : found[at].end]
+        if part not in (",", ")"):
+            break
+        file_open -= part == ")"
+        at += 1
+    if file_open or old_open or not taken:
+        return None
+    return found[at - 1].end, relaxed
 
 
 def spelling_end(old: str, at: int, token: Token, part: str) -> int | None:

@@ -3392,3 +3392,345 @@ def test_help_says_a_thin_result_means_rephrase(capsys):
         paper.main(["-h"])
     out = " ".join(capsys.readouterr().out.split())
     assert "2-3 key terms" in out and "synonyms" in out and "rephrase" in out
+
+
+# LessWrong and Alignment Forum posts: fetched from LessWrong's GraphQL API, cached as
+# Markdown, and read with text, outline, grep and meta.
+
+POST_ID = "HLJoJYi52mxgomujc"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"https://www.lesswrong.com/posts/{POST_ID}/realistic-reward-hacking",
+        f"https://lesswrong.com/posts/{POST_ID}/realistic-reward-hacking",
+        f"https://www.lesswrong.com/posts/{POST_ID}",
+        f"https://www.lesswrong.com/posts/{POST_ID}/",
+        f"http://www.lesswrong.com/posts/{POST_ID}/slug?commentId=abc#heading",
+        f"https://www.alignmentforum.org/posts/{POST_ID}/realistic-reward-hacking",
+        f"https://alignmentforum.org/posts/{POST_ID}",
+        f"https://www.greaterwrong.com/posts/{POST_ID}/realistic-reward-hacking",
+        f"https://greaterwrong.com/posts/{POST_ID}",
+        f"https://www.lesswrong.com/s/pFatcKW3JJhTSxqAF/p/{POST_ID}",
+        f"https://www.greaterwrong.com/s/pFatcKW3JJhTSxqAF/p/{POST_ID}",
+        f"lw:{POST_ID}",
+        f"LW:{POST_ID}",
+        f"  lw:{POST_ID}  ",
+    ],
+)
+def test_every_post_form_names_the_same_post(text):
+    assert paper.parse_id(text) == paper.LessWrongPost(POST_ID)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "lw:",
+        "lw:not-an-id",
+        "https://www.lesswrong.com/posts/",
+        "https://www.lesswrong.com/tag/ai",
+        "https://www.lesswrong.com/s/pFatcKW3JJhTSxqAF",
+        "https://www.lesswrong.com/s/pFatcKW3JJhTSxqAF/p/",
+        "https://www.greaterwrong.com/",
+    ],
+)
+def test_rejects_what_is_not_a_post(bad):
+    with pytest.raises(paper.UsageError, match="LessWrong post"):
+        paper.parse_id(bad)
+
+
+POST_MARKDOWN = """**TL;DR**: fine-tuning on realistic reward hacks.
+
+Introduction
+============
+
+The models alignment fake 21.9% of the time.
+
+1.  Models trained on toy hacks
+2.  Models trained on realistic hacks
+
+```
+# a comment in a code block
+```
+
+Takeaways
+---------
+
+### **Section A:**
+
+---
+
+The end.
+"""
+POST_URL = f"https://www.lesswrong.com/posts/{POST_ID}/realistic-reward-hacking"
+
+
+def post_answer(**fields):
+    """LessWrong's answer for the post, with `fields` replacing its own."""
+    result = {
+        "title": "Realistic Reward Hacking Induces Different and Deeper Misalignment",
+        "postedAt": "2025-10-09T18:45:07.342Z",
+        "baseScore": 149,
+        "pageUrl": POST_URL,
+        "user": {"displayName": "Jozdien"},
+        "coauthors": [],
+        "contents": {"markdown": POST_MARKDOWN},
+        **fields,
+    }
+    return ok({"data": {"post": {"result": result}}})
+
+
+def post_route(*answers):
+    return ("POST", "www.lesswrong.com/graphql", list(answers) or [post_answer()])
+
+
+def test_text_of_a_post_caches_its_markdown_and_prints_the_path(cache, capsys):
+    http = FakeHTTP(post_route())
+    code, out, err, _ = run(capsys, ["text", f"lw:{POST_ID}"], http)
+    assert code == 0, err
+    path = Path(out.strip())
+    assert path.suffix == ".md" and path.is_relative_to(cache)
+    assert path.read_text() == POST_MARKDOWN
+    [call] = http.calls
+    assert call["json"]["variables"] == {"id": POST_ID}
+    assert "markdown" in call["json"]["query"]
+    assert call["headers"]["User-Agent"] == f"paper (mailto:{paper.MAILTO})"
+
+
+def test_a_second_text_of_a_post_reads_the_cache(cache, capsys):
+    _, first, _, _ = run(capsys, ["text", f"lw:{POST_ID}"], FakeHTTP(post_route()))
+    url = f"https://www.alignmentforum.org/posts/{POST_ID}"
+    code, again, err, _ = run(capsys, ["text", url], FakeHTTP())
+    assert (code, again) == (0, first), err
+
+
+def test_outline_of_a_post_lists_its_markdown_headings(cache, capsys):
+    code, out, err, _ = run(
+        capsys, ["outline", f"lw:{POST_ID}"], FakeHTTP(post_route())
+    )
+    assert code == 0, err
+    # Setext headings at their text's line, ATX ones as written; nothing from the code
+    # block, the numbered list or the rule after a blank line.
+    assert out.splitlines() == [
+        "     3  # Introduction",
+        "    15  ## Takeaways",
+        "    18  ### **Section A:**",
+    ]
+
+
+def test_grep_finds_a_line_in_a_post(cache, capsys):
+    argv = ["grep", POST_URL, r"21\.9%", "-C", "0"]
+    code, out, err, _ = run(capsys, argv, FakeHTTP(post_route()))
+    assert (code, out) == (0, "6:The models alignment fake 21.9% of the time.\n"), err
+
+
+POST_BLOCK = (
+    "Realistic Reward Hacking Induces Different and Deeper Misalignment\n"
+    "  2025-10-09 · LessWrong\n"
+    "  authors: Jozdien, Second Author\n"
+    "  karma: 149\n"
+    f"  url: {POST_URL}\n"
+)
+
+
+def test_meta_of_a_post_prints_its_title_date_authors_karma_and_url(cache, capsys):
+    answer = post_answer(coauthors=[{"displayName": "Second Author"}])
+    code, out, err, _ = run(
+        capsys, ["meta", f"lw:{POST_ID}"], FakeHTTP(post_route(answer))
+    )
+    assert (code, out) == (0, POST_BLOCK), err
+
+
+def test_text_and_meta_of_a_post_share_one_request(cache, capsys):
+    answer = post_answer(coauthors=[{"displayName": "Second Author"}])
+    run(capsys, ["text", f"lw:{POST_ID}"], FakeHTTP(post_route(answer)))
+    code, out, err, _ = run(capsys, ["meta", POST_URL], FakeHTTP())
+    assert (code, out) == (0, POST_BLOCK), err
+
+
+def test_meta_prints_papers_and_posts_in_the_order_given(cache, capsys):
+    http = FakeHTTP(
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+        post_route(post_answer(user=None)),
+    )
+    code, out, err, _ = run(capsys, ["meta", f"lw:{POST_ID}", "1706.03762"], http)
+    assert code == 0, err
+    blocks = out.split("\n", 3)
+    assert blocks[:3] == [
+        "Realistic Reward Hacking Induces Different and Deeper Misalignment",
+        "  2025-10-09 · LessWrong",
+        "  karma: 149",  # no authors line for a deleted account without coauthors
+    ]
+    assert "Attention is All you Need" in blocks[3]
+
+
+MISSING_POST = ok(
+    {
+        "errors": [
+            {
+                "message": "app.missing_document",
+                "extensions": {"code": "INTERNAL_SERVER_ERROR"},
+            }
+        ],
+        "data": {"post": None},
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "answer", [MISSING_POST, ok({"data": {"post": {"result": None}}})]
+)
+def test_a_post_lesswrong_doesnt_have_exits_1_and_caches_nothing(cache, capsys, answer):
+    code, out, err, _ = run(
+        capsys, ["text", f"lw:{POST_ID}"], FakeHTTP(post_route(answer))
+    )
+    assert (code, out) == (1, "")
+    assert f"not found: LessWrong has no post {POST_ID}" in err
+    assert not (cache / "lesswrong").exists()
+
+
+def test_meta_names_a_missing_post_and_prints_the_rest(cache, capsys):
+    http = FakeHTTP(
+        post_route(MISSING_POST),
+        ("GET", "/paper/arXiv:1706.03762", [ok(ATTENTION)]),
+    )
+    code, out, err, _ = run(capsys, ["meta", f"lw:{POST_ID}", "1706.03762"], http)
+    assert code == 1
+    assert out.startswith("Attention is All you Need\n")
+    assert f"paper: not found: lw:{POST_ID}" in err
+
+
+@pytest.mark.parametrize(
+    "answer, says",
+    [
+        (
+            status(400, {"errors": [{"message": 'Cannot query field "x".'}]}),
+            'LessWrong: HTTP 400: Cannot query field "x".',
+        ),
+        (
+            ok({"errors": [{"message": "Query too complex"}], "data": {"post": None}}),
+            "LessWrong: Query too complex",
+        ),
+        (ok(["not", "an", "object"]), "LessWrong sent an unexpected answer"),
+        (
+            ok({"data": {"post": {"result": "x"}}}),
+            "LessWrong sent an unexpected answer",
+        ),
+    ],
+)
+def test_a_lesswrong_failure_exits_3_with_its_message(cache, capsys, answer, says):
+    code, out, err, _ = run(
+        capsys, ["text", f"lw:{POST_ID}"], FakeHTTP(post_route(answer))
+    )
+    assert (code, out) == (3, "")
+    assert says in err
+    assert not (cache / "lesswrong").exists()
+
+
+def test_a_busy_lesswrong_is_retried_paced_and_logged(cache, capsys):
+    busy = paper.Response(503, {"Retry-After": "2"}, b"busy")
+    paces = []
+    http = FakeHTTP(post_route(busy, post_answer()))
+    code, _, err, sleeps = run(capsys, ["text", f"lw:{POST_ID}"], http, paces=paces)
+    assert code == 0, err
+    assert sleeps == [2]
+    assert paces == ["LessWrong", "LessWrong"]
+    assert [
+        (e["service"], e["method"], e["url"], e["status"], e["attempts"])
+        for e in logged(cache)
+    ] == [("LessWrong", "POST", paper.LESSWRONG, 200, 2)]
+
+
+def test_a_post_without_a_body_has_an_empty_text(cache, capsys):
+    http = FakeHTTP(post_route(post_answer(contents=None)))
+    code, out, err, _ = run(capsys, ["text", f"lw:{POST_ID}"], http)
+    assert code == 0, err
+    assert Path(out.strip()).read_text() == ""
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["cites", f"lw:{POST_ID}"],
+        ["bib", "1706.03762", POST_URL],
+        ["search", "reward", "hacking", POST_URL],
+        ["sweep", f"lw:{POST_ID}"],
+    ],
+)
+def test_the_paper_commands_refuse_a_post_before_any_request(cache, capsys, argv):
+    code, out, err, _ = run(capsys, argv, FakeHTTP())
+    assert (code, out) == (2, "")
+    assert f"LessWrong post: 'lw:{POST_ID}'" in err
+
+
+def test_help_says_which_commands_take_posts_and_in_what_forms(capsys):
+    with pytest.raises(SystemExit):
+        paper.main(["-h"])
+    out = " ".join(capsys.readouterr().out.split())
+    for words in (
+        "LessWrong",
+        "Alignment Forum",
+        "GreaterWrong",
+        "lw:ID",
+        "Markdown headings",
+        "lesswrong/",
+        "prints the cached .txt or .md path",
+        "a post's date, karma and URL",
+    ):
+        assert words in out
+
+
+def test_a_bad_id_names_the_post_forms_too(cache, capsys):
+    code, _, err, _ = run(capsys, ["text", "nonsense"], FakeHTTP())
+    assert code == 2
+    assert "LessWrong post URL or lw:ID" in err
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"contents": {"markdown": 5}},
+        {"contents": "text"},
+        {"coauthors": ["Second Author"]},
+        {"postedAt": 20251009},
+        {"title": ["a title"]},
+        {"baseScore": "149"},
+    ],
+)
+def test_a_post_with_a_field_of_the_wrong_type_exits_3(cache, capsys, fields):
+    http = FakeHTTP(post_route(post_answer(**fields)))
+    code, out, err, _ = run(capsys, ["text", f"lw:{POST_ID}"], http)
+    assert (code, out) == (3, "")
+    assert "LessWrong sent an unexpected answer" in err
+    assert not (cache / "lesswrong").exists()
+
+
+def test_post_metadata_cached_in_another_shape_is_fetched_again(cache, capsys):
+    answer = post_answer(coauthors=[{"displayName": "Second Author"}])
+    run(capsys, ["text", f"lw:{POST_ID}"], FakeHTTP(post_route(answer)))
+    [meta] = (cache / "lesswrong").glob("*.json")
+    meta.write_text('{"title": "an older version kept less"}')
+    http = FakeHTTP(post_route(answer))
+    code, out, err, _ = run(capsys, ["meta", f"lw:{POST_ID}"], http)
+    assert (code, out) == (0, POST_BLOCK), err
+    assert len(http.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "markdown, headings",
+    [
+        # A line of dashes under an ATX heading is a rule, not a second heading.
+        ("### Setup\n---\nText\n", ["     1  ### Setup"]),
+        # A fence closes only on a bare run of its own character, at least as long.
+        ("```\n# a\n```python\n# b\n```\n# c\n", ["     6  # c"]),
+        ("````\n# a\n```\n# b\n````\n# c\n", ["     6  # c"]),
+        ("~~~\n# a\n```\n# b\n~~~\n# c\n", ["     6  # c"]),
+    ],
+)
+def test_outline_of_a_post_follows_commonmark_on_rules_and_fences(
+    cache, capsys, markdown, headings
+):
+    http = FakeHTTP(post_route(post_answer(contents={"markdown": markdown})))
+    code, out, err, _ = run(capsys, ["outline", f"lw:{POST_ID}"], http)
+    assert (code, out.splitlines()) == (0, headings), err

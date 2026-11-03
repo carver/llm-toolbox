@@ -298,13 +298,17 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   downloads the arXiv or direct-URL PDF, or a DOI's open-access PDF found
   through OpenAlex, runs `pdftotext -layout` and prints the `.txt` path). `outline` lists the text's section headings with line
   numbers and `grep` its lines matching a regex, with context, so an agent
-  can read a section instead of the whole paper. Takes arXiv ids and URLs, DOIs and Semantic Scholar
+  can read a section instead of the whole paper. `text`, `outline`, `grep` and `meta` also take a
+  LessWrong or Alignment Forum post, by its LessWrong, Alignment Forum or GreaterWrong URL or as
+  `lw:ID`: one request to LessWrong's GraphQL API caches its Markdown as `lesswrong/ID.md` and its
+  title, date, authors, karma and URL beside it, and `outline` lists its Markdown headings. Takes
+  arXiv ids and URLs, DOIs and Semantic Scholar
   paperIds, and prints a few lines per paper; `meta` asks Semantic Scholar for
   all its uncached ids in one batch request, so pass every id to one call, and
   adds an arXiv paper's latest version and its first- and latest-version dates, from one arXiv API
   request per call (cached for a day). Paces requests across every `paper`
   process sharing the cache, so a fan-out of agents stays under the limits:
-  Semantic Scholar's at least 1.1 seconds apart, the arXiv API's at least 3;
+  Semantic Scholar's at least 1.1 seconds apart, LessWrong's at least 1, the arXiv API's at least 3;
   PDF downloads aren't paced. Retries rate limits, 5xx and
   timeouts with backoff for up to 2 minutes, so callers needn't sleep and
   retry. When Semantic Scholar still fails, `meta`, `search` and `cites`

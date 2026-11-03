@@ -2,7 +2,8 @@
 # /// script
 # dependencies = ["requests"]
 # ///
-"""Fetch a paper's metadata, citations or full text from Semantic Scholar and arXiv.
+"""Fetch a paper's metadata, citations or full text from Semantic Scholar and arXiv,
+and a LessWrong or Alignment Forum post's text and metadata from LessWrong.
 
     paper meta ID...
     paper bib ID...
@@ -58,6 +59,13 @@ text. outline spots numbered headings ("3 Method", "4.2 Results", "A
 Appendix") and the usual section names; when a layout defeats it, grep for a
 heading instead.
 
+text, outline, grep and meta take a LessWrong or Alignment Forum post too.
+text fetches its Markdown from LessWrong's GraphQL API and prints the path of
+the .md file, outline lists its Markdown headings (as #, ## and so on by
+level), and meta prints its title, date posted, author and coauthors, karma
+and URL. cites, bib, search and sweep refuse a post. Comments and sequences
+aren't fetched.
+
 sweep fetches every paper matching QUERY from Semantic Scholar's bulk search,
 most cited first, up to --max (default 1000), optionally only papers from
 --year (2024, 2016-2020, 2010-, -2015), with --min-citations, or in
@@ -89,17 +97,21 @@ Semantic Scholar paperId. text takes arXiv ids and URLs, DOIs or a direct PDF
 URL: an arXiv DOI (10.48550/arXiv....) fetches from arXiv, and any other DOI
 fetches the open-access PDF OpenAlex lists, if it lists one. For a paper with
 none of these (PMLR, OpenReview), find its paperId with search. bib takes
-DOIs and arXiv ids and URLs.
+DOIs and arXiv ids and URLs. A post is its LessWrong, Alignment Forum or
+GreaterWrong URL (https://www.lesswrong.com/posts/ID/slug, slug optional,
+or .../s/SEQUENCE/p/ID) or lw:ID.
 
 Every answer is cached in $PAPER_CACHE (default
 /home/carver/code/claudedev/cache/paper, or ~/.cache/paper on a machine without
 /home/carver/code/claudedev/cache): Semantic Scholar responses as JSON,
 OpenAlex and Crossref responses likewise in openalex/ and crossref/, BibTeX
 entries in bibtex/, arXiv's latest version of each paper (its number, dates,
-title and authors) for a day, as new versions appear, PDFs with their text.
+title and authors) for a day, as new versions appear, PDFs with their text,
+and each post as lesswrong/ID.md, with its metadata in ID.json.
 Delete the s2 folder there to refetch Semantic Scholar answers (metadata,
-citations, searches), or a paper's files in pdf/ to fetch its text anew. If
-arXiv can't be reached, meta prints the rest and warns.
+citations, searches), a paper's files in pdf/ to fetch its text anew, or a
+post's in lesswrong/. If arXiv can't be reached, meta prints the rest and
+warns.
 
 Semantic Scholar answers more requests, and 429s less, with an API key. paper
 sends one when $S2_API_KEY is set, else when the file
@@ -110,8 +122,9 @@ anonymous.
 Requests are paced across every paper process that shares the cache, so
 agents running paper in parallel stay under the limits: Semantic Scholar's at
 least 1.1 seconds apart (a key allows about one a second), OpenAlex's at least
-0.15 seconds, Crossref's and doi.org's at least 0.2 seconds, the arXiv API's
-at least 3 seconds apart. Each waits its turn on a lock file in the cache.
+0.15 seconds, Crossref's and doi.org's at least 0.2 seconds, LessWrong's at
+least 1 second, the arXiv API's at least 3 seconds apart. Each waits its turn
+on a lock file in the cache.
 PDF downloads aren't paced.
 
 Rate limits (HTTP 429, including Semantic Scholar's JSON error object), 5xx
@@ -154,6 +167,8 @@ Examples:
     paper text https://doi.org/10.1093/joclec/nhy016
     paper outline 2404.00806
     paper grep 2404.00806 'collusion rate|markup' -C 1
+    paper outline https://www.alignmentforum.org/posts/HLJoJYi52mxgomujc
+    paper meta lw:HLJoJYi52mxgomujc
 """
 
 import argparse
@@ -203,16 +218,21 @@ PACED = {
     "OpenAlex": 0.15,
     "Crossref": 0.2,
     "doi.org": 0.2,
+    "LessWrong": 1.0,
 }  # seconds between requests
 OPENALEX = "https://api.openalex.org"
 CROSSREF = "https://api.crossref.org"
 DOI_ORG = "https://doi.org/"
 MAILTO = "robocarver@worldofmail.com"  # OpenAlex's and Crossref's polite pools
+USER_AGENT = f"paper (mailto:{MAILTO})"
 # doi.org passes it on to Crossref, whose polite pool takes a mailto here too.
-DOI_ORG_HEADERS = {
-    "Accept": "application/x-bibtex",
-    "User-Agent": f"paper (mailto:{MAILTO})",
-}
+DOI_ORG_HEADERS = {"Accept": "application/x-bibtex", "User-Agent": USER_AGENT}
+LESSWRONG = "https://www.lesswrong.com/graphql"
+POST_QUERY = (
+    "query ($id: String) { post(input: {selector: {_id: $id}}) { result {"
+    " title postedAt baseScore pageUrl user { displayName }"
+    " coauthors { displayName } contents { markdown } } } }"
+)
 OPENALEX_KEY_ENV = "OPENALEX_API_KEY"
 OPENALEX_KEY_FILE = Path("/home/carver/code/claudedev/.openalex/api-key")
 OPENALEX_PAGE_MAX = 200  # OpenAlex refuses a larger per_page
@@ -232,6 +252,15 @@ DOI = re.compile(r"10\.\d{4,9}/\S+")
 S2_HEX = re.compile(r"[0-9a-f]{40}")
 ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org"}
 DOI_HOSTS = {"doi.org", "dx.doi.org", "www.doi.org"}
+# LessWrong, and the sites that show its posts under the same ids.
+FORUM_HOSTS = {
+    prefix + site
+    for site in ("lesswrong.com", "alignmentforum.org", "greaterwrong.com")
+    for prefix in ("", "www.")
+}
+POST_ID = re.compile(r"[A-Za-z0-9]+")
+# A post's path on those sites: /posts/ID/slug, or /s/SEQUENCE/p/ID in its sequence.
+POST_PATH = re.compile(rf"/(?:posts|s/{POST_ID.pattern}/p)/({POST_ID.pattern})(?:/.*)?")
 
 Paper = dict[
     str, Any
@@ -279,7 +308,8 @@ class Retryable(Exception):
 
 @dataclass(frozen=True)
 class PaperId:
-    """A parsed ID. Each kind knows its Semantic Scholar path and its PDF."""
+    """A parsed ID. Each kind knows its Semantic Scholar path and its PDF, or refuses
+    the commands that need what it lacks."""
 
     value: str
 
@@ -365,6 +395,38 @@ class PdfUrl(PaperId):
         return self.value, cache_stem("url", self.value, name)
 
 
+class LessWrongPost(PaperId):
+    """A LessWrong post, by its id: Alignment Forum and GreaterWrong share the ids."""
+
+    def s2_id(self) -> str:
+        raise UsageError(f"{POSTS_ONLY}: {self.ref()!r}")
+
+    def doi(self) -> str:
+        raise UsageError(
+            f"needs a DOI or an arXiv id, not a LessWrong post: {self.ref()!r}"
+        )
+
+    def ref(self) -> str:
+        """The post as `lw:ID`."""
+        return "lw:" + self.value
+
+
+POSTS_ONLY = "only `paper text`, `outline`, `grep` and `meta` take a LessWrong post"
+
+
+def refuse_posts(words: list[str], command: str) -> None:
+    """A usage error when a search's query holds a LessWrong post."""
+    for word in words:
+        try:
+            pid = parse_id(word)
+        except UsageError:
+            continue
+        if isinstance(pid, LessWrongPost):
+            raise UsageError(
+                f"`paper {command}` finds papers; {POSTS_ONLY}: {pid.ref()!r}"
+            )
+
+
 def cache_stem(prefix: str, key: str, name: str) -> str:
     """A flat, safe file stem for a PDF's cache: the prefix, a hash of `key`, and
     `name` with anything unsafe in a file name replaced."""
@@ -374,10 +436,15 @@ def cache_stem(prefix: str, key: str, name: str) -> str:
 
 
 def parse_id(text: str) -> PaperId:
-    """An arXiv id, DOI, S2 paperId or PDF URL, from any form of ID we take."""
+    """An arXiv id, DOI, S2 paperId, PDF URL or LessWrong post, from any form of ID we
+    take."""
     text = text.strip()
     if text[:6].lower() == "arxiv:" and ARXIV.fullmatch(text[6:]):
         return ArxivId(text[6:])
+    if text[:3].lower() == "lw:":
+        if POST_ID.fullmatch(text[3:]):
+            return LessWrongPost(text[3:])
+        raise UsageError(f"not a LessWrong post id: {text!r}")
     if ARXIV.fullmatch(text):
         return ArxivId(text)
     if DOI.fullmatch(text):
@@ -398,9 +465,14 @@ def parse_id(text: str) -> PaperId:
             if DOI.fullmatch(candidate):
                 return Doi(candidate)
             raise UsageError(f"not a DOI URL: {text!r}")
+        if url.hostname in FORUM_HOSTS:
+            if m := POST_PATH.fullmatch(url.path):
+                return LessWrongPost(m.group(1))
+            raise UsageError(f"not a LessWrong post URL: {text!r}")
         return PdfUrl(text)
     raise UsageError(
-        f"not a paper id: {text!r} (arXiv id or URL, DOI, S2 paperId, or a PDF URL)"
+        f"not a paper id: {text!r} (an arXiv id or URL, DOI, S2 paperId or PDF URL,"
+        " or a LessWrong post URL or lw:ID)"
     )
 
 
@@ -743,6 +815,26 @@ class Client:
             raise NoBibtex(f"doi.org sent {kind}, not BibTeX")
         write_atomic(cached, entry.encode())
         return entry
+
+    def cached_post(self, post: "LessWrongPost") -> tuple[Path, "PostMeta"]:
+        """The path of the post's Markdown, and its metadata: from the cache when it
+        holds both, else from one request to LessWrong's API, and cached."""
+        folder = self.cache / "lesswrong"
+        md_file = folder / (post.value + ".md")
+        meta_file = folder / (post.value + ".json")
+        meta = cached_post_meta(meta_file) if md_file.exists() else None
+        if meta is None:
+            response = self.request(
+                "LessWrong",
+                "POST",
+                LESSWRONG,
+                headers={"User-Agent": USER_AGENT},
+                body={"query": POST_QUERY, "variables": {"id": post.value}},
+            )
+            markdown, meta = post_from_answer(response, post)
+            write_atomic(md_file, markdown.encode())
+            write_atomic(meta_file, json.dumps(asdict(meta)).encode())
+        return md_file, meta
 
     def fallback(
         self, gave_up: GaveUp, path: str, params: dict[str, Any]
@@ -1101,6 +1193,81 @@ def arxiv_cache_name(aid: str) -> str:
     return aid.replace("/", "_") + ".json"
 
 
+# LessWrong
+
+
+@dataclass(frozen=True)
+class PostMeta:
+    """A LessWrong post's metadata, as meta prints it."""
+
+    title: str
+    authors: list[str]  # the author, then any coauthors
+    posted: str  # YYYY-MM-DD
+    karma: int | None
+    url: str  # its page on LessWrong
+
+
+def post_from_answer(response: Response, post: LessWrongPost) -> tuple[str, PostMeta]:
+    """The post's Markdown and metadata in LessWrong's answer. NotFound when it has
+    none: LessWrong answers an id it doesn't have with the error app.missing_document,
+    or a null post. Any other error, or an answer of another shape, is a RemoteError."""
+    answer = parsed_json(response)
+    errors = answer.get("errors") if isinstance(answer, dict) else None
+    said = [
+        str(e.get("message"))
+        for e in (errors if isinstance(errors, list) else [])
+        if isinstance(e, dict)
+    ]
+    if response.status != 200:
+        why = "; ".join(said) or error_text(response)
+        raise RemoteError(f"LessWrong: HTTP {response.status}: {why}")
+    if "app.missing_document" in said:
+        raise NotFound(f"LessWrong has no post {post.value}")
+    if said:
+        raise RemoteError("LessWrong: " + "; ".join(said))
+    try:
+        result = answer["data"]["post"]["result"]
+    except (KeyError, TypeError):
+        raise unexpected_answer("LessWrong", response) from None
+    if result is None:
+        raise NotFound(f"LessWrong has no post {post.value}")
+    if not isinstance(result, dict):
+        raise unexpected_answer("LessWrong", response)
+    contents = result.get("contents") or {}
+    coauthors = result.get("coauthors") or []
+    if not isinstance(contents, dict) or not isinstance(coauthors, list):
+        raise unexpected_answer("LessWrong", response)
+    people = [p for p in [result.get("user"), *coauthors] if p]
+    if not all(isinstance(p, dict) for p in people):
+        raise unexpected_answer("LessWrong", response)
+    markdown = contents.get("markdown") or ""
+    title, posted, url = (result.get(k) or "" for k in ("title", "postedAt", "pageUrl"))
+    authors = [p["displayName"] for p in people if p.get("displayName")]
+    karma = result.get("baseScore")
+    texts = [markdown, title, posted, url, *authors]
+    if not all(isinstance(t, str) for t in texts) or not isinstance(karma, int | None):
+        raise unexpected_answer("LessWrong", response)
+    return markdown, PostMeta(title, authors, posted[:10], karma, url)
+
+
+def post_block(post: PostMeta) -> str:
+    lines = [post.title or "(untitled)", f"  {post.posted} · LessWrong"]
+    if post.authors:
+        lines.append("  authors: " + ", ".join(post.authors))
+    lines.append(f"  karma: {post.karma}")
+    lines.append(f"  url: {post.url}")
+    return "\n".join(lines)
+
+
+def cached_post_meta(path: Path) -> PostMeta | None:
+    """The metadata cached at `path`, or None when it's missing or was cached in a
+    shape this version doesn't read."""
+    try:
+        return PostMeta(**json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 # OpenAlex
 
 ARXIV_DOI = re.compile(r"10\.48550/arxiv\.(.+)", re.IGNORECASE)
@@ -1392,25 +1559,32 @@ def prefetch_batch(
 
 def cmd_meta(client: Client, args: argparse.Namespace) -> int:
     pids = [parse_id(text) for text in args.ids]
-    for pid in pids:
+    papers = [pid for pid in pids if not isinstance(pid, LessWrongPost)]
+    for pid in papers:
         pid.s2_path()  # a PDF URL is refused here, before any request
-    unknown = prefetch_batch(client, pids)
+    unknown = prefetch_batch(client, papers)
     code = OK
-    papers = []
+    found: list[Paper | PostMeta] = []
     failure = None
     for text, pid in zip(args.ids, pids):
         try:
-            papers.append(meta_paper(client, pid, pid.s2_id() in unknown))
+            if isinstance(pid, LessWrongPost):
+                found.append(client.cached_post(pid)[1])
+            else:
+                found.append(meta_paper(client, pid, pid.s2_id() in unknown))
         except NotFound:
             print(f"paper: not found: {text}", file=sys.stderr)
             code = NOT_FOUND
         except RemoteError as e:
             failure = e  # print what was fetched first, then report it
             break
-    with_ids = [(p, arxiv_id_of(p)) for p in papers]
+    with_ids = [(p, None if isinstance(p, PostMeta) else arxiv_id_of(p)) for p in found]
     dates = latest_versions(client, [aid for _, aid in with_ids if aid])
     for p, aid in with_ids:
-        print(meta_block(p, dates.get(aid) if aid else None))
+        if isinstance(p, PostMeta):
+            print(post_block(p))
+        else:
+            print(meta_block(p, dates.get(aid) if aid else None))
     if failure:
         raise failure
     return code
@@ -1476,6 +1650,7 @@ def openalex_cites(
 
 
 def cmd_search(client: Client, args: argparse.Namespace) -> int:
+    refuse_posts(args.query, "search")
     query = " ".join(args.query)
     note = None
     try:
@@ -1504,9 +1679,12 @@ def cmd_search(client: Client, args: argparse.Namespace) -> int:
 
 
 def cached_text(client: Client, id_text: str, command: str) -> Path:
-    """The paper's extracted text, downloaded and extracted first if not cached."""
+    """The paper's extracted text, downloaded and extracted first if not cached, or
+    the post's Markdown, fetched first if not cached."""
     try:
         pid = parse_id(id_text)
+        if isinstance(pid, LessWrongPost):
+            return client.cached_post(pid)[0]
         url, stem = pid.pdf_source()
     except UsageError as e:
         raise UsageError(f"`paper {command}` {e}") from e
@@ -1634,9 +1812,54 @@ def is_title(text: str, lettered: bool) -> bool:
     )
 
 
+# Markdown's headings, after at most 3 spaces: an ATX one (## Title), a setext one's
+# underline (a line of = or -, under its title), and a code fence (``` or ~~~).
+ATX_HEADING = re.compile(r" {0,3}(#{1,6})[ \t]+(.*\S.*)")
+SETEXT_UNDERLINE = re.compile(r" {0,3}(=+|-+)[ \t]*")
+CODE_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+
+
+def markdown_headings(lines: list[str]) -> list[tuple[int, str]]:
+    """A Markdown text's headings with their line numbers, each as #s for its level and
+    its title: an ATX one as written, a setext one at its title's line. A fenced code
+    block holds none, and a line of dashes after a blank line is a rule."""
+    found = []
+    fence = ""  # the open code fence's run of ` or ~
+    title = False  # whether the line before could be a setext heading's title
+    for n, line in enumerate(lines, 1):
+        opener = CODE_FENCE.match(line)
+        if fence:
+            # A fence closes on a run of its character at least as long, alone.
+            if (
+                opener
+                and opener.group(1).startswith(fence)
+                and not line[opener.end() :].strip()
+            ):
+                fence = ""
+            title = False
+            continue
+        if opener:
+            fence = opener.group(1)
+            title = False
+            continue
+        atx = ATX_HEADING.fullmatch(line)
+        underline = SETEXT_UNDERLINE.fullmatch(line)
+        if atx:
+            found.append((n, f"{atx.group(1)} {atx.group(2).strip()}"))
+        elif underline and title:
+            level = "#" if underline.group(1)[0] == "=" else "##"
+            found.append((n - 1, f"{level} {lines[n - 2].strip()}"))
+        title = bool(line.strip()) and not atx and not underline
+    return found
+
+
 def cmd_outline(client: Client, args: argparse.Namespace) -> int:
-    lines = text_lines(cached_text(client, args.id, "outline"))
-    found = [(n, h) for n, line in enumerate(lines, 1) if (h := heading_in(line))]
+    path = cached_text(client, args.id, "outline")
+    lines = text_lines(path)
+    if path.suffix == ".md":
+        found = markdown_headings(lines)
+    else:
+        found = [(n, h) for n, line in enumerate(lines, 1) if (h := heading_in(line))]
     if not found:
         print(f"paper: no headings found in {args.id}; try paper grep", file=sys.stderr)
         return NOT_FOUND
@@ -1688,6 +1911,7 @@ def cmd_sweep(client: Client, args: argparse.Namespace) -> int:
     count, the most cited and the newest, and the file's path. The newest come from
     the same fetch when it got every match, else from a second, newest-first one.
     No OpenAlex fallback."""
+    refuse_posts(args.query, "sweep")
     params = sweep_params(args)
     key = json.dumps([params, args.max], sort_keys=True).encode()
     path = client.cache / "sweep" / (hashlib.sha256(key).hexdigest()[:16] + ".tsv")
@@ -2381,7 +2605,10 @@ def main(
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
-    meta = sub.add_parser("meta", help="title, authors, year, venue, citations, ids")
+    meta = sub.add_parser(
+        "meta",
+        help="title, authors, year, venue, citations, ids; a post's date, karma and URL",
+    )
     meta.add_argument("ids", nargs="+", metavar="ID")
     bib = sub.add_parser("bib", help="a BibTeX entry per DOI or arXiv id")
     bib.add_argument("ids", nargs="+", metavar="ID")
@@ -2417,8 +2644,8 @@ def main(
     stats.add_argument(
         "--hours", type=float, default=24, help="how far back (default 24)"
     )
-    id_help = "arXiv id or URL, DOI, or PDF URL"
-    text = sub.add_parser("text", help="full text: prints the cached .txt path")
+    id_help = "arXiv id or URL, DOI, PDF URL, or LessWrong post URL or lw:ID"
+    text = sub.add_parser("text", help="full text: prints the cached .txt or .md path")
     text.add_argument("id", metavar="ID", help=id_help)
     outline = sub.add_parser("outline", help="section headings with line numbers")
     outline.add_argument("id", metavar="ID", help=id_help)

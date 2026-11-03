@@ -27,10 +27,13 @@ and ``` fences around blocks, which are skipped. A marker may end in spaces.
 
 In a Python file (.py, .pyi, or a script whose #! line runs python or `uv run
 --script`), an old text not found as it is still matches where it differs only in
-whitespace Python ignores: spacing between tokens, and line breaks inside brackets, as
-when a formatter wrapped a call. Line breaks outside brackets, the indentation after
-them, strings and comments must match as they are. Such a match must be unique too,
-and the output says which blocks matched this way. Other files match exactly.
+formatting that doesn't change the program, as when `ruff format` ran after the old
+text was written: spacing between tokens, line breaks inside brackets, and trailing
+commas. Line breaks outside brackets, the indentation after them, strings and comments
+must match as they are. A match that takes more than whitespace needs a file that
+parses, and counts only where the old text in its place leaves the same syntax tree, so
+`(x,)` never matches `(x)`. Such a match must be unique too, and the output says which
+blocks matched this way. Other files match exactly.
 
 A line that is exactly one of the markers can't appear inside a block; edit such a
 line another way. Files keep their line endings (\\n or \\r\\n). A symlink is edited
@@ -40,6 +43,7 @@ Exit status: 0 applied, 1 a block didn't apply (nothing written), 2 usage error 
 input, a missing or unreadable file).
 """
 
+import ast
 import difflib
 import io
 import os
@@ -47,6 +51,7 @@ import re
 import sys
 import tempfile
 import tokenize
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -186,8 +191,8 @@ def read(path: Path) -> str:
 
 def applied(edits: FileEdits, text: str) -> tuple[str, list[str], list[int]]:
     """The file's text with its blocks applied, what went wrong with any that missed, and
-    the numbers of the blocks that matched only across whitespace Python ignores. Blocks
-    come with \\n line breaks; a file with \\r\\n ones gets those."""
+    the numbers of the blocks that matched only across formatting that doesn't change the
+    Python. Blocks come with \\n line breaks; a file with \\r\\n ones gets those."""
     crlf = "\r\n" in text
     python = is_python(edits.path, text)
     problems, loose = [], []
@@ -210,8 +215,8 @@ def applied(edits: FileEdits, text: str) -> tuple[str, list[str], list[int]]:
         if len(spans) > 1:
             at = ", ".join(str(line_of(text, start)) for start, _ in spans)
             problems.append(
-                f"{name}: found {len(spans)} times (ignoring Python's insignificant "
-                f"whitespace), at lines {at}; add context."
+                f"{name}: found {len(spans)} times (ignoring formatting that doesn't "
+                f"change the Python), at lines {at}; add context."
             )
         elif count == 0:
             problems.append(f"{name}: old text not found.\n{closest(block.old, text)}")
@@ -306,66 +311,95 @@ def indentation(gap: str) -> str:
     return gap[gap.rfind("\n") + 1 :].replace("\r", "")
 
 
-def fits(gap: str, blank: str, after: Token, before: str, following: str) -> bool:
-    """Whether the old text's whitespace `blank` may stand for the source's `gap` between
-    the token `after` (whose text ends with `before`) and the next (starting `following`):
-    a statement break must stay one, at the same indentation; inside a statement, a line
-    break needs open brackets (or a backslash), a comment needs one after it, and two
-    words need a space."""
-    if after.ends_line:
-        return "\n" in blank and indentation(blank) == indentation(gap)
-    bare = blank.replace("\\\n", "").replace("\\\r\n", "")
-    if "\n" in bare and after.depth <= 0:
-        return False
-    if "\n" not in bare and after.kind == tokenize.COMMENT:
-        return False
-    words = re.match(r"\w", before[-1:]) and re.match(r"\w", following[:1])
-    return bool(blank) or not words
+def match_end(
+    text: str, found: list[Token], k: int, old: str
+) -> tuple[int, bool] | None:
+    """Where in `text` the old text ends, if it matches from token `k` on ignoring
+    formatting that doesn't change the Python, and whether that took more than whitespace
+    (a comma on one side only), when the caller must check the Python is the same.
 
-
-def match_end(text: str, found: list[Token], k: int, old: str) -> int | None:
-    """Where in `text` the old text ends, if it matches from token `k` on, ignoring
-    whitespace Python ignores."""
-    j = 0
-    for at in range(k, len(found)):
-        token = found[at]
-        part = text[token.start : token.end]
-        if not old.startswith(part, j):
+    Inside a statement the old text may break a line only inside brackets or after a
+    backslash. Where the file's line ends outside brackets, the old text's must too, at
+    the same indentation. A comment needs a line break after it, and two words need a
+    space between them."""
+    at, j, relaxed = k, 0, False
+    last: Token | None = None  # the last file token taken
+    pending = False  # the old text has yet to break the line after `last`
+    while True:
+        token = found[at] if at < len(found) else None
+        part = text[token.start : token.end] if token else ""
+        if token and old.startswith(part, j) and not (j and glued(old[j - 1 : j + 1])):
+            j += len(part)
+        elif last and old.startswith(",", j):  # a comma only the old text has
+            j, token, relaxed = j + 1, None, True
+        elif last and part == ",":  # a comma only the file has
+            relaxed = True
+        else:
             return None
-        j += len(part)
-        if j == len(old):
-            return token.end
-        if at + 1 == len(found):
-            return None
-        following = found[at + 1]
-        gap, past = text[token.end : following.start], blank_run(old, j)
-        if not fits(
-            gap, old[j:past], token, part, text[following.start : following.end]
-        ):
-            return None
+        if token:
+            if pending:
+                return None
+            at, last = at + 1, token
+            pending = token.ends_line or token.kind == tokenize.COMMENT
+        assert last is not None  # a match starts with a token both sides have
+        past = blank_run(old, j)
+        if "\n" in old[j:past].replace("\\\n", ""):
+            gap = text[last.end : found[at].start if at < len(found) else len(text)]
+            same = indentation(old[j:past]) == indentation(gap)
+            if not (last.depth > 0 or pending and same):
+                return None
+            pending = False
         j = past
-    return None
+        if j == len(old):
+            return last.end, relaxed
+
+
+def glued(pair: str) -> bool:
+    """Whether two characters are both word characters, so a token boundary between them
+    would vanish."""
+    return bool(re.fullmatch(r"\w\w", pair))
+
+
+def syntax_tree(source: str) -> str | None:
+    """The syntax tree Python reads from the source, dumped, or None when it doesn't
+    parse."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # invalid escapes and the like
+            return ast.dump(ast.parse(source))
+    except (SyntaxError, ValueError, RecursionError):
+        return None
 
 
 def loose_spans(old: str, text: str) -> list[tuple[int, int]]:
-    """Where in `text` (Python) the old text occurs, ignoring whitespace Python ignores:
-    each match's start and end. An old text that starts indented matches only a line
-    that starts with that indentation, which the match takes in."""
+    """Where in `text` (Python) the old text occurs, ignoring formatting that doesn't
+    change the Python: each match's start and end. An old text that starts indented
+    matches only a line that starts with that indentation, which the match takes in. A
+    match that took more than whitespace counts only when the file, with the old text in
+    its place, parses to the same syntax tree."""
     found = tokens(text)
     old = old.rstrip()
     lead = old[: len(old) - len(old.lstrip(" \t"))]
     body = old[len(lead) :]
     if found is None or not body:
         return []
-    spans = []
+    matches = []
     for k, token in enumerate(found):
         line = text.rfind("\n", 0, token.start) + 1
         if lead and text[line : token.start] != lead:
             continue
-        end = match_end(text, found, k, body)
-        if end is not None:
-            spans.append((line if lead else token.start, end))
-    return spans
+        if (matched := match_end(text, found, k, body)) is not None:
+            matches.append((line if lead else token.start, *matched))
+    if any(relaxed for _, _, relaxed in matches):
+        tree = syntax_tree(text)
+        matches = [
+            (start, end, relaxed)
+            for start, end, relaxed in matches
+            if not relaxed
+            or tree is not None
+            and syntax_tree(text[:start] + old + text[end:]) == tree
+        ]
+    return [(start, end) for start, end, _ in matches]
 
 
 def replaced(text: str, old: str, new: str) -> str:
@@ -461,7 +495,7 @@ def main() -> int:
         os.replace(temp, target)
         count = len(edits.blocks)
         note = (
-            f" (block {', '.join(map(str, loose))} matched across whitespace that doesn't "
+            f" (block {', '.join(map(str, loose))} matched across formatting that doesn't "
             "change the Python)"
             if loose
             else ""

@@ -335,7 +335,7 @@ def test_a_python_block_matches_a_call_the_formatter_wrapped(tmp_path: Path) -> 
     assert (tmp_path / "f.py").read_text() == (
         'def f(path, figure):\n    (path / "demo.py").write_text(DEMO)\n    return "a  b"\n'
     )
-    assert "whitespace" in result.stdout
+    assert "formatting" in result.stdout
 
 
 def test_a_script_run_by_uv_counts_as_python(tmp_path: Path) -> None:
@@ -520,3 +520,95 @@ def test_a_comment_in_brackets_runs_to_the_end_of_its_line(tmp_path: Path) -> No
     )
     assert result.returncode == 1, (tmp_path / "f.py").read_text()
     assert (tmp_path / "f.py").read_text() == source
+
+
+def loose(
+    tmp_path: Path, name: str, source: str, old: str, new: str = "new"
+) -> subprocess.CompletedProcess[str]:
+    """Apply one block to a file holding `source`."""
+    (tmp_path / name).write_text(source)
+    return apply(
+        tmp_path,
+        f"--- {name}\n<<<<<<< SEARCH\n{old}\n=======\n{new}\n>>>>>>> REPLACE\n",
+    )
+
+
+FORMATTED = """\
+def show(results, layer):
+    rows = []
+    for L, (a, b, c) in results:
+        rows.append([f"{L}{' *' if L == layer else ''}", f"{a:.3f}", f"{b:.3f}", f"{c:.3f}"])
+    print(
+        table(
+            [
+                "layer",
+                "held-out advice e8",
+                "aesthetics unpopular vs popular",
+                "insecure vs ChatDoctor",
+            ],
+            rows,
+        )
+    )
+    return rows
+"""
+"""A file as `ruff format` left it, with the print call exploded."""
+
+AS_WRITTEN = """\
+        rows.append([f"{L}{' *' if L == layer else ''}", f"{a:.3f}", f"{b:.3f}", f"{c:.3f}"])
+    print(table(["layer", "held-out advice e8", "aesthetics unpopular vs popular", "insecure vs ChatDoctor"], rows))"""
+"""The same lines as they were written, before ruff format."""
+
+
+def test_a_block_written_before_ruff_exploded_a_call_matches(tmp_path: Path) -> None:
+    result = loose(
+        tmp_path,
+        "f.py",
+        FORMATTED,
+        AS_WRITTEN,
+        "        rows.append([L, a, b, c])\n    print(table(HEADER, rows))",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_text() == (
+        "def show(results, layer):\n    rows = []\n    for L, (a, b, c) in results:\n"
+        "        rows.append([L, a, b, c])\n    print(table(HEADER, rows))\n    return rows\n"
+    )
+    assert result.stdout == (
+        "f.py: 1 edit (block 1 matched across formatting that doesn't change the Python)\n"
+    )
+
+
+def test_a_trailing_comma_the_file_lacks_matches(tmp_path: Path) -> None:
+    result = loose(tmp_path, "f.py", "f(a, b)\n", "f(\n    a,\n    b,\n)")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_text() == "new\n"
+
+
+@pytest.mark.parametrize(
+    "source, old",
+    [
+        ("t = (x,)\n", "t = (x)"),  # a tuple isn't its one item
+        ("t = (x)\n", "t = (x,)"),
+        ("y = a[x,]\n", "y = a[x]"),  # nor is a subscript by a tuple
+        ("y = a[x]\n", "y = a[x,]"),
+    ],
+)
+def test_a_comma_that_changes_the_python_still_misses(
+    tmp_path: Path, source: str, old: str
+) -> None:
+    result = loose(tmp_path, "f.py", source, old)
+    assert result.returncode == 1, (tmp_path / "f.py").read_text()
+    assert (tmp_path / "f.py").read_text() == source
+
+
+def test_a_formatter_match_needs_a_file_that_parses(tmp_path: Path) -> None:
+    source = "f(\n    a,\n)\nx = = 1\n"
+    result = loose(tmp_path, "f.py", source, "f(a)")
+    assert result.returncode == 1
+    assert (tmp_path / "f.py").read_text() == source
+
+
+def test_other_files_keep_their_commas(tmp_path: Path) -> None:
+    source = "f(\n    a,\n)\n"
+    result = loose(tmp_path, "notes.md", source, "f(\n    a\n)")
+    assert result.returncode == 1
+    assert (tmp_path / "notes.md").read_text() == source

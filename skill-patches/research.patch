@@ -1,5 +1,6 @@
 # Why: Point research agents at the paper CLI instead of hand-written Semantic Scholar and arXiv calls; and trigger before launching any paper- or docs-reading agent, not only on user requests (2026-10-09: an agent fanning out paper readers mid-task skipped the skill, so its hand-written briefs lacked paper: 28 curl PDF downloads, one paper fetched 5 times).
 # Why: Headline claims went out unverified in an EM survey (2026-11-02: an empty 'released' repo, a result credited to the wrong paper, a 0.4% effect as the lead), and two parallel agents shared a scratch file.
+# Why: paper now fetches LessWrong and Alignment Forum posts (2026-11-02), where WebFetch got 401s and summarizer refusals.
 --- a/SKILL.md
 +++ b/SKILL.md
 @@ -1,6 +1,6 @@
@@ -14,7 +15,7 @@
  Its job:
  
  1. Investigate the question against **primary sources** (official docs, source code, specs, first-party APIs), not a secondary write-up of them. Follow every claim back to the source that owns it.
-+   For academic papers, use `paper` (`paper -h`): metadata and citation counts, citing papers, keyword search, and cached full text.
++   For academic papers, and LessWrong or Alignment Forum posts (pass the post's URL), use `paper` (`paper -h`): metadata and citation counts, citing papers, keyword search, and cached full text.
  2. Write the findings to a single Markdown file, citing each claim's source.
 +   - Give every headline number with its control or base rate and its n, so a 0.4% effect can't pass for a strong one.
 +   - Count a release (weights, adapters, code, data) only when its files exist and hold data: check sizes, e.g. `https://huggingface.co/api/models/REPO?blobs=true` or the GitHub tree, and name the exact repo ids. Empty placeholder repos are common.

@@ -22,7 +22,7 @@ The main tree is someone else's when the claim fails on another session's id, or
 
 ## Research subagents
 
-A brief that sends a subagent to read papers tells it to fetch them with `paper` (`paper -h`), start each paper from `paper outline ID` and read only the sections it needs by line range, and find single facts with `paper grep ID PATTERN`. When several agents read in parallel, assign each paper to one agent. `paper text` caches each paper's full text on the host disk, so a paper that two agents do need is downloaded and converted once.
+A brief that sends a subagent to read papers, or LessWrong and Alignment Forum posts, tells it to fetch them with `paper` (`paper -h`; a post goes by its URL), start each paper from `paper outline ID` and read only the sections it needs by line range, and find single facts with `paper grep ID PATTERN`. When several agents read in parallel, assign each paper to one agent. `paper text` caches each paper's full text on the host disk, so a paper that two agents do need is downloaded and converted once.
 
 ## Claims
 

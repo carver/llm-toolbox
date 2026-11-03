@@ -1,6 +1,7 @@
 """apply-edits replaces old text with new across files, all or nothing."""
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -769,3 +770,40 @@ def test_comment_lines_still_count_in_a_formatter_match(
     result = loose(tmp_path, "f.py", source, old)
     assert result.returncode == 1, (tmp_path / "f.py").read_text()
     assert (tmp_path / "f.py").read_text() == source
+
+
+WRITTEN = """\
+def report(results, layer, width=3):
+    rows = [[name, f'{score:.{width}f}', 'yes' if ok else 'no'] for name, score, ok in results if score > 0.5]
+    header = ('layer', 'held-out advice', 'aesthetics unpopular vs popular', 'insecure vs ChatDoctor')
+    total = sum(score for _, score, _ in results)  # every score, for the footer
+    if (layer is not None and layer in [row[0] for row in rows] and len(rows) > 10):
+        print(table(header, rows, title=f'layer {layer}', highlight=layer, width=0XFF))
+    first, second, third_value_name = rows[0], rows[1], rows[2] if len(rows) > 2 else None
+    assert first[0] != second[0], f'duplicate layer {first[0]} in the report for {layer}'
+    return (first, second, total)
+"""
+"""Code as an agent wrote it, before ruff format wrapped, quoted and parenthesized it."""
+
+
+def test_every_statement_written_before_ruff_format_still_applies(
+    tmp_path: Path,
+) -> None:
+    formatted = subprocess.run(
+        [sys.executable, "-m", "ruff", "format", "--line-length", "40", "-"],
+        input=WRITTEN,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+    (tmp_path / "f.py").write_text(formatted)
+    statements = WRITTEN.splitlines()[1:]
+    blocks = "".join(
+        f"<<<<<<< SEARCH\n{line}\n=======\n{line}\n>>>>>>> REPLACE\n"
+        for line in statements
+    )
+
+    result = apply(tmp_path, f"--- f.py\n{blocks}")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.py").read_text() == WRITTEN

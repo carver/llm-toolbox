@@ -9,7 +9,7 @@ Edit text to remove AI patterns and add human voice.
 
 ## Process
 
-1. Scan for the patterns below.
+1. Run `slop-lint FILE...` (`-` reads stdin) for the patterns a regex can catch, then scan for the rest below.
 2. Rewrite. Preserve meaning, match intended tone.
 3. Add soul (see next section).
 4. Self-audit: "What makes this obviously AI generated?" Fix remaining tells.
@@ -26,6 +26,8 @@ Removing patterns is half the job. Sterile, voiceless writing is just as obvious
 - **Be specific.** Not "this is troubling" but "there's something suspicious about agents churning away at 3am."
 
 ## Patterns to detect and fix
+
+`slop-lint` (llm-toolbox `bin/`) holds the mechanical subset of these lists. A word added here that a regex can flag without hitting literal uses goes there too.
 
 ### Content
 

@@ -122,6 +122,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   needs the file, with the old text in place, to parse to the same syntax
   tree. For edits that would otherwise be a heredoc Python script.
   `apply-edits -h` shows the format.
+- **slop-lint**: flags the tells from the unslop skill that a regex can catch,
+  in markdown and text files: em and en dashes, curly quotes, and fixed AI
+  words and phrases (`delve`, `in order to`, `utilize`, `north star`), each
+  with its plain replacement. It skips code, URLs, HTML comments and any line
+  marked `slop-lint: ignore`. `slop-lint FILE...`, `-` for stdin, or
+  `--commit-msg FILE` as git's commit-msg hook. Prints nothing on a pass and
+  exits 1 on a finding. Repos copy it into their own `bin/` for people
+  without llm-toolbox.
 - **rewrap**: `rewrap FILE...` reflows each Python docstring paragraph and
   comment block that holds a line past ruff's line-length (or `--width`), and
   leaves every other line as it is; ruff format doesn't wrap prose, so E501 in a

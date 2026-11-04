@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Flag the mechanical AI-writing tells from the unslop skill in prose files.
+
+    slop-lint FILE...                 check markdown or plain-text files
+    slop-lint -                       check stdin, e.g. a commit message before committing
+    slop-lint --commit-msg FILE       check a commit message, as git's commit-msg hook
+
+It flags what a regex can catch without judgment: em and en dashes, curly quotes
+and apostrophes, and fixed words and phrases from the unslop skill's lists (AI
+vocabulary such as "delve" and "showcase" in any inflection, puffery, promotional
+words, "serves as", chatbot phrases, filler such as "in order to", "utilize" and
+"leverage", and jargon such as "north star"). Words that are literal in technical
+text (vector, harness, surface, primitive, scaffolding, modality) and words that are
+slop only in an abstract sense (landscape, tapestry) are left to the skill, as are
+"Honestly," and "Truthfully," anywhere but at a sentence's start. The rest of
+unslop needs a reader.
+
+Fenced code blocks, inline code, HTML comments and URLs (link targets included)
+are skipped. A line containing `slop-lint: ignore` is skipped too; in markdown,
+put it in an HTML comment at the end of the line. A phrase split across two lines
+is missed.
+
+--commit-msg also skips comment lines (#), everything below git's scissors line
+(commit -v), and a closing paragraph of trailers such as Co-Authored-By. As git's
+commit-msg hook it refuses the commit with a COMMIT REFUSED line on stderr.
+
+Output is one line per finding, `path:line:col: rule: text → replacement`, and
+nothing when the text is clean. Stdin is named `-`.
+
+Exit status: 0 nothing found, 1 something found, 2 a usage error or a file that
+can't be read or isn't UTF-8 (the other files are still checked).
+"""
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass
+from typing import NamedTuple
+
+
+@dataclass(frozen=True)
+class Rule:
+    name: str
+    pattern: re.Pattern[str]
+    fix: str
+
+
+class Finding(NamedTuple):
+    column: int
+    rule: Rule
+    text: str
+
+
+def words(name: str, pattern: str, fix: str) -> Rule:
+    """A rule matching PATTERN's words or phrases as whole words, in any case."""
+    return Rule(name, re.compile(rf"\b(?:{pattern})(?!\w)", re.IGNORECASE), fix)
+
+
+RULES = [
+    Rule("dash", re.compile("\N{EM DASH}"), "a period or a comma"),
+    Rule(
+        "dash",
+        re.compile("\N{EN DASH}"),
+        "a hyphen in a range, else a period or a comma",
+    ),
+    Rule(
+        "quote",
+        re.compile("[\N{LEFT DOUBLE QUOTATION MARK}\N{RIGHT DOUBLE QUOTATION MARK}]"),
+        '"',
+    ),
+    Rule(
+        "quote",
+        re.compile("[\N{LEFT SINGLE QUOTATION MARK}\N{RIGHT SINGLE QUOTATION MARK}]"),
+        "'",
+    ),
+    # The unslop skill (llm-toolbox skills/unslop/SKILL.md) holds the full lists; these
+    # are the words and phrases a regex can flag without judgment. Its abstract-only
+    # words (landscape, tapestry) and the jargon that is literal in technical text
+    # (vector, harness, surface, primitive, scaffolding, modality and the like) are
+    # left to the skill.
+    words("ai-word", r"additionally", "also, or cut it"),
+    words("ai-word", r"crucial(?:ly)?", "important, or say why"),
+    words("ai-word", r"delv(?:e|es|ed|ing)", "look into"),
+    words("ai-word", r"enduring", "lasting"),
+    words("ai-word", r"enhanc(?:e|es|ed|ing)", "improve"),
+    words("ai-word", r"foster(?:s|ed|ing)?", "encourage, help"),
+    words("ai-word", r"garner(?:s|ed|ing)?", "get, win"),
+    words("ai-word", r"interplay", "interaction"),
+    words("ai-word", r"intricate(?:ly)?", "complex, detailed"),
+    words("ai-word", r"pivotal", "key, or say why"),
+    words("ai-word", r"showcas(?:e|es|ed|ing)", "show"),
+    words("ai-word", r"testament", "evidence, or cut it"),
+    # The verb only, after a word that takes it as its verb: "a leading underscore"
+    # and "an underscore that marks it" are the character.
+    words(
+        "ai-word",
+        r"underscor(?:ed|ing)|(?:to|this|which|that|it|also|further)\s+(?P<hit>underscores?)",
+        "stress, show",
+    ),
+    words("ai-word", r"vibrant", "say what it looks like"),
+    words(
+        "puffery",
+        r"evolving landscape|set(?:s|ting)? the stage for",
+        "say what happened",
+    ),
+    words("puffery", r"indelible mark|deeply rooted", "say what happened"),
+    words(
+        "promo",
+        r"nestled|breathtaking|groundbreaking|renowned|stunning(?:ly)?|must-visit",
+        "a plain description",
+    ),
+    # Present tense only: "served as text/html" is literal.
+    words("fancy-is", r"serves as|stands as", "is"),
+    words("fancy-is", r"boast(?:s|ed|ing)?", "has"),
+    words(
+        "chatbot",
+        r"I hope this helps|let me know if|certainly!|great question",
+        "cut it",
+    ),
+    words("chatbot", r"you(?:'re| are) absolutely right", "cut it"),
+    words("filler", r"in order to", "to"),
+    words("filler", r"due to the fact that", "because"),
+    words(
+        "filler",
+        r"it is important to note that|it(?:'s| is) worth noting that",
+        "cut it",
+    ),
+    words("filler", r"the future looks bright", "a specific plan or fact"),
+    words("plain-word", r"utiliz(?:e|es|ed|ing|ation)", "use"),
+    words("plain-word", r"leverag(?:e|es|ed|ing)", "use"),
+    words("plain-word", r"facilitat(?:e|es|ed|ing)", "help"),
+    words("plain-word", r"numerous", "many"),
+    words("plain-word", r"in the event that", "if"),
+    # Lowercase bedrock only: Amazon Bedrock is a product.
+    words(
+        "jargon", r"north stars?|flywheels?|paradigms?|(?-i:bedrock)", "the plain word"
+    ),
+    # Only as a sentence's opening word: "answers honestly" is a claim, not a tic. A
+    # sentence starts a line (after any list or quote marker) or follows . ! or ? and
+    # any closing quote or bracket.
+    Rule(
+        "sincerity",
+        re.compile(
+            r"(?:^[ \t]*(?:[-*+>][ \t]+|\d+[.)][ \t]+)*|[.!?][\"')\]]*[ \t]+)"
+            r"(?P<hit>(?:Honestly|Truthfully),)"
+        ),
+        "cut it",
+    ),
+]
+
+
+# A fence opens with three or more backticks (and no backtick after them) or tildes,
+# at any indent and inside block quotes; the same character, at least as many times
+# and with nothing after it, closes it.
+QUOTE_AND_INDENT = r"(?:[ \t]*>)*[ \t]*"
+FENCE = re.compile(rf"{QUOTE_AND_INDENT}(`{{3,}}(?=[^`]*$)|~{{3,}})")
+# Blanked before the rules run, keeping newlines, so line numbers and columns still
+# count from the original text. Inline code and HTML comments may cross lines, but
+# inline code never crosses a blank line.
+SKIPPED = [
+    # inline code: `a` or ``a ` b``
+    re.compile(r"(?<!`)(`+)(?!`)(?:(?!\n[ \t]*\n)[\s\S])+?(?<!`)\1(?!`)"),
+    re.compile(r"<!--[\s\S]*?-->"),
+    # URLs (printable ASCII, so a dash after one is still prose), autolinks, link
+    # targets and reference definitions
+    re.compile(
+        r"https?://[!-~]+|www\.[!-~]+|<[^<>\s]+>|\]\([^)]*\)|^ {0,3}\[[^\]]+\]:[ \t]*\S+",
+        re.MULTILINE,
+    ),
+]
+IGNORE = "slop-lint: ignore"
+
+
+def blank(match: re.Match[str]) -> str:
+    return re.sub(r"[^\n]", " ", match.group())
+
+
+def prose(lines: list[str]):
+    """Yield (line number, line) for each line, with fenced code and lines marked
+    ignore emptied, and inline code, HTML comments and URLs blanked."""
+    kept = []
+    closing = None
+    for line in lines:
+        if closing:
+            if closing.fullmatch(line):
+                closing = None
+            kept.append("")
+        elif opening := FENCE.match(line):
+            fence = opening.group(1)
+            closing = re.compile(
+                rf"{QUOTE_AND_INDENT}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*"
+            )
+            kept.append("")
+        else:
+            kept.append("" if IGNORE in line else line)
+    text = "\n".join(kept)
+    for pattern in SKIPPED:
+        text = pattern.sub(blank, text)
+    yield from enumerate(text.split("\n"), 1)
+
+
+SCISSORS = "# ------------------------ >8 ------------------------"
+# A trailer's key is hyphenated (Co-Authored-By, Signed-off-by) or one of git's usual
+# single words, so a prose line such as "Why: …" is still checked.
+TRAILER = re.compile(
+    r"(?:[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+|Fixes|Closes|Resolves|Refs|Cc|Bug): \S"
+)
+
+
+def commit_message(lines: list[str]) -> list[str]:
+    """The message's lines with comments and trailers emptied and the diff below the
+    scissors line cut, so line numbers still match the file. Trailers are lines of
+    the last paragraph, when that paragraph isn't the subject's."""
+    if SCISSORS in lines:
+        lines = lines[: lines.index(SCISSORS)]
+    lines = ["" if line.startswith("#") else line for line in lines]
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    start = end
+    while start and lines[start - 1].strip():
+        start -= 1
+    if any(line.strip() for line in lines[:start]):
+        for index in range(start, end):
+            if TRAILER.match(lines[index]):
+                lines[index] = ""
+    return lines
+
+
+def check_line(line: str) -> list[Finding]:
+    found = []
+    for rule in RULES:
+        for match in rule.pattern.finditer(line):
+            # A rule that needs context around its hit names the hit (?P<hit>…).
+            group = "hit" if "hit" in rule.pattern.groupindex else 0
+            if match.start(group) == -1:
+                group = 0
+            found.append(Finding(match.start(group) + 1, rule, match.group(group)))
+    return sorted(found, key=lambda finding: finding.column)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="slop-lint",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--commit-msg",
+        action="store_true",
+        help="the files are commit messages (git's commit-msg hook)",
+    )
+    parser.add_argument("files", nargs="+", metavar="FILE")
+    args = parser.parse_args(argv)
+    found = unreadable = False
+    for path in args.files:
+        try:
+            if path == "-":
+                text = sys.stdin.read()
+            else:
+                with open(path, encoding="utf-8") as file:
+                    text = file.read()
+        except (OSError, UnicodeDecodeError) as error:
+            print(f"slop-lint: {path}: {error}", file=sys.stderr)
+            unreadable = True
+            continue
+        lines = text.splitlines()
+        if args.commit_msg:
+            lines = commit_message(lines)
+        for number, line in prose(lines):
+            for finding in check_line(line):
+                found = True
+                rule = finding.rule
+                print(
+                    f"{path}:{number}:{finding.column}: {rule.name}: {finding.text}"
+                    f" → {rule.fix}"
+                )
+    status = 2 if unreadable else 1 if found else 0
+    if status and args.commit_msg:
+        sys.stdout.flush()  # git sends both streams to one place; findings come first
+        why = (
+            "slop-lint couldn't read the commit message"
+            if unreadable
+            else "slop-lint flagged the commit message; reword it, or add"
+            " `slop-lint: ignore` to a line to keep it"
+        )
+        print(f"COMMIT REFUSED: {why}", file=sys.stderr)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

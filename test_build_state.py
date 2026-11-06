@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -699,6 +700,167 @@ def test_a_failing_check_after_folding_keeps_the_build_open(repo):
     assert "--fixup" in done.stderr and "earlier" in done.stderr
     assert build_state(repo, "show").returncode == 0
     assert subjects(repo, "HEAD~2") == ["Work", "More"]  # folded, not undone
+
+
+def test_finish_checks_each_commit_the_fold_rewrote_and_no_other(repo):
+    checked = agent_check(repo, 'git write-tree >> "$(git rev-parse --git-dir)/trees"')
+    trees = repo / ".git" / "trees"
+    build_state(repo, "start")
+    commit(repo, "x.py", "Before")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "b.py", "More")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert trees.read_text().split() == [
+        git(repo, "rev-parse", f"HEAD~{n}^{{tree}}").strip() for n in (1, 0)
+    ]
+    assert checked.read_text().split() == ["checked", "checked"]
+
+
+@pytest.mark.parametrize(
+    "reads",
+    [
+        "git show :a.py | grep -q uses-c && ! git cat-file -e :c.py 2>/dev/null",
+        "grep -q uses-c a.py && ! [ -e c.py ]",
+    ],
+    ids=["the index", "the work tree"],
+)
+def test_a_fold_that_breaks_an_earlier_commit_names_it_and_leaves_head(repo, reads):
+    # a.py's fix uses c.py, which only the later commit adds
+    agent_check(repo, f"{reads} && {{ echo a.py needs c.py; exit 1; }}; exit 0")
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "c.py", "Add c")
+    commit(repo, "a.py", "uses-c", f"--fixup={work}")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    broken = git(repo, "rev-parse", "--short=12", "HEAD~1").strip()
+    assert f"{broken} Work" in done.stderr
+    assert "a.py needs c.py" in done.stdout + done.stderr
+    assert subjects(repo, "HEAD~2") == ["Work", "Add c"]  # folded, not undone
+    assert git(repo, "symbolic-ref", "HEAD").strip() == "refs/heads/main"
+    assert git(repo, "status", "--porcelain") == ""
+    assert build_state(repo, "show").returncode == 0
+
+
+def test_a_rewritten_commit_whose_tree_passed_before_isnt_checked_again(repo):
+    agent_check(repo, 'git write-tree >> "$(git rev-parse --git-dir)/trees"')
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+    commit(repo, "b.py", "More")  # its tree is the one it had before the fold
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    trees = (repo / ".git" / "trees").read_text().split()
+    assert trees == [git(repo, "rev-parse", "HEAD~1^{tree}").strip()]
+
+
+def test_each_commit_is_checked_on_a_clean_tree_whatever_a_check_leaves(repo):
+    agent_check(
+        repo,
+        '[ -z "$(git status --porcelain --untracked-files=no)" ] || '
+        "{ echo dirty; exit 1; }; echo formatted >> a.py",
+    )
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "b.py", "More")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert git(repo, "status", "--porcelain", "--untracked-files=no") == ""
+
+
+def test_finish_keeps_a_branch_that_a_tag_shares_its_name_with(repo):
+    agent_check(repo, "exit 0")
+    git(repo, "tag", "main")
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+
+    assert build_state(repo, "finish").returncode == 0
+    assert git(repo, "symbolic-ref", "HEAD").strip() == "refs/heads/main"
+
+
+def test_a_detached_build_ends_detached_at_its_folded_tip(repo):
+    agent_check(repo, "exit 0")
+    git(repo, "checkout", "-q", "--detach")
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "b.py", "More")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "HEAD"
+    assert subjects(repo, "HEAD~2") == ["Work", "More"]
+
+
+def test_the_check_runs_at_the_top_of_the_tree(repo):
+    agent_check(repo, "[ -f README ] || { echo not at the top; exit 1; }")
+    (repo / "sub").mkdir()
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+
+    done = build_state(repo / "sub", "finish")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_finish_stopped_mid_check_leaves_head_on_its_branch(repo):
+    started = repo / ".git" / "started"
+    sleeper = repo / ".git" / "sleeper"
+    agent_check(repo, f'sleep 30 & echo $! > "{sleeper}"; touch "{started}"; wait')
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "b.py", "More")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    finish = subprocess.Popen(
+        [str(SCRIPT), "finish"],
+        cwd=repo,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 10
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert started.exists()
+    assert (
+        git(repo, "rev-list", "--count", "HEAD").strip() == "2"
+    )  # at the first commit
+
+    finish.terminate()
+    finish.wait(timeout=10)
+
+    assert git(repo, "symbolic-ref", "HEAD").strip() == "refs/heads/main"
+    assert git(repo, "rev-parse", "HEAD^{tree}") == tree
+    assert git(repo, "status", "--porcelain") == ""
+    # the check stopped too, so it can't touch the tree after
+    pid = int(sleeper.read_text())
+    deadline = time.monotonic() + 5
+    while running(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not running(pid)
+
+
+def running(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat = Path(f"/proc/{pid}/stat")
+    return not (stat.exists() and stat.read_text().split(") ")[1].startswith("Z"))
 
 
 def test_finish_runs_no_check_without_a_fix_to_fold(repo):

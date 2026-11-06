@@ -214,7 +214,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   a teammate's, runs the check every time. The check's output shows only when
   it fails, ending with `COMMIT REFUSED`; a pass prints one line. A fixup!,
   squash! or amend! commit skips the check (found from the running `git
-  commit`'s arguments), since `build-state finish` checks the folded result.
+  commit`'s arguments), since `build-state finish` checks each commit a fold
+  rewrites.
   `install.py` also registers it as a Claude Code hook that refuses `git commit
   --no-verify`, except in a repo with no agent check, such as a scratch repo.
 - **issue-todo**: a GitHub issue's task-list items across its body and every
@@ -251,7 +252,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `refactor` the refactor base. `finish` refuses leftover conflict markers,
   folds `fixup!` commits into the commits they fix, leaving every other commit
   separate and the tree as it was, and runs the repo's `agent-pre-commit` on
-  the result when it folded a fix commit. Then it lists the commits since the
+  each commit the fold rewrote, checked out in turn, so a fix folded into a
+  commit before the code it needs fails naming that commit; HEAD ends back on
+  its branch either way. Then it lists the commits since the
   base and the test files changed since the refactor base, and fails naming
   any ref or config key that moved. In a detached worktree, the branch it lands on (the
   main tree's) may move: finish then says to rebase onto it. `review-prompt

@@ -341,8 +341,8 @@ def run_check(path):
         return 1
     if (args := running_commit_args()) is not None and is_fix_commit(args):
         print(
-            f"{HOOK_NAME}: skipped for a fix commit; build-state finish runs it on the "
-            "folded result",
+            f"{HOOK_NAME}: skipped for a fix commit; build-state finish runs it on each "
+            "commit the fold rewrites",
             file=sys.stderr,
         )
         return 0

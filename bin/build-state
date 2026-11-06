@@ -7,8 +7,9 @@
     build-state refactor    record the refactor base (HEAD), before applying review fixes
     build-state show        print the recorded bases
     build-state finish      fold fixups into the commits they fix, check the fingerprint,
-                            print the commits since the base and the test files changed
-                            since the refactor base
+                            run the repo's agent-pre-commit on each commit the fold
+                            rewrote, print the commits since the base and the test
+                            files changed since the refactor base
     build-state review-prompt BRIEF
                             print the review subagent's prompt for the commit at HEAD:
                             the base, the commits, the brief as its spec, the standards
@@ -30,6 +31,16 @@ uncommitted changes and leftover conflict markers since the base. On a conflict 
 the rebase, and when the folded tree differs from the tree before, it resets to that;
 either way the branch is as it was.
 
+Fix commits skip the repo's agent-pre-commit when they're made, so after a fold finish
+runs it on every commit the fold rewrote, oldest first: from the first commit a fix went
+into, up to HEAD. A fix folded into an earlier commit than the code it needs leaves that
+commit broken while HEAD passes. Commits the fold left alone, and rewritten ones whose
+tree a commit other than a fix had before the fold, passed the check when they were made.
+Each commit is checked out for its check, forced, since some checks read or write the
+work tree; then HEAD goes back to the branch's folded tip, also when finish is stopped
+by Ctrl-C, SIGTERM or SIGHUP, which stop the check too. The first failure names its
+commit, keeps the build open and leaves the branch folded.
+
 The fingerprint is every ref except the work branch and its upstream, the stash, and the
 branches checked out in other linked worktrees at start or at finish, which other sessions
 move (a symbolic ref, such as origin/HEAD, counts by the ref it points to), and every entry
@@ -47,14 +58,17 @@ says "X moved since start: rebase onto it" while HEAD lacks one of its commits.
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 # tests/x.py, test/x.py, spec/x.rb, test_x.py, x_test.go, x.test.ts, x.spec.js
@@ -297,19 +311,71 @@ def fold_fixups(base: str) -> bool:
     return False
 
 
-def check_folded() -> bool:
-    """Run the repo's agent-pre-commit on HEAD, which the index holds after a fold;
-    through agent-commit-gate when it's on PATH. True when it passes or there's none."""
+@contextlib.contextmanager
+def back_at_head() -> Iterator[None]:
+    """Return HEAD to where it is now, on its branch, however the block ends: a
+    SIGTERM or SIGHUP stops it the way Ctrl-C does."""
+    # The full ref, since a tag may share the branch's short name.
+    ref = git("symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
+    branch = ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else ""
+    tip = head()
+
+    def stop(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    handlers = {s: signal.signal(s, stop) for s in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        yield
+    finally:
+        git("checkout", "-q", "--force", *([branch] if branch else ["--detach", tip]))
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+
+
+def agent_check() -> list[str] | None:
+    """The command that runs the repo's agent-pre-commit, through agent-commit-gate
+    when it's on PATH; None when the repo has none."""
     # --git-path is relative to the current directory, which may be a subdirectory.
     hooks = Path(git("rev-parse", "--git-path", "hooks").stdout.strip()).resolve()
     hook = hooks / "agent-pre-commit"
     if not (hook.is_file() and os.access(hook, os.X_OK)):
-        return True
+        return None
     gate = shutil.which("agent-commit-gate")
-    argv = [gate, "--run", str(hook)] if gate else [str(hook)]
-    print(f"Checking the folded result with {hook.name}...", flush=True)
+    return [gate, "--run", str(hook)] if gate else [str(hook)]
+
+
+def passes(argv: list[str], top: str) -> bool:
+    """Whether the check passes, run at the top of the tree as git runs a hook, in a
+    process group of its own, which dies when finish is stopped."""
     env = os.environ | {"AGENT_PRE_COMMIT": "1"}
-    return subprocess.run(argv, env=env, check=False).returncode == 0
+    check = subprocess.Popen(argv, env=env, cwd=top, start_new_session=True)
+    try:
+        return check.wait() == 0
+    except BaseException:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(check.pid, signal.SIGKILL)
+        check.wait()
+        raise
+
+
+def first_failing(argv: list[str], commits: list[str]) -> str | None:
+    """Run the check `argv` on each commit in turn, oldest first, and return the first
+    that fails; None when every one passes. Each commit is checked out, index and work
+    tree both, since some checks read the work tree, and forced, so nothing one check
+    leaves reaches the next; HEAD comes back to where it was after, on its branch. The
+    caller made sure no tracked file has changes."""
+    top = git("rev-parse", "--show-toplevel").stdout.strip()
+    with back_at_head():
+        for sha in commits:
+            print(git("log", "-1", "--format=  %h %s", sha).stdout, end="", flush=True)
+            git("checkout", "-q", "--force", "--detach", sha)
+            if not passes(argv, top):
+                return sha
+    return None
+
+
+def tree_of(commit: str) -> str:
+    return git("rev-parse", f"{commit}^{{tree}}").stdout.strip()
 
 
 def report_tests(refactor_base: str) -> None:
@@ -351,10 +417,13 @@ def finish(args: argparse.Namespace) -> int:
         )
     before = head()
     fixes = ("fixup! ", "squash! ", "amend! ")
-    folding = any(
-        subject.startswith(fixes)
-        for subject in git("log", "--format=%s", f"{base}..HEAD").stdout.splitlines()
-    )
+    before_fold = set(git("rev-list", f"{base}..HEAD").stdout.split())
+    # The trees the check passed when their commits were made; fix commits skip it.
+    passed = {
+        tree_of(sha)
+        for sha in before_fold
+        if not git("log", "-1", "--format=%s", sha).stdout.startswith(fixes)
+    }
     if not fold_fixups(base):
         return 1
     if (
@@ -373,12 +442,26 @@ def finish(args: argparse.Namespace) -> int:
             "These fix commits before the base, so they weren't folded:",
             *(f"  {subject}" for subject in unfolded),
         )
-    if folding and not check_folded():
+    rewritten = [
+        sha
+        for sha in git("rev-list", "--reverse", f"{base}..HEAD").stdout.split()
+        if sha not in before_fold and tree_of(sha) not in passed
+    ]
+    argv = agent_check() if rewritten else None
+    if argv:
+        print(
+            f"Checking the {len(rewritten)} commit{'' if len(rewritten) == 1 else 's'} "
+            "the fold rewrote with agent-pre-commit...",
+            flush=True,
+        )
+    if argv and (broken := first_failing(argv, rewritten)):
+        named = git("log", "-1", "--format=%h %s", "--abbrev=12", broken).stdout.strip()
         return fail(
-            "The repo's agent-pre-commit fails on the folded result, and fix commits",
-            "skip it when they're made. Find the commit that caused the failure, which",
-            "may be an earlier one rather than the last, fix it with",
-            "`git commit --fixup=<that commit>`, and run finish again.",
+            f"The repo's agent-pre-commit fails at {named}, a commit the fold rewrote.",
+            "A fix folded into an earlier commit than the code it needs breaks that",
+            "commit while HEAD passes. Fix it with",
+            f"`git commit --fixup={broken[:12]}`, or move that code into it, and run",
+            "finish again. The branch stays folded, at HEAD.",
         )
     if "refactor_base" in state:
         report_tests(state["refactor_base"])

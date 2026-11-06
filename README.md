@@ -145,7 +145,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **mutate-check**: `mutate-check -- CMD` breaks code briefly with apply-edits
   blocks from stdin, runs CMD (a test run), and puts every file back, also when
   stopped. It exits 0 when CMD failed (the tests catch the break) and 1 when it
-  passed, printing one line and at most 3 of pytest's `E ` lines. For checking
+  passed, printing one line and at most 3 of pytest's `E ` lines. It exits 3,
+  inconclusive, when no test judged the break: the build failed (a Rust compile
+  error, such as unused code under `-D warnings`), pytest collected nothing, or
+  CMD ran past `--timeout` (600 seconds by default) and was stopped. For checking
   that a test which passed on its first run guards what it's meant to.
 - **conflicts**: `conflicts FILE` lists a file's conflict hunks, numbered, with
   each side and its marker label; `conflicts FILE N SIDE` (or `all SIDE`)

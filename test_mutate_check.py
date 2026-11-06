@@ -187,3 +187,123 @@ def test_a_child_ignoring_term_is_killed_once_the_grace_ends(repo: Path) -> None
     proc.wait(timeout=2)
 
     assert (repo / "calc.py").read_text() == CODE
+
+
+RUST_BUILD_FAILURE = (
+    "error: function `double` is never used\n"
+    "error: could not compile `calc` (lib) due to 1 previous error\n"
+    "error: command `cargo test --no-run --message-format=json-render-diagnostics` "
+    "exited with code 101\n"
+)
+
+
+def test_a_build_that_fails_is_inconclusive_not_caught(repo: Path) -> None:
+    (repo / "build.txt").write_text(RUST_BUILD_FAILURE)
+    result = check(repo, BREAK, "sh", "-c", "cat build.txt; exit 101")
+
+    assert result.returncode == 3, result.stdout
+    assert "inconclusive" in result.stdout
+    assert "could not compile" in result.stdout
+    assert (repo / "calc.py").read_text() == CODE
+
+
+def test_a_rust_type_error_is_inconclusive(repo: Path) -> None:
+    result = check(
+        repo, BREAK, "sh", "-c", "echo 'error[E0308]: mismatched types'; exit 101"
+    )
+
+    assert result.returncode == 3, result.stdout
+
+
+def test_pytest_that_collects_nothing_is_inconclusive(repo: Path) -> None:
+    broken = BREAK.replace("return n + 3", "return n +")
+
+    result = check(repo, broken, *PYTEST)
+
+    assert result.returncode == 3, result.stdout
+    assert "inconclusive" in result.stdout
+    assert (repo / "calc.py").read_text() == CODE
+
+
+def test_a_command_that_runs_past_the_timeout_is_inconclusive(repo: Path) -> None:
+    started = time.monotonic()
+    result = subprocess.run(
+        [str(SCRIPT), "--timeout", "0.5", "--", "sleep", "30"],
+        input=BREAK,
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=os.environ | {"MUTATE_CHECK_GRACE": "0.2"},
+    )
+
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "0.5" in result.stdout and "hung" in result.stdout
+    assert time.monotonic() - started < 10
+    assert (repo / "calc.py").read_text() == CODE
+
+
+def test_a_bad_timeout_is_a_usage_error(repo: Path) -> None:
+    result = subprocess.run(
+        [str(SCRIPT), "--timeout", "soon", "--", "true"],
+        input=BREAK,
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert (repo / "calc.py").read_text() == CODE
+
+
+def test_a_failing_test_that_prints_rust_errors_is_still_caught(repo: Path) -> None:
+    output = (
+        "error[E0599]: no method named `frob`\n"
+        "test ui::compile_fail ... FAILED\n"
+        "test result: FAILED. 3 passed; 1 failed\n"
+    )
+    (repo / "out.txt").write_text(output)
+    result = check(repo, BREAK, "sh", "-c", "cat out.txt; exit 101")
+
+    assert result.returncode == 0, result.stdout
+
+
+def test_a_timeout_stops_the_commands_children_too(repo: Path) -> None:
+    result = subprocess.run(
+        [
+            str(SCRIPT),
+            "--timeout",
+            "0.5",
+            "--",
+            "sh",
+            "-c",
+            "trap '' TERM; sleep 30 & echo $! > child; wait",
+        ],
+        input=BREAK,
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=os.environ | {"MUTATE_CHECK_GRACE": "0.2"},
+    )
+
+    assert result.returncode == 3, result.stdout + result.stderr
+    child = int((repo / "child").read_text())
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)
+    assert (repo / "calc.py").read_text() == CODE
+
+
+def test_an_endless_timeout_is_a_usage_error(repo: Path) -> None:
+    result = subprocess.run(
+        [str(SCRIPT), "--timeout", "inf", "--", "true"],
+        input=BREAK,
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2, result.stdout + result.stderr

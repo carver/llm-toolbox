@@ -9,21 +9,32 @@
   >>>>>>> REPLACE
   EOF
 
+  mutate-check [--timeout SECONDS] -- CMD...
+
 Stdin holds apply-edits blocks (`apply-edits -h` shows the format), which apply-edits
 applies all or nothing. Then the command runs, and every file the blocks name is put
 back byte for byte, also when mutate-check is stopped by Ctrl-C, SIGTERM or SIGHUP.
 
-Prints one line, with up to 3 of the command's pytest `E ` lines when it failed, or its
-last line of output when there are none; never the whole output.
+A failure counts as a catch only when tests ran. A mutation that stops the build (a Rust
+`error: could not compile` or `error[E...]`, as unused code under `-D warnings` does),
+or pytest exiting 2, 4 or 5 (collection errors, usage, no tests), is inconclusive: no
+test judged it. So is a command that runs past --timeout (default 600 seconds), which
+is stopped: a hang isn't a catch.
+
+Prints one line, with up to 3 of the command's pytest `E ` lines or Rust `error` lines
+when it failed, or its last line of output when there are none; never the whole output.
 
 Exit status: 0 the command failed, so the mutation was caught; 1 it passed, so the
 tests miss it; 2 usage error or blocks that didn't apply (the command didn't run);
-128+N stopped by signal N.
+3 inconclusive: the build failed, no tests ran, or the command hung; 128+N stopped by
+signal N.
 """
 
 import importlib.machinery
 import importlib.util
+import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -32,7 +43,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType, ModuleType
 
-CAUGHT, MISSED, USAGE = 0, 1, 2
+CAUGHT, MISSED, USAGE, INCONCLUSIVE = 0, 1, 2, 3
+DEFAULT_TIMEOUT = 600.0
+# pytest's statuses when no test judged anything: interrupted or collection errors,
+# a usage error, no tests collected.
+PYTEST_NOTHING_RAN = {2, 4, 5}
 BIN = Path(__file__).resolve().parent
 SHOWN_ERRORS = 3
 STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
@@ -95,23 +110,69 @@ def restore(originals: dict[Path, Original]) -> list[str]:
     return failed
 
 
-def run(command: list[str]) -> tuple[int, str]:
-    """The command's exit status and output. Stopped, it stops the command too, killing it
-    if it ignores SIGTERM for 5 seconds ($MUTATE_CHECK_GRACE, which the tests shorten)."""
+class TimedOut(Exception):
+    pass
+
+
+def run(command: list[str], timeout: float) -> tuple[int, str]:
+    """The command's exit status and output. Stopped, or past `timeout` seconds (then
+    raising TimedOut), it stops the command too, killing it if it ignores SIGTERM for 5
+    seconds ($MUTATE_CHECK_GRACE, which the tests shorten)."""
     # Read before the command starts, so a bad value stops here rather than mid-stop
     grace = float(os.environ.get("MUTATE_CHECK_GRACE", "5"))
-    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # Its own process group, so stopping it stops what it started, such as the test
+    # binaries cargo runs, too.
+    child = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
     try:
-        output, _ = child.communicate()
+        output, _ = child.communicate(timeout=timeout)
     except Stopped:
-        child.terminate()
-        try:
-            child.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait()
+        stop_child(child, grace)
         raise
+    except subprocess.TimeoutExpired as e:
+        stop_child(child, grace)
+        raise TimedOut from e
     return child.returncode, output.decode(errors="replace")
+
+
+def stop_child(child: subprocess.Popen[bytes], grace: float) -> None:
+    """Stop the command's process group: SIGTERM, then SIGKILL once `grace` seconds
+    pass, or at once when the command has gone but left children behind."""
+    signal_group(child, signal.SIGTERM)
+    try:
+        child.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    signal_group(child, signal.SIGKILL)
+    child.wait()
+
+
+def signal_group(child: subprocess.Popen[bytes], signum: signal.Signals) -> None:
+    try:
+        os.killpg(child.pid, signum)
+    except ProcessLookupError:
+        pass
+
+
+RUST_BUILD_FAILED = re.compile(r"error: could not compile|error\[E\d+\]")
+# A cargo or nextest summary line: tests ran, so a failure is theirs.
+TESTS_RAN = re.compile(r"^test result: |^\s*Summary \[")
+
+
+def build_errors(output: str) -> list[str]:
+    """Rust's compile errors, when the build failed before any test ran."""
+    lines = output.splitlines()
+    if any(TESTS_RAN.search(line) for line in lines):
+        return []
+    return [line for line in lines if RUST_BUILD_FAILED.match(line)]
+
+
+def runs_pytest(command: list[str]) -> bool:
+    return any(Path(arg).name == "pytest" or arg.endswith("pytest") for arg in command)
 
 
 def summary(output: str) -> list[str]:
@@ -128,7 +189,7 @@ def stop(signum: int, _frame: FrameType | None) -> None:
     raise Stopped(signum)
 
 
-def mutated_run(edits: str, command: list[str]) -> tuple[int, str]:
+def mutated_run(edits: str, command: list[str], timeout: float) -> tuple[int, str]:
     """Apply the edits, run the command, and give its status and output. Raises
     Stopped, and UsageError when the edits don't apply or the command won't start."""
     applied = subprocess.run(
@@ -141,7 +202,7 @@ def mutated_run(edits: str, command: list[str]) -> tuple[int, str]:
     if applied.returncode != 0:
         raise UsageError(applied.stderr.rstrip())
     try:
-        return run(command)
+        return run(command, timeout)
     except OSError as e:
         raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
 
@@ -151,6 +212,16 @@ def main() -> int:
     if args[:1] in (["-h"], ["--help"]):
         print(__doc__)
         return 0
+    timeout = DEFAULT_TIMEOUT
+    if args[:1] == ["--timeout"]:
+        try:
+            timeout = float(args[1])
+        except (IndexError, ValueError):
+            timeout = math.nan
+        if not (math.isfinite(timeout) and timeout > 0):
+            print("mutate-check: --timeout takes a number of seconds", file=sys.stderr)
+            return USAGE
+        args = args[2:]
     if args[:1] != ["--"] or len(args) < 2:
         print(f"mutate-check: give the command after --\n{__doc__}", file=sys.stderr)
         return USAGE
@@ -165,10 +236,16 @@ def main() -> int:
         signal.signal(signum, stop)
     status: int | None = None
     try:
-        code, output = mutated_run(edits, args[1:])
+        code, output = mutated_run(edits, args[1:], timeout)
     except UsageError as e:
         print(e, file=sys.stderr)
         status = USAGE
+    except TimedOut:
+        print(
+            f"mutate-check: inconclusive: the command hung past {timeout:g} seconds"
+            " and was stopped; a hang isn't a catch"
+        )
+        status = INCONCLUSIVE
     except Stopped as e:
         print(f"mutate-check: stopped by signal {e.signum}", file=sys.stderr)
         status = 128 + e.signum
@@ -182,6 +259,15 @@ def main() -> int:
     if code == 0:
         print("mutate-check: not caught: the command passed with the mutation")
         return MISSED
+    errors = build_errors(output)
+    if errors or (runs_pytest(args[1:]) and code in PYTEST_NOTHING_RAN):
+        print(
+            f"mutate-check: inconclusive: the command exited {code} before any test"
+            " judged the mutation"
+        )
+        for line in (errors or summary(output))[:SHOWN_ERRORS]:
+            print(f"  {line}")
+        return INCONCLUSIVE
     print(f"mutate-check: caught: the command exited {code}")
     for line in summary(output):
         print(f"  {line}")

@@ -39,14 +39,21 @@ PYTEST = [
 ]
 
 
-def check(cwd: Path, edits: str, *cmd: str) -> subprocess.CompletedProcess[str]:
+def check(
+    cwd: Path,
+    edits: str,
+    *cmd: str,
+    options: tuple[str, ...] = (),
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(SCRIPT), "--", *cmd],
+        [str(SCRIPT), *options, "--", *cmd],
         input=edits,
         cwd=cwd,
         text=True,
         capture_output=True,
         check=False,
+        env=env,
     )
 
 
@@ -227,13 +234,12 @@ def test_pytest_that_collects_nothing_is_inconclusive(repo: Path) -> None:
 
 def test_a_command_that_runs_past_the_timeout_is_inconclusive(repo: Path) -> None:
     started = time.monotonic()
-    result = subprocess.run(
-        [str(SCRIPT), "--timeout", "0.5", "--", "sleep", "30"],
-        input=BREAK,
-        cwd=repo,
-        text=True,
-        capture_output=True,
-        check=False,
+    result = check(
+        repo,
+        BREAK,
+        "sleep",
+        "30",
+        options=("--timeout", "0.5"),
         env=os.environ | {"MUTATE_CHECK_GRACE": "0.2"},
     )
 
@@ -244,14 +250,7 @@ def test_a_command_that_runs_past_the_timeout_is_inconclusive(repo: Path) -> Non
 
 
 def test_a_bad_timeout_is_a_usage_error(repo: Path) -> None:
-    result = subprocess.run(
-        [str(SCRIPT), "--timeout", "soon", "--", "true"],
-        input=BREAK,
-        cwd=repo,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    result = check(repo, BREAK, "true", options=("--timeout", "soon"))
 
     assert result.returncode == 2
     assert (repo / "calc.py").read_text() == CODE
@@ -270,21 +269,13 @@ def test_a_failing_test_that_prints_rust_errors_is_still_caught(repo: Path) -> N
 
 
 def test_a_timeout_stops_the_commands_children_too(repo: Path) -> None:
-    result = subprocess.run(
-        [
-            str(SCRIPT),
-            "--timeout",
-            "0.5",
-            "--",
-            "sh",
-            "-c",
-            "trap '' TERM; sleep 30 & echo $! > child; wait",
-        ],
-        input=BREAK,
-        cwd=repo,
-        text=True,
-        capture_output=True,
-        check=False,
+    result = check(
+        repo,
+        BREAK,
+        "sh",
+        "-c",
+        "trap '' TERM; sleep 30 & echo $! > child; wait",
+        options=("--timeout", "0.5"),
         env=os.environ | {"MUTATE_CHECK_GRACE": "0.2"},
     )
 
@@ -297,13 +288,6 @@ def test_a_timeout_stops_the_commands_children_too(repo: Path) -> None:
 
 
 def test_an_endless_timeout_is_a_usage_error(repo: Path) -> None:
-    result = subprocess.run(
-        [str(SCRIPT), "--timeout", "inf", "--", "true"],
-        input=BREAK,
-        cwd=repo,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    result = check(repo, BREAK, "true", options=("--timeout", "inf"))
 
     assert result.returncode == 2, result.stdout + result.stderr

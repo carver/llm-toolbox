@@ -217,7 +217,7 @@ def main() -> int:
         try:
             timeout = float(args[1])
         except (IndexError, ValueError):
-            timeout = math.nan
+            timeout = 0.0
         if not (math.isfinite(timeout) and timeout > 0):
             print("mutate-check: --timeout takes a number of seconds", file=sys.stderr)
             return USAGE

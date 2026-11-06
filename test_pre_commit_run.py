@@ -13,6 +13,15 @@ SCRIPT = Path(__file__).resolve().parent / "bin" / "pre-commit-run"
 # when $PRE_COMMIT_FAILS is set; each call goes to $UVX_LOG.
 FAKE_UVX = """#!/bin/sh
 echo "$*" >> "$UVX_LOG"
+# A formatter hook: rewrites $PRE_COMMIT_REWRITES to "tidy" when it isn't, and fails
+# as pre-commit does when a hook changes files.
+if [ -n "${PRE_COMMIT_REWRITES:-}" ] && [ "$(cat "$PRE_COMMIT_REWRITES")" != tidy ]; then
+  echo tidy > "$PRE_COMMIT_REWRITES"
+  echo "ruff format..............................................................Failed"
+  echo "- hook id: ruff-format"
+  echo "- files were modified by this hook"
+  exit 1
+fi
 echo "ruff format..............................................................Passed"
 if [ -n "${PRE_COMMIT_FAILS:-}" ]; then echo "a.py:1:1: F401 unused import"; exit 1; fi
 exit 0
@@ -272,3 +281,120 @@ def test_a_persons_run_streams_pre_commits_own_output(repo):
     done = run(repo)
 
     assert "Passed" in done.stdout  # pre-commit's own stdout, not replayed on stderr
+
+
+# A formatter hook that rewrites files: an agent's fully staged files are restaged.
+
+
+def staged_ugly(repo, name="a.py"):
+    (repo / name).write_text("ugly\n")
+    git(repo, "add", "--", f":(literal){name}")
+    return repo / name
+
+
+def test_an_agents_staged_file_a_hook_rewrote_is_restaged_and_rechecked(repo):
+    target = staged_ugly(repo)
+    done = run(repo, agent=True, PRE_COMMIT_REWRITES=str(target))
+    assert done.returncode == 0, done.stderr
+    assert git(repo, "show", ":a.py") == "tidy\n"
+    assert "a.py" in done.stderr and "staged" in done.stderr
+    assert len(uvx_calls(repo)) == 2
+
+
+def test_a_rewritten_file_that_had_unstaged_changes_is_refused(repo):
+    target = staged_ugly(repo)
+    target.write_text("ugly, and more not for this commit\n")
+    done = run(repo, agent=True, PRE_COMMIT_REWRITES=str(target))
+    assert done.returncode == 1
+    assert last_line(done).startswith("COMMIT REFUSED")
+    assert git(repo, "show", ":a.py") == "ugly\n"
+
+
+def test_a_rewritten_file_that_isnt_staged_is_refused(repo):
+    staged_ugly(repo)
+    other = repo / "b.py"
+    other.write_text("ugly\n")
+    git(repo, "add", "b.py")
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "b")
+    done = run(repo, agent=True, PRE_COMMIT_REWRITES=str(other))
+    assert done.returncode == 1
+    assert "b.py" not in git(repo, "diff", "--cached", "--name-only")
+
+
+def test_a_persons_rewritten_file_is_left_for_them_to_stage(repo):
+    target = staged_ugly(repo)
+    done = run(repo, PRE_COMMIT_REWRITES=str(target))
+    assert done.returncode == 1
+    assert git(repo, "show", ":a.py") == "ugly\n"
+
+
+def test_another_failure_after_restaging_is_refused(repo):
+    target = staged_ugly(repo)
+    done = run(repo, agent=True, PRE_COMMIT_REWRITES=str(target), PRE_COMMIT_FAILS="1")
+    assert done.returncode == 1
+    assert "F401" in done.stderr
+    assert len(uvx_calls(repo)) == 2
+
+
+def test_a_name_with_glob_characters_stages_only_itself(repo):
+    left_out = repo / "a1.py"
+    left_out.write_text("committed\n")
+    git(repo, "add", "a1.py")
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "a1")
+    left_out.write_text("not for this commit\n")
+    target = staged_ugly(repo, "a[1].py")
+    done = run(repo, agent=True, PRE_COMMIT_REWRITES=str(target))
+    assert done.returncode == 0, done.stderr
+    assert git(repo, "show", ":a[1].py") == "tidy\n"
+    assert git(repo, "show", ":a1.py") == "committed\n"
+
+
+def test_a_commit_of_named_paths_is_refused_not_restaged(repo):
+    # `git commit PATH` commits from a temporary next-index; staging there would
+    # leave the real index unformatted, so the next commit would undo it.
+    target = staged_ugly(repo)
+    next_index = repo / ".git" / "next-index-1234.lock"
+    next_index.write_bytes((repo / ".git" / "index").read_bytes())
+    done = run(
+        repo,
+        agent=True,
+        PRE_COMMIT_REWRITES=str(target),
+        GIT_INDEX_FILE=str(next_index),
+    )
+    assert done.returncode == 1
+    assert len(uvx_calls(repo)) == 1
+
+
+def test_a_rewrite_alongside_a_file_with_unstaged_changes_leaves_the_index_alone(repo):
+    # A fake hook that rewrites both a fully staged file and a partly staged one.
+    staged_ugly(repo, "a.py")
+    partly = staged_ugly(repo, "b.py")
+    partly.write_text("ugly, and more\n")
+    hook = repo.parent / "fakebin" / "uvx"
+    hook.write_text(
+        '#!/bin/sh\necho "$*" >> "$UVX_LOG"\n'
+        'if [ "$(cat a.py)" != tidy ]; then echo tidy > a.py; echo tidy > b.py;'
+        ' echo "- files were modified by this hook"; exit 1; fi\nexit 0\n'
+    )
+    done = run(repo, agent=True)
+    assert done.returncode == 1
+    assert git(repo, "show", ":a.py") == "ugly\n", "nothing was restaged"
+    assert len(uvx_calls(repo)) == 1
+
+
+def test_a_hook_that_rewrites_an_untracked_file_is_refused(repo):
+    # A formatter that runs over the whole tree, as cargo fmt does, can rewrite a file
+    # git doesn't track; pre-commit doesn't stash those, and nothing may change them.
+    target = staged_ugly(repo)
+    untracked = repo / "notes.py"
+    untracked.write_text("mine\n")
+    hook = repo.parent / "fakebin" / "uvx"
+    hook.write_text(
+        '#!/bin/sh\necho "$*" >> "$UVX_LOG"\n'
+        f'if [ "$(cat {target})" != tidy ]; then echo tidy > {target}; echo tidy > {untracked};'
+        ' echo "- files were modified by this hook"; exit 1; fi\nexit 0\n'
+    )
+    done = run(repo, agent=True)
+    assert done.returncode == 1
+    assert git(repo, "show", ":a.py") == "ugly\n", "nothing was restaged"
+    assert len(uvx_calls(repo)) == 1

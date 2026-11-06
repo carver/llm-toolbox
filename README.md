@@ -202,9 +202,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   hook. A person sees its output as it runs; an agent (`AI_AGENT` set) sees it
   only on a failure, and every refusal ends with `COMMIT REFUSED`. It refuses
   first when `.pre-commit-config.yaml` has unstaged changes, which pre-commit
-  won't run with (`PRE_COMMIT_VERSION` picks the version). `pre-commit-run
-  --install REPO` copies it into `REPO/bin/` and adds its call to the repo's
-  hook, for a new project or an old one.
+  won't run with (`PRE_COMMIT_VERSION` picks the version). For an agent, when a
+  formatter hook rewrites staged files that had no unstaged changes, it stages
+  them and runs pre-commit once more, so a formatting refusal doesn't cost a
+  retry. `pre-commit-run --install REPO` copies it into `REPO/bin/` and adds its
+  call to the repo's hook, for a new project or an old one.
 - **agent-commit-gate**: gives agents' commits a repo's slow checks.
   `agent-commit-gate --install REPO...` adds a line to the top of the repo's
   pre-commit hook: when `$AI_AGENT` is set, as Claude Code sets it, the hook

@@ -1,5 +1,6 @@
 """apply-edits replaces old text with new across files, all or nothing."""
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -379,7 +380,9 @@ def test_whitespace_that_changes_the_python_still_misses(
     assert (tmp_path / "f.py").read_text() == source
 
 
-def test_other_files_still_match_exactly(tmp_path: Path) -> None:
+def test_a_line_break_between_words_still_misses_in_other_files(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "notes.md").write_text("Some text\nwrapped here.\n")
     result = apply(
         tmp_path,
@@ -608,11 +611,22 @@ def test_a_formatter_match_needs_a_file_that_parses(tmp_path: Path) -> None:
     assert (tmp_path / "f.py").read_text() == source
 
 
-def test_other_files_keep_their_commas(tmp_path: Path) -> None:
-    source = "f(\n    a,\n)\n"
-    result = loose(tmp_path, "notes.md", source, "f(\n    a\n)")
-    assert result.returncode == 1
-    assert (tmp_path / "notes.md").read_text() == source
+@pytest.mark.parametrize(
+    "source, old",
+    [
+        ("let t = (\n    x,\n);\n", "let t = (x);"),  # a tuple isn't its one item
+        ("let t = (x);\n", "let t = (\n    x,\n);"),
+        ("let t = (x,);\n", "let t = (x);"),
+        # a formatter adds a comma only on a line of its own, so nothing else matches
+        ("let t = g(x,);\n", "let t = g(x);"),
+    ],
+)
+def test_other_files_keep_a_comma_that_makes_a_tuple(
+    tmp_path: Path, source: str, old: str
+) -> None:
+    result = loose(tmp_path, "f.rs", source, old)
+    assert result.returncode == 1, (tmp_path / "f.rs").read_text()
+    assert (tmp_path / "f.rs").read_text() == source
 
 
 @pytest.mark.parametrize(
@@ -807,3 +821,250 @@ def test_every_statement_written_before_ruff_format_still_applies(
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert (tmp_path / "f.py").read_text() == WRITTEN
+
+
+RUSTFMT_OUT = """\
+fn check(state: &State, form: &Form) -> Result<()> {
+    if form.token.is_empty() {
+        let found = lookup(
+            &state.pool,
+            &form.token,
+            "a  spaced  label",
+        );
+        assert!(
+            found.contains("unrecognised positive_control.checks"),
+            "{found}"
+        );
+        let date = Date::parse(
+            found.trim(),
+            format_description!("[year]-[month]-[day]"),
+        )
+        .ok()?;
+        record(
+            date.expect("a date the parser read once already, so it can't fail now"),
+        );
+    }
+    Ok(())
+}
+"""
+"""Rust as rustfmt leaves it: calls split across lines, deeper indentation."""
+
+
+@pytest.mark.parametrize(
+    "old, first, last",
+    [
+        # a call split across lines, with the trailing comma rustfmt adds, and the
+        # indentation the agent wrote before the code moved into an `if`
+        (
+            '    let found = lookup(&state.pool, &form.token, "a  spaced  label");',
+            3,
+            7,
+        ),
+        # a macro call rustfmt split without a trailing comma
+        (
+            '    assert!(found.contains("unrecognised positive_control.checks"), "{found}");',
+            8,
+            11,
+        ),
+        # a method chain rustfmt broke before the `.`
+        (
+            '    let date = Date::parse(found.trim(), format_description!("[year]-[month]-[day]")).ok()?;',
+            12,
+            16,
+        ),
+        # a call of one argument, which rustfmt gave a trailing comma
+        (
+            '        record(date.expect("a date the parser read once already, so it can\'t fail now"));',
+            17,
+            19,
+        ),
+        # a `{` on a line of its own
+        ("fn check(state: &State, form: &Form) -> Result<()>\n{", 1, 1),
+    ],
+    ids=["call", "macro", "chain", "one argument", "brace"],
+)
+def test_a_block_written_before_rustfmt_rewrapped_it_matches(
+    tmp_path: Path, old: str, first: int, last: int
+) -> None:
+    result = loose(tmp_path, "f.rs", RUSTFMT_OUT, old, "    replaced();")
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = RUSTFMT_OUT.splitlines(keepends=True)
+    assert (tmp_path / "f.rs").read_text() == "".join(
+        [*lines[: first - 1], "    replaced();\n", *lines[last:]]
+    )
+    assert (
+        result.stdout
+        == "f.rs: 1 edit (block 1 matched ignoring whitespace and trailing commas)\n"
+    )
+
+
+def test_a_loose_match_puts_the_new_text_in_as_written(tmp_path: Path) -> None:
+    source = "fn f() {\n    if x {\n        g(\n            a,\n            b,\n        );\n    }\n}\n"
+    result = loose(tmp_path, "f.rs", source, "    g(a, b);", "    h(a,b);")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.rs").read_text() == (
+        "fn f() {\n    if x {\n    h(a,b);\n    }\n}\n"
+    )
+
+
+def test_a_rustfmt_rewrap_matches_after_real_rustfmt(tmp_path: Path) -> None:
+    rustfmt = shutil.which("rustfmt")
+    if rustfmt is None:
+        pytest.skip("rustfmt isn't on PATH")
+    written = (
+        "fn f(state: &State) {\n"
+        '    let reply = state.client.post("/entries").header("x", "y").body(text.clone()).send().await.unwrap();\n'
+        '    for value in [date_in(100), "next spring".to_string(), "2026-13-40".to_string()] {\n'
+        "        check(value);\n"
+        "    }\n"
+        "}\n"
+    )
+    formatted = subprocess.run(
+        [rustfmt, "--edition", "2021", "--emit", "stdout"],
+        input=written,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert formatted != written
+    (tmp_path / "f.rs").write_text(formatted)
+    blocks = "".join(
+        f"<<<<<<< SEARCH\n{line}\n=======\n{line}\n>>>>>>> REPLACE\n"
+        for line in written.splitlines()[1:3]
+    )
+
+    result = apply(tmp_path, f"--- f.rs\n{blocks}")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        (tmp_path / "f.rs")
+        .read_text()
+        .startswith(
+            "fn f(state: &State) {\n" + "".join(written.splitlines(keepends=True)[1:3])
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "source, old, new, result",
+    [
+        # a block moved deeper, every line by the same step
+        (
+            "fn f() {\n    if c {\n        g(\n            a,\n        );\n        h();\n    }\n}\n",
+            "    g(a);\n    h();",
+            "    k();",
+            "fn f() {\n    if c {\n    k();\n    }\n}\n",
+        ),
+        # an empty new text deletes the lines, line break and all
+        (
+            "fn f() {\n    g(\n        a,\n    );\n    k();\n}\n",
+            "    g(a);",
+            "",
+            "fn f() {\n    k();\n}\n",
+        ),
+        # brackets that hold two items aren't a tuple of one
+        ("let t = (\n    a,\n    b,\n);\n", "let t = (a, b);", "t", "t\n"),
+        # a `{` on its own line after a signature, an operator leading a line
+        ("fn f(a: u8)\n{\n", "fn f(a: u8) {", "g", "g\n"),
+        ("let ok = first\n    && second;\n", "let ok = first && second;", "t", "t\n"),
+        # a block's closer on its own line
+        (
+            "let v = if c {\n    a\n} else {\n    b\n};\n",
+            "let v = if c { a } else { b };",
+            "t",
+            "t\n",
+        ),
+    ],
+    ids=["moved deeper", "deleted", "two items", "brace", "operator", "closer"],
+)
+def test_more_rewraps_match_in_other_files(
+    tmp_path: Path, source: str, old: str, new: str, result: str
+) -> None:
+    done = loose(tmp_path, "f.rs", source, old, new)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (tmp_path / "f.rs").read_text() == result
+
+
+def test_a_loose_match_reads_a_crlf_files_strings_across_lines(tmp_path: Path) -> None:
+    (tmp_path / "f.rs").write_bytes(b'let s = "a\r\nb";\r\nf(x,\r\n  y);\r\n')
+    result = apply(
+        tmp_path,
+        '--- f.rs\n<<<<<<< SEARCH\nlet s = "a\nb";\nf(x, y);\n=======\nnew\n>>>>>>> REPLACE\n',
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "f.rs").read_bytes() == b"new\r\n"
+
+
+def test_a_loose_match_found_twice_in_another_file_needs_more_context(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "fn f() {\n    g(\n        a,\n        b,\n    );\n    g(a,\n      b);\n}\n"
+    )
+    result = loose(tmp_path, "f.rs", source, "g(a, b);")
+    assert result.returncode == 1
+    assert (
+        "found 2 times (ignoring whitespace and trailing commas), at lines 2, 6"
+        in result.stderr
+    )
+    assert (tmp_path / "f.rs").read_text() == source
+
+
+@pytest.mark.parametrize(
+    "source, old",
+    [
+        # whitespace inside a string, in any of its quotes
+        ('let s = f("a  b",\n    c);\n', 'let s = f("a b", c);'),
+        ("let s = f(`a\n  b`,\n    c);\n", "let s = f(`a\n b`, c);"),
+        ("let c = f('a  b',\n    c);\n", "let c = f('a b', c);"),
+        # and inside a comment, or across the line break that ends one
+        ("x = f(a,\n  b) // a  note\n", "x = f(a, b) // a note"),
+        ("// note\nlet x = 1;\n", "// note let x = 1;"),
+        ("# note\nx = 1\n", "# note x = 1"),
+        # a line break between two words separates them: a shell's two commands
+        ("make build\nmake test\n", "make build make test"),
+        # spaces that separate tokens, or join them
+        ("let y = a - -b;\n", "let y = a --b;"),
+        ("x = a + = b\n", "x = a += b"),
+        ('let x = r "a";\n', 'let x = r"a";'),
+        # a line break between statements, or after a block
+        ("a();\nb();\n", "a(); b();"),
+        ("}\nfoo();\n", "} foo();"),
+        # a backslash continuation is a line break other files may not ignore, and a
+        # backslash before a space may escape it
+        ("run \\\n  --flag\n", "run --flag"),
+        ("run \\\n  --flag\n", "run \\ --flag"),
+        # a comment's line break may end a preprocessor line
+        ("f(a,\n  b)\n#define X 1\n", "f(a, b) #define X 1"),
+        # an indented old text is a line's start, not a statement mid-line
+        ("fn f() { g(a,\n    b); }\n", "    g(a, b);"),
+        # a block's line break, even inside parentheses, may end a statement
+        ("foo(func() {\n\tx := a\n\t(*b).c()\n})\n", "foo(func() { x := a (*b).c() })"),
+        # a line break after a word may end a statement before punctuation
+        ("return\n{ a: 1 };\n", "return { a: 1 };"),
+        ("val x = a\n- b\n", "val x = a - b"),
+        ("make\n-j4\n", "make -j4"),
+        # a space next to an operator may matter
+        ("x=1\nf(a,\n  b)\n", "x = 1\nf(a, b)"),
+        ("run --flag\nf(a,\n  b)\n", "run -- flag\nf(a, b)"),
+        # strings a lexer may misread still keep their spaces
+        ("msg = '''\na  b\n'''\n", "msg = '''\na b\n'''"),
+        ("it's 'a  b' ok\n", "it's 'a b' ok"),
+        ('let p = r"C:\\";\nlet s = f("a  b", c);\n', 'let s = f("a b", c);'),
+        ("const re = /'/; f('a  b')\n", "const re = /'/; f('a b')"),
+        # indentation that carries meaning: a recipe's tab, a key's level
+        ("all:\n\tgcc -o x x.c\n", "    gcc -o x x.c"),
+        ("a:\n  b: 1\n  c: 2\n", "a:\n  b: 1\nc: 2"),
+        # a call's parentheses come straight after its name
+        ("return (\n    x,\n);\n", "return (x);"),
+        # an old text that starts with a blank line has no line to start at
+        ("fn f() {\n\n    g(\n        a,\n    );\n}\n", "\n    g(a);"),
+    ],
+)
+def test_whitespace_that_can_change_meaning_still_misses_in_other_files(
+    tmp_path: Path, source: str, old: str
+) -> None:
+    result = loose(tmp_path, "f.txt", source, old)
+    assert result.returncode == 1, (tmp_path / "f.txt").read_text()
+    assert "closest is" in result.stderr
+    assert (tmp_path / "f.txt").read_text() == source

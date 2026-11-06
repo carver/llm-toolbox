@@ -35,7 +35,23 @@ indentation after them and comments must match as they are. A match that takes m
 than whitespace needs a file that parses, and counts only where the old text in its
 place leaves the same syntax tree, so `(x,)` never matches `(x)`, and `x * (a + b)`
 never matches `x * a + b`. Such a match must be unique too, and the output says which
-blocks matched this way. Other files match exactly.
+blocks matched this way.
+
+In any other file, an old text not found as it is still matches where it differs only in
+whitespace a formatter such as rustfmt or prettier changes, and in a trailing comma, as
+when it split a call over lines. Whitespace may come or go next to a bracket or comma,
+and before a method chain's `.`. A line break may come or go inside ( or [, after
+punctuation other than `)]};?!`, and before a closing bracket, a chain's `.`, `&&`, `||`,
+or a `{` after `)`, `]` or `>`. The indentation after a line break may differ, but
+outside ( and [ every line must move as far as the first, so a block may move deeper as
+a whole, and tabs never stand for spaces. A comma at the end of a line before a closing
+bracket may be on one side only, in [ ] or { }, or in ( ) that hold a call's arguments or
+another comma, so `(x,)` never matches `(x)`. Anything else must match as it is: spacing
+within a line, strings ("...", `...`, '...', triple quotes, Rust's raw strings) and
+comments (//, #, /* */), and the whitespace between two words or next to a backslash. An
+old text that starts indented matches only at the start of a line, at any depth, and its
+replacement goes in as written. Such a match must be unique too, and the output says
+which blocks matched this way.
 
 A line that is exactly one of the markers can't appear inside a block; edit such a
 line another way. Files keep their line endings (\\n or \\r\\n). A symlink is edited
@@ -57,6 +73,7 @@ import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 USAGE = 2
 MISSED = 1
@@ -192,12 +209,13 @@ def read(path: Path) -> str:
         raise UsageError(f"can't read {path} as text: {e}") from e
 
 
-def applied(edits: FileEdits, text: str) -> tuple[str, list[str], list[int]]:
+def applied(edits: FileEdits, text: str) -> tuple[str, list[str], str]:
     """The file's text with its blocks applied, what went wrong with any that missed, and
-    the numbers of the blocks that matched only across formatting that doesn't change the
-    Python. Blocks come with \\n line breaks; a file with \\r\\n ones gets those."""
+    a note naming the blocks that matched only loosely ("" for none). Blocks come with
+    \\n line breaks; a file with \\r\\n ones gets those."""
     crlf = "\r\n" in text
     python = is_python(edits.path, text)
+    ignoring = PYTHON_LOOSELY if python else LAYOUT_LOOSELY
     problems, loose = [], []
     for block in edits.blocks:
         old, new = (block.old, block.new)
@@ -205,12 +223,15 @@ def applied(edits: FileEdits, text: str) -> tuple[str, list[str], list[int]]:
             old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
         count = text.count(old)
         if count == 1:
-            text = replaced(text, old, new)
+            at = text.index(old)
+            text = spliced(text, at, at + len(old), new)
             continue
-        spans = loose_spans(block.old, text) if count == 0 and python else []
+        spans = []
+        if count == 0:
+            # the Python tokenizer reads \r\n as \n; the generic lexer keeps strings whole
+            spans = loose_spans(block.old, text) if python else layout_spans(old, text)
         if len(spans) == 1:
-            start, end = spans[0]
-            text = text[:start] + new + text[end:]
+            text = spliced(text, *spans[0], new)
             loose.append(block.number)
             continue
         first = next(line.strip() for line in block.old.splitlines() if line.strip())
@@ -218,15 +239,17 @@ def applied(edits: FileEdits, text: str) -> tuple[str, list[str], list[int]]:
         if len(spans) > 1:
             at = ", ".join(str(line_of(text, start)) for start, _ in spans)
             problems.append(
-                f"{name}: found {len(spans)} times (ignoring formatting that doesn't "
-                f"change the Python), at lines {at}; add context."
+                f"{name}: found {len(spans)} times (ignoring {ignoring}), at lines {at}; "
+                "add context."
             )
         elif count == 0:
             problems.append(f"{name}: old text not found.\n{closest(block.old, text)}")
         else:
             at = ", ".join(str(n) for n in line_numbers(text, old))
             problems.append(f"{name}: found {count} times, at lines {at}; add context.")
-    return text, problems, loose
+    how = f"across {ignoring}" if python else f"ignoring {ignoring}"
+    note = f" (block {', '.join(map(str, loose))} matched {how})" if loose else ""
+    return text, problems, note
 
 
 def is_python(path: Path, text: str) -> bool:
@@ -464,17 +487,258 @@ def loose_spans(old: str, text: str) -> list[tuple[int, int]]:
     return [(start, end) for start, end, _ in matches]
 
 
-def replaced(text: str, old: str, new: str) -> str:
-    """The text with old swapped for new. Deleting whole lines takes the line break
-    after them too."""
-    at = text.index(old)
-    end = at + len(old)
-    if not new and (at == 0 or text[at - 1] == "\n"):
+PYTHON_LOOSELY = "formatting that doesn't change the Python"
+LAYOUT_LOOSELY = "whitespace and trailing commas"
+"""What a loose match ignores, in a Python file and in any other."""
+
+
+@dataclass
+class Lexeme:
+    start: int
+    end: int
+    kind: Literal[
+        "word", "string", "comment", "mark"
+    ]  # a mark: one punctuation character
+    text: str
+
+    @property
+    def wordish(self) -> bool:
+        return self.kind in ("word", "string")
+
+
+LEXEME = re.compile(
+    r"""
+    (?P<comment> //[^\n]* | \#[^\n]* | /\*.*?(?:\*/|\Z) )
+  | (?P<string>
+        r(?P<hashes>\#*)".*?(?:"(?P=hashes)|\Z)
+      | (?P<triple>'''|\"\"\").*?(?:(?P=triple)|\Z)
+      | "(?:\\.|[^"\\])*(?:"|\Z)
+      | `(?:\\.|[^`\\])*(?:`|\Z)
+      | '(?:\\.|[^'\\\n])*'
+    )
+  | (?P<word> \w+ )
+  | (?P<mark> \S )
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+"""The lexemes of a file in no language in particular. A string in " or `, triple quotes,
+or Rust's raw r"..." and r#"..."# may span lines, and runs to the end of the text when it
+isn't closed; a ' string stays on its line, else the ' is a mark (an apostrophe, a Rust
+lifetime)."""
+
+OPENERS = {"(": ")", "[": "]", "{": "}"}
+
+
+def lexemes(text: str) -> list[Lexeme]:
+    found = []
+    for match in LEXEME.finditer(text):
+        kind = match.lastgroup
+        if kind not in ("comment", "word", "mark"):
+            kind = "string"  # the last group to close may be one inside a string's
+        body = match.group().rstrip() if kind == "comment" else match.group()
+        found.append(Lexeme(match.start(), match.start() + len(body), kind, body))
+    return found
+
+
+@dataclass
+class Bracket:
+    """A bracket opened inside a layout match."""
+
+    opener: str
+    call: bool  # a `(` straight after a name, a `!`, a `>` or a closer: a call's arguments
+    commas: int = 0  # at its own level
+
+
+@dataclass
+class Indents:
+    """The indentation of the match's first line in the file and in the old text, which
+    every later line start outside brackets must keep its shift from."""
+
+    file: str
+    old: str
+
+    def keep(self, file: str, old: str) -> bool:
+        """Whether a line indented `file` in the file and `old` in the old text sits as
+        deep, against the first line, on both sides: tabs and spaces never stand in for
+        each other."""
+        if file == old and self.file == self.old:
+            return True
+        uniform = len(set(file + old + self.file + self.old)) <= 1
+        return uniform and len(file) - len(old) == len(self.file) - len(self.old)
+
+
+def gaps_agree(
+    file_gap: str,
+    old_gap: str,
+    a: Lexeme,
+    b: Lexeme,
+    after: Lexeme | None,
+    inside: bool,
+) -> bool:
+    """Whether the whitespace between lexemes `a` and `b` (`after` follows `b`) may be
+    `file_gap` in the file and `old_gap` in the old text. `inside` says whether the
+    innermost bracket the match opened is a ( or [.
+
+    On one line a gap must match as it is. Whether there is one may differ next to a
+    bracket or comma, or before a method chain's `.`; whether it breaks the line may
+    differ inside ( or [, after a mark other than `)]};?!`, or before a closer, a chain's
+    `.`, `&&`, `||`, or a `{` after `)`, `]` or `>`. Next to a comment or a backslash, and
+    between two words or strings, neither may."""
+    if file_gap == old_gap:
+        return True
+    spaced = bool(file_gap) != bool(old_gap)
+    broken = ("\n" in file_gap) != ("\n" in old_gap)
+    if not (spaced or broken):
+        return "\n" in file_gap  # the indentation after a line break may differ
+    if "comment" in (a.kind, b.kind) or "\\" in (a.text, b.text):
+        return False
+    if a.wordish and b.wordish:
+        return False
+    chain = (
+        b.text == "."
+        and after is not None
+        and after.kind == "word"
+        and after.start == b.end
+    )
+    if spaced and not (chain or a.text in ",()[]{}" or b.text in ",()[]{}"):
+        return False
+    doubled = (
+        b.text in "&|"
+        and after is not None
+        and after.text == b.text
+        and after.start == b.end
+    )
+    return (
+        not broken
+        or inside
+        or (a.kind == "mark" and a.text not in ")]};?!")
+        or b.text in ")]}"
+        or chain
+        or doubled
+        or (b.text == "{" and a.text in ")]>")
+    )
+
+
+def layout_end(
+    text: str,
+    found: list[Lexeme],
+    k: int,
+    old: str,
+    wanted: list[Lexeme],
+    indents: Indents,
+) -> int | None:
+    """Where in `text` the old text ends, if its lexemes `wanted` match the file's from
+    lexeme `k` on, with gaps between them that `gaps_agree` allows, line starts outside
+    brackets that keep their indentation's shift (`indents`), and trailing commas only
+    one side has (`trailing_comma`)."""
+    i, j = k, 0
+    brackets: list[Bracket] = []
+    joined = False  # no gap before the current lexeme on either side, and one before it
+    while True:
+        lexeme = found[i]
+        if lexeme.text in OPENERS:
+            call = (
+                joined
+                and lexeme.text == "("
+                and (found[i - 1].kind == "word" or found[i - 1].text in ")]!>")
+            )
+            brackets.append(Bracket(lexeme.text, call))
+        elif brackets and lexeme.text == OPENERS[brackets[-1].opener]:
+            brackets.pop()
+        elif lexeme.text == "," and brackets:
+            brackets[-1].commas += 1
+        if j + 1 == len(wanted):
+            return lexeme.end
+        if i + 1 == len(found):
+            return None
+        file_gap = text[lexeme.end : found[i + 1].start]
+        old_gap = old[wanted[j].end : wanted[j + 1].start]
+        skipped = skip_comma((text, found, i + 1), (old, wanted, j + 1), brackets)
+        if skipped is None:
+            return None
+        i, j = skipped
+        inside = bool(brackets) and brackets[-1].opener != "{"
+        after = found[i + 1] if i + 1 < len(found) else None
+        if not gaps_agree(file_gap, old_gap, lexeme, found[i], after, inside):
+            return None
+        line_start = "\n" in file_gap and "\n" in old_gap and not inside
+        if line_start and not indents.keep(indentation(file_gap), indentation(old_gap)):
+            return None
+        joined = not file_gap and not old_gap
+
+
+Place = tuple[str, list[Lexeme], int]
+"""A source, its lexemes, and the index of one of them."""
+
+
+def skip_comma(
+    file: Place, old: Place, brackets: list[Bracket]
+) -> tuple[int, int] | None:
+    """The indexes of the file's and the old text's next lexemes, as given or past a
+    trailing comma only one side has; None when they differ otherwise."""
+    (_, found, i), (_, wanted, j) = file, old
+    if found[i].text == wanted[j].text:
+        return i, j
+    if trailing_comma(file, wanted[j].text, brackets):
+        return i + 1, j
+    if trailing_comma(old, found[i].text, brackets):
+        return i, j + 1
+    return None
+
+
+def trailing_comma(place: Place, closer: str, brackets: list[Bracket]) -> bool:
+    """Whether the lexeme at `place` is a trailing comma the other side lacks, before
+    `closer`: one at the end of its line before the closer, as formatters add when they
+    split brackets over lines. In parentheses, only where they hold a call's arguments,
+    or another comma, so that `(x,)` never matches `(x)`."""
+    source, lexed, at = place
+    if lexed[at].text != "," or at + 1 == len(lexed) or lexed[at + 1].text != closer:
+        return False
+    if "\n" not in source[lexed[at].end : lexed[at + 1].start]:
+        return False
+    if not brackets or OPENERS[brackets[-1].opener] != closer:
+        return False
+    return closer != ")" or brackets[-1].call or brackets[-1].commas > 0
+
+
+def layout_spans(old: str, text: str) -> list[tuple[int, int]]:
+    """Where in `text` (any file but Python) the old text occurs, ignoring differences in
+    whitespace that can't change what the file means, and trailing commas a formatter
+    adds or drops: each match's start and end. An old text that starts indented matches
+    only a lexeme that starts its line, and the match takes in the line's indentation,
+    however deep; one that starts with a line break matches nothing."""
+    old = old.rstrip()
+    body = old.lstrip(" \t")
+    lead = old[: len(old) - len(body)]
+    wanted = lexemes(old)
+    if not wanted or body.startswith(("\n", "\r")):
+        return []
+    found = lexemes(text)
+    spans = []
+    for k, lexeme in enumerate(found):
+        if lexeme.text != wanted[0].text:
+            continue
+        line = text.rfind("\n", 0, lexeme.start) + 1
+        before = text[line : lexeme.start]
+        if lead and before.strip():
+            continue
+        indents = Indents(before[: len(before) - len(before.lstrip(" \t"))], lead)
+        if not indents.keep(indents.file, indents.old):
+            continue
+        if (end := layout_end(text, found, k, old, wanted, indents)) is not None:
+            spans.append((line if lead else lexeme.start, end))
+    return spans
+
+
+def spliced(text: str, start: int, end: int, new: str) -> str:
+    """The text with new in place of start to end. Deleting whole lines takes the line
+    break after them too."""
+    if not new and (start == 0 or text[start - 1] == "\n"):
         for newline in ("\r\n", "\n"):
             if text.startswith(newline, end):
                 end += len(newline)
                 break
-    return text[:at] + new + text[end:]
+    return text[:start] + new + text[end:]
 
 
 def line_of(text: str, index: int) -> int:
@@ -538,8 +802,8 @@ def main() -> int:
         return USAGE
     results, problems = [], []
     for edits, text in zip(files, texts, strict=True):
-        new_text, missed, loose = applied(edits, text)
-        results.append((edits, new_text, loose))
+        new_text, missed, note = applied(edits, text)
+        results.append((edits, new_text, note))
         problems += missed
     if problems:
         print("\n".join(problems) + "\nNothing was written.", file=sys.stderr)
@@ -553,15 +817,9 @@ def main() -> int:
             os.unlink(temp)
         print(f"apply-edits: {e}\nNothing was written.", file=sys.stderr)
         return USAGE
-    for (temp, target), (edits, _, loose) in zip(temps, results, strict=True):
+    for (temp, target), (edits, _, note) in zip(temps, results, strict=True):
         os.replace(temp, target)
         count = len(edits.blocks)
-        note = (
-            f" (block {', '.join(map(str, loose))} matched across formatting that doesn't "
-            "change the Python)"
-            if loose
-            else ""
-        )
         print(f"{edits.path}: {count} edit{'' if count == 1 else 's'}{note}")
     return 0
 

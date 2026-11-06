@@ -120,7 +120,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   comment it respaced still misses. A match never crosses a statement break,
   indentation, a comment or a value that differs, and one beyond whitespace
   needs the file, with the old text in place, to parse to the same syntax
-  tree. For edits that would otherwise be a heredoc Python script.
+  tree. In any other file, a miss still matches across whitespace a formatter
+  such as rustfmt changes (a call split over lines, deeper indentation, a `{`
+  moved) and the trailing comma it adds, never inside a string or comment, nor
+  across a line break between two words or after a `;`, and every line keeps
+  its depth against the first. Either kind of loose
+  match must be unique, and the output names it. For edits that would otherwise
+  be a heredoc Python script.
   `apply-edits -h` shows the format.
 - **slop-lint**: flags the tells from the unslop skill that a regex can catch,
   in markdown and text files: em and en dashes, curly quotes, and fixed AI

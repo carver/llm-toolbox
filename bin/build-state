@@ -11,8 +11,10 @@
                             rewrote, print the commits since the base and the test
                             files changed since the refactor base
     build-state review-prompt BRIEF
-                            print the review subagent's prompt for the commit at HEAD:
-                            the base, the commits, the brief as its spec, the standards
+                            write the review subagent's prompt for the commit at HEAD
+                            to build-review-prompt.md in the git dir, and print a short
+                            prompt that points the reviewer at it. The file holds the
+                            base, the commits, the brief as its spec, the standards
                             sources, and code-review's standards section and its
                             Standards and Spec briefs, copied verbatim from its
                             SKILL.md (fails when they can't be found there); on stderr,
@@ -22,7 +24,8 @@
                             without FILE), keeping every tree; refuses with
                             uncommitted changes, merges after SHA, or SHA pushed
 
-The state lives in the worktree's git dir, as build-state.json; finish removes it.
+The state lives in the worktree's git dir, as build-state.json, beside the review
+prompt; finish removes both.
 
 finish folds only fixup!, squash! and amend! commits (`git commit --fixup=SHA`), each
 into the commit it names, with an autosquash rebase onto the base. Every other commit
@@ -469,6 +472,7 @@ def finish(args: argparse.Namespace) -> int:
         if behind(branch):
             print(f"{branch} moved since start: rebase onto it")
     path.unlink()
+    (path.parent / REVIEW_FILE).unlink(missing_ok=True)
     return 0
 
 
@@ -479,6 +483,13 @@ BRIEF_LINE = re.compile(r'^- The brief: "(.*)"\s*$')
 HEADING = re.compile(r"^(#|\*\*)")
 AXIS_HEADING = re.compile(r"^\*\*(Standards|Spec) sub-agent prompt\*\*")
 SOURCES_HEADING = "### 3. Identify the standards sources"
+# The full prompt goes to this file beside the state, and the pointer below to stdout,
+# so the agent that spawns the reviewer neither reads nor retypes the whole prompt.
+REVIEW_FILE = "build-review-prompt.md"
+POINTER = """\
+Your instructions for this review are in {path}. Read that whole file first, then \
+follow it. Report only: edit no files and make no commits.
+"""
 REVIEW_PROMPT = """\
 Review the changes in {top} since {base}, up to {sha}. Report only: edit no files and \
 make no commits.
@@ -491,8 +502,10 @@ while you review.
 Spec: {brief}. Read it in full.
 
 You may run the repo's own build and check commands; writing outputs git ignores is \
-fine. To see whether a test catches a break, use `mutate-check -- CMD` (`mutate-check \
--h`), which puts the code back, rather than a scripted edit.
+fine. Run tools at the versions the repo pins (its hooks, pre-commit config or lock \
+files), not whatever `uvx` or `PATH` gives: another version reports what the repo's \
+checks don't. To see whether a test catches a break, use `mutate-check -- CMD` \
+(`mutate-check -h`), which puts the code back, rather than a scripted edit.
 
 Run two separate reviews and report them under the headings `## Standards` and `## Spec`. \
 Don't merge or rerank findings across the two.
@@ -573,7 +586,8 @@ def review_prompt(args: argparse.Namespace) -> int:
         GLOBAL_STANDARDS,
         *(str(top / n) for n in REPO_STANDARDS if (top / n).is_file()),
     ]
-    print(
+    prompt_file = state_file().parent / REVIEW_FILE
+    prompt_file.write_text(
         REVIEW_PROMPT.format(
             top=top,
             base=base,
@@ -584,9 +598,9 @@ def review_prompt(args: argparse.Namespace) -> int:
             sources_section=section(text, SOURCES_HEADING),
             standards=briefs["Standards"],
             spec=briefs["Spec"],
-        ),
-        end="",
+        )
     )
+    print(POINTER.format(path=prompt_file), end="")
     return 0
 
 
@@ -704,7 +718,8 @@ def main(argv: list[str] | None = None) -> int:
         "finish", help="fold fixups, check the fingerprint, list the commits"
     ).set_defaults(run=finish)
     prompt_command = commands.add_parser(
-        "review-prompt", help="print the review subagent's prompt"
+        "review-prompt",
+        help="write the review subagent's prompt to a file and print a pointer to it",
     )
     prompt_command.add_argument("brief", type=Path, help="the build's brief file")
     prompt_command.add_argument(

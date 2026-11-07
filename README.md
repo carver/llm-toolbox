@@ -268,9 +268,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   base and the test files changed since the refactor base, and fails naming
   any ref or config key that moved. In a detached worktree, the branch it lands on (the
   main tree's) may move: finish then says to rebase onto it. `review-prompt
-  BRIEF` prints the review subagent's prompt for the commit at HEAD, with
-  `/code-review`'s two briefs and its standards section copied from its
-  SKILL.md, and says on stderr when the repo has no `CODING_STANDARDS.md`.
+  BRIEF` writes the review subagent's prompt for the commit at HEAD to the git
+  dir, with `/code-review`'s two briefs and its standards section copied from
+  its SKILL.md, and prints a short prompt pointing at that file, to pass to the
+  subagent; it says on stderr when the repo has no `CODING_STANDARDS.md`.
   `reword SHA [FILE]` replaces a commit's message (FILE, or stdin), keeping
   every tree; it refuses during a rebase, with uncommitted changes, with merges
   after the commit, a later `fixup!` naming it, or the commit already pushed.

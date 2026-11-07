@@ -148,7 +148,14 @@ def test_review_prompt_carries_the_build_and_both_code_review_briefs(repo, tmp_p
     )
 
     assert shown.returncode == 0, shown.stderr
-    prompt = shown.stdout
+    # What it prints is the short prompt to pass on: it names the file that holds the
+    # whole prompt, so the main agent neither reads nor retypes it.
+    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").strip())
+    prompt_file = git_dir / "build-review-prompt.md"
+    assert str(prompt_file) in shown.stdout and "Read" in shown.stdout
+    assert len(shown.stdout) < 400, shown.stdout
+    prompt = prompt_file.read_text()
+    assert "versions the repo pins" in prompt
     head = git(repo, "rev-parse", "HEAD").strip()
     assert str(repo) in prompt and f"git diff {base}...{head}" in prompt
     assert "Parse dates" in prompt and "Note the house rules" in prompt
@@ -218,6 +225,26 @@ def test_review_prompt_refuses_a_brief_that_doesnt_exist(repo, tmp_path):
     assert shown.stdout == ""
 
 
+def test_finish_removes_the_review_prompt_file_with_the_state(repo, tmp_path):
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    (tmp_path / "brief.md").write_text("Parse dates.\n")
+    skill = code_review_skill(tmp_path)
+    build_state(
+        repo, "review-prompt", str(tmp_path / "brief.md"), "--skill", str(skill)
+    )
+    prompt_file = (
+        Path(git(repo, "rev-parse", "--absolute-git-dir").strip())
+        / "build-review-prompt.md"
+    )
+    assert prompt_file.is_file()
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert not prompt_file.exists()
+
+
 def test_review_prompt_without_start_says_so(repo, tmp_path):
     skill = code_review_skill(tmp_path)
 
@@ -235,7 +262,9 @@ def test_review_prompt_finds_both_briefs_in_the_installed_code_review(repo, tmp_
     shown = build_state(repo, "review-prompt", str(tmp_path / "brief.md"))
 
     assert shown.returncode == 0, shown.stderr
-    assert shown.stdout.count("Under 400 words") == 2
+    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").strip())
+    prompt = (git_dir / "build-review-prompt.md").read_text()
+    assert prompt.count("Under 400 words") == 2
 
 
 def test_finish_without_start_says_so(repo):
@@ -605,11 +634,15 @@ def test_finish_fails_when_folding_changes_the_tree(repo):
 
 
 def review_prompt_for(repo, tmp_path):
+    """The whole review prompt: the file the printed pointer names."""
     (tmp_path / "brief.md").write_text("Parse dates.\n")
     skill = code_review_skill(tmp_path)
-    return build_state(
+    shown = build_state(
         repo, "review-prompt", str(tmp_path / "brief.md"), "--skill", str(skill)
     )
+    assert shown.returncode == 0, shown.stderr
+    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").strip())
+    return (git_dir / "build-review-prompt.md").read_text()
 
 
 def test_review_prompt_pins_the_commit_under_review(repo, tmp_path):
@@ -617,7 +650,7 @@ def test_review_prompt_pins_the_commit_under_review(repo, tmp_path):
     build_state(repo, "start")
     reviewed = commit(repo, "parser.py", "Parse dates")
 
-    prompt = review_prompt_for(repo, tmp_path).stdout
+    prompt = review_prompt_for(repo, tmp_path)
 
     assert f"git diff {base}...{reviewed}" in prompt
     assert f"git show {reviewed}:" in prompt
@@ -628,7 +661,7 @@ def test_review_prompt_quotes_the_standards_sources_section(repo, tmp_path):
     build_state(repo, "start")
     commit(repo, "parser.py", "Parse dates")
 
-    prompt = review_prompt_for(repo, tmp_path).stdout
+    prompt = review_prompt_for(repo, tmp_path)
 
     assert (
         "Search the repo for every file that documents how code should be written."
@@ -642,7 +675,7 @@ def test_review_prompt_names_mutate_check_and_allows_the_repos_build(repo, tmp_p
     build_state(repo, "start")
     commit(repo, "parser.py", "Parse dates")
 
-    prompt = review_prompt_for(repo, tmp_path).stdout
+    prompt = review_prompt_for(repo, tmp_path)
 
     assert "mutate-check" in prompt
     assert "build" in prompt and "ignore" in prompt

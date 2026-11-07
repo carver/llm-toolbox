@@ -33,7 +33,7 @@ Done when `git log <base>..HEAD` shows your commits and the repo's checks pass.
 
 ## 3. Review
 
-Spawn one review subagent in the foreground, and wait for its report before doing anything else. Its prompt is what `build-state review-prompt BRIEF` prints: `<base>` as the fixed point, the brief file as the spec, and `/code-review`'s Standards and Spec briefs with their standards sources and smell baseline, reported under separate headings. Append any ask this change needs, such as a sweep for leftovers of a rename. The prompt pins the commit under review; don't rebase or rewrite the tree until the report is in, since the reviewer runs the tests in it.
+Spawn one review subagent in the foreground, and wait for its report before doing anything else. Its prompt is what `build-state review-prompt BRIEF` prints: a short pointer to the file that holds the whole prompt, which you pass on as it is, without reading the file. That file gives `<base>` as the fixed point, the brief file as the spec, and `/code-review`'s Standards and Spec briefs with their standards sources and smell baseline, reported under separate headings. Append to the pointer any ask this change needs, such as a sweep for leftovers of a rename. The prompt pins the commit under review; don't rebase or rewrite the tree until the report is in, since the reviewer runs the tests in it.
 
 ## 4. Triage
 

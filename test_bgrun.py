@@ -76,8 +76,9 @@ def test_prints_the_commands_own_pid_and_logs_its_output(tmp_path, started):
     pid = int(result.stdout)
     started.append(pid)
     assert cmdline(pid) == [sys.executable, "-c", script]
-    content = wait_for(log, "oops")
-    assert "hello" in content
+    # stderr's line comes first and stdout's on its flush: wait for each.
+    wait_for(log, "oops")
+    wait_for(log, "hello")
 
 
 def test_runs_in_its_own_session_and_outlives_the_calling_shell(tmp_path, started):

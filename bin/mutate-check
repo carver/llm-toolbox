@@ -159,6 +159,19 @@ def signal_group(child: subprocess.Popen[bytes], signum: signal.Signals) -> None
 
 
 RUST_BUILD_FAILED = re.compile(r"error: could not compile|error\[E\d+\]")
+# A lint that `-D warnings` makes an error: the mutation left an item unused.
+RUST_UNUSED = re.compile(
+    r"is never (used|read|constructed)|unused `|unused (variable|import)|does not need to be mutable"
+)
+# A compile error's own line: `error: ...` or `error[E0308]: ...`, or with
+# --message-format=short `src/lib.rs:4:5: error: ...`.
+RUST_ERROR = re.compile(r"^error(\[E\d+\])?: |^\S+:\d+:\d+: error")
+# cargo's and nextest's lines that only say the build failed, after the cause.
+RUST_FAILED_ONLY = re.compile(r"^error: (could not compile|command `)")
+UNUSED_HINT = (
+    "  hint: the mutation left code unused, which -D warnings refuses; keep it used,"
+    " such as with `let _ = &name;`, or mutate a condition instead of removing a call"
+)
 # A cargo or nextest summary line: tests ran, so a failure is theirs.
 TESTS_RAN = re.compile(r"^test result: |^\s*Summary \[")
 
@@ -168,7 +181,22 @@ def build_errors(output: str) -> list[str]:
     lines = output.splitlines()
     if any(TESTS_RAN.search(line) for line in lines):
         return []
-    return [line for line in lines if RUST_BUILD_FAILED.match(line)]
+    if not any(RUST_BUILD_FAILED.match(line) for line in lines):
+        return []
+    # Each error and the `-->` line that places it, causes first, then cargo's lines
+    # that only say the build failed, so the cap on lines shown keeps the cause.
+    causes, failed = [], []
+    for index, line in enumerate(lines):
+        if not RUST_ERROR.match(line):
+            continue
+        if RUST_FAILED_ONLY.match(line):
+            failed.append(line)
+            continue
+        causes.append(line)
+        place = lines[index + 1].strip() if index + 1 < len(lines) else ""
+        if place.startswith("-->"):
+            causes.append(f"  {place}")
+    return causes + failed
 
 
 def runs_pytest(command: list[str]) -> bool:
@@ -267,6 +295,8 @@ def main() -> int:
         )
         for line in (errors or summary(output))[:SHOWN_ERRORS]:
             print(f"  {line}")
+        if any(RUST_UNUSED.search(line) for line in errors):
+            print(UNUSED_HINT)
         return INCONCLUSIVE
     print(f"mutate-check: caught: the command exited {code}")
     for line in summary(output):

@@ -214,6 +214,44 @@ def test_a_build_that_fails_is_inconclusive_not_caught(repo: Path) -> None:
     assert (repo / "calc.py").read_text() == CODE
 
 
+def test_a_mutation_that_leaves_code_unused_says_why_and_how_to_keep_it_used(
+    repo: Path,
+) -> None:
+    (repo / "build.txt").write_text(RUST_BUILD_FAILURE)
+    result = check(repo, BREAK, "sh", "-c", "cat build.txt; exit 101")
+
+    assert result.returncode == 3, result.stdout
+    assert "function `double` is never used" in result.stdout
+    assert "let _ =" in result.stdout, result.stdout
+
+
+def test_the_cause_and_its_place_come_before_cargos_lines(repo: Path) -> None:
+    (repo / "build.txt").write_text(
+        "error: could not compile `calc` (lib) due to 1 previous error\n"
+        "error: could not compile `calc` (lib test) due to 1 previous error\n"
+        "error: command `cargo test --no-run` exited with code 101\n"
+        "error: field `rate` is never read\n"
+        "  --> src/limits.rs:12:5\n"
+    )
+    result = check(repo, BREAK, "sh", "-c", "cat build.txt; exit 101")
+
+    shown = result.stdout.splitlines()
+    assert "field `rate` is never read" in shown[1], result.stdout
+    assert "src/limits.rs:12:5" in shown[2], result.stdout
+    assert "let _ =" in result.stdout
+
+
+def test_a_short_format_error_and_a_clippy_unused_lint_are_shown(repo: Path) -> None:
+    (repo / "build.txt").write_text(
+        "src/lib.rs:4:5: error: unused `self` argument\n"
+        "error: could not compile `calc` (lib) due to 1 previous error\n"
+    )
+    result = check(repo, BREAK, "sh", "-c", "cat build.txt; exit 101")
+
+    assert "src/lib.rs:4:5: error: unused `self` argument" in result.stdout
+    assert "let _ =" in result.stdout
+
+
 def test_a_rust_type_error_is_inconclusive(repo: Path) -> None:
     result = check(
         repo, BREAK, "sh", "-c", "echo 'error[E0308]: mismatched types'; exit 101"

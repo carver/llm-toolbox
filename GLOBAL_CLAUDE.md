@@ -49,6 +49,8 @@ Before scraping a site, look for its data source: an official API or MCP endpoin
 
 ## Profiling
 
+Before you time anything, check the load with `uptime`. Other sessions share this machine's cores, and a load above the core count (`nproc`) slows every timing you take: wait for it to drop, or give the load beside the numbers.
+
 To find what's slow, start with a sampling profiler (`py-spy` for Python, `--subprocesses` for the interpreters it spawns): it disturbs what it measures far less than cProfile, `strace -f` or a hand-built timing loop. Compare timings with `hyperfine`, not repeated runs by hand. Reach for deterministic tracing only for what sampling can't tell, such as an exact call count.
 
 ## Claude from code

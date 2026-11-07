@@ -165,8 +165,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   whether the main tree is behind; `--remove` removes the worktree. In a repo
   that doesn't push, `--local` lands the commits on the main tree's branch
   instead: it claims the main tree for the merge with the `CLAUDE_WORKING`
-  flag, holding `CLAUDE_CODE_SESSION_ID`, fast-forwards it, and rebases and checks once more when another
-  session lands first. It stops on another session's claim, and on
+  flag, holding `CLAUDE_CODE_SESSION_ID`, fast-forwards it, and rebases and checks again, up to 10 times,
+  when another session lands first. It stops on another session's claim, and on
   uncommitted changes there that touch the same files.
 - **gui-shot**: runs a GUI app on a headless display (Xvfb, or weston for
   Wayland), clicks and types into it, and saves screenshots. For checking a

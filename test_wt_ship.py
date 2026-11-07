@@ -162,7 +162,7 @@ def test_the_default_check_is_the_repos_agent_pre_commit(setup):
     assert remote_main(origin) == before
 
 
-def test_a_push_that_loses_a_race_rebases_and_retries_once(setup):
+def test_a_push_that_loses_one_race_rebases_and_retries(setup):
     origin, main, wt, other = setup
     commit(wt, "a.py", "x = 1\n", "Add a")
     # Another session pushes between wt-ship's fetch and its push.
@@ -186,6 +186,51 @@ def test_a_push_that_loses_a_race_rebases_and_retries_once(setup):
     ]
     notice = done.stdout.split("Notice for other sessions:")[1]
     assert "Add a" in notice and "Race" not in notice and "c.py" not in notice
+
+
+def racing_pre_push(main, other, races):
+    """A pre-push hook in which another session pushes first, `races` times."""
+    hooks = Path(git(main, "rev-parse", "--absolute-git-dir")) / "hooks"
+    count = hooks.parent / "races"
+    (hooks / "pre-push").write_text(
+        f'#!/bin/sh\nn=$(cat "{count}" 2>/dev/null || echo 0)\n'
+        f'[ "$n" -ge {races} ] && exit 0\necho $((n + 1)) > "{count}"\n'
+        "unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX\n"
+        f'cd "{other}" && echo "$n" >> c.py && git add c.py && git commit -qm "Race $n"'
+        " && git push -q origin main\n"
+    )
+    (hooks / "pre-push").chmod(0o755)
+
+
+def test_a_push_that_keeps_losing_races_keeps_rebasing_until_it_lands(setup):
+    origin, main, wt, other = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    racing_pre_push(main, other, races=3)
+
+    done = ship(wt, "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert git(origin, "log", "--format=%s", "main").splitlines() == [
+        "Add a",
+        "Race 2",
+        "Race 1",
+        "Race 0",
+        "start",
+    ]
+
+
+def test_a_push_that_never_wins_stops_after_its_tries(setup):
+    origin, main, wt, other = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    racing_pre_push(main, other, races=1000)
+
+    done = ship(wt, "--check", "true")
+
+    assert done.returncode == 5
+    assert "won the race" in done.stderr and "run wt-ship again" in done.stderr, (
+        done.stderr
+    )
+    assert "Add a" not in git(origin, "log", "--format=%s", "main")
 
 
 def test_uncommitted_changes_are_refused(setup):
@@ -294,7 +339,48 @@ def test_local_rebases_onto_what_the_main_tree_got_meanwhile(setup):
     assert git(main, "rev-parse", "main~1") == theirs
 
 
-def test_local_retries_once_when_the_main_tree_moves_during_the_check(setup):
+def moving_check(main, moves):
+    """A check that lands another session's commit in the main tree on its first
+    `moves` runs, and counts its runs in a file beside the main tree."""
+    ran = main.parent / "checks"
+    check = (
+        f'echo x >> "{ran}"; [ "$(wc -l < "{ran}")" -gt {moves} ] && exit 0; '
+        "unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX; "
+        f'cd "{main}" && echo z >> c.py && git add c.py && git commit -qm "Race $(wc -l < "{ran}")"'
+    )
+    return check, ran
+
+
+def test_local_keeps_rebasing_while_the_main_tree_moves(setup):
+    _, main, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    check, ran = moving_check(main, moves=3)
+
+    done = ship(wt, "--local", "--check", check)
+
+    assert done.returncode == 0, done.stderr
+    assert git(main, "log", "--format=%s", "main").splitlines()[0] == "Add a"
+    assert ran.read_text().count("x") == 4
+    assert not flag(main).exists()
+
+
+def test_local_stops_after_its_tries_and_says_what_moved_the_branch(setup):
+    _, main, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    check, ran = moving_check(main, moves=1000)
+
+    done = ship(wt, "--local", "--remove", "--check", check)
+
+    assert done.returncode == 5, done.stderr
+    assert ran.read_text().count("x") == 10
+    assert "wt-ship --local --remove" in done.stderr and "Race 10" in done.stderr, (
+        done.stderr
+    )
+    assert "Add a" not in git(main, "log", "--format=%s", "main")
+    assert not flag(main).exists()
+
+
+def test_local_rebases_when_the_main_tree_moves_once_during_the_check(setup):
     _, main, wt, _ = setup
     commit(wt, "a.py", "x = 1\n", "Add a")
     ran = main.parent / "checks"

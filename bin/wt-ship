@@ -19,7 +19,8 @@ In order, it:
 4. runs the check: --check CMD (through sh), else the repo's agent-pre-commit hook
    (through agent-commit-gate --run when it's on PATH), else none, and says so;
 5. pushes HEAD to REMOTE/BRANCH. When another session's push wins the race (a
-   non-fast-forward rejection), it fetches, rebases, checks and pushes once more;
+   non-fast-forward rejection), it fetches, rebases, checks and pushes again, up to
+   10 tries in all, then stops saying to run it again;
 6. fetches again and confirms the remote branch holds HEAD;
 7. prints the range it pushed, a notice for other sessions (which it doesn't send),
    and whether the main tree's branch is now behind the remote.
@@ -38,15 +39,16 @@ plain rebase would. Then it claims the main tree with the CLAUDE_WORKING flag of
 user's global instructions, holding $CLAUDE_CODE_SESSION_ID (a flag this session
 already holds is kept; another session's stops it, naming whose it is and since when),
 and fast-forwards the main tree with `git merge --ff-only`. When another session
-landed during the check, it rebases and checks once more, still holding the claim,
-then merges. When the main tree's uncommitted changes touch the files the merge
+landed during the check, it rebases and checks again, up to 10 times, still holding
+the claim, then merges. When the main tree's uncommitted changes touch the files the merge
 changes, it stops, merging nothing: ask the user. The flag it made goes once the merge
 is done or has failed, or the run is stopped. It must run in a linked worktree.
 
 Exit status: 0 shipped, landed or nothing to do; 1 a step failed (the message says
 what to do); 2 a usage error; with --local, 3 another session holds the main tree's
 claim (tell the user the flag's age), 4 the main tree's uncommitted changes touch the
-files the landing changes (ask the user).
+files the landing changes (ask the user); 5 the tries ran out, another session's
+pushes or commits winning each of 10 (run it again later).
 """
 
 import argparse
@@ -201,6 +203,12 @@ REJECTED = (
 
 
 FIXUP_PREFIXES = ("fixup! ", "squash! ", "amend! ")
+# How many times a push may lose a race to another session's, each followed by a
+# rebase and the check, before wt-ship gives up; the same for a landing whose branch
+# moves during the check.
+TRIES = 10
+# The exit status when the tries run out: nothing failed, so run it again later.
+TRY_AGAIN = 5
 
 
 def has_fixups(upstream):
@@ -277,17 +285,25 @@ def ship(args):
         print(f"HEAD is already in {upstream}: nothing to push.")
         return 0
     rebase_and_check(remote, branch, args.check)
-    old = out("rev-parse", upstream)
-    pushed = git("push", "-q", remote, f"HEAD:{branch}", check=False)
-    if pushed.returncode != 0:
+    for attempt in range(1, TRIES + 1):
+        old = out("rev-parse", upstream)
+        pushed = git("push", "-q", remote, f"HEAD:{branch}", check=False)
+        if pushed.returncode == 0:
+            break
         if not any(sign in pushed.stderr for sign in REJECTED):
             raise Stop(f"The push failed:\n{pushed.stderr.strip()}")
+        if attempt == TRIES:
+            raise Stop(
+                f"Another push won the race {TRIES} times running: run wt-ship again"
+                f" once {upstream} is quieter.\n{pushed.stderr.strip()}",
+                status=TRY_AGAIN,
+            )
         print(
-            f"Another push won the race, so trying once more:\n{pushed.stderr.strip()}"
+            f"Another push won the race, so rebasing, checking and trying again"
+            f" (try {attempt + 1} of {TRIES}):\n{pushed.stderr.strip()}",
+            flush=True,
         )
         rebase_and_check(remote, branch, args.check)
-        old = out("rev-parse", upstream)
-        git("push", "-q", remote, f"HEAD:{branch}")
     git("fetch", "-q", remote, branch)
     new = out("rev-parse", "HEAD")
     if not is_ancestor(new, upstream):
@@ -420,9 +436,24 @@ def land(args):
         return 0
     prepare(ref, args.check, LAND)
     with claim(main_path):
-        if not is_ancestor(ref, "HEAD"):
+        # The claim stops other sessions from landing, but the owner, or a tool that
+        # doesn't read the flag, may still move the branch: rebase until HEAD holds
+        # it, checking each time, at most TRIES checks in all.
+        attempt = 1
+        while not is_ancestor(ref, "HEAD"):
+            arrived = out("log", "--oneline", f"HEAD..{ref}")
+            if attempt == TRIES:
+                again = "wt-ship --local" + (" --remove" if args.remove else "")
+                raise Stop(
+                    f"{branch} moved during the check {TRIES} times running, so"
+                    f" nothing was landed. What arrived last:\n{arrived}\n"
+                    f"Find what keeps committing to {branch}, then run {again} again.",
+                    status=TRY_AGAIN,
+                )
+            attempt += 1
             print(
-                f"{branch} moved during the check, so rebasing and checking once more.",
+                f"{branch} moved during the check, so rebasing and checking again"
+                f" (try {attempt} of {TRIES}).",
                 flush=True,
             )
             prepare(ref, args.check, LAND)

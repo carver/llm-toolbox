@@ -352,7 +352,9 @@ def test_a_failing_agent_check_ends_with_commit_refused(installed):
 
 
 @pytest.mark.parametrize("flag", ["--fixup=HEAD", "--squash=HEAD"])
-def test_a_fix_commit_skips_the_agent_check(installed, flag):
+def test_a_small_fix_commit_without_a_quick_check_skips_the_agent_check(
+    installed, flag
+):
     assert commit(installed).returncode == 0
     (installed / "a").write_text("bad\n")
     git(installed, "add", "a")
@@ -361,9 +363,155 @@ def test_a_fix_commit_skips_the_agent_check(installed, flag):
 
     assert run.returncode == 0, run.stderr
     assert (
-        "skipped for a fix commit" in run.stderr and "build-state finish" in run.stderr
+        "skipped for a small fix commit" in run.stderr
+        and "build-state finish" in run.stderr
     )
     assert ran(installed) == ["agent", "fast", "fast"]
+
+
+def quick_check(repo, body='echo quick >> "$(git rev-parse --git-dir)/ran"'):
+    return hook(repo, "agent-quick-check", body)
+
+
+def test_a_small_fix_commit_runs_the_quick_check_not_the_agent_check(installed):
+    quick_check(installed)
+    assert commit(installed).returncode == 0
+    (installed / "a").write_text("still good\n")
+    git(installed, "add", "a")
+
+    run = commit(installed, "--fixup=HEAD")
+
+    assert run.returncode == 0, run.stderr
+    assert ran(installed) == ["agent", "fast", "quick", "fast"]
+    assert "agent-quick-check: passed" in run.stderr
+
+
+def test_a_failing_quick_check_refuses_the_fix_commit(installed):
+    quick_check(installed, "echo 'quick check: lint'; exit 1")
+    assert commit(installed).returncode == 0
+    (installed / "a").write_text("still good\n")
+    git(installed, "add", "a")
+
+    run = commit(installed, "--fixup=HEAD")
+
+    assert run.returncode != 0
+    assert "quick check: lint" in run.stderr
+    assert run.stderr.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")
+
+
+def lines(count, word="line"):
+    return "".join(f"{word} {n}\n" for n in range(count))
+
+
+def checks_for_fix(installed, prepare, change, *flags):
+    """`prepare` sets files up and an ordinary commit records them; then `change`
+    alters them and a fix commit records that. Returns the checks the fix commit ran."""
+    quick_check(installed)
+    prepare(installed)
+    git(installed, "add", "-A")
+    assert commit(installed).returncode == 0
+    before = len(ran(installed))
+    change(installed)
+    git(installed, "add", "-A")
+    commit(installed, "--fixup=HEAD", *flags)
+    return ran(installed)[before:]
+
+
+def write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def retarget(link, target):
+    link.unlink()
+    link.symlink_to(target)
+
+
+QUICK = ["quick", "fast"]
+FULL = ["agent", "fast"]
+
+
+@pytest.mark.parametrize(
+    "prepare, change, expected",
+    [
+        # 10 lines replaced: 10 added, 10 removed.
+        (
+            lambda repo: write(repo / "a", lines(10)),
+            lambda repo: write(repo / "a", lines(10, "new")),
+            QUICK,
+        ),
+        (
+            lambda repo: write(repo / "a", lines(10)),
+            lambda repo: write(repo / "a", lines(11, "new")),
+            FULL,
+        ),
+        (
+            lambda repo: write(repo / "tests" / "x.py", "x\n"),
+            lambda repo: write(repo / "tests" / "x.py", "y\n"),
+            FULL,
+        ),
+        (
+            lambda repo: write(repo / "test_a.py", "x\n"),
+            lambda repo: write(repo / "test_a.py", "y\n"),
+            FULL,
+        ),
+        (
+            lambda repo: write(repo / "tests" / "t\u00e9st.py", "x\n"),
+            lambda repo: write(repo / "tests" / "t\u00e9st.py", "y\n"),
+            FULL,
+        ),
+        (
+            lambda repo: (repo / "b.bin").write_bytes(b"\0\1\2"),
+            lambda repo: (repo / "b.bin").write_bytes(b"\0\1\3"),
+            FULL,
+        ),
+        (
+            lambda repo: write(repo / "c.txt", "c\n"),
+            lambda repo: (repo / "c.txt").unlink(),
+            FULL,
+        ),
+        (
+            lambda repo: write(repo / "c.txt", lines(5)),
+            lambda repo: (repo / "c.txt").rename(repo / "d.txt"),
+            FULL,
+        ),
+        (lambda repo: None, lambda repo: write(repo / "new.txt", "n\n"), FULL),
+        (
+            lambda repo: write(repo / "run.sh", "echo\n"),
+            lambda repo: (repo / "run.sh").chmod(0o755),
+            FULL,
+        ),
+        (
+            lambda repo: (repo / "link").symlink_to("a"),
+            lambda repo: retarget(repo / "link", "b"),
+            FULL,
+        ),
+    ],
+    ids=[
+        "20 lines",
+        "21 lines",
+        "a file under tests",
+        "a file named test_",
+        "a test file whose path git quotes",
+        "a binary file",
+        "a deleted file",
+        "a renamed file",
+        "a new file",
+        "a mode change",
+        "a symlink retargeted",
+    ],
+)
+def test_only_a_small_fix_commit_runs_the_quick_check(
+    installed, prepare, change, expected
+):
+    assert checks_for_fix(installed, prepare, change) == expected
+
+
+def test_an_empty_fix_commit_is_small(installed):
+    def nothing(_):
+        pass
+
+    assert checks_for_fix(installed, nothing, nothing, "--allow-empty") == QUICK
 
 
 def test_a_fixup_subject_given_with_m_skips_the_agent_check(installed):

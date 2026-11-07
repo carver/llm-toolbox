@@ -228,10 +228,15 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   committed. A tree that already passed the check, as in an amend that
   changes only the message, skips it; an agent without llm-toolbox, such as
   a teammate's, runs the check every time. The check's output shows only when
-  it fails, ending with `COMMIT REFUSED`; a pass prints one line. A fixup!,
-  squash! or amend! commit skips the check (found from the running `git
-  commit`'s arguments), since `build-state finish` checks each commit a fold
-  rewrites.
+  it fails, ending with `COMMIT REFUSED`; a pass prints one line. A small
+  fixup!, squash! or amend! commit (found from the running `git commit`'s
+  arguments) runs `agent-quick-check` instead, when the repo keeps one beside
+  `agent-pre-commit`, and otherwise skips the check, since `build-state finish`
+  checks each commit a fold rewrites. Small means at most 20 lines changed, in
+  files it only modifies in place (no mode change, no binary, symlink or
+  submodule), none of them a test: a lint or syntax repair. Any
+  other fix commit runs the full check. A repo's `agent-quick-check` holds only
+  its fast static checks, such as a linter or a type checker, and no tests.
   `install.py` also registers it as a Claude Code hook that refuses `git commit
   --no-verify`, except in a repo with no agent check, such as a scratch repo.
 - **issue-todo**: a GitHub issue's task-list items across its body and every

@@ -34,7 +34,8 @@ uncommitted changes and leftover conflict markers since the base. On a conflict 
 the rebase, and when the folded tree differs from the tree before, it resets to that;
 either way the branch is as it was.
 
-Fix commits skip the repo's agent-pre-commit when they're made, so after a fold finish
+Small fix commits get only the repo's agent-quick-check when they're made, if that, and
+a fold puts each fix into an earlier commit, so after a fold finish
 runs it on every commit the fold rewrote, oldest first: from the first commit a fix went
 into, up to HEAD. A fix folded into an earlier commit than the code it needs leaves that
 commit broken while HEAD passes. Commits the fold left alone, and rewritten ones whose
@@ -454,7 +455,7 @@ def finish(args: argparse.Namespace) -> int:
     before = head()
     fixes = ("fixup! ", "squash! ", "amend! ")
     before_fold = set(git("rev-list", f"{base}..HEAD").stdout.split())
-    # The trees the check passed when their commits were made; fix commits skip it.
+    # The trees the check passed when their commits were made; small fix commits skip it.
     passed = {
         tree_of(sha)
         for sha in before_fold

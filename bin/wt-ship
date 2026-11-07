@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Ship a worktree's commits to a repo that pushes: rebase, check, push, verify.
+"""Ship a worktree's commits: rebase, check, then push, or with --local land them on
+the main tree's branch.
 
     wt-ship                       rebase onto origin/<main tree's branch>, check, push
     wt-ship --check 'make test'   run this check instead of the repo's agent-pre-commit
     wt-ship --remove              then remove this worktree, through the main tree
     wt-ship --remote up --branch dev
+    wt-ship --local [--remove]    in a repo that doesn't push: land on the main tree
 
 In order, it:
 
@@ -24,18 +26,57 @@ In order, it:
 BRANCH defaults to the branch the main worktree has checked out. Nothing to push is a
 clean exit. --remove runs `git worktree remove` from the main tree once the push is
 confirmed, so a shell left in the removed folder must cd elsewhere.
+
+--local, for a repo whose owner pushes, takes the same steps against the branch the
+main tree has checked out instead of a remote (no --remote, and no other --branch):
+it rebases onto that branch and checks as above, then claims the main tree with the
+CLAUDE_WORKING flag of the user's global instructions, holding $CLAUDE_CODE_SESSION_ID
+(a flag this session already holds is kept; another session's stops it, naming whose
+it is and since when), and fast-forwards the main tree with `git merge --ff-only`.
+When another session landed during the check, it rebases and checks once more, still
+holding the claim, then merges. When the main tree's uncommitted changes touch the
+files the merge changes, it stops, merging nothing: ask the user. The flag it made goes
+once the merge is done or has failed, or the run is stopped. It must run in a linked
+worktree.
+
+Exit status: 0 shipped, landed or nothing to do; 1 a step failed (the message says
+what to do); 2 a usage error; with --local, 3 another session holds the main tree's
+claim (tell the user the flag's age), 4 the main tree's uncommitted changes touch the
+files the landing changes (ask the user).
 """
 
 import argparse
 import os
 import shutil
+import signal
 import subprocess
 import sys
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
+
+# --local's outcomes the user decides on.
+CLAIMED, SAME_FILES = 3, 4
 
 
 class Stop(Exception):
-    """A step failed; the message says what to do."""
+    """A step failed; the message says what to do, and status is the exit status."""
+
+    def __init__(self, message, status=1):
+        super().__init__(message)
+        self.status = status
+
+
+class Mode(NamedTuple):
+    """What a run does with the commits, for its messages."""
+
+    done: str  # "pushed" or "landed"
+    command: str  # how to run it again
+
+
+PUSH = Mode("pushed", "wt-ship")
+LAND = Mode("landed", "wt-ship --local")
 
 
 def git(*args, check=True):
@@ -71,7 +112,7 @@ def is_ancestor(older, newer):
     return git("merge-base", "--is-ancestor", older, newer, check=False).returncode == 0
 
 
-def rebase(upstream):
+def rebase(upstream, mode):
     env = os.environ | {"GIT_SEQUENCE_EDITOR": ":", "GIT_EDITOR": ":"}
     run = subprocess.run(
         ["git", "rebase", "-q", "-i", "--autosquash", upstream],
@@ -85,7 +126,7 @@ def rebase(upstream):
             f"{run.stdout}{run.stderr}".rstrip()
             + f"\nThe rebase onto {upstream} hit a conflict and is still in progress."
             "\nResolve each hunk (`conflicts FILE`, `conflicts -h`), `git add` the file,"
-            " `git rebase --continue`, then run wt-ship again."
+            f" `git rebase --continue`, then run `{mode.command}` again."
         )
 
 
@@ -104,7 +145,19 @@ def markers(upstream):
         )
 
 
-def run_check(command):
+def run_stoppable(argv, env=None):
+    """Run argv to its end and return its exit status. When this run is stopped
+    meanwhile, argv's whole process group is stopped too, so no check outlives it."""
+    process = subprocess.Popen(argv, env=env, start_new_session=True)
+    try:
+        return process.wait()
+    except BaseException:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait()
+        raise
+
+
+def run_check(command, mode):
     if command is None:
         hook = Path(out("rev-parse", "--git-path", "hooks")) / "agent-pre-commit"
         hook = (
@@ -120,13 +173,13 @@ def run_check(command):
         gate = shutil.which("agent-commit-gate")
         argv = [gate, "--run", str(hook)] if gate else [str(hook)]
         env = os.environ | {"AGENT_PRE_COMMIT": "1"}
-        code = subprocess.run(argv, env=env, check=False).returncode
+        code = run_stoppable(argv, env)
         name = "agent-pre-commit"
     else:
-        code = subprocess.run(["sh", "-c", command], check=False).returncode
+        code = run_stoppable(["sh", "-c", command])
         name = repr(command)
     if code != 0:
-        raise Stop(f"The check {name} failed (exit {code}); nothing was pushed.")
+        raise Stop(f"The check {name} failed (exit {code}); nothing was {mode.done}.")
 
 
 # A push that lost a race: refused as a non-fast-forward, or the branch moved mid-push.
@@ -139,24 +192,36 @@ REJECTED = (
 )
 
 
+def prepare(upstream, check, mode):
+    """Rebase onto upstream when HEAD lacks it, refuse markers, check."""
+    if not is_ancestor(upstream, "HEAD"):
+        rebase(upstream, mode)
+    markers(upstream)
+    run_check(check, mode)
+
+
 def rebase_and_check(remote, branch, check):
     """Fetch, rebase onto the remote branch, refuse markers, check."""
     git("fetch", "-q", remote, branch)
     upstream = f"{remote}/{branch}"
-    if not is_ancestor(upstream, "HEAD"):
-        rebase(upstream)
-    markers(upstream)
-    run_check(check)
+    prepare(upstream, check, PUSH)
     return upstream
+
+
+def locate():
+    """This worktree's path, the main tree's, the main tree's branch (None when
+    detached), and whether this is the main tree."""
+    here = os.path.realpath(out("rev-parse", "--show-toplevel"))
+    main_path, main_branch = worktrees()[0]
+    return here, main_path, main_branch, os.path.realpath(main_path) == here
 
 
 def ship(args):
     if git("status", "--porcelain", "--untracked-files=no").stdout:
         raise Stop("There are uncommitted changes: commit or stash them first.")
-    trees = worktrees()
-    here = os.path.realpath(out("rev-parse", "--show-toplevel"))
-    main_path, main_branch = trees[0]
-    in_main = os.path.realpath(main_path) == here
+    if args.local:
+        return land(args)
+    here, main_path, main_branch, in_main = locate()
     if args.remove and in_main:
         raise Stop("--remove works only in a linked worktree, not the main tree.")
     branch = args.branch or main_branch
@@ -164,7 +229,7 @@ def ship(args):
         raise Stop(
             "The main tree is on a detached HEAD: say which branch with --branch."
         )
-    remote = args.remote
+    remote = args.remote or "origin"
     git("fetch", "-q", remote, branch)
     upstream = f"{remote}/{branch}"
     if is_ancestor("HEAD", upstream):
@@ -186,54 +251,184 @@ def ship(args):
     new = out("rev-parse", "HEAD")
     if not is_ancestor(new, upstream):
         raise Stop(f"{upstream} doesn't hold {new[:12]} after the push.")
-    report(old, new, branch, upstream, main_path, main_branch)
-    if args.remove:
-        os.chdir(main_path)
-        git("worktree", "remove", here)
-        print(f"Removed the worktree {here}.")
-    return 0
-
-
-def report(old, new, branch, upstream, main_path, main_branch):
-    subjects = out("log", "--format=%s", "--reverse", f"{old}..{new}").splitlines()
-    files = out("diff", "--name-only", old, new).splitlines()
-    print(f"Pushed {old[:7]}..{new[:7]} to {upstream}.")
-    print("\nNotice for other sessions:")
-    print(
-        f"FYI: pushed {old[:7]}..{new[:7]} to {branch}: {'; '.join(subjects)}. Files: {', '.join(files)}."
-    )
+    report(old, new, PUSH.done, branch, f"to {upstream}")
     if main_branch == branch:
         local = out("rev-parse", f"refs/heads/{branch}")
         if local != new and is_ancestor(local, upstream):
             print(
                 f"\nThe main tree ({main_path}) is behind {upstream}: pull there once it's yours."
             )
+    if args.remove:
+        remove(main_path, here)
+    return 0
+
+
+def remove(main_path, here):
+    os.chdir(main_path)
+    git("worktree", "remove", here)
+    print(f"Removed the worktree {here}.")
+
+
+def report(old, new, verb, branch, where):
+    subjects = out("log", "--format=%s", "--reverse", f"{old}..{new}").splitlines()
+    files = out("diff", "--name-only", old, new).splitlines()
+    print(f"{verb.capitalize()} {old[:7]}..{new[:7]} {where}.")
+    print("\nNotice for other sessions:")
+    print(
+        f"FYI: {verb} {old[:7]}..{new[:7]} to {branch}: {'; '.join(subjects)}. Files: {', '.join(files)}."
+    )
+
+
+# The flag that claims a main tree, by the user's global instructions (GLOBAL_CLAUDE.md).
+FLAG = "CLAUDE_WORKING"
+
+
+def exclude_flag(main_path):
+    """List FLAG in the main repo's info/exclude, so git never shows or commits it."""
+    common = Path(
+        out("-C", main_path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    )
+    exclude = common / "info" / "exclude"
+    exclude.parent.mkdir(exist_ok=True)
+    text = exclude.read_text() if exclude.exists() else ""
+    if FLAG not in text.splitlines():
+        with exclude.open("a") as file:
+            file.write(("" if text.endswith("\n") or not text else "\n") + f"{FLAG}\n")
+
+
+@contextmanager
+def claim(main_path):
+    """Hold the main tree's FLAG: kept when this session holds it already, made (and
+    removed afterwards) when absent; another session's stops it."""
+    exclude_flag(main_path)
+    path = Path(main_path) / FLAG
+    me = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    made = False
+    try:
+        made = held_by(path, me)
+        yield
+    finally:
+        if made:
+            path.unlink(missing_ok=True)
+
+
+def held_by(path, me):
+    """Take the flag at path for session me: True when this made it, False when me
+    held it already; another session's flag stops it."""
+    for _ in range(3):
+        try:
+            with path.open("x") as file:
+                stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                file.write(f"{me or 'unknown-session'} {stamp}\n")
+            return True
+        except FileExistsError:
+            try:
+                held = path.read_text().strip()
+            except FileNotFoundError:
+                continue  # released between the two calls: try again
+        if me and held.split()[:1] == [me]:
+            return False
+        raise Stop(
+            f"Another session has claimed the main tree ({path}: {held or 'no text yet'}),"
+            " so it was left alone. Tell the user the flag's age, so they can clear one a"
+            " crashed session left, then run `wt-ship --local` again.",
+            CLAIMED,
+        )
+    raise Stop(f"{path} kept appearing and vanishing: run `wt-ship --local` again.")
+
+
+def merge(main_path, sha):
+    """Fast-forward the main tree to sha."""
+    run = git("-C", main_path, "merge", "-q", "--ff-only", sha, check=False)
+    if run.returncode == 0:
+        return
+    said = f"{run.stdout}{run.stderr}".strip()
+    if "would be overwritten" in said:
+        raise Stop(
+            "The main tree's uncommitted changes touch files this landing changes, so"
+            f" nothing was merged; ask the user:\n{said}",
+            SAME_FILES,
+        )
+    raise Stop(f"git merge --ff-only failed in the main tree:\n{said}")
+
+
+def land(args):
+    """--local: rebase onto the main tree's branch, check, and fast-forward it."""
+    if args.remote is not None:
+        raise Stop(
+            "--local lands on the main tree's branch: --remote doesn't go with it."
+        )
+    here, main_path, branch, in_main = locate()
+    if in_main:
+        raise Stop(
+            "--local lands a linked worktree on the main tree's branch: run it in the"
+            " worktree, not the main tree."
+        )
+    if not branch:
+        raise Stop(
+            "The main tree is on a detached HEAD: --local has no branch to land on."
+        )
+    if args.branch and args.branch != branch:
+        raise Stop(
+            f"--local lands on the branch the main tree has checked out ({branch}),"
+            f" not {args.branch}."
+        )
+    ref = f"refs/heads/{branch}"  # a tag of the same name mustn't stand in for it
+    if is_ancestor("HEAD", ref):
+        print(f"HEAD is already in {branch}: nothing to land.")
+        return 0
+    prepare(ref, args.check, LAND)
+    with claim(main_path):
+        if not is_ancestor(ref, "HEAD"):
+            print(
+                f"{branch} moved during the check, so rebasing and checking once more.",
+                flush=True,
+            )
+            prepare(ref, args.check, LAND)
+        old = out("merge-base", ref, "HEAD")
+        new = out("rev-parse", "HEAD")
+        merge(main_path, new)
+        if not is_ancestor(new, ref):
+            raise Stop(f"{branch} doesn't hold {new[:12]} after the merge.")
+    report(old, new, LAND.done, branch, f"on {branch} in the main tree ({main_path})")
+    if args.remove:
+        remove(main_path, here)
+    return 0
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    parser.add_argument("--remote", help="the remote (default origin)")
     parser.add_argument(
-        "--remote", default="origin", help="the remote (default origin)"
+        "--branch",
+        help="the branch to push to (default: the main tree's; --local takes only that)",
     )
     parser.add_argument(
-        "--branch", help="the branch to push to (default: the main tree's)"
-    )
-    parser.add_argument(
-        "--check", metavar="CMD", help="the check to run before pushing"
+        "--check",
+        metavar="CMD",
+        help="the check to run before pushing or landing",
     )
     parser.add_argument(
         "--remove",
         action="store_true",
-        help="remove this worktree once the push is confirmed",
+        help="remove this worktree once the push or the landing is confirmed",
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="land on the main tree's branch instead of pushing (a repo that doesn't push)",
     )
     args = parser.parse_args(argv)
+    # A stopped run unwinds like a failed one, so a claim it made is released.
+    for stop in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(stop, lambda signum, _frame: sys.exit(128 + signum))
     try:
         return ship(args)
     except Stop as error:
         print(error, file=sys.stderr)
-        return 1
+        return error.status
 
 
 if __name__ == "__main__":

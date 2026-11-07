@@ -1,7 +1,10 @@
 """wt-ship, against a bare remote, a main tree and a detached worktree beside it."""
 
+import os
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -23,9 +26,15 @@ def commit(cwd, path, text, message):
     return git(cwd, "rev-parse", "HEAD")
 
 
-def ship(cwd, *args):
+def ship(cwd, *args, session="s-mine"):
+    env = os.environ | {"CLAUDE_CODE_SESSION_ID": session}
     return subprocess.run(
-        [str(SCRIPT), *args], cwd=cwd, capture_output=True, text=True, check=False
+        [str(SCRIPT), *args],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 
@@ -229,3 +238,276 @@ def test_a_push_refused_for_another_reason_isnt_retried(setup):
 
     assert done.returncode == 1
     assert count.read_text().count("x") == 1
+
+
+# --local: land on the main tree's branch, in a repo that doesn't push
+
+
+def main_head(main):
+    return git(main, "rev-parse", "main")
+
+
+def flag(main):
+    return main / "CLAUDE_WORKING"
+
+
+def test_local_fast_forwards_the_main_tree_and_releases_its_claim(setup):
+    origin, main, wt, _ = setup
+    pushed = remote_main(origin)
+    commit(main, "tracked.txt", "kept\n", "Track a file")
+    # The user's own edits, to other files: tracked and modified, staged, untracked.
+    (main / "tracked.txt").write_text("kept\nthe user's edit\n")
+    (main / "staged.txt").write_text("staged\n")
+    git(main, "add", "staged.txt")
+    (main / "notes.txt").write_text("the user's own edit\n")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    new = git(wt, "rev-parse", "HEAD")
+    assert main_head(main) == new
+    assert (main / "a.py").read_text() == "x = 1\n"  # the work tree moved too
+    assert (main / "tracked.txt").read_text() == "kept\nthe user's edit\n"
+    assert "staged.txt" in git(main, "diff", "--cached", "--name-only")
+    assert (main / "notes.txt").exists()
+    assert not flag(main).exists()
+    assert "CLAUDE_WORKING" in (main / ".git/info/exclude").read_text()
+    assert remote_main(origin) == pushed  # nothing pushed
+    assert "Add a" in done.stdout.split("Notice for other sessions:")[1]
+    assert wt.exists()
+
+
+def test_local_rebases_onto_what_the_main_tree_got_meanwhile(setup):
+    _, main, wt, _ = setup
+    theirs = commit(main, "b.py", "y = 2\n", "Add b")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert git(main, "log", "--format=%s", "main").splitlines() == [
+        "Add a",
+        "Add b",
+        "start",
+    ]
+    assert git(main, "rev-parse", "main~1") == theirs
+
+
+def test_local_retries_once_when_the_main_tree_moves_during_the_check(setup):
+    _, main, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    ran = main.parent / "checks"
+    # The first check lands another session's commit in the main tree.
+    check = (
+        f'echo x >> "{ran}"; [ "$(wc -l < "{ran}")" -gt 1 ] && exit 0; '
+        "unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX; "
+        f'cd "{main}" && echo z >> c.py && git add c.py && git commit -qm Race'
+    )
+
+    done = ship(wt, "--local", "--check", check)
+
+    assert done.returncode == 0, done.stderr
+    assert git(main, "log", "--format=%s", "main").splitlines() == [
+        "Add a",
+        "Race",
+        "start",
+    ]
+    assert ran.read_text().count("x") == 2
+    assert not flag(main).exists()
+
+
+def test_local_leaves_a_main_tree_another_session_claimed(setup):
+    _, main, wt, _ = setup
+    before = main_head(main)
+    flag(main).write_text("s-other 2026-11-07T01:02:03+00:00\n")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 3, done.stderr
+    assert "s-other" in done.stderr and "2026-11-07T01:02:03" in done.stderr
+    assert main_head(main) == before
+    assert flag(main).read_text() == "s-other 2026-11-07T01:02:03+00:00\n"
+
+
+def test_local_keeps_a_claim_this_session_holds(setup):
+    _, main, wt, _ = setup
+    flag(main).write_text("s-mine 2026-11-07T01:02:03+00:00\n")
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == new
+    assert flag(main).read_text() == "s-mine 2026-11-07T01:02:03+00:00\n"
+
+
+def test_local_stops_when_the_main_trees_changes_touch_the_same_files(setup):
+    _, main, wt, _ = setup
+    before = main_head(main)
+    (main / "README").write_text("start\nthe user's edit\n")
+    commit(wt, "README", "ours\n", "Ours")
+
+    done = ship(wt, "--local", "--check", "true", "--remove")
+
+    assert done.returncode == 4, done.stderr
+    assert "ask the user" in done.stderr and "README" in done.stderr
+    assert main_head(main) == before
+    assert (main / "README").read_text() == "start\nthe user's edit\n"
+    assert not flag(main).exists()
+    assert wt.exists()  # --remove only after a landing
+
+
+def test_local_remove_removes_the_worktree_once_landed(setup):
+    _, main, wt, _ = setup
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", "--remove")
+
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == new and not wt.exists()
+
+
+def test_local_with_nothing_to_land_says_so(setup):
+    _, _, wt, _ = setup
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0 and "nothing to land" in done.stdout
+
+
+@pytest.mark.parametrize(
+    "args", [["--remote", "up"], ["--branch", "dev"]], ids=["remote", "branch"]
+)
+def test_local_refuses_another_target(setup, args):
+    _, main, wt, _ = setup
+    before = main_head(main)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", *args)
+
+    assert done.returncode == 1 and "--local" in done.stderr
+    assert main_head(main) == before
+
+
+def test_local_takes_branch_naming_the_main_trees_own(setup):
+    _, main, wt, _ = setup
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--branch", "main", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == new
+
+
+def test_local_refuses_a_detached_main_tree(setup):
+    _, main, wt, _ = setup
+    git(main, "checkout", "-q", "--detach")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 1 and "detached" in done.stderr
+
+
+def install_hook(main, name, body):
+    hooks = Path(git(main, "rev-parse", "--absolute-git-dir")) / "hooks"
+    (hooks / name).write_text(f"#!/bin/sh\n{body}\n")
+    (hooks / name).chmod(0o755)
+
+
+def test_local_merges_while_it_holds_the_claim(setup):
+    _, main, wt, _ = setup
+    seen = main.parent / "flag-at-merge"
+    install_hook(main, "post-merge", f'cat "{main}/CLAUDE_WORKING" > "{seen}"')
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert seen.read_text().startswith("s-mine ")
+
+
+def test_local_keeps_the_worktree_when_the_branch_doesnt_hold_head_after(setup):
+    _, main, wt, _ = setup
+    # Something undoes the merge at once, as a misbehaving hook could.
+    install_hook(
+        main,
+        "post-merge",
+        "unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE; git reset -q --hard HEAD~1",
+    )
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", "--remove")
+
+    assert done.returncode == 1 and "doesn't hold" in done.stderr
+    assert wt.exists() and not flag(main).exists()
+
+
+def test_local_lands_when_a_tag_shares_the_branchs_name(setup):
+    _, main, wt, _ = setup
+    git(main, "tag", "main", "HEAD")
+    commit(main, "b.py", "y = 2\n", "Add b")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert git(main, "log", "--format=%s", "refs/heads/main").splitlines() == [
+        "Add a",
+        "Add b",
+        "start",
+    ]
+
+
+def test_local_failing_check_says_nothing_was_landed(setup):
+    _, main, wt, _ = setup
+    before = main_head(main)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "exit 3")
+
+    assert done.returncode == 1
+    assert "nothing was landed" in done.stderr and "push" not in done.stderr
+    assert main_head(main) == before
+
+
+def test_local_stopped_during_the_retry_releases_the_claim(setup):
+    _, main, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    ran, started = main.parent / "checks", main.parent / "retry-started"
+    # The first check lands another commit in the main tree, forcing the retry under
+    # the claim; the retry's check waits to be stopped.
+    check = (
+        f'echo x >> "{ran}"; if [ "$(wc -l < "{ran}")" -gt 1 ]; then'
+        f' touch "{started}"; sleep 30; exit 0; fi; '
+        "unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX; "
+        f'cd "{main}" && echo z >> c.py && git add c.py && git commit -qm Race'
+    )
+    env = os.environ | {"CLAUDE_CODE_SESSION_ID": "s-mine"}
+    run = subprocess.Popen(
+        [str(SCRIPT), "--local", "--check", check],
+        cwd=wt,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 20
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert flag(main).exists()
+    run.send_signal(signal.SIGTERM)
+    run.communicate(timeout=20)
+
+    assert run.returncode != 0
+    assert not flag(main).exists()
+
+
+def test_local_is_refused_in_the_main_tree(setup):
+    _, main, _, _ = setup
+    commit(main, "a.py", "x = 1\n", "Add a")
+
+    done = ship(main, "--local", "--check", "true")
+
+    assert done.returncode == 1 and "linked worktree" in done.stderr

@@ -157,12 +157,17 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   refuses a hunk that never closes, lacks its separator or nests, treats a
   separator outside a hunk as content (a reStructuredText underline), and
   never stages the file.
-- **wt-ship**: ships a worktree's commits in a repo that pushes. It rebases
+- **wt-ship**: ships a worktree's commits. In a repo that pushes, it rebases
   onto the remote branch (the main tree's, by default), refuses leftover
   conflict markers, runs the repo's `agent-pre-commit` (or `--check CMD`),
   pushes with one retry when another push wins the race, and confirms the
   remote holds HEAD. Then it prints the range, a notice for other sessions and
-  whether the main tree is behind; `--remove` removes the worktree.
+  whether the main tree is behind; `--remove` removes the worktree. In a repo
+  that doesn't push, `--local` lands the commits on the main tree's branch
+  instead: it claims the main tree for the merge with the `CLAUDE_WORKING`
+  flag, holding `CLAUDE_CODE_SESSION_ID`, fast-forwards it, and rebases and checks once more when another
+  session lands first. It stops on another session's claim, and on
+  uncommitted changes there that touch the same files.
 - **gui-shot**: runs a GUI app on a headless display (Xvfb, or weston for
   Wayland), clicks and types into it, and saves screenshots. For checking a
   desktop app's UI from a sandbox with no screen. `gui-shot -h` lists the

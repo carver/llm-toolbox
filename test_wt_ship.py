@@ -511,3 +511,73 @@ def test_local_is_refused_in_the_main_tree(setup):
     done = ship(main, "--local", "--check", "true")
 
     assert done.returncode == 1 and "linked worktree" in done.stderr
+
+
+def test_local_replays_only_its_own_commits_when_the_branch_was_rewritten(setup):
+    _, main, wt, _ = setup
+    # The worktree starts at an unpushed commit of the main tree's.
+    old = commit(main, "b.py", "y = 2\n", "Add b")
+    git(wt, "checkout", "-q", "--detach", old)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    # Another session rewrites that commit before anything is pushed.
+    (main / "b.py").write_text("y = 3\n")
+    git(main, "commit", "-q", "-a", "--amend", "-m", "Add b")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert git(main, "log", "--format=%s", "main").splitlines() == [
+        "Add a",
+        "Add b",
+        "start",
+    ]
+    assert (main / "b.py").read_text() == "y = 3\n"
+
+
+def test_local_names_its_own_landed_commit_the_branch_dropped_and_leaves_it_out(setup):
+    _, main, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    assert ship(wt, "--local", "--check", "true").returncode == 0
+    # The main tree drops it, then gains another commit.
+    git(main, "reset", "-q", "--hard", "HEAD~1")
+    commit(main, "d.py", "w = 4\n", "Add d")
+    commit(wt, "c.py", "z = 3\n", "Add c")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert git(main, "log", "--format=%s", "main").splitlines() == [
+        "Add c",
+        "Add d",
+        "start",
+    ]
+    skipped = done.stdout.split("Not replaying", 1)[1].split("\n\n")[0]
+    assert "Add a" in skipped and "Add c" not in skipped
+
+
+def test_local_leaves_out_what_the_branch_dropped_even_with_nothing_after(setup):
+    _, main, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    assert ship(wt, "--local", "--check", "true").returncode == 0
+    git(main, "reset", "-q", "--hard", "HEAD~1")
+    commit(wt, "c.py", "z = 3\n", "Add c")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert git(main, "log", "--format=%s", "main").splitlines() == ["Add c", "start"]
+    assert "Not replaying" in done.stdout and "Add a" in done.stdout
+
+
+def test_local_folds_fixups_into_the_commits_they_fix(setup):
+    _, main, wt, _ = setup
+    first = commit(wt, "a.py", "x = 1\n", "Add a")
+    with open(wt / "a.py", "a") as file:
+        file.write("y = 2\n")
+    git(wt, "commit", "-q", "-a", f"--fixup={first}")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert git(main, "log", "--format=%s", "main").splitlines() == ["Add a", "start"]
+    assert (main / "a.py").read_text() == "x = 1\ny = 2\n"

@@ -11,9 +11,10 @@ the main tree's branch.
 In order, it:
 
 1. refuses uncommitted changes to tracked files;
-2. fetches the remote, and when HEAD lacks REMOTE/BRANCH, rebases onto it, folding
-   fixup! commits (autosquash). A conflict stops it with the rebase in progress:
-   resolve the hunks (`conflicts -h`), `git rebase --continue`, then run it again;
+2. fetches the remote, and when HEAD lacks REMOTE/BRANCH or holds fixup! commits,
+   rebases onto it, folding them (autosquash). A conflict stops it with the rebase in
+   progress: resolve the hunks (`conflicts -h`), `git rebase --continue`, then run it
+   again;
 3. refuses leftover conflict markers in what it would push;
 4. runs the check: --check CMD (through sh), else the repo's agent-pre-commit hook
    (through agent-commit-gate --run when it's on PATH), else none, and says so;
@@ -29,15 +30,18 @@ confirmed, so a shell left in the removed folder must cd elsewhere.
 
 --local, for a repo whose owner pushes, takes the same steps against the branch the
 main tree has checked out instead of a remote (no --remote, and no other --branch):
-it rebases onto that branch and checks as above, then claims the main tree with the
-CLAUDE_WORKING flag of the user's global instructions, holding $CLAUDE_CODE_SESSION_ID
-(a flag this session already holds is kept; another session's stops it, naming whose
-it is and since when), and fast-forwards the main tree with `git merge --ff-only`.
-When another session landed during the check, it rebases and checks once more, still
-holding the claim, then merges. When the main tree's uncommitted changes touch the
-files the merge changes, it stops, merging nothing: ask the user. The flag it made goes
-once the merge is done or has failed, or the run is stopped. It must run in a linked
-worktree.
+it rebases onto that branch and checks as above, replaying only the commits since this
+worktree forked from it (`--fork-point`, from the branch's reflog): a commit the branch
+held then and holds no more, one another session rewrote or dropped, isn't replayed,
+and the run names each such commit. With no fork point in the reflog it rebases as a
+plain rebase would. Then it claims the main tree with the CLAUDE_WORKING flag of the
+user's global instructions, holding $CLAUDE_CODE_SESSION_ID (a flag this session
+already holds is kept; another session's stops it, naming whose it is and since when),
+and fast-forwards the main tree with `git merge --ff-only`. When another session
+landed during the check, it rebases and checks once more, still holding the claim,
+then merges. When the main tree's uncommitted changes touch the files the merge
+changes, it stops, merging nothing: ask the user. The flag it made goes once the merge
+is done or has failed, or the run is stopped. It must run in a linked worktree.
 
 Exit status: 0 shipped, landed or nothing to do; 1 a step failed (the message says
 what to do); 2 a usage error; with --local, 3 another session holds the main tree's
@@ -69,14 +73,17 @@ class Stop(Exception):
 
 
 class Mode(NamedTuple):
-    """What a run does with the commits, for its messages."""
+    """What a run does with the commits: for its messages, and how it rebases."""
 
     done: str  # "pushed" or "landed"
     command: str  # how to run it again
+    # Rebase only the commits since HEAD forked from the branch, found through the
+    # branch's reflog, so a commit another session rewrote meanwhile isn't replayed.
+    fork_point: bool
 
 
-PUSH = Mode("pushed", "wt-ship")
-LAND = Mode("landed", "wt-ship --local")
+PUSH = Mode("pushed", "wt-ship", fork_point=False)
+LAND = Mode("landed", "wt-ship --local", fork_point=True)
 
 
 def git(*args, check=True):
@@ -114,8 +121,9 @@ def is_ancestor(older, newer):
 
 def rebase(upstream, mode):
     env = os.environ | {"GIT_SEQUENCE_EDITOR": ":", "GIT_EDITOR": ":"}
+    fork = ["--fork-point"] if mode.fork_point else []
     run = subprocess.run(
-        ["git", "rebase", "-q", "-i", "--autosquash", upstream],
+        ["git", "rebase", "-q", "-i", "--autosquash", *fork, upstream],
         env=env,
         capture_output=True,
         text=True,
@@ -192,9 +200,42 @@ REJECTED = (
 )
 
 
+FIXUP_PREFIXES = ("fixup! ", "squash! ", "amend! ")
+
+
+def has_fixups(upstream):
+    """Whether HEAD holds a commit to fold, since upstream."""
+    subjects = out("log", "--format=%s", f"{upstream}..HEAD").splitlines()
+    return any(subject.startswith(FIXUP_PREFIXES) for subject in subjects)
+
+
+def not_replayed(upstream):
+    """The commits a --fork-point rebase onto upstream leaves out: those upstream held
+    when HEAD forked from it and holds no more, such as one another session rewrote
+    or dropped. Empty when upstream's reflog has no fork point."""
+    fork = git("merge-base", "--fork-point", upstream, "HEAD", check=False)
+    if fork.returncode != 0:
+        return []
+    base = out("merge-base", upstream, "HEAD")
+    point = fork.stdout.strip()
+    if point == base:
+        return []
+    return out("log", "--reverse", "--format=%h %s", f"{base}..{point}").splitlines()
+
+
 def prepare(upstream, check, mode):
-    """Rebase onto upstream when HEAD lacks it, refuse markers, check."""
-    if not is_ancestor(upstream, "HEAD"):
+    """Rebase onto upstream when HEAD lacks it, holds fixups to fold, or (--local)
+    holds commits the branch dropped; refuse markers; check."""
+    skipped = not_replayed(upstream) if mode.fork_point else []
+    if skipped:
+        print(
+            f"Not replaying these, which {upstream.removeprefix('refs/heads/')} held"
+            " when this worktree forked from it and holds no more:\n  "
+            + "\n  ".join(skipped)
+            + "\n",
+            flush=True,
+        )
+    if skipped or has_fixups(upstream) or not is_ancestor(upstream, "HEAD"):
         rebase(upstream, mode)
     markers(upstream)
     run_check(check, mode)

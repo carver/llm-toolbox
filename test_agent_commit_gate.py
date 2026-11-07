@@ -6,7 +6,10 @@ import io
 import json
 import os
 import shutil
+import signal
+import socket
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -18,6 +21,7 @@ loader = importlib.machinery.SourceFileLoader("agent_commit_gate", str(SCRIPT))
 spec = importlib.util.spec_from_loader("agent_commit_gate", loader)
 gate = importlib.util.module_from_spec(spec)
 loader.exec_module(gate)
+import fifo  # from lib/, which loading the gate put on the path
 
 
 def run_hook(monkeypatch, capsys, command, tool="Bash"):
@@ -627,3 +631,101 @@ def test_without_the_gate_a_refusal_still_ends_with_commit_refused(installed):
 
     assert run.returncode != 0
     assert run.stderr.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")
+
+
+@pytest.fixture
+def held_lane():
+    """heavy's normal lane, held by another job: a live process named in its slot.
+    Killing the process (`held_lane.kill()`) frees it."""
+    holder = subprocess.Popen(["sleep", "60"])
+    start = fifo.started(holder.pid)
+    lane = Path(os.environ["HEAVY_DIR"]) / "normal"
+    lane.mkdir(parents=True)
+    (lane / "slot").write_text(
+        f"s-other 2026-11-07T01:02:03+00:00 host={socket.gethostname()}"
+        f" pid={holder.pid} start={start}\ncwd=/elsewhere\ncmd=cargo test\n"
+    )
+    holder.lane = lane
+    yield holder
+    holder.kill()
+    holder.wait()
+
+
+@pytest.fixture
+def committing():
+    """Start an agent's `git commit` in a repo in the background, in a process group of
+    its own; every one is killed and reaped at the end."""
+    procs = []
+
+    def start(repo):
+        env = without_repo_vars(os.environ)
+        env["PATH"] = os.pathsep.join([str(SCRIPT.parent), env["PATH"]])
+        env["AI_AGENT"] = "test-agent"
+        proc = subprocess.Popen(
+            ["git", "commit", "-q", "-m", "x"],
+            cwd=repo,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        procs.append(proc)
+        return proc
+
+    yield start
+    for proc in procs:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate(timeout=10)
+
+
+def wait_for_entry(lane):
+    deadline = time.monotonic() + 20
+    while not any(p.name[:1].isdigit() for p in lane.iterdir()):
+        assert time.monotonic() < deadline, "the check never joined the queue"
+        time.sleep(0.05)
+
+
+def test_an_agent_check_waits_its_turn_in_heavys_queue(
+    installed, held_lane, committing
+):
+    commit_run = committing(installed)
+    wait_for_entry(held_lane.lane)
+    assert ran(installed) == []  # it waits: neither check has run
+    held_lane.kill()  # not reaped: a zombie, which has ended all the same
+    _, err = commit_run.communicate(timeout=30)
+
+    assert commit_run.returncode == 0, err
+    assert ran(installed) == ["agent", "fast"]
+    assert "waiting for the normal lane" in err and "cargo test" in err
+
+
+def test_stopping_a_check_that_waits_leaves_the_queue_in_one_line(
+    installed, held_lane, committing
+):
+    commit_run = committing(installed)
+    wait_for_entry(held_lane.lane)
+    os.killpg(commit_run.pid, signal.SIGINT)  # Ctrl-C reaches the whole group
+    _, err = commit_run.communicate(timeout=30)
+
+    assert commit_run.returncode != 0
+    assert "Traceback" not in err, err
+    assert "COMMIT REFUSED" in err
+    assert not any(p.name[:1].isdigit() for p in held_lane.lane.iterdir())
+
+
+def test_a_heavy_inside_an_agent_check_runs_at_once(installed, committing):
+    # The check holds the lane's slot; a heavy it runs must not wait on it.
+    heavy = SCRIPT.parent / "heavy"
+    hook(
+        installed,
+        "agent-pre-commit",
+        f'"{heavy}" -- true && echo agent >> "$(git rev-parse --git-dir)/ran"',
+    )
+    git(installed, "add", ".githooks/agent-pre-commit")
+    commit_run = committing(installed)
+    _, err = commit_run.communicate(timeout=30)
+
+    assert commit_run.returncode == 0, err
+    assert ran(installed) == ["agent", "fast"]

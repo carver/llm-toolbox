@@ -22,7 +22,8 @@ stops the loop when agent-pre-commit runs pre-commit itself. The line runs the
 check through `--run`, which skips it when it already passed on the same tree,
 as when an amend changes only the message; an agent without agent-commit-gate
 on PATH, such as a teammate's, runs the check directly instead. An older line
-is replaced.
+is replaced. A check `--run` runs waits its turn in heavy's queue (bin/heavy), so
+agents' commit checks never run at once, and prints heavy's waiting lines.
 
 Without arguments it is a Claude Code PreToolUse hook (install.py registers it
 in ~/.claude/settings.json) that refuses `git commit --no-verify` (or `-n`),
@@ -43,7 +44,11 @@ import shlex
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import heavyqueue
 
 HOOK_NAME = "agent-pre-commit"
 COMMENT = f"# Agents' commits also run the slower {HOOK_NAME} (llm-toolbox agent-commit-gate)."
@@ -388,15 +393,32 @@ def install(repo):
     return None
 
 
-def run_quiet(path, name):
+def run_quiet(path, name, queue=True):
     """Run the check at `path`, named `name` in what it prints, and return its exit
     code. Its output shows only when it fails: agents filtered a noisy pass with greps,
-    and the greps hid failed commits."""
-    started = time.monotonic()
-    # `path` as given: Path() would drop a leading ./ and send it to a PATH lookup.
-    run = subprocess.run(
-        [path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False
-    )
+    and the greps hid failed commits. With queue, it runs once it's its turn in heavy's
+    queue, whose waiting lines print as they come."""
+    with ExitStack() as stack:
+        env = None
+        try:
+            if queue:
+                job = stack.enter_context(heavyqueue.turn(command=name, hint=False))
+                job.pin()  # the check inherits the job's cores
+                env = job.env
+        except heavyqueue.QueueError as error:
+            print(
+                f"heavy: can't use its queue ({error}), so the check runs without it.",
+                file=sys.stderr,
+            )
+        started = time.monotonic()
+        # `path` as given: Path() would drop a leading ./ and send it to a PATH lookup.
+        run = subprocess.run(
+            [path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            env=env,
+        )
     code = run.returncode
     if code == 0:
         print(f"{name}: passed ({time.monotonic() - started:.0f}s)", file=sys.stderr)
@@ -421,7 +443,8 @@ def run_check(path):
         # Beside `path` as given, so a ./ path stays one.
         quick = os.path.join(os.path.dirname(path), QUICK_NAME)
         if os.path.isfile(quick) and os.access(quick, os.X_OK):
-            return run_quiet(quick, QUICK_NAME)
+            # Fast static checks only, no tests: not worth a place in heavy's queue.
+            return run_quiet(quick, QUICK_NAME, queue=False)
         print(
             f"{HOOK_NAME}: skipped for a small fix commit; build-state finish runs it on "
             "each commit the fold rewrites",
@@ -466,7 +489,11 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     if args.run:
-        return run_check(args.run)
+        try:
+            return run_check(args.run)
+        except KeyboardInterrupt:
+            print("COMMIT REFUSED: the agent check was stopped.", file=sys.stderr)
+            return 130
     if args.install:
         errors = [e for e in map(install, args.install) if e]
         for error in errors:

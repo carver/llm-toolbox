@@ -25,14 +25,16 @@ ENTRY = re.compile(r"\d{20}-\d+")
 
 def started(pid):
     """When process pid started (field 22 of /proc/PID/stat); None when there is no
-    such process, "" when it can't be read (a /proc that hides other users')."""
+    such process or it has ended (a zombie its parent hasn't reaped), "" when it
+    can't be read (a /proc that hides other users')."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     except FileNotFoundError:
         return None
     except OSError:
         return ""
-    return stat.rsplit(")", 1)[1].split()[19]
+    state, *rest = stat.rsplit(")", 1)[1].split()
+    return None if state == "Z" else rest[18]
 
 
 class Holder(NamedTuple):
@@ -50,6 +52,13 @@ class Holder(NamedTuple):
         pid = str(os.getpid())
         stamp = datetime.now().astimezone().isoformat(timespec="seconds")
         return cls(session, stamp, socket.gethostname(), pid, started(pid))
+
+    @classmethod
+    def mine(cls):
+        """This process, for this Claude Code session."""
+        return cls.now(
+            os.environ.get("CLAUDE_CODE_SESSION_ID", "") or "unknown-session"
+        )
 
     @classmethod
     def parse(cls, text):
@@ -130,25 +139,30 @@ def ahead(folder, entry):
     return found
 
 
-def holder_of(slot, folder):
-    """The text of the slot at path slot, or None when it's free; a slot whose process
-    has ended is cleared first, under the queue's lock."""
+def slot_text(slot, folder, stale=Holder.gone):
+    """The text of the slot at path slot, or None when it's free. A slot whose holder
+    is stale (by default, its process has ended) is cleared first, under the queue's
+    lock."""
     with locked(folder):
         text = read(slot)
-        if text is not None and Holder.parse(text).gone():
+        if text is not None and stale(Holder.parse(text)):
             slot.unlink()
             return None
     return text
 
 
-def take(slot, text):
+def take(slot, text, folder):
     """Make the slot at path slot hold text: True when it was free, False when another
-    process holds it."""
+    process holds it. The text goes in whole: written beside the queue in folder, then
+    linked into place, so a reader never finds a slot half written."""
+    part = folder / f".slot.{os.getpid()}.part"
+    part.write_text(text)
     try:
-        with slot.open("x") as file:
-            file.write(text)
+        os.link(part, slot)
     except FileExistsError:
         return False
+    finally:
+        part.unlink(missing_ok=True)
     return True
 
 

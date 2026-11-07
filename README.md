@@ -239,6 +239,25 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   its fast static checks, such as a linter or a type checker, and no tests.
   `install.py` also registers it as a Claude Code hook that refuses `git commit
   --no-verify`, except in a repo with no agent check, such as a scratch repo.
+  The check runs once it's its turn in `heavy`'s queue, whose waiting lines
+  print as they come.
+- **heavy**: `heavy -- CMD` runs a CPU-heavy command once it's its turn and its
+  cores are quiet. Every session on the VM shares two lanes, each running one
+  job at a time, first come first served: `heavy --long` jobs on the last
+  quarter of the cores, normal ones on the rest while a long job runs and on
+  all of them otherwise (with fewer than 4 cores, long jobs share the normal
+  lane). A lane's head starts once its cores stay under half busy for
+  `$HEAVY_QUIET_SECONDS` (10), sampled every `$HEAVY_POLL` seconds, or at the
+  first quiet sample when it arrived to a free lane; then CMD runs in the
+  foreground with the terminal, pinned to those cores (`CARGO_BUILD_JOBS` to
+  match), and heavy exits with its status. Stopped, it stops CMD's process
+  group, with SIGKILL after `$HEAVY_GRACE` seconds. `heavy status` shows each
+  lane's holder, waiters and how busy its cores are. A third job in a lane, or
+  a head stalled for `$HEAVY_STALL_SECONDS` (600), gets a hint to push a topic
+  branch and open a PR for CI's results instead. A heavy inside a job
+  (`$HEAVY_SLOT`) runs at once, and wt-ship's `--check` queues too. The queue
+  lives in `$HEAVY_DIR` (`/tmp/heavy`); `$HEAVY_BUSY` names a file that stands
+  in for how busy the cores are, for the tests.
 - **issue-todo**: a GitHub issue's task-list items across its body and every
   comment (`issue-todo show N`), which `gh issue view` splits between two
   commands, and ticking one where it lives (`issue-todo tick N MATCH --note

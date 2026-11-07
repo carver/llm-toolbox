@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Run a CPU-heavy command when it's its turn and its cores are quiet.
+
+    heavy -- CMD [ARGS...]          a build, a test suite, anything heavy
+    heavy --long -- CMD [ARGS...]   a long run, such as a local mutants shard
+    heavy status                    each lane's holder, waiters and how busy it is
+
+Every session on this VM shares two lanes, each running one job at a time, first come
+first served. A long job runs on the last quarter of the cores; while one runs, a
+normal job gets the rest, and otherwise all of them, so a commit's checks never wait
+behind a long run. (With fewer than 4 cores, a long job takes the normal lane.) The
+head of a lane starts once its cores have stayed under half busy at every one-second
+sample for 10 seconds, however long that takes: work outside the queue holds it up,
+and `heavy status` shows how busy the cores are. A job that arrives to a free lane,
+nobody waiting, starts at the first quiet sample. CMD then runs in the foreground,
+pinned to those cores (CARGO_BUILD_JOBS set to match), with this call's environment,
+folder, terminal and output, and heavy exits with its status. Commit checks join the
+queue on their own, through agent-commit-gate, and so does wt-ship's --check.
+
+While it waits, heavy prints a line on stderr when what it waits on changes. When it
+joins a lane that already holds two jobs, or has headed its lane for
+HEAVY_STALL_SECONDS without quiet cores, it suggests getting build and test results
+from GitHub instead: push a topic branch and open a PR (never main).
+
+A heavy started inside a job (HEAVY_SLOT names the job's slot) runs at once, so a
+check that calls heavy never waits on itself. A job whose process has ended is
+cleared from the queue. Stopping heavy (SIGINT, SIGTERM, SIGHUP) stops CMD's process
+group, with SIGKILL after HEAVY_GRACE seconds, and frees its place; CMD also gets
+SIGTERM should heavy die.
+
+Environment:
+  HEAVY_DIR            the queue's folder (default /tmp/heavy)
+  HEAVY_QUIET_SECONDS  how long the cores must stay quiet (default 10)
+  HEAVY_POLL           seconds per sample (default 1)
+  HEAVY_STALL_SECONDS  how long a head waits before suggesting a PR (default 600)
+  HEAVY_GRACE          seconds CMD gets to stop before SIGKILL (default 5)
+  HEAVY_BUSY           a file whose number stands in for how busy the cores are (tests)
+  HEAVY_SLOT           set for CMD, to the slot it holds
+
+Exit status: CMD's own; 2 a usage error; 125 heavy couldn't use its queue; 126 CMD
+couldn't be run (a folder, or not executable); 127 CMD wasn't found; 128+N stopped
+by signal N.
+"""
+
+import argparse
+import ctypes
+import os
+import shlex
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import heavyqueue
+
+STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+PR_SET_PDEATHSIG = 1
+
+
+class Stopped(Exception):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+def on_signal(signum, _frame):
+    raise Stopped(signum)
+
+
+def die_with_heavy():
+    """In CMD, before it starts: get SIGTERM should heavy die, even by SIGKILL."""
+    ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+
+
+def hand_terminal(group):
+    """Make group the terminal's foreground group, so CMD can read it; a CMD stopped
+    for reading before the handover (SIGTTIN) is continued."""
+    old = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    try:
+        os.tcsetpgrp(sys.stdin.fileno(), group)
+    except OSError:
+        pass
+    finally:
+        signal.signal(signal.SIGTTOU, old)
+    try:
+        os.killpg(group, signal.SIGCONT)
+    except ProcessLookupError:
+        pass
+
+
+def stop(proc):
+    """Stop CMD's process group: TERM, then KILL after HEAVY_GRACE seconds. Further
+    signals are ignored meanwhile, so a second Ctrl-C can't cut the KILL short."""
+    for sig in STOPS:
+        signal.signal(sig, signal.SIG_IGN)
+    grace = heavyqueue.knob("HEAVY_GRACE", 5)
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, None)):
+        try:
+            os.killpg(proc.pid, sig)
+            os.killpg(proc.pid, signal.SIGCONT)  # a stopped group can't act on TERM
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def run(command, long):
+    with heavyqueue.turn(long=long, command=shlex.join(command)) as job:
+        job.pin()  # CMD inherits this process's cores
+        terminal = sys.stdin.isatty()
+        try:
+            # heavy runs no threads, so preexec_fn is safe here.
+            proc = subprocess.Popen(
+                command,
+                env=job.env,
+                process_group=0,
+                preexec_fn=die_with_heavy,  # noqa: PLW1509
+            )
+        except FileNotFoundError:
+            print(f"heavy: no command {command[0]} to run.", file=sys.stderr)
+            return 127
+        except OSError as error:
+            print(f"heavy: can't run {command[0]}: {error.strerror}.", file=sys.stderr)
+            return 126
+        if terminal:
+            hand_terminal(proc.pid)
+        try:
+            code = proc.wait()
+        except Stopped:
+            stop(proc)
+            raise
+        finally:
+            if terminal:
+                hand_terminal(os.getpgrp())
+        return 128 - code if code < 0 else code
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--long", action="store_true", help="a long run: a quarter of the cores"
+    )
+    parser.add_argument(
+        "command", nargs=argparse.REMAINDER, help="status, or -- CMD [ARGS...]"
+    )
+    args = parser.parse_args(argv)
+    if args.command == ["status"]:
+        print(heavyqueue.status())
+        return 0
+    if args.command[:1] != ["--"] or len(args.command) < 2:
+        parser.error("expected `status` or `-- CMD [ARGS...]`")
+    for sig in STOPS:
+        signal.signal(sig, on_signal)
+    try:
+        return run(args.command[1:], args.long)
+    except Stopped as stopped:
+        return 128 + stopped.signum
+    except heavyqueue.QueueError as error:
+        print(
+            f"heavy: can't use its queue ({error}). Fix or remove it, then run again.",
+            file=sys.stderr,
+        )
+        return 125
+
+
+if __name__ == "__main__":
+    sys.exit(main())

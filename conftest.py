@@ -79,6 +79,21 @@ def no_inherited_repo():
         yield
 
 
+@pytest.fixture(autouse=True)
+def private_heavy_queue(tmp_path_factory, monkeypatch):
+    """Each test gets a heavy queue of its own whose cores are always quiet, so a test
+    that commits through agent-commit-gate neither joins the VM's real queue (behind
+    real builds) nor waits on another test's. HEAVY_SLOT goes too: the suite may be
+    running inside a commit check that holds the real slot."""
+    folder = tmp_path_factory.mktemp("heavy")
+    (folder / "busy").write_text("0\n")
+    monkeypatch.setenv("HEAVY_DIR", str(folder / "queue"))
+    monkeypatch.setenv("HEAVY_BUSY", str(folder / "busy"))
+    monkeypatch.setenv("HEAVY_QUIET_SECONDS", "0")
+    monkeypatch.setenv("HEAVY_POLL", "0.01")
+    monkeypatch.delenv("HEAVY_SLOT", raising=False)
+
+
 def started_child(parent: int, arg: str) -> int:
     """The pid of `parent`'s child that has `arg` as one of its arguments, waiting up
     to 5 seconds for it to start. While a shell sources $BASH_ENV it forks short-lived

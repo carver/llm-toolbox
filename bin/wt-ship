@@ -96,6 +96,8 @@ class Stop(Exception):
         self.status = status
 
 
+HEAVY = Path(__file__).resolve().parent / "heavy"
+
 # This run's command line, so a stop can say to run the same thing again; main sets it.
 RERUN = "wt-ship"
 
@@ -216,7 +218,8 @@ def run_check(command, mode):
         code = run_stoppable(argv, env)
         name = "agent-pre-commit"
     else:
-        code = run_stoppable(["sh", "-c", command])
+        # Through heavy, so a --check waits its turn with every other heavy job.
+        code = run_stoppable([str(HEAVY), "--", "sh", "-c", command])
         name = repr(command)
     if code != 0:
         raise Stop(f"The check {name} failed (exit {code}); nothing was {mode.done}.")
@@ -430,7 +433,7 @@ def claim(main_path, wait):
     flag or entry whose process has ended is cleared."""
     exclude_flag(main_path)
     path = Path(main_path) / FLAG
-    me = Holder.now(os.environ.get("CLAUDE_CODE_SESSION_ID", "") or "unknown-session")
+    me = Holder.mine()
     folder = common_dir(main_path) / QUEUE
     entry = None
     mine = None
@@ -465,13 +468,13 @@ def take(path, folder, me, entry):
     deadline = time.monotonic() + wait_seconds()
     said = None
     while True:
-        text = fifo.holder_of(path, folder)
+        text = fifo.slot_text(path, folder)
         held = Holder.parse(text) if text is not None else None
         if held is not None and held.session == me.session and held.pid is None:
             return None
         ahead = waiters_ahead(folder, entry)
         if held is None and not ahead:
-            if not fifo.take(path, me.line()):
+            if not fifo.take(path, me.line(), folder):
                 continue  # another session took it first: look again
             if entry is not None:
                 entry.unlink(missing_ok=True)

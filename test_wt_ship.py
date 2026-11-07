@@ -1162,3 +1162,29 @@ def test_a_stop_says_to_run_the_same_command_again(setup):
 
     assert done.returncode == 3, done.stderr
     assert "`wt-ship -C ../repo-wt-topic --local --check true` again" in done.stderr
+
+
+def test_a_check_given_with_check_waits_its_turn_in_heavys_queue(
+    setup, holder, background
+):
+    _, main, wt, _ = setup
+    alive = holder()
+    lane = Path(os.environ["HEAVY_DIR"]) / "normal"
+    lane.mkdir(parents=True)
+    (lane / "slot").write_text(
+        f"s-other 2026-11-07T01:02:03+00:00 host={socket.gethostname()}"
+        f" pid={alive.pid} start={start_time(alive.pid)}\ncwd=/x\ncmd=cargo test\n"
+    )
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    shipping = background(wt, "--local", "--check", "true")
+    wait_until(
+        lambda: any(p.name[:1].isdigit() for p in lane.iterdir()), "the check to queue"
+    )
+    assert main_head(main) != new
+    alive.kill()
+    alive.wait()
+    status, _, err = finish(shipping)
+
+    assert status == 0, err
+    assert main_head(main) == new

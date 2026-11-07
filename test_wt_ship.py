@@ -3,6 +3,7 @@
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -26,16 +27,43 @@ def commit(cwd, path, text, message):
     return git(cwd, "rev-parse", "HEAD")
 
 
-def ship(cwd, *args, session="s-mine"):
-    env = os.environ | {"CLAUDE_CODE_SESSION_ID": session}
+def ship_env(session="s-mine", wait="10", **extra):
+    """wt-ship's environment: short waits, so a test that waits by mistake ends."""
+    return os.environ | {
+        "CLAUDE_CODE_SESSION_ID": session,
+        "WT_SHIP_WAIT": wait,
+        "WT_SHIP_POLL": "0.05",
+        **extra,
+    }
+
+
+def ship(cwd, *args, session="s-mine", wait="10"):
     return subprocess.run(
         [str(SCRIPT), *args],
         cwd=cwd,
-        env=env,
+        env=ship_env(session, wait),
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def ship_in_background(cwd, *args, session="s-mine", wait="10"):
+    return subprocess.Popen(
+        [str(SCRIPT), *args],
+        cwd=cwd,
+        env=ship_env(session, wait),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def wait_until(condition, what, seconds=20):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.05)
 
 
 def configure(cwd):
@@ -409,7 +437,7 @@ def test_local_leaves_a_main_tree_another_session_claimed(setup):
     flag(main).write_text("s-other 2026-11-07T01:02:03+00:00\n")
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local", "--check", "true", wait="0.3")
 
     assert done.returncode == 3, done.stderr
     assert "s-other" in done.stderr and "2026-11-07T01:02:03" in done.stderr
@@ -513,6 +541,10 @@ def test_local_merges_while_it_holds_the_claim(setup):
 
     assert done.returncode == 0, done.stderr
     assert seen.read_text().startswith("s-mine ")
+    # The holder's host and process, so a later session can tell it's gone.
+    fields = dict(f.split("=", 1) for f in seen.read_text().split()[2:])
+    assert fields["host"] == socket.gethostname()
+    assert int(fields["pid"]) > 0 and fields["start"]
 
 
 def test_local_keeps_the_worktree_when_the_branch_doesnt_hold_head_after(setup):
@@ -667,3 +699,386 @@ def test_local_folds_fixups_into_the_commits_they_fix(setup):
     assert done.returncode == 0, done.stderr
     assert git(main, "log", "--format=%s", "main").splitlines() == ["Add a", "start"]
     assert (main / "a.py").read_text() == "x = 1\ny = 2\n"
+
+
+# Waiting for the main tree: holders and waiters are real processes, so their
+# liveness is judged from real PIDs.
+
+
+def start_time(pid):
+    """A process's start time, field 22 of /proc/PID/stat, after the command name."""
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+
+
+def holder_flag(proc, host=None):
+    host = host or socket.gethostname()
+    return (
+        f"s-other 2026-11-07T01:02:03+00:00 host={host} pid={proc.pid}"
+        f" start={start_time(proc.pid)}\n"
+    )
+
+
+@pytest.fixture
+def holder():
+    """A live process to name in a flag, killed when the test ends."""
+    procs = []
+
+    def start():
+        proc = subprocess.Popen(["sleep", "60"])
+        procs.append(proc)
+        return proc
+
+    yield start
+    for proc in procs:
+        proc.kill()
+        proc.wait()
+
+
+def queue(main):
+    """The queue's entries: its lock and half-written entries start with a dot."""
+    folder = main / ".git" / "wt-ship-queue"
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.iterdir() if not p.name.startswith("."))
+
+
+def queued_sessions(main):
+    """The sessions in the queue; an entry may go while it's being read."""
+    sessions = []
+    for entry in queue(main):
+        try:
+            sessions.append(entry.read_text().split()[0])
+        except (FileNotFoundError, IndexError):
+            pass
+    return sessions
+
+
+def finish(proc):
+    out, err = proc.communicate(timeout=30)
+    return proc.returncode, out, err
+
+
+def test_local_clears_a_flag_whose_process_is_gone_and_lands(setup, holder):
+    _, main, wt, _ = setup
+    gone = holder()
+    text = holder_flag(gone)
+    gone.kill()
+    gone.wait()
+    flag(main).write_text(text)
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", wait="0.3")
+
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == new
+    assert not flag(main).exists()
+
+
+def test_local_waits_while_another_landing_holds_the_flag_then_lands(
+    setup, holder, background
+):
+    _, main, wt, _ = setup
+    flag(main).write_text(holder_flag(holder()))
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    waiting = background(wt, "--local", "--check", "true")
+    wait_until(lambda: queue(main), "the waiter to join the queue")
+    flag(main).unlink()  # that landing finished
+    status, out, err = finish(waiting)
+
+    assert status == 0, err
+    assert main_head(main) == new
+    assert "s-other" in out, out
+    assert queue(main) == []
+    assert not flag(main).exists()
+
+
+def test_local_waits_for_a_holder_that_dies_then_lands(setup, holder, background):
+    _, main, wt, _ = setup
+    alive = holder()
+    flag(main).write_text(holder_flag(alive))
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    waiting = background(wt, "--local", "--check", "true")
+    wait_until(lambda: queue(main), "the waiter to join the queue")
+    alive.kill()
+    alive.wait()
+    status, _, err = finish(waiting)
+
+    assert status == 0, err
+    assert main_head(main) == new
+
+
+def test_local_never_clears_a_flag_from_another_host(setup, holder):
+    _, main, wt, _ = setup
+    gone = holder()
+    text = holder_flag(gone, host="some-other-machine")
+    gone.kill()
+    gone.wait()
+    flag(main).write_text(text)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", wait="0.3")
+
+    assert done.returncode == 3, done.stderr
+    assert flag(main).read_text() == text
+    assert queue(main) == []
+
+
+def test_no_wait_stops_at_once_on_a_held_flag(setup, holder):
+    _, main, wt, _ = setup
+    flag(main).write_text(holder_flag(holder()))
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    started = time.monotonic()
+    done = ship(wt, "--local", "--no-wait", "--check", "true", wait="30")
+
+    assert done.returncode == 3, done.stderr
+    assert time.monotonic() - started < 10
+    assert queue(main) == []
+
+
+def test_waiters_land_in_the_order_they_came(setup, holder, background):
+    _, main, wt, _ = setup
+    second_wt = main.parent / "repo-wt-second"
+    git(main, "worktree", "add", "-q", "--detach", str(second_wt))
+    flag(main).write_text(holder_flag(holder()))
+    first = commit(wt, "a.py", "x = 1\n", "First")
+    commit(second_wt, "b.py", "y = 1\n", "Second")
+
+    one = background(wt, "--local", "--check", "true", session="s-one")
+    wait_until(lambda: len(queue(main)) == 1, "the first waiter to join")
+    two = background(second_wt, "--local", "--check", "true", session="s-two")
+    wait_until(lambda: len(queue(main)) == 2, "the second waiter to join")
+    flag(main).unlink()
+
+    for proc in (one, two):
+        status, _, err = finish(proc)
+        assert status == 0, err
+    assert git(main, "log", "--format=%s", "-2").splitlines() == ["Second", "First"]
+    assert git(main, "rev-parse", "main~1") == first
+    assert queue(main) == []
+
+
+def test_a_killed_waiter_doesnt_hold_up_the_queue(setup, holder, background):
+    _, main, wt, _ = setup
+    second_wt = main.parent / "repo-wt-second"
+    git(main, "worktree", "add", "-q", "--detach", str(second_wt))
+    flag(main).write_text(holder_flag(holder()))
+    commit(wt, "a.py", "x = 1\n", "First")
+    new = commit(second_wt, "b.py", "y = 1\n", "Second")
+
+    killed = background(wt, "--local", "--check", "true", session="s-one")
+    wait_until(lambda: len(queue(main)) == 1, "the first waiter to join")
+    killed.kill()  # no chance to clean up: its entry stays behind
+    killed.communicate()
+    assert queued_sessions(main) == ["s-one"]
+    two = background(second_wt, "--local", "--check", "true", session="s-two")
+    # The second waiter drops the killed one's entry as it joins.
+    wait_until(lambda: queued_sessions(main) == ["s-two"], "the dead entry to go")
+    flag(main).unlink()
+    status, _, err = finish(two)
+
+    assert status == 0, err
+    assert main_head(main) == new
+    assert queue(main) == []
+
+
+def test_a_waiter_stopped_while_waiting_leaves_the_queue(setup, holder, background):
+    _, main, wt, _ = setup
+    text = holder_flag(holder())
+    flag(main).write_text(text)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    waiting = background(wt, "--local", "--check", "true")
+    wait_until(lambda: queue(main), "the waiter to join the queue")
+    waiting.send_signal(signal.SIGTERM)
+    status, _, _ = finish(waiting)
+
+    assert status != 0
+    assert queue(main) == []
+    assert flag(main).read_text() == text
+
+
+@pytest.fixture
+def background():
+    """Start wt-ship in the background; every run is killed and reaped at the end."""
+    procs = []
+
+    def start(cwd, *args, session="s-mine", wait="10"):
+        proc = ship_in_background(cwd, *args, session=session, wait=wait)
+        procs.append(proc)
+        return proc
+
+    yield start
+    for proc in procs:
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate()
+
+
+def queue_entry(main, proc, session="s-ahead"):
+    """A queue entry for a live process, as a waiter ahead of this one writes it."""
+    folder = main / ".git" / "wt-ship-queue"
+    folder.mkdir(exist_ok=True)
+    entry = folder / f"{time.time_ns() - 10**9:020d}-{proc.pid}"
+    entry.write_text(
+        f"{session} 2026-11-07T01:00:00+00:00 host={socket.gethostname()}"
+        f" pid={proc.pid} start={start_time(proc.pid)}\n"
+    )
+    return entry
+
+
+def test_a_flag_naming_a_reused_pid_is_cleared(setup, holder):
+    _, main, wt, _ = setup
+    alive = holder()
+    # The PID is live, but the process holding it started at another time.
+    flag(main).write_text(
+        f"s-other 2026-11-07T01:02:03+00:00 host={socket.gethostname()}"
+        f" pid={alive.pid} start=1\n"
+    )
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", wait="0.3")
+
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == new
+
+
+def test_no_wait_still_clears_a_flag_whose_process_is_gone(setup, holder):
+    _, main, wt, _ = setup
+    gone = holder()
+    text = holder_flag(gone)
+    gone.kill()
+    gone.wait()
+    flag(main).write_text(text)
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--no-wait", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == new
+
+
+def test_a_flag_missing_a_field_is_waited_on_not_misread(setup, holder):
+    _, main, wt, _ = setup
+    gone = holder()
+    # No start=, and a field wt-ship doesn't write: it can't judge this one.
+    text = f"s-other 2026-11-07T01:02:03+00:00 host={socket.gethostname()} pid={gone.pid} note=x\n"
+    gone.kill()
+    gone.wait()
+    flag(main).write_text(text)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", wait="0.3")
+
+    assert done.returncode == 3, done.stderr
+    assert flag(main).read_text() == text
+
+
+def test_another_run_of_this_session_holding_the_flag_is_waited_on(setup, holder):
+    # A subagent, or a rerun after a Bash timeout, shares the session's id.
+    _, main, wt, _ = setup
+    text = holder_flag(holder()).replace("s-other", "s-mine", 1)
+    flag(main).write_text(text)
+    before = main_head(main)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", wait="0.3")
+
+    assert done.returncode == 3, done.stderr
+    assert main_head(main) == before
+    assert flag(main).read_text() == text
+
+
+def test_no_wait_doesnt_jump_the_queue(setup, holder):
+    _, main, wt, _ = setup
+    entry = queue_entry(main, holder())
+    before = main_head(main)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--no-wait", "--check", "true")
+
+    assert done.returncode == 3, done.stderr
+    assert main_head(main) == before
+    assert str(entry) in done.stderr and "s-ahead" in done.stderr
+
+
+def test_giving_up_behind_a_waiter_names_its_entry(setup, holder):
+    _, main, wt, _ = setup
+    entry = queue_entry(main, holder())
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", wait="0.3")
+
+    assert done.returncode == 3, done.stderr
+    assert str(entry) in done.stderr and "s-ahead" in done.stderr
+    assert "2026-11-07T01:00:00" in done.stderr
+    assert [e.name for e in queue(main)] == [entry.name]
+
+
+def test_a_waiter_stopped_with_ctrl_c_leaves_quietly(setup, holder, background):
+    _, main, wt, _ = setup
+    flag(main).write_text(holder_flag(holder()))
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    waiting = background(wt, "--local", "--check", "true")
+    wait_until(lambda: queue(main), "the waiter to join the queue")
+    waiting.send_signal(signal.SIGINT)
+    status, _, err = finish(waiting)
+
+    assert status == 128 + signal.SIGINT
+    assert "Traceback" not in err
+    assert queue(main) == []
+
+
+def test_a_queue_it_cant_use_fails_in_one_line(setup, holder):
+    _, main, wt, _ = setup
+    (main / ".git" / "wt-ship-queue").write_text("not a folder\n")
+    flag(main).write_text(holder_flag(holder()))
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", wait="0.3")
+
+    assert done.returncode == 1
+    assert done.stderr.count("\n") == 1, done.stderr
+    assert "wt-ship-queue" in done.stderr
+
+
+def test_files_in_the_queue_that_arent_entries_are_ignored(setup):
+    _, main, wt, _ = setup
+    folder = main / ".git" / "wt-ship-queue"
+    (folder / "0000-sub").mkdir(parents=True)
+    (folder / "README").write_text("")
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", wait="0.3")
+
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == new
+
+
+def test_the_flag_goes_only_while_it_holds_this_runs_text(setup):
+    # Should another session's text replace this run's flag, leaving deletes nothing.
+    _, main, wt, _ = setup
+    theirs = "s-other 2026-11-07T01:02:03+00:00\n"
+    install_hook(main, "post-merge", f"printf '{theirs}' > \"{main}/CLAUDE_WORKING\"")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert flag(main).read_text() == theirs
+
+
+def test_waiting_says_whom_it_waits_on_once_per_change(setup, holder):
+    _, main, wt, _ = setup
+    flag(main).write_text(holder_flag(holder()))
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", "--check", "true", wait="0.5")
+
+    assert done.returncode == 3
+    lines = [ln for ln in done.stdout.splitlines() if ln.startswith("Waiting")]
+    assert len(lines) == 1, done.stdout
+    assert "s-other" in lines[0] and "2026-11-07T01:02:03" in lines[0]

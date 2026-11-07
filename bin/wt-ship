@@ -35,28 +35,44 @@ it rebases onto that branch and checks as above, replaying only the commits sinc
 worktree forked from it (`--fork-point`, from the branch's reflog): a commit the branch
 held then and holds no more, one another session rewrote or dropped, isn't replayed,
 and the run names each such commit. With no fork point in the reflog it rebases as a
-plain rebase would. Then it claims the main tree with the CLAUDE_WORKING flag of the
-user's global instructions, holding $CLAUDE_CODE_SESSION_ID (a flag this session
-already holds is kept; another session's stops it, naming whose it is and since when),
-and fast-forwards the main tree with `git merge --ff-only`. When another session
-landed during the check, it rebases and checks again, up to 10 times, still holding
-the claim, then merges. When the main tree's uncommitted changes touch the files the merge
-changes, it stops, merging nothing: ask the user. The flag it made goes once the merge
-is done or has failed, or the run is stopped. It must run in a linked worktree.
+plain rebase would. Then it claims the main tree with its CLAUDE_WORKING flag, which
+records $CLAUDE_CODE_SESSION_ID, the time, and this host and process (an old-style
+flag of this session's, one without a process, is kept), and fast-forwards the main
+tree with `git merge --ff-only`. While another run holds the flag, this session's
+other runs (a subagent's) included, it waits its turn in a first-come-first-served
+queue in the repo's common git dir, printing a line when whom it waits on changes,
+and gives up after WT_SHIP_WAIT seconds, naming what held it up; --no-wait gives up
+at once when the flag is held or anyone is queued. Under a lock in the queue folder,
+it clears a flag, or an entry, whose process ran on this host and has ended. A flag
+it can't judge, an old-style one or one from another host, it only waits on.
+When another session landed during the check, it rebases and checks again, up to 10
+times, still holding the claim, then merges. When the main tree's uncommitted changes
+touch the files the merge changes, it stops, merging nothing: ask the user. The flag
+it made, and its place in the queue, go once the merge is done or has failed, or the
+run is stopped. It must run in a linked worktree.
+
+Environment:
+  WT_SHIP_WAIT   seconds --local waits for the main tree (default 1800)
+  WT_SHIP_POLL   seconds between its looks at the flag and the queue (default 5;
+                 the tests shorten both)
 
 Exit status: 0 shipped, landed or nothing to do; 1 a step failed (the message says
-what to do); 2 a usage error; with --local, 3 another session holds the main tree's
-claim (tell the user the flag's age), 4 the main tree's uncommitted changes touch the
-files the landing changes (ask the user); 5 the tries ran out, another session's
-pushes or commits winning each of 10 (run it again later).
+what to do); 2 a usage error; with --local, 3 another session held the main tree's
+claim past the wait (tell the user what held it up and since when), 4 the main tree's
+uncommitted changes touch the files the landing changes (ask the user); 5 the tries
+ran out, another session's pushes or commits winning each of 10 (run it again later).
 """
 
 import argparse
+import fcntl
 import os
+import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -313,7 +329,7 @@ def ship(args):
         local = out("rev-parse", f"refs/heads/{branch}")
         if local != new and is_ancestor(local, upstream):
             print(
-                f"\nThe main tree ({main_path}) is behind {upstream}: pull there once it's yours."
+                f"\nThe main tree ({main_path}) is behind {upstream}: tell the user, who pulls there."
             )
     if args.remove:
         remove(main_path, here)
@@ -342,10 +358,7 @@ FLAG = "CLAUDE_WORKING"
 
 def exclude_flag(main_path):
     """List FLAG in the main repo's info/exclude, so git never shows or commits it."""
-    common = Path(
-        out("-C", main_path, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    )
-    exclude = common / "info" / "exclude"
+    exclude = common_dir(main_path) / "info" / "exclude"
     exclude.parent.mkdir(exist_ok=True)
     text = exclude.read_text() if exclude.exists() else ""
     if FLAG not in text.splitlines():
@@ -353,45 +366,217 @@ def exclude_flag(main_path):
             file.write(("" if text.endswith("\n") or not text else "\n") + f"{FLAG}\n")
 
 
+# The queue of sessions waiting to land, in the repo's common git dir. An entry is
+# named for when its waiter joined, so names sort in queue order.
+QUEUE = "wt-ship-queue"
+ENTRY = re.compile(r"\d{20}-\d+")
+
+
+def wait_seconds():
+    return float(os.environ.get("WT_SHIP_WAIT", "1800"))
+
+
+def poll_seconds():
+    return float(os.environ.get("WT_SHIP_POLL", "5"))
+
+
+def started(pid):
+    """When process pid started (field 22 of /proc/PID/stat); None when there is no
+    such process, "" when it can't be read (a /proc that hides other users')."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return ""
+    return stat.rsplit(")", 1)[1].split()[19]
+
+
+class Holder(NamedTuple):
+    """Who holds the flag or a queue entry: `<session> <since>`, then, as wt-ship
+    writes them, the host, PID and start time of the process holding it."""
+
+    session: str
+    since: str
+    host: str | None = None
+    pid: str | None = None
+    start: str | None = None
+
+    @classmethod
+    def now(cls, session):
+        pid = str(os.getpid())
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        return cls(session, stamp, socket.gethostname(), pid, started(pid))
+
+    @classmethod
+    def parse(cls, text):
+        words = text.split()
+        fields = dict(word.split("=", 1) for word in words[2:] if "=" in word)
+        return cls(
+            words[0] if words else "?",
+            words[1] if len(words) > 1 else "?",
+            fields.get("host"),
+            fields.get("pid"),
+            fields.get("start"),
+        )
+
+    def line(self):
+        return (
+            f"{self.session} {self.since} host={self.host} pid={self.pid}"
+            f" start={self.start}\n"
+        )
+
+    def gone(self):
+        """Whether its process has certainly ended: it ran on this host, and its PID
+        is free or names a process that started at another time. A holder without
+        those fields, or from another host, may be alive."""
+        if None in (self.host, self.pid, self.start) or not self.pid.isdigit():
+            return False
+        if self.host != socket.gethostname():
+            return False
+        now = started(self.pid)
+        return now is None or (now != "" and now != self.start)
+
+    def __str__(self):
+        return f"{self.session}, since {self.since}"
+
+
+def read(path):
+    """The text at path, or None when it's gone."""
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        return None
+
+
 @contextmanager
-def claim(main_path):
-    """Hold the main tree's FLAG: kept when this session holds it already, made (and
-    removed afterwards) when absent; another session's stops it."""
+def locked(folder):
+    """Hold the queue's lock, so two sessions never clear the same dead flag."""
+    with (folder / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def common_dir(main_path):
+    return Path(
+        out("-C", main_path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    )
+
+
+@contextmanager
+def claim(main_path, wait):
+    """Hold the main tree's FLAG: kept when it's an old-style flag of this session's,
+    made (and removed afterwards, while it still holds this run's text) when free.
+    With wait, join the queue and take the flag on this session's turn, giving up
+    after WT_SHIP_WAIT seconds; without, stop when it's held or anyone is queued. A
+    flag or entry whose process has ended is cleared."""
     exclude_flag(main_path)
     path = Path(main_path) / FLAG
-    me = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    made = False
+    me = Holder.now(os.environ.get("CLAUDE_CODE_SESSION_ID", "") or "unknown-session")
+    folder = common_dir(main_path) / QUEUE
+    entry = None
+    mine = None
     try:
-        made = held_by(path, me)
+        try:
+            folder.mkdir(exist_ok=True)
+            if wait:
+                entry = folder / f"{time.time_ns():020d}-{os.getpid()}"
+                part = folder / f".{entry.name}.part"
+                part.write_text(me.line())
+                part.rename(entry)  # whole, so a reader never sees it half written
+        except OSError as error:
+            raise Stop(
+                f"Can't use the queue {folder}: {error.strerror}. Fix or remove it, then"
+                " run `wt-ship --local` again."
+            ) from None
+        mine = take(path, folder, me, entry)
         yield
     finally:
-        if made:
+        if entry is not None:
+            entry.unlink(missing_ok=True)
+        if mine is not None and read(path) == mine:
             path.unlink(missing_ok=True)
 
 
-def held_by(path, me):
-    """Take the flag at path for session me: True when this made it, False when me
-    held it already; another session's flag stops it."""
-    for _ in range(3):
-        try:
-            with path.open("x") as file:
-                stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-                file.write(f"{me or 'unknown-session'} {stamp}\n")
-            return True
-        except FileExistsError:
+def waiters_ahead(folder, entry):
+    """The live waiters that joined before entry (all of them, without one), oldest
+    first, as (entry path, holder); ended ones are removed."""
+    ahead = []
+    for other in sorted(folder.iterdir()):
+        if entry is not None and other.name >= entry.name:
+            break
+        if not ENTRY.fullmatch(other.name) or not other.is_file():
+            continue
+        text = read(other)
+        if text is None:
+            continue
+        holder = Holder.parse(text)
+        if holder.gone():
+            other.unlink(missing_ok=True)
+        else:
+            ahead.append((other, holder))
+    return ahead
+
+
+def take(path, folder, me, entry):
+    """Take the flag at path: the text it wrote, or None when it kept an old-style flag
+    of this session's. Waits its turn in the queue when entry is set."""
+    deadline = time.monotonic() + wait_seconds()
+    said = None
+    while True:
+        with locked(folder):
+            text = read(path)
+            held = Holder.parse(text) if text is not None else None
+            if held is not None and held.gone():
+                path.unlink()
+                held = None
+        if held is not None and held.session == me.session and held.pid is None:
+            return None
+        ahead = waiters_ahead(folder, entry)
+        if held is None and not ahead:
             try:
-                held = path.read_text().strip()
-            except FileNotFoundError:
-                continue  # released between the two calls: try again
-        if me and held.split()[:1] == [me]:
-            return False
-        raise Stop(
-            f"Another session has claimed the main tree ({path}: {held or 'no text yet'}),"
-            " so it was left alone. Tell the user the flag's age, so they can clear one a"
-            " crashed session left, then run `wt-ship --local` again.",
-            CLAIMED,
+                with path.open("x") as file:
+                    file.write(me.line())
+            except FileExistsError:
+                continue  # another session took it first: look again
+            if entry is not None:
+                entry.unlink(missing_ok=True)
+            return me.line()
+        if entry is None or time.monotonic() >= deadline:
+            raise Stop(gave_up(path, held, ahead, entry is not None), CLAIMED)
+        status = (
+            f"{len(ahead)} ahead in the queue, the first {ahead[0][1]}"
+            if ahead
+            else "first in the queue"
         )
-    raise Stop(f"{path} kept appearing and vanishing: run `wt-ship --local` again.")
+        if held is not None:
+            status += f"; the main tree is held by {held}"
+        if status != said:
+            print(f"Waiting to land: {status}.", flush=True)
+            said = status
+        time.sleep(poll_seconds())
+
+
+def gave_up(path, held, ahead, waited):
+    """Why --local stopped without the main tree, naming what held it up."""
+    seconds = wait_seconds()
+    if not waited:
+        took = ""
+    elif seconds >= 60:
+        took = f" after {seconds / 60:.0f} minutes"
+    else:
+        took = f" after {seconds:.0f} seconds"
+    blockers = []
+    if held is not None:
+        blockers.append(f"the flag {path} ({held})")
+    if ahead:
+        first, holder = ahead[0]
+        blockers.append(f"{len(ahead)} waiting ahead, the first {first} ({holder})")
+    return (
+        f"Stopped waiting for the main tree{took}: {' and '.join(blockers)}. Tell the user"
+        " what held it up and since when, so they can clear one a crashed session left,"
+        " then run `wt-ship --local` again."
+    )
 
 
 def merge(main_path, sha):
@@ -435,7 +620,7 @@ def land(args):
         print(f"HEAD is already in {branch}: nothing to land.")
         return 0
     prepare(ref, args.check, LAND)
-    with claim(main_path):
+    with claim(main_path, wait=not args.no_wait):
         # The claim stops other sessions from landing, but the owner, or a tool that
         # doesn't read the flag, may still move the branch: rebase until HEAD holds
         # it, checking each time, at most TRIES checks in all.
@@ -492,9 +677,14 @@ def main(argv=None):
         action="store_true",
         help="land on the main tree's branch instead of pushing (a repo that doesn't push)",
     )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="with --local, stop at once when another session holds the main tree",
+    )
     args = parser.parse_args(argv)
     # A stopped run unwinds like a failed one, so a claim it made is released.
-    for stop in (signal.SIGTERM, signal.SIGHUP):
+    for stop in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(stop, lambda signum, _frame: sys.exit(128 + signum))
     try:
         return ship(args)

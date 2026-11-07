@@ -1065,3 +1065,85 @@ def test_reword_leaves_a_rebase_in_progress_alone(repo, tmp_path):
     assert result.returncode == 1
     assert "rebase" in result.stderr
     assert (repo / ".git" / "rebase-merge").exists()  # still the user's, in progress
+
+
+def test_finish_folds_onto_where_head_meets_main_when_main_was_rewritten(
+    repo, worktree
+):
+    """Another session rewrote main under the build (here, amending its tip), and the
+    worktree was rebased onto the new main: the recorded base is in neither."""
+    base = git(worktree, "rev-parse", "HEAD").strip()
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    commit(worktree, "a.py", "fixup! Work", "--allow-empty")
+    git(repo, "commit", "-q", "--amend", "-m", "start, reworded elsewhere")
+    advance(repo, "refs/heads/main")
+    git(worktree, "rebase", "-q", "--onto", "main", base)
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "rewritten" in done.stdout, done.stdout
+    assert subjects(worktree, "main") == ["Work"]
+
+
+def test_finish_says_so_when_the_base_is_gone_and_head_meets_no_landing_branch(
+    repo, worktree
+):
+    base = git(worktree, "rev-parse", "HEAD").strip()
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    # The work is rebuilt on a root of its own, so HEAD shares no history with the
+    # base or with main, the branch it lands on.
+    tree = git(worktree, "rev-parse", "HEAD^{tree}").strip()
+    root = git(worktree, "commit-tree", tree, "-m", "a new root").strip()
+    git(worktree, "rebase", "-q", "--onto", root, base)
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 1
+    assert base[:12] in done.stderr and "meets no branch" in done.stderr, done.stderr
+
+
+def test_a_build_on_a_branch_folds_from_its_upstream_when_that_was_rewritten(repo):
+    commit(repo, "m.py", "Middle")
+    git(repo, "checkout", "-q", "-b", "work", "--track", "main")
+    base = git(repo, "rev-parse", "HEAD").strip()
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    commit(repo, "a.py", "fixup! Work", "--allow-empty")
+    # Another session rewrites main's tip; the work is rebased onto the new one.
+    git(repo, "checkout", "-q", "main")
+    git(repo, "commit", "-q", "--amend", "-m", "Middle, reworded elsewhere")
+    git(repo, "checkout", "-q", "work")
+    git(repo, "rebase", "-q", "--onto", "main", base)
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "where HEAD meets main" in done.stdout, done.stdout
+    assert subjects(repo, "main") == ["Work"]
+
+
+def test_a_branch_at_the_base_that_isnt_the_landing_branch_leaves_the_fold_alone(
+    repo, tmp_path
+):
+    # dev and main both sit at the base, a commit after start, so both share start
+    # with HEAD; only main is rewritten.
+    commit(repo, "m.py", "Middle")
+    git(repo, "branch", "dev")  # sorts before main
+    worktree = tmp_path / "wt"
+    git(repo, "worktree", "add", "-q", "--detach", str(worktree))
+    base = git(worktree, "rev-parse", "HEAD").strip()
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    commit(worktree, "a.py", "fixup! Work", "--allow-empty")
+    git(repo, "commit", "-q", "--amend", "-m", "Middle, reworded elsewhere")
+    advance(repo, "refs/heads/main")
+    git(worktree, "rebase", "-q", "--onto", "main", base)
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "where HEAD meets main" in done.stdout, done.stdout
+    assert subjects(worktree, "main") == ["Work"]

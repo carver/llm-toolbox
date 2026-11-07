@@ -142,6 +142,25 @@ def target_branches(base: str) -> list[str]:
     )
 
 
+def rewritten_base(targets: set[str]) -> tuple[str, str] | None:
+    """When another session rewrote the branch a build lands on (a rebase, an amended
+    tip) and HEAD was rebased onto the new one, the recorded base is in neither, and a
+    fold from it would replay the branch's own commits. This is that branch and where
+    HEAD meets it now: a landing branch, or, for a build on a named branch, which has
+    none, the branch's upstream. None if HEAD meets none of them."""
+    upstream = git(
+        "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False
+    ).stdout.strip()
+    for branch, ref in [
+        *((name, f"refs/heads/{name}") for name in sorted(targets)),
+        *([(upstream, upstream)] if upstream else []),
+    ]:
+        meet = git("merge-base", "HEAD", ref, check=False).stdout.strip()
+        if meet:
+            return branch, meet
+    return None
+
+
 def behind(branch: str) -> bool:
     """Whether HEAD lacks a commit of the branch, local or any remote's."""
     listed = git(
@@ -410,6 +429,20 @@ def finish(args: argparse.Namespace) -> int:
         return fail(
             "The repo changed outside the work branch since start:",
             *(f"  {name}" for name in moved),
+        )
+    if not ancestor(base, "HEAD"):
+        found = rewritten_base(targets)
+        if found is None:
+            return fail(
+                f"The base {base[:12]} isn't in HEAD's history, and HEAD meets no branch",
+                "this build lands on, so there's nothing to fold onto. Find the commit",
+                "the work starts after and run `build-state start --base COMMIT --force`.",
+            )
+        branch, base = found
+        print(
+            f"The base {state['base'][:12]} isn't in HEAD's history: {branch} was rewritten"
+            f" since start. Folding from {base[:12]}, where HEAD meets {branch}.",
+            flush=True,
         )
     if markers := conflict_markers(base):
         return fail(

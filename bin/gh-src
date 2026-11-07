@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Print the path of a cached checkout of a GitHub repo at a ref.
+
+    gh-src OWNER/REPO REF
+    gh-src --refresh OWNER/REPO BRANCH
+
+REF is a tag, a branch or a full commit SHA. The first call makes a shallow clone
+(one commit, no history); later calls, from any session, print the same path
+without touching the network. Read and grep the source under the printed path,
+rather than fetching it file by file with `gh api .../contents`.
+
+Options:
+  --refresh   fetch REF again, as when a branch has moved since it was cached
+
+The printed path, <cache>/OWNER/REPO/REF (a `/` in REF written as %2F), is a
+symlink to the checkout of the commit REF named, .commits/<SHA> beside it. A
+checkout never changes once made, so a refresh only moves the symlink, and anyone
+reading the old commit's files keeps them. A tag and its SHA share one checkout.
+Calls at once are safe: each fetches into a temporary folder, and the loser of a
+race drops its copy.
+
+Environment:
+  GH_SRC_CACHE     the cache folder. Default: /home/carver/code/claudedev/cache/src
+                   when its parent exists (the host disk, shared by every session),
+                   else ~/.cache/gh-src
+  GH_SRC_URL_BASE  where repos are fetched from, OWNER/REPO appended. Default:
+                   https://github.com/ (the tests point it at file:// repos)
+
+Exit status: 0 the path is printed; 1 the fetch failed (no such repo or ref, or no
+network); 2 usage error; 128+N stopped by signal N, after stopping git and removing
+what it fetched.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+DEFAULT_CACHE = "/home/carver/code/claudedev/cache/src"
+
+# GitHub owner and repo names; `.` and `..` are refused apart.
+NAME = re.compile(r"[A-Za-z0-9_.-]+")
+SHA = re.compile(r"[0-9a-f]{40}")
+
+
+class Stopped(Exception):
+    def __init__(self, signum: int):
+        self.signum = signum
+
+
+def on_signal(signum: int, _frame) -> None:
+    raise Stopped(signum)
+
+
+def cache_root() -> Path:
+    if env := os.environ.get("GH_SRC_CACHE"):
+        return Path(env)
+    default = Path(DEFAULT_CACHE)
+    return default if default.parent.is_dir() else Path.home() / ".cache" / "gh-src"
+
+
+def is_ref(ref: str) -> bool:
+    if SHA.fullmatch(ref):
+        return True
+    check = ["git", "check-ref-format", "--allow-onelevel", ref]
+    return subprocess.run(check, capture_output=True, check=False).returncode == 0
+
+
+def run_git(into: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run git in its own process group, which is stopped if this call is."""
+    proc = subprocess.Popen(
+        ["git", "-C", str(into), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate()
+    except BaseException:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+def shallow_checkout(url: str, ref: str, into: Path) -> tuple[str, str]:
+    """Check REF out into INTO. Return (its commit SHA, ""), or ("", git's error)."""
+    for args in (
+        ["init", "-q"],
+        ["fetch", "-q", "--depth", "1", url, ref],
+        ["-c", "advice.detachedHead=false", "checkout", "-q", "FETCH_HEAD"],
+        ["rev-parse", "HEAD"],
+    ):
+        result = run_git(into, *args)
+        if result.returncode != 0:
+            lines = result.stderr.strip().splitlines()
+            fatal = [line for line in lines if line.startswith(("fatal:", "error:"))]
+            return "", (fatal or lines or [f"git {args[0]} failed"])[-1]
+    return result.stdout.strip(), ""
+
+
+def fetch(url: str, ref: str, target: Path) -> str:
+    """Point TARGET at a checkout of REF. Return git's error, or ""."""
+    repo_dir = target.parent
+    work = Path(tempfile.mkdtemp(prefix=".tmp.", dir=repo_dir))
+    link = repo_dir / f".tmp.link.{os.getpid()}"
+    try:
+        sha, error = shallow_checkout(url, ref, work)
+        if error:
+            return error
+        commit = repo_dir / ".commits" / sha
+        commit.parent.mkdir(exist_ok=True)
+        try:
+            work.rename(commit)
+        except OSError:
+            # Another call put this commit in place first: use that one.
+            if not commit.is_dir():
+                raise
+        link.symlink_to(Path(".commits") / sha)
+        link.replace(target)
+        return ""
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        link.unlink(missing_ok=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("repo", help="OWNER/REPO")
+    parser.add_argument("ref", help="a tag, a branch or a full commit SHA")
+    parser.add_argument("--refresh", action="store_true", help="fetch REF again")
+    args = parser.parse_args()
+    parts = args.repo.split("/")
+    if len(parts) != 2 or not all(
+        NAME.fullmatch(part) and part not in (".", "..") for part in parts
+    ):
+        parser.error(f"expected OWNER/REPO, got {args.repo}")
+    if not is_ref(args.ref):
+        parser.error(f"{args.ref} is not a ref: expected a tag, a branch or a full SHA")
+    owner, name = parts
+
+    folder = args.ref.replace("%", "%25").replace("/", "%2F")
+    target = cache_root() / owner / name / folder
+    if target.exists() and not args.refresh:
+        print(target)
+        return 0
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, on_signal)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    base = os.environ.get("GH_SRC_URL_BASE", "https://github.com/")
+    url = f"{base}{owner}/{name}"
+    try:
+        if error := fetch(url, args.ref, target):
+            print(f"gh-src: can't fetch {args.ref} of {url}: {error}", file=sys.stderr)
+            return 1
+    except Stopped as stopped:
+        return 128 + stopped.signum
+    print(target)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

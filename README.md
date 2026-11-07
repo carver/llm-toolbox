@@ -322,6 +322,15 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   (`$YT_TRANSCRIPT_CACHE` overrides), and exits 3 when YouTube refuses the
   request (it blocks IPs that fetch a lot), so callers can retry later.
 
+- **gh-src**: `gh-src OWNER/REPO REF` prints the path of a checkout of a GitHub
+  repo at a tag, branch or commit SHA, for reading and grepping another
+  project's source rather than fetching it file by file with `gh api`. The first
+  call makes a shallow clone in `claudedev/cache/src/` (`$GH_SRC_CACHE`
+  overrides), shared by every session; later calls print the path without the
+  network. Each commit's checkout never changes, so `--refresh`, which fetches a
+  moved branch again, leaves readers of the old one their files.
+  `$GH_SRC_URL_BASE` points it somewhere other than GitHub, for the tests.
+
 - **paper**: a paper's metadata (`meta`), the papers citing it (`cites`) and
   keyword search (`search`) from Semantic Scholar, every paper matching a boolean
   query (`sweep`: Semantic Scholar's bulk search, written to a TSV file reused for

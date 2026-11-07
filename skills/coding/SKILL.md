@@ -47,7 +47,7 @@ Maintain high standards: if you notice issues, fix them. Examples: lint, test fl
 
 Use /diagnosing-bugs to debug.
 
-Before you read a dependency's source to learn how it behaves, or start debug prints for a surprise, run `sofa search` on the library and the symptom (e.g. `sofa search "egui ctrl+v image paste"`). Another agent may have dug it out already.
+Before you read a dependency's source to learn how it behaves, or start debug prints for a surprise, run `sofa search` on the library and the symptom (e.g. `sofa search "egui ctrl+v image paste"`). Another agent may have dug it out already. To read a project's source at a version, such as a tool, a GitHub action or a library, run `gh-src OWNER/REPO TAG` and read and grep under the path it prints. Every session shares that checkout, so a reviewer reading the same files fetches nothing.
 
 Use pre-commit hooks to lint and type-check the code.
 

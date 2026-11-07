@@ -354,6 +354,22 @@ def test_local_fast_forwards_the_main_tree_and_releases_its_claim(setup):
     assert wt.exists()
 
 
+def test_the_notice_names_directories_with_counts_not_every_file(setup):
+    _, _, wt, _ = setup
+    for path in ("bin", "skills/build"):
+        (wt / path).mkdir(parents=True, exist_ok=True)
+    commit(wt, "bin/one", "1\n", "One")
+    commit(wt, "bin/two", "2\n", "Two")
+    commit(wt, "skills/build/SKILL.md", "s\n", "Skill")
+    commit(wt, "README.md", "r\n", "Readme")
+
+    done = ship(wt, "--local", "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    notice = done.stdout.split("Notice for other sessions:")[1]
+    assert "Files: README.md, bin/ (2), skills/build/ (1)." in notice, notice
+
+
 def test_local_rebases_onto_what_the_main_tree_got_meanwhile(setup):
     _, main, wt, _ = setup
     theirs = commit(main, "b.py", "y = 2\n", "Add b")

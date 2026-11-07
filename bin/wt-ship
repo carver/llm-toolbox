@@ -359,13 +359,33 @@ def remove(main_path, here):
     print(f"Removed the worktree {here}.")
 
 
+def changed_places(files):
+    """The top-level files and directories among `files`, a directory with how many
+    of them it holds, in the order git lists them, so a notice stays short: a skill
+    is named by its own folder, since that says which skill changed."""
+    # Each place in the order git first lists it; a file's count stays 0.
+    counts: dict[str, int] = {}
+    for path in files:
+        parts = path.split("/")
+        if len(parts) == 1:
+            counts.setdefault(path, 0)
+            continue
+        depth = 2 if parts[0] == "skills" and len(parts) > 2 else 1
+        folder = "/".join(parts[:depth]) + "/"
+        counts[folder] = counts.get(folder, 0) + 1
+    return ", ".join(
+        f"{place} ({count})" if place.endswith("/") else place
+        for place, count in counts.items()
+    )
+
+
 def report(old, new, verb, branch, where):
     subjects = out("log", "--format=%s", "--reverse", f"{old}..{new}").splitlines()
     files = out("diff", "--name-only", old, new).splitlines()
     print(f"{verb.capitalize()} {old[:7]}..{new[:7]} {where}.")
     print("\nNotice for other sessions:")
     print(
-        f"FYI: {verb} {old[:7]}..{new[:7]} to {branch}: {'; '.join(subjects)}. Files: {', '.join(files)}."
+        f"FYI: {verb} {old[:7]}..{new[:7]} to {branch}: {'; '.join(subjects)}. Files: {changed_places(files)}."
     )
 
 

@@ -1,0 +1,11 @@
+# Why: Fire for failures the agent investigates on its own too: it guessed at a CI shard's culprit twice before reproducing it.
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -1,6 +1,6 @@
+ ---
+ name: diagnosing-bugs
+-description: Diagnosis loop for hard bugs and performance regressions. Use when the user says "diagnose"/"debug this", or reports something broken/throwing/failing/slow.
++description: Diagnosis loop for hard bugs and performance regressions. Use when the user says "diagnose"/"debug this", or reports something broken/throwing/failing/slow, or when a failure you're chasing yourself, such as a CI job that keeps failing, has no obvious cause.
+ ---
+ 
+ # Diagnosing Bugs

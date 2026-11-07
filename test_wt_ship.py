@@ -255,9 +255,10 @@ def test_a_push_that_never_wins_stops_after_its_tries(setup):
     done = ship(wt, "--check", "true")
 
     assert done.returncode == 5
-    assert "won the race" in done.stderr and "run wt-ship again" in done.stderr, (
-        done.stderr
-    )
+    assert (
+        "won the race" in done.stderr
+        and "run `wt-ship --check true` again" in done.stderr
+    ), done.stderr
     assert "Add a" not in git(origin, "log", "--format=%s", "main")
 
 
@@ -297,6 +298,8 @@ def test_remove_is_refused_in_the_main_tree(setup):
     done = ship(main, "--check", "true", "--remove")
 
     assert done.returncode == 1 and "main tree" in done.stderr
+    # From the main tree, the way on is -C, not a cd into the worktree.
+    assert "-C" in done.stderr, done.stderr
 
 
 def test_a_push_refused_for_another_reason_isnt_retried(setup):
@@ -629,6 +632,7 @@ def test_local_is_refused_in_the_main_tree(setup):
     done = ship(main, "--local", "--check", "true")
 
     assert done.returncode == 1 and "linked worktree" in done.stderr
+    assert "-C" in done.stderr, done.stderr
 
 
 def test_local_replays_only_its_own_commits_when_the_branch_was_rewritten(setup):
@@ -1082,3 +1086,63 @@ def test_waiting_says_whom_it_waits_on_once_per_change(setup, holder):
     lines = [ln for ln in done.stdout.splitlines() if ln.startswith("Waiting")]
     assert len(lines) == 1, done.stdout
     assert "s-other" in lines[0] and "2026-11-07T01:02:03" in lines[0]
+
+
+# -C: a call that starts outside the worktree keeps its shell out of the folder
+# --remove deletes.
+
+
+def test_c_lands_and_removes_the_worktree_from_outside_it(setup):
+    _, main, wt, _ = setup
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(
+        main, "-C", "../repo-wt-topic", "--local", "--remove", "--check", "true"
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == new
+    assert not wt.exists()
+
+
+def test_c_pushes_from_outside_the_worktree(setup):
+    origin, main, wt, _ = setup
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(main.parent, "-C", str(wt), "--check", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert remote_main(origin) == new
+
+
+def test_c_naming_no_folder_is_a_usage_error(setup):
+    _, main, _, _ = setup
+
+    done = ship(main, "-C", "../nowhere", "--local", "--check", "true")
+
+    assert done.returncode == 2
+    assert "../nowhere" in done.stderr
+    assert done.stderr.count("\n") == 1, done.stderr
+
+
+def test_c_naming_a_file_is_a_usage_error(setup):
+    _, main, _, _ = setup
+
+    done = ship(main, "-C", "README", "--local", "--check", "true")
+
+    assert done.returncode == 2
+    assert "README" in done.stderr
+    assert done.stderr.count("\n") == 1, done.stderr
+
+
+def test_a_stop_says_to_run_the_same_command_again(setup):
+    _, main, wt, _ = setup
+    flag(main).write_text("s-other 2026-11-07T01:02:03+00:00\n")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(
+        main, "-C", "../repo-wt-topic", "--local", "--check", "true", wait="0.3"
+    )
+
+    assert done.returncode == 3, done.stderr
+    assert "`wt-ship -C ../repo-wt-topic --local --check true` again" in done.stderr

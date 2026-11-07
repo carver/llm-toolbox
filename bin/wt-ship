@@ -7,6 +7,8 @@ the main tree's branch.
     wt-ship --remove              then remove this worktree, through the main tree
     wt-ship --remote up --branch dev
     wt-ship --local [--remove]    in a repo that doesn't push: land on the main tree
+    wt-ship -C ../repo-wt-topic --local --remove
+                                  the same, run from outside the worktree
 
 In order, it:
 
@@ -27,7 +29,10 @@ In order, it:
 
 BRANCH defaults to the branch the main worktree has checked out. Nothing to push is a
 clean exit. --remove runs `git worktree remove` from the main tree once the push is
-confirmed, so a shell left in the removed folder must cd elsewhere.
+confirmed. A shell that started the run inside the worktree is left in a deleted
+folder, where Claude Code's Bash tool reports exit 1 after a landing that worked; -C
+DIR, which runs wt-ship as if started in DIR (as `git -C` does), lets the call start
+outside it.
 
 --local, for a repo whose owner pushes, takes the same steps against the branch the
 main tree has checked out instead of a remote (no --remote, and no other --branch):
@@ -67,6 +72,7 @@ import argparse
 import fcntl
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -90,18 +96,26 @@ class Stop(Exception):
         self.status = status
 
 
+# This run's command line, so a stop can say to run the same thing again; main sets it.
+RERUN = "wt-ship"
+
+
+def worktree_hint(main_path):
+    """How to run wt-ship on a worktree from the main tree."""
+    return f"`wt-ship -C ../{Path(main_path).name}-wt-<topic>`"
+
+
 class Mode(NamedTuple):
     """What a run does with the commits: for its messages, and how it rebases."""
 
     done: str  # "pushed" or "landed"
-    command: str  # how to run it again
     # Rebase only the commits since HEAD forked from the branch, found through the
     # branch's reflog, so a commit another session rewrote meanwhile isn't replayed.
     fork_point: bool
 
 
-PUSH = Mode("pushed", "wt-ship", fork_point=False)
-LAND = Mode("landed", "wt-ship --local", fork_point=True)
+PUSH = Mode("pushed", fork_point=False)
+LAND = Mode("landed", fork_point=True)
 
 
 def git(*args, check=True):
@@ -152,7 +166,7 @@ def rebase(upstream, mode):
             f"{run.stdout}{run.stderr}".rstrip()
             + f"\nThe rebase onto {upstream} hit a conflict and is still in progress."
             "\nResolve each hunk (`conflicts FILE`, `conflicts -h`), `git add` the file,"
-            f" `git rebase --continue`, then run `{mode.command}` again."
+            f" `git rebase --continue`, then run `{RERUN}` again."
         )
 
 
@@ -288,7 +302,10 @@ def ship(args):
         return land(args)
     here, main_path, main_branch, in_main = locate()
     if args.remove and in_main:
-        raise Stop("--remove works only in a linked worktree, not the main tree.")
+        raise Stop(
+            "--remove works only on a linked worktree, not the main tree: name one"
+            f" with -C, as {worktree_hint(main_path)}."
+        )
     branch = args.branch or main_branch
     if not branch:
         raise Stop(
@@ -310,7 +327,7 @@ def ship(args):
             raise Stop(f"The push failed:\n{pushed.stderr.strip()}")
         if attempt == TRIES:
             raise Stop(
-                f"Another push won the race {TRIES} times running: run wt-ship again"
+                f"Another push won the race {TRIES} times running: run `{RERUN}` again"
                 f" once {upstream} is quieter.\n{pushed.stderr.strip()}",
                 status=TRY_AGAIN,
             )
@@ -487,7 +504,7 @@ def claim(main_path, wait):
         except OSError as error:
             raise Stop(
                 f"Can't use the queue {folder}: {error.strerror}. Fix or remove it, then"
-                " run `wt-ship --local` again."
+                f" run `{RERUN}` again."
             ) from None
         mine = take(path, folder, me, entry)
         yield
@@ -575,7 +592,7 @@ def gave_up(path, held, ahead, waited):
     return (
         f"Stopped waiting for the main tree{took}: {' and '.join(blockers)}. Tell the user"
         " what held it up and since when, so they can clear one a crashed session left,"
-        " then run `wt-ship --local` again."
+        f" then run `{RERUN}` again."
     )
 
 
@@ -603,8 +620,8 @@ def land(args):
     here, main_path, branch, in_main = locate()
     if in_main:
         raise Stop(
-            "--local lands a linked worktree on the main tree's branch: run it in the"
-            " worktree, not the main tree."
+            "--local lands a linked worktree on the main tree's branch: name one with"
+            f" -C, as {worktree_hint(main_path)}."
         )
     if not branch:
         raise Stop(
@@ -628,7 +645,7 @@ def land(args):
         while not is_ancestor(ref, "HEAD"):
             arrived = out("log", "--oneline", f"HEAD..{ref}")
             if attempt == TRIES:
-                again = "wt-ship --local" + (" --remove" if args.remove else "")
+                again = f"`{RERUN}`"
                 raise Stop(
                     f"{branch} moved during the check {TRIES} times running, so"
                     f" nothing was landed. What arrived last:\n{arrived}\n"
@@ -657,6 +674,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    parser.add_argument(
+        "-C",
+        dest="directory",
+        metavar="DIR",
+        help="run as if started in DIR, the worktree, so the call can start outside it",
+    )
     parser.add_argument("--remote", help="the remote (default origin)")
     parser.add_argument(
         "--branch",
@@ -683,6 +706,18 @@ def main(argv=None):
         help="with --local, stop at once when another session holds the main tree",
     )
     args = parser.parse_args(argv)
+    global RERUN
+    RERUN = shlex.join(["wt-ship", *(sys.argv[1:] if argv is None else argv)])
+    if args.directory is not None:
+        try:
+            os.chdir(args.directory)
+        except OSError as error:
+            print(
+                f"Can't run in {args.directory}: {error.strerror}. Give -C the"
+                " worktree's folder.",
+                file=sys.stderr,
+            )
+            return 2
     # A stopped run unwinds like a failed one, so a claim it made is released.
     for stop in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(stop, lambda signum, _frame: sys.exit(128 + signum))

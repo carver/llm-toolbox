@@ -136,6 +136,14 @@ def free_memory():
     return None
 
 
+def stamped(text):
+    """A waiter's text with the time on its first line made now, for the slot it
+    takes: its entry's says when it joined the queue, its slot's when it started."""
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    rest = text.split("\n", 1)[1] if "\n" in text else ""
+    return Holder.parse(text)._replace(since=now).line() + rest
+
+
 def first_line(text):
     return text.split("\n", 1)[0]
 
@@ -481,7 +489,7 @@ class Bid:
             cpus = [cpu for cpu in holder_cpus if cpu in allowed] or allowed
             room = math.floor(SHARE_FIT * len(holder_cpus) - load)
             jobs = max(1, min(len(cpus), room))
-            text = self.text + f"cores={span(cpus)}\njobs={jobs}\n"
+            text = stamped(self.text) + f"cores={span(cpus)}\njobs={jobs}\n"
             if not fifo.take(self.folder / "share", text, self.folder):
                 return None
         self.entry.unlink(missing_ok=True)
@@ -614,7 +622,7 @@ class Waiter:
                     )
                     return None
             cpus = lane_cores(self.lane, self.cpus)
-            text = self.text + f"cores={span(cpus)}\n"
+            text = stamped(self.text) + f"cores={span(cpus)}\n"
             if fifo.take(self.folder / "slot", text, self.folder):
                 return Start(self.folder / "slot", text, cpus, len(cpus), 0)
         return None

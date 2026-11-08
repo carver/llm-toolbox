@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -1353,3 +1354,22 @@ def test_history_keeps_what_another_heavy_wrote_into_it(box):
     (entry,) = data["commands"].values()
     assert data["elsewhere"] == "kept" and entry["note"] == "kept", data
     assert [cores for cores, _ in entry["runs"]] == [1, 2], data
+
+
+def test_a_slot_says_when_its_job_started_not_when_it_joined(box, background):
+    tmp_path, _, _ = box
+    first, second = blocker(tmp_path, "a"), blocker(tmp_path, "b")
+    a = background("--", *first[0])
+    wait_until(first[1].exists, "a to start")
+    b = background("--", *second[0])
+    wait_until(lambda: entries(tmp_path), "b to queue")
+    time.sleep(1.1)  # so b joins and starts in different seconds
+    freed = datetime.now().astimezone().replace(microsecond=0)
+    first[2].touch()
+    wait_until(second[1].exists, "b to start")
+    slot = (lane(tmp_path) / "slot").read_text()
+    second[2].touch()
+    for proc in (a, b):
+        finish(proc)
+
+    assert datetime.fromisoformat(fifo.Holder.parse(slot).since) >= freed, slot

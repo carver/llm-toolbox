@@ -163,7 +163,16 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   marker outside a hunk; treats a separator outside a hunk as content (a
   reStructuredText underline), as it does a hunk the merge's inputs already
   held (a test fixture's); reads the marker length from `conflict-marker-size`;
-  and never stages the file.
+  and never stages the file. `conflicts --continue` finishes the stopped
+  rebase, cherry-pick, merge, revert or am: while a file git has unmerged, or
+  one staged by hand since the stop, would be committed with a hunk (it stages
+  them in a copy of the index to see), it names each with its count and stages
+  nothing, and so it does for a conflict git wrote no markers into (a deleted
+  side, binary), which is yours to `git add` or `git rm`. Otherwise it stages
+  them and runs the continue with `GIT_EDITOR=true`, then lists the next stop's
+  conflicts. An agent had chained `git add` and
+  `git rebase --continue` after a resolve that failed, and committed the
+  markers.
 - **wt-ship**: ships a worktree's commits. In a repo that pushes, it rebases
   onto the remote branch (the main tree's, by default), refuses leftover
   conflict markers, runs the repo's `agent-pre-commit` through

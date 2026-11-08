@@ -1,6 +1,8 @@
-"""conflicts lists a file's conflict hunks and resolves them by side."""
+"""conflicts lists a file's conflict hunks, resolves them by side, and --continue
+finishes the rebase, cherry-pick, merge, revert or am they came from."""
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -294,9 +296,22 @@ def git(cwd, *args):
     ).stdout
 
 
+class Link(str):
+    """A symlink's target, for `commit`."""
+
+
 def commit(repo, message, files):
     for name, text in files.items():
-        (repo / name).write_text(text)
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if text is None or isinstance(text, Link):
+            path.unlink(missing_ok=True)
+        if isinstance(text, Link):
+            path.symlink_to(text)
+        elif isinstance(text, bytes):
+            path.write_bytes(text)
+        elif text is not None:
+            path.write_text(text)
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", message)
 
@@ -312,18 +327,33 @@ def new_repo(path):
 FIXTURE = "<<<<<<< fixture\nkept\n=======\nkept too\n>>>>>>> fixture\n"
 
 
+def diverged(repo, base, theirs, ours):
+    """A repo whose main (checked out) and other branch from `base`: each a dict of
+    file texts, with None for a file the commit deletes."""
+    new_repo(repo)
+    commit(repo, "base", base)
+    git(repo, "checkout", "-q", "-b", "other")
+    commit(repo, "theirs", theirs)
+    git(repo, "checkout", "-q", "main")
+    commit(repo, "ours", ours)
+    return repo
+
+
+def stop(repo, *args):
+    """Run a git command that must stop at a conflict."""
+    run = subprocess.run(["git", *args], cwd=repo, capture_output=True, check=False)
+    assert run.returncode != 0, run
+
+
 def merge_conflict(repo, attributes=""):
     """A merge stopped at a conflict in a.txt, whose text also holds FIXTURE."""
-    new_repo(repo)
-    commit(repo, "base", {".gitattributes": attributes, "a.txt": f"{FIXTURE}line\n"})
-    git(repo, "checkout", "-q", "-b", "other")
-    commit(repo, "theirs", {"a.txt": f"{FIXTURE}theirs\n"})
-    git(repo, "checkout", "-q", "main")
-    commit(repo, "ours", {"a.txt": f"{FIXTURE}ours\n"})
-    merge = subprocess.run(
-        ["git", "merge", "-q", "other"], cwd=repo, capture_output=True, check=False
+    diverged(
+        repo,
+        {".gitattributes": attributes, "a.txt": f"{FIXTURE}line\n"},
+        {"a.txt": f"{FIXTURE}theirs\n"},
+        {"a.txt": f"{FIXTURE}ours\n"},
     )
-    assert merge.returncode == 1, merge
+    stop(repo, "merge", "-q", "other")
     return repo / "a.txt"
 
 
@@ -349,3 +379,288 @@ def test_only_the_markers_git_wrote_make_hunks(tmp_path, attributes):
     assert "fixture" not in shown.stdout
     assert done.returncode == 0, done.stderr
     assert file.read_text() == f"{FIXTURE}theirs\n"
+
+
+@pytest.fixture(scope="module")
+def stopped_template(tmp_path_factory):
+    """A rebase of two commits onto `up`, stopped at the first, where a.txt and b.txt
+    conflict; the second conflicts in c.txt. Made once: each test copies it."""
+    repo = new_repo(tmp_path_factory.mktemp("stopped"))
+    commit(repo, "base", {"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"})
+    git(repo, "checkout", "-q", "-b", "up")
+    commit(repo, "up", {"a.txt": "a up\n", "b.txt": "b up\n", "c.txt": "c up\n"})
+    git(repo, "checkout", "-q", "main")
+    commit(repo, "first", {"a.txt": "a mine\n", "b.txt": "b mine\n"})
+    commit(repo, "second", {"c.txt": "c mine\n"})
+    stop(repo, "rebase", "up")
+    return repo
+
+
+@pytest.fixture
+def stopped(stopped_template, tmp_path):
+    shutil.copytree(stopped_template, tmp_path, symlinks=True, dirs_exist_ok=True)
+    return tmp_path
+
+
+def unmerged(repo):
+    return git(repo, "diff", "--name-only", "--diff-filter=U").split()
+
+
+def subjects(repo):
+    return git(repo, "log", "--format=%s").split("\n")[:-1]
+
+
+def test_continue_refuses_while_a_file_holds_a_hunk(stopped):
+    conflicts(stopped, "a.txt", "all", "theirs")
+
+    done = conflicts(stopped, "--continue")
+
+    assert done.returncode == 1, done
+    assert "b.txt: 1 hunk left" in done.stderr and "a.txt" not in done.stderr
+    assert unmerged(stopped) == ["a.txt", "b.txt"]  # nothing staged
+    assert subjects(stopped)[0] == "up"
+
+
+def test_continue_commits_and_lists_the_next_stops_conflicts(stopped):
+    conflicts(stopped, "a.txt", "all", "theirs", "b.txt", "all", "ours")
+
+    done = conflicts(stopped, "--continue")
+
+    assert done.returncode == 1, done
+    assert git(stopped, "show", "HEAD:a.txt") == "a mine\n"
+    assert git(stopped, "show", "HEAD:b.txt") == "b up\n"
+    assert subjects(stopped)[0] == "first" and unmerged(stopped) == ["c.txt"]
+    assert "c.txt, hunk 1" in done.stdout and "c mine" in done.stdout
+    assert "stopped" in done.stderr and "conflicts --continue" in done.stderr
+    assert "hint:" not in done.stdout + done.stderr  # git's own advice to git add
+
+
+def test_continue_runs_the_rebase_to_its_end(stopped):
+    (stopped / "a.txt").write_text("Title\n=======\n")  # an underline, not a marker
+    conflicts(stopped, "b.txt", "all", "both")
+    conflicts(stopped, "--continue")
+    conflicts(stopped, "c.txt", "all", "theirs")
+
+    done = conflicts(stopped, "--continue")
+
+    assert done.returncode == 0, done
+    assert subjects(stopped) == ["second", "first", "up", "base"]
+    assert git(stopped, "show", "HEAD:a.txt") == "Title\n=======\n"
+    assert git(stopped, "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize("then", ["keep", "delete", "link"])
+def test_continue_refuses_a_file_staged_with_a_hunk_left(stopped, then):
+    conflicts(stopped, "a.txt", "all", "ours")
+    git(stopped, "add", "a.txt", "b.txt")
+    if then != "keep":  # what's staged is what would be committed
+        (stopped / "b.txt").unlink()
+    if then == "link":
+        (stopped / "b.txt").symlink_to("a.txt")
+
+    done = conflicts(stopped, "--continue")
+
+    assert done.returncode == 1, done
+    assert "b.txt: 1 hunk left" in done.stderr
+    assert subjects(stopped)[0] == "up"
+
+
+def test_continue_stops_when_staging_fails(stopped):
+    conflicts(stopped, "a.txt", "all", "ours", "b.txt", "all", "ours")
+    (stopped / ".git" / "index.lock").write_text("")
+
+    done = conflicts(stopped, "--continue")
+
+    assert done.returncode == 128, done
+    assert "index.lock" in done.stderr and "stopped" not in done.stderr
+    assert subjects(stopped)[0] == "up"
+
+
+def test_continue_with_nothing_to_continue_exits_3(tmp_path):
+    outside = conflicts(tmp_path, "--continue")
+    (tmp_path / "repo").mkdir()
+    repo = new_repo(tmp_path / "repo")
+    commit(repo, "base", {"a.txt": "a\n"})
+    idle = conflicts(repo, "--continue")
+
+    assert outside.returncode == 3 and idle.returncode == 3
+    assert "in progress" in idle.stderr
+
+
+BINARY_MERGE = {".gitattributes": "f.txt merge=binary\n", "f.txt": "f\n"}
+
+
+@pytest.mark.parametrize(
+    "base, theirs, ours, why",
+    [
+        ({}, {"f.txt": None}, {"f.txt": "f mine\n"}, "deleted by them"),
+        ({}, {"f.txt": "f theirs\n"}, {"f.txt": None}, "deleted by us"),
+        ({}, {"f.txt": b"\0theirs"}, {"f.txt": b"\0mine"}, "binary"),
+        ({}, {"f.txt": b"\0theirs"}, {"f.txt": "text mine\n"}, "binary"),
+        ({"f.txt": Link("a")}, {"f.txt": Link("b")}, {"f.txt": Link("c")}, "a symlink"),
+        (BINARY_MERGE, {"f.txt": "f theirs\n"}, {"f.txt": "f mine\n"}, "merged by"),
+    ],
+)
+def test_continue_leaves_a_conflict_without_markers_to_you(
+    tmp_path, base, theirs, ours, why
+):
+    repo = diverged(tmp_path, {"f.txt": "f\n", **base}, theirs, ours)
+    stop(repo, "merge", "other")
+
+    refused = conflicts(repo, "--continue")
+    git(repo, "add", "-A")
+    done = conflicts(repo, "--continue")
+
+    assert refused.returncode == 1, refused
+    assert f"f.txt: {why}" in refused.stderr and "git rm f.txt" in refused.stderr
+    assert done.returncode == 0, done
+    assert len(git(repo, "log", "-1", "--format=%P").split()) == 2
+
+
+def test_continue_stops_at_the_fixture_only_while_a_real_hunk_is_left(tmp_path):
+    merge_conflict(tmp_path, "")
+
+    refused = conflicts(tmp_path, "--continue")
+    conflicts(tmp_path, "a.txt", "1", "ours")
+    done = conflicts(tmp_path, "--continue")
+
+    assert refused.returncode == 1 and "a.txt: 1 hunk left" in refused.stderr
+    assert done.returncode == 0, done
+    assert git(tmp_path, "show", "HEAD:a.txt") == f"{FIXTURE}ours\n"
+
+
+def test_continue_counts_hunks_in_a_file_kept_in_another_encoding(tmp_path):
+    def utf16(text):
+        return text.encode("utf-16")
+
+    repo = diverged(
+        tmp_path,
+        {
+            ".gitattributes": "f.txt working-tree-encoding=UTF-16\n",
+            "f.txt": utf16("f\n"),
+        },
+        {"f.txt": utf16("o\n")},
+        {"f.txt": utf16("m\n")},
+    )
+    stop(repo, "merge", "other")
+
+    done = conflicts(repo, "--continue")
+
+    assert done.returncode == 1 and "f.txt: 1 hunk left" in done.stderr, done
+
+
+def test_continue_counts_hunks_in_a_crlf_file(tmp_path):
+    repo = diverged(
+        tmp_path, {"f.txt": "f\r\n"}, {"f.txt": "o\r\n"}, {"f.txt": "m\r\n"}
+    )
+    stop(repo, "merge", "other")
+
+    done = conflicts(repo, "--continue")
+
+    assert done.returncode == 1 and "f.txt: 1 hunk left" in done.stderr
+
+
+def sequence_repo(repo):
+    """main and other each change f.txt from the base, and other then adds g.txt."""
+    diverged(repo, {"f.txt": "f\n"}, {"f.txt": "f theirs\n"}, {"f.txt": "f ours\n"})
+    git(repo, "checkout", "-q", "other")
+    commit(repo, "then", {"g.txt": "g\n"})
+    git(repo, "checkout", "-q", "main")
+    return repo
+
+
+def start_merge(repo):
+    stop(repo, "merge", "other")
+
+
+def start_cherry_pick(repo):
+    stop(repo, "cherry-pick", "main..other")
+
+
+def start_hand_committed_pick(repo):
+    """A range cherry-pick whose conflicted commit was committed by hand, so only
+    the sequencer remembers the pick."""
+    stop(repo, "cherry-pick", "main..other")
+    conflicts(repo, "f.txt", "all", "theirs")
+    git(repo, "commit", "-qam", "theirs, by hand")
+
+
+def start_revert(repo):
+    commit(repo, "after", {"f.txt": "f after\n"})
+    stop(repo, "revert", "--no-edit", "HEAD~1")
+
+
+def start_am(repo):
+    patches = repo / ".git" / "patches"
+    git(repo, "format-patch", "-q", "-o", str(patches), "main..other")
+    stop(repo, "am", "-3", *sorted(map(str, patches.iterdir())))
+
+
+@pytest.mark.parametrize(
+    "start, last",
+    [
+        (start_merge, "Merge branch 'other'"),
+        (start_cherry_pick, "then"),
+        (start_hand_committed_pick, "then"),
+        (start_revert, 'Revert "ours"'),
+        (start_am, "then"),
+    ],
+)
+def test_continue_finishes_each_kind_of_operation(tmp_path, start, last):
+    repo = sequence_repo(tmp_path)
+    start(repo)
+    if unmerged(repo):
+        conflicts(repo, "f.txt", "all", "theirs")
+
+    done = conflicts(repo, "--continue")
+
+    assert done.returncode == 0, done
+    assert subjects(repo)[0] == last
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_continue_names_paths_as_conflicts_takes_them(tmp_path):
+    repo = diverged(
+        tmp_path,
+        {"sub/a.txt": "a\n", "all": "x\n"},
+        {"sub/a.txt": "a theirs\n", "all": "x theirs\n"},
+        {"sub/a.txt": "a ours\n", "all": "x ours\n"},
+    )
+    stop(repo, "merge", "other")
+
+    top = conflicts(repo, "--continue")
+    sub = conflicts(repo / "sub", "--continue")
+
+    assert "./all: 1 hunk left" in top.stderr and "sub/a.txt: 1" in top.stderr
+    assert "../all: 1 hunk left" in sub.stderr and "\n  a.txt: 1" in sub.stderr
+
+
+def test_continue_stages_a_name_with_glob_characters_as_itself(tmp_path):
+    repo = diverged(
+        tmp_path,
+        {"a*.txt": "a\n", "ab.txt": "b\n"},
+        {"a*.txt": "a theirs\n"},
+        {"a*.txt": "a ours\n"},
+    )
+    stop(repo, "merge", "other")
+    (repo / "ab.txt").write_text("b, not for this commit\n")
+    conflicts(repo, "a*.txt", "all", "ours")
+
+    done = conflicts(repo, "--continue")
+
+    assert done.returncode == 0, done
+    assert git(repo, "status", "--porcelain") == " M ab.txt\n"
+
+
+def test_continue_passes_on_a_failure_that_isnt_a_stop(tmp_path):
+    repo = diverged(tmp_path, {"f.txt": "f\n"}, {"f.txt": "o\n"}, {"f.txt": "m\n"})
+    stop(repo, "merge", "other")
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\necho no thanks >&2\nexit 1\n")
+    hook.chmod(0o755)
+    conflicts(repo, "f.txt", "all", "ours")
+
+    done = conflicts(repo, "--continue")
+
+    assert done.returncode == 1 and "no thanks" in done.stderr
+    assert "stopped" not in done.stderr

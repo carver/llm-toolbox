@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""List and resolve git conflict hunks, one hunk or a whole file at a time.
+"""List and resolve git conflict hunks, then continue the operation they stopped.
 
     conflicts FILE...           list each file's hunks, numbered, with both sides
     conflicts FILE N SIDE       resolve hunk N of FILE
     conflicts FILE all SIDE     resolve every hunk of FILE the same way
+    conflicts --continue        stage the resolved files and continue
 
 Triples repeat, to resolve several files in one call:
 `conflicts a.py all ours b.md 1 theirs b.md 2 both`. Hunk numbers are the listing's,
@@ -24,11 +25,27 @@ already held word for word, such as a test fixture's, is content too, and marker
 as long as the file's conflict-marker-size attribute makes git write them (7 when
 unset). A hunk that never closes, lacks its separator or opens inside another, or a
 closing or base marker outside any hunk, makes conflicts refuse the file and change
-nothing. Line endings, and bytes that aren't UTF-8, are kept. It never stages a
-file: once a file has no hunk left it says so, and `git add FILE` is yours.
+nothing. Line endings, and bytes that aren't UTF-8, are kept. Resolving never stages
+a file: once a file has no hunk left it says so.
 
-Exit status: 0 listed or resolved; 1 a hunk that isn't there, a malformed or
-unreadable file (nothing changed); 2 a usage error (nothing changed).
+--continue finishes the stopped rebase, cherry-pick, merge, revert or am. It checks
+what would be committed: each file git has unmerged, as `git add` would stage it
+(worked out in a copy of the index), and each staged by hand since the stop, as
+staged. While any still holds a hunk (counted as the listing counts them) or is
+malformed, it names each with its count and stages nothing. It does the same for a
+conflict git wrote no markers into, where nothing tells a resolution from the side
+git left: a side deleted, binary, a symlink or submodule, or a merge attribute such
+as binary; `git add` or `git rm` that one yourself, once it holds what it should.
+Otherwise it stages the unmerged files, runs `git COMMAND --continue` with
+GIT_EDITOR=true, so each commit keeps the message git prepared, passes on git's
+output and exits with its status. When that stops at the next commit's conflicts, it
+lists them as `conflicts FILE` does. Paths print relative to the current directory.
+
+Exit status: 0 listed, resolved, or continued to the end; 1 a hunk that isn't there
+or a malformed or unreadable file (nothing changed), --continue refused (nothing
+staged), or the continue stopped at the next conflict; 2 a usage error (nothing
+changed); 3 --continue with nothing in progress; any other: git's own failure, from
+staging or the continue.
 """
 
 import argparse
@@ -43,7 +60,8 @@ from pathlib import Path
 
 USAGE = """
   conflicts [-h] FILE...
-  conflicts [-h] FILE N|all SIDE [FILE N|all SIDE ...]"""
+  conflicts [-h] FILE N|all SIDE [FILE N|all SIDE ...]
+  conflicts [-h] --continue"""
 SIDES = ("ours", "theirs", "both", "base")
 MARK = 7  # git's default conflict-marker-size
 
@@ -163,11 +181,18 @@ class Facts:
     binary: bool  # a NUL byte early in some stage's blob, as git judges it
 
 
-def run_git(args: list[str], cwd: Path | None, stdin: bytes | None = None) -> bytes:
+def run_git(
+    args: list[str], cwd: Path | None, stdin: bytes | None = None, env=None
+) -> bytes:
     """git's output, or b"" when git fails or isn't there."""
     try:
         done = subprocess.run(
-            ["git", *args], cwd=cwd, input=stdin, capture_output=True, check=False
+            ["git", *args],
+            cwd=cwd,
+            input=stdin,
+            env=env,
+            capture_output=True,
+            check=False,
         )
     except OSError:
         return b""
@@ -179,14 +204,17 @@ def toplevel() -> Path | None:
     return Path(os.fsdecode(out)) if out else None
 
 
-def index_stages(top: Path, flag: str, paths: list[str] | None = None) -> dict:
+def index_stages(
+    top: Path, flag: str, paths: list[str] | None = None, env=None
+) -> dict:
     """Each path's entries by stage, as `git ls-files FLAG` lists them: -u the
-    unmerged ones, --resolve-undo those of paths staged by hand during this stop."""
+    unmerged ones, --resolve-undo those of paths staged by hand during this stop,
+    --stage every one."""
     if paths == []:
         return {}
-    args = ["--literal-pathspecs", "ls-files", "-z", flag]
+    args = ["--literal-pathspecs", "ls-files", "-z", flag, "--", *(paths or [])]
     found: dict[str, dict[int, tuple[str, str]]] = {}
-    for record in run_git([*args, "--", *(paths or [])], top).split(b"\0"):
+    for record in run_git(args, top, env=env).split(b"\0"):
         if record:
             info, _, path = record.partition(b"\t")
             mode, sha, stage = info.decode().split()
@@ -222,7 +250,7 @@ def held(data: list[bytes], size: int) -> frozenset[tuple[str, ...]]:
     """The hunks these blobs hold, each as its lines without endings."""
     found = set()
     for blob in data:
-        lines = blob.decode("utf-8", "surrogateescape").splitlines(keepends=True)
+        lines = text_lines(blob)
         try:
             parts = parse(lines, Known(size))
         except Malformed:
@@ -301,6 +329,19 @@ def read_lines(path: Path) -> list[str]:
     """The file's lines with their endings; a byte that isn't UTF-8 survives a write."""
     with open(path, newline="", encoding="utf-8", errors="surrogateescape") as file:
         return file.read().splitlines(keepends=True)
+
+
+def text_lines(blob: bytes) -> list[str]:
+    """A blob's lines, as read_lines reads a file's."""
+    return blob.decode("utf-8", "surrogateescape").splitlines(keepends=True)
+
+
+def load(path: Path, known: Known) -> list[Hunk | str]:
+    """The file's parts; Refused when it's malformed or can't be read."""
+    try:
+        return parse(read_lines(path), known)
+    except OSError as error:
+        raise Refused(error.strerror) from error
 
 
 def replace_all(texts: list[tuple[str, str]]) -> None:
@@ -413,7 +454,7 @@ def resolved(path: str, picks: list[tuple[str, str]], known: Known) -> tuple[str
     left = len(found) - len(sides)
     after = f"{plural(left, 'hunk')} left" if left else "no conflicts left"
     if not left:
-        after += f", so `git add {path}`"
+        after += f", so `git add {path}`, or `conflicts --continue`"
     return "".join(out), f"{path}: resolved ({said}); {after}"
 
 
@@ -476,6 +517,192 @@ def list_files(paths: list[str]) -> int:
     return code
 
 
+# Each operation by the file git keeps in its dir while one is stopped, first match
+# first: `git am` keeps rebase-apply/applying in the folder a rebase also uses, and a
+# range cherry-pick or revert whose stopped commit was committed by hand keeps only
+# sequencer/todo.
+OPERATIONS = (
+    ("rebase-merge", "rebase"),
+    ("rebase-apply/applying", "am"),
+    ("rebase-apply", "rebase"),
+    ("CHERRY_PICK_HEAD", "cherry-pick"),
+    ("REVERT_HEAD", "revert"),
+    ("MERGE_HEAD", "merge"),
+    ("sequencer/todo", None),  # named by its first command
+)
+SEQUENCED = {"pick": "cherry-pick", "revert": "revert"}
+MISSING_SIDE = {
+    frozenset({1, 3}): "deleted by us",
+    frozenset({1, 2}): "deleted by them",
+    frozenset({2}): "added by us",
+    frozenset({3}): "added by them",
+    frozenset({1}): "both deleted",
+}
+# merge attribute values under which git merges text and writes markers.
+TEXT_MERGES = ("unspecified", "set", "text", "union")
+
+
+def git_paths(top: Path, names: tuple[str, ...]) -> dict[str, Path]:
+    """Where each of `names` lives in this worktree's git dir."""
+    args = [arg for name in names for arg in ("--git-path", name)]
+    out = run_git(["rev-parse", *args], top).decode().splitlines()
+    return {name: top / path for name, path in zip(names, out)}
+
+
+def operation(top: Path) -> str | None:
+    """The git command whose stop this is: rebase, am, cherry-pick, revert or merge."""
+    paths = git_paths(top, tuple(name for name, _ in OPERATIONS))
+    for name, command in OPERATIONS:
+        if not paths[name].exists():
+            continue
+        if command:
+            return command
+        commands = paths[name].read_text().split()
+        return SEQUENCED.get(commands[0]) if commands else None
+    return None
+
+
+def shown(top: Path, path: str) -> str:
+    """`path` (relative to `top`) as `conflicts` takes it from here."""
+    relative = os.path.relpath(top / path)
+    return f"./{relative}" if is_keyword(relative) or relative[0] == "-" else relative
+
+
+def unmarked_why(facts: Facts, file: Path) -> str | None:
+    """Why git wrote no markers into this unmerged file, when it wrote none: so
+    nothing tells its resolution from the side git left in the worktree."""
+    if 2 not in facts.stages or 3 not in facts.stages:
+        return MISSING_SIDE[frozenset(facts.stages)]
+    if any(mode not in REGULAR for mode, _ in facts.stages.values()):
+        return "a symlink or submodule"
+    if facts.binary:
+        return "binary"
+    if facts.merge not in TEXT_MERGES:
+        return f"merged by its merge attribute ({facts.merge})"
+    if file.is_symlink() or not file.is_file():
+        return "not a file in the worktree"
+    return None
+
+
+def unmarked_note(top: Path, path: str, facts: Facts) -> str | None:
+    """For an unmerged file git wrote no markers into, the line that says so."""
+    name, why = shown(top, path), unmarked_why(facts, top / path)
+    if why is None:
+        return None
+    return (
+        f"{name}: {why}, so git wrote no markers to check; `git add {name}`"
+        f" or `git rm {name}` once it holds what it should"
+    )
+
+
+def as_staged(top: Path, adding: list[str], paths: list[str]) -> tuple[int, dict]:
+    """The text each of `paths` would be committed with once `adding` is staged, as git
+    stores it (after its filters and encodings), worked out in a copy of the index so
+    nothing is staged yet; with git add's failure status, or 0. A path that wouldn't
+    be committed as a regular file has none."""
+    index = git_paths(top, ("index",))["index"]
+    handle, copy = tempfile.mkstemp(dir=index.parent, prefix="conflicts-index.")
+    os.close(handle)
+    env = {**os.environ, "GIT_INDEX_FILE": copy}
+    try:
+        shutil.copyfile(index, copy)
+        if adding:
+            add = subprocess.run(
+                ["git", "--literal-pathspecs", "add", "--", *adding],
+                cwd=top,
+                env=env,
+                check=False,
+            )
+            if add.returncode:
+                return add.returncode, {}
+        entries = index_stages(top, "--stage", paths, env)
+    finally:
+        os.unlink(copy)
+    kept = {path: s[0] for path, s in entries.items() if s.get(0, ("",))[0] in REGULAR}
+    data = blobs(top, {sha for _, sha in kept.values()})
+    return 0, {path: text_lines(data[sha]) for path, (_, sha) in kept.items()}
+
+
+def proceed() -> int:
+    """`conflicts --continue`."""
+    top = toplevel()
+    command = operation(top) if top else None
+    if command is None:
+        print(
+            "conflicts: no rebase, cherry-pick, merge, revert or am in progress",
+            file=sys.stderr,
+        )
+        return 3
+    unmerged = index_stages(top, "-u")
+    by_hand = {
+        path: stages
+        for path, stages in index_stages(top, "--resolve-undo").items()
+        if path not in unmerged
+    }
+    facts = gather(top, {**unmerged, **by_hand})
+    notes = {path: unmarked_note(top, path, facts[path]) for path in unmerged}
+    adding = sorted(path for path, note in notes.items() if note is None)
+    status, staged = as_staged(top, adding, sorted(facts))
+    if status:
+        return status
+    left = []
+    for path in sorted(facts):
+        name, where = shown(top, path), "" if path in unmerged else ", as staged"
+        try:
+            count = len(hunks(parse(staged.get(path, []), facts[path].known)))
+        except Malformed as error:
+            left.append(f"{name}: {error}{where}")
+            continue
+        if notes.get(path):
+            left.append(notes[path])
+        elif count:
+            left.append(f"{name}: {plural(count, 'hunk')} left{where}")
+    if left:
+        print(
+            f"conflicts: {plural(len(left), 'file')} still in conflict, so nothing"
+            " was staged; resolve these, then run `conflicts --continue` again:",
+            *(f"  {line}" for line in left),
+            sep="\n",
+            file=sys.stderr,
+        )
+        return 1
+    if adding:
+        add = subprocess.run(
+            ["git", "--literal-pathspecs", "add", "--", *adding], cwd=top, check=False
+        )
+        if add.returncode:
+            return add.returncode
+    print(
+        f"conflicts: staged {plural(len(adding), 'file')}; running git {command}"
+        " --continue",
+        flush=True,
+    )
+    code = subprocess.run(
+        ["git", "-c", "advice.mergeConflict=false", command, "--continue"],
+        cwd=top,
+        env={**os.environ, "GIT_EDITOR": "true"},
+        check=False,
+    ).returncode
+    # Every unmerged file was staged, so one unmerged now is the next commit's.
+    if code and (unmerged := index_stages(top, "-u")):
+        facts = gather(top, unmerged)
+        for path in sorted(facts):
+            if note := unmarked_note(top, path, facts[path]):
+                print(note)
+                continue
+            try:
+                show(shown(top, path), load(top / path, facts[path].known))
+            except Refused as error:
+                print(f"{shown(top, path)}: {error}")
+        sys.stdout.flush()
+        print(
+            f"conflicts: the {command} stopped at the next conflict; resolve it,"
+            " then run `conflicts --continue`",
+            file=sys.stderr,
+        )
+    return code
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         usage=USAGE,
@@ -483,10 +710,22 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("args", nargs="*", help=argparse.SUPPRESS)
-    args = parser.parse_args(argv).args
+    parser.add_argument(
+        "--continue",
+        dest="proceed",
+        action="store_true",
+        help="check, stage and continue the stopped rebase, cherry-pick, merge,"
+        " revert or am",
+    )
+    options = parser.parse_args(argv)
+    args = options.args
     sys.stdout.reconfigure(errors="replace")  # a listed line that isn't UTF-8
+    if options.proceed:
+        if args:
+            parser.error("--continue takes no FILE")
+        return proceed()
     if not args:
-        parser.error("name a FILE")
+        parser.error("name a FILE, or --continue")
     try:
         files = choices(args)
     except Usage as error:

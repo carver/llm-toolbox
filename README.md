@@ -281,7 +281,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   fixup!, squash! or amend! commit (found from the running `git commit`'s
   arguments) runs `agent-quick-check` instead, when the repo keeps one beside
   `agent-pre-commit`, and otherwise skips the check, since `build-state finish`
-  checks each commit a fold rewrites. Small means at most 20 lines changed, in
+  checks each commit before the tip with no pass on record, and `wt-ship` the
+  tip. Small means at most 20 lines changed, in
   files it only modifies in place (no mode change, no binary, symlink or
   submodule), none of them a test: a lint or syntax repair. Any
   other fix commit runs the full check. A repo's `agent-quick-check` holds only
@@ -399,9 +400,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   separate and the tree as it was (a fix that conflicts gets the later commit
   it was made on top of and the `reword` command that points it there), and
   runs the repo's `agent-pre-commit` through `agent-commit-gate --run` on
-  each commit the fold rewrote, checked out in turn (it says so: meanwhile the
-  tree holds that commit, not the folded tip), with `CHECK_BASE` usually
-  the commit before, so a fix folded into a
+  each commit since the base but HEAD (`wt-ship` checks HEAD when it lands)
+  whose tree passed no version of it on the gate's record, checked out in
+  turn (it says so: meanwhile the tree holds that commit, not the folded tip),
+  with `CHECK_BASE` usually the commit before. A commit the agent hook passed is on the record, as is one a
+  fold rewrote to a tree that passed; a fold's new tree, finish's or one by
+  hand, is not, so a fix folded into a
   commit before the code it needs fails naming that commit; HEAD ends back on
   its branch either way. Then it lists the commits since the
   base and the test files changed since the refactor base, and fails naming

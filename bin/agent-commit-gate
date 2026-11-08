@@ -10,8 +10,9 @@ A fix commit (fixup!, squash!, amend!) that is small, at most 20 lines changed i
 files it only modifies in place, none binary and none a test, runs the optional
 `agent-quick-check`
 beside it instead, the repo's fast static checks, or nothing when the repo has
-none: `build-state finish` runs the full check on each commit a fold rewrites. Any
-other fix commit runs the full check.
+none: `build-state finish` runs the full check on each commit since its base but
+the tip with no pass on the record below, and wt-ship on the tip. Any other fix
+commit runs the full check.
 
 `--install REPO...` puts one line first in each repo's pre-commit hook (creating
 the hook if needed). When `$AI_AGENT` is set, as Claude Code sets it in its
@@ -673,7 +674,7 @@ def run_check(path):
             return refuse_if_staged_changed(code, before, QUICK_NAME)
         print(
             f"{HOOK_NAME}: skipped for a small fix commit; build-state finish runs it on "
-            "each commit the fold rewrites",
+            "each commit before the tip with no pass on record, wt-ship on the tip",
             file=sys.stderr,
         )
         return 0

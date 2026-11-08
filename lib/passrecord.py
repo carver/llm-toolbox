@@ -4,7 +4,8 @@ It lives in the repo's common git dir, which every worktree shares: a line for e
 tree that passed, `<tree> <the check's fingerprint>`, newest last, the last RECORD_SIZE.
 The fingerprint is the SHA-1 of the check's bytes, so an edited check reuses no pass of
 its old self. agent-commit-gate writes it and reads it to skip a check or find
-CHECK_BASE; build-state reads it to tell a reviewer the check passed.
+CHECK_BASE; build-state reads it to tell a reviewer the check passed, and to find the
+commits finish checks.
 """
 
 import fcntl
@@ -62,6 +63,15 @@ def passed(tree, check):
     except OSError:
         return False
     return record is not None and key in recorded(record)
+
+
+def passed_any_version():
+    """The trees that passed some version of the agent check, by the record of the
+    repository in the current directory: for build-state finish, which asks whether a
+    commit builds, not whether it passes the check as it is now. Empty when there's no
+    record."""
+    record = record_path()
+    return {key.partition(" ")[0] for key in recorded(record)} if record else set()
 
 
 @contextmanager

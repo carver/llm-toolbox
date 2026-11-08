@@ -883,6 +883,13 @@ def agent_check(repo, body):
     return repo / ".git" / "checked"
 
 
+def commit_passing(repo, path, message):
+    """Commit, and put the commit's tree on the gate's record of passes."""
+    sha = commit(repo, path, message)
+    pass_the_agent_check(repo)
+    return sha
+
+
 def test_finish_gives_each_commit_it_checks_the_one_before_as_check_base(repo):
     bases = repo / ".git" / "bases"
     agent_check(repo, f'echo "${{CHECK_BASE:-none}}" >> "{bases}"')
@@ -897,11 +904,10 @@ def test_finish_gives_each_commit_it_checks_the_one_before_as_check_base(repo):
     done = build_state(repo, "finish", env={"PATH": path_without(GATE.name)})
 
     assert done.returncode == 0, done.stderr
-    folded_work = git(repo, "rev-parse", "HEAD~1").strip()
-    assert bases.read_text().split() == ["none", start, folded_work]
+    assert bases.read_text().split() == ["none", start]
 
 
-def test_finish_checks_the_folded_result_when_it_folded_a_fix(repo):
+def test_finish_leaves_the_tip_to_wt_ship(repo):
     checked = agent_check(repo, "exit 0")
     build_state(repo, "start")
     work = commit(repo, "a.py", "Work")
@@ -910,7 +916,7 @@ def test_finish_checks_the_folded_result_when_it_folded_a_fix(repo):
     done = build_state(repo, "finish")
 
     assert done.returncode == 0, done.stderr
-    assert checked.read_text().split() == ["checked"]
+    assert not checked.exists()
 
 
 def test_finish_says_the_work_tree_holds_each_commit_it_checks(repo):
@@ -918,6 +924,7 @@ def test_finish_says_the_work_tree_holds_each_commit_it_checks(repo):
     agent_check(repo, "exit 0")
     build_state(repo, "start")
     work = commit(repo, "a.py", "Work")
+    commit(repo, "b.py", "More")
     commit(repo, "a.py", "fix work", f"--fixup={work}")
 
     done = build_state(repo, "finish")
@@ -945,22 +952,24 @@ def test_a_failing_check_after_folding_keeps_the_build_open(repo):
     assert subjects(repo, "HEAD~2") == ["Work", "More"]  # folded, not undone
 
 
-def test_finish_checks_each_commit_the_fold_rewrote_and_no_other(repo):
+def test_finish_checks_each_commit_before_the_tip_with_no_pass_on_record(repo):
     checked = agent_check(repo, 'git write-tree >> "$(git rev-parse --git-dir)/trees"')
     trees = repo / ".git" / "trees"
     build_state(repo, "start")
-    commit(repo, "x.py", "Before")
-    work = commit(repo, "a.py", "Work")
-    commit(repo, "b.py", "More")
+    commit_passing(repo, "x.py", "Before")
+    work = commit_passing(repo, "a.py", "Work")
+    commit_passing(repo, "b.py", "More")
     commit(repo, "a.py", "fix work", f"--fixup={work}")
+    trees.unlink()
+    checked.unlink()
 
     done = build_state(repo, "finish")
 
     assert done.returncode == 0, done.stderr
     assert trees.read_text().split() == [
-        git(repo, "rev-parse", f"HEAD~{n}^{{tree}}").strip() for n in (1, 0)
+        git(repo, "rev-parse", "HEAD~1^{tree}").strip()
     ]
-    assert checked.read_text().split() == ["checked", "checked"]
+    assert checked.read_text().split() == ["checked"]
 
 
 @pytest.mark.parametrize(
@@ -991,18 +1000,104 @@ def test_a_fold_that_breaks_an_earlier_commit_names_it_and_leaves_head(repo, rea
     assert build_state(repo, "show").returncode == 0
 
 
+def test_a_commit_folded_by_hand_is_checked_though_finish_folds_nothing(repo):
+    # a.py's fix uses c.py, which only the later commit adds
+    agent_check(
+        repo,
+        "git show :a.py | grep -q uses-c && ! git cat-file -e :c.py 2>/dev/null"
+        " && { echo a.py needs c.py; exit 1; }; exit 0",
+    )
+    build_state(repo, "start")
+    work = commit_passing(repo, "a.py", "Work")
+    commit_passing(repo, "c.py", "Add c")
+    commit(repo, "a.py", "uses-c", f"--fixup={work}")
+    fold = subprocess.run(
+        ["git", "rebase", "-q", "-i", "--autosquash", "HEAD~3"],
+        cwd=repo,
+        env=os.environ | {"GIT_SEQUENCE_EDITOR": ":"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fold.returncode == 0, fold.stderr
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    broken = git(repo, "rev-parse", "--short=12", "HEAD~1").strip()
+    assert f"{broken} Work" in done.stderr
+    assert "a.py needs c.py" in done.stdout + done.stderr
+    assert build_state(repo, "show").returncode == 0
+
+
+def test_a_commit_whose_tree_passed_an_earlier_version_of_the_check_isnt_checked(
+    repo,
+):
+    checked = agent_check(repo, "exit 0")
+    build_state(repo, "start")
+    commit_passing(repo, "a.py", "Work")
+    agent_check(repo, "exit 0  # stricter now")
+    commit(repo, "b.py", "More")
+    checked.unlink()
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert not checked.exists()
+
+
+def test_a_commit_from_before_the_build_added_the_agent_check_isnt_checked(repo):
+    git(repo, "config", "core.hooksPath", ".githooks")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    hook = repo / ".githooks" / "agent-pre-commit"
+    hook.parent.mkdir()
+    hook.write_text('#!/bin/sh\necho checked >> "$(git rev-parse --git-dir)/checked"\n')
+    hook.chmod(0o755)
+    commit(repo, ".githooks/agent-pre-commit", "# Add the agent check")
+    commit(repo, "b.py", "More")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (repo / ".git" / "checked").read_text().split() == ["checked"]
+
+
+def test_finish_checks_a_signed_commit_whatever_git_log_shows_of_it(repo):
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("signing needs ssh-keygen")
+    key = repo / ".git" / "signing-key"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True
+    )
+    git(repo, "config", "gpg.format", "ssh")
+    git(repo, "config", "user.signingkey", str(key))
+    git(repo, "config", "log.showSignature", "true")
+    checked = agent_check(repo, "exit 0")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work", "-S")
+    commit(repo, "b.py", "More", "-S")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert checked.read_text().split() == ["checked"]
+
+
 def test_a_rewritten_commit_whose_tree_passed_before_isnt_checked_again(repo):
     agent_check(repo, 'git write-tree >> "$(git rev-parse --git-dir)/trees"')
     build_state(repo, "start")
     work = commit(repo, "a.py", "Work")
     commit(repo, "a.py", "fix work", f"--fixup={work}")
-    commit(repo, "b.py", "More")  # its tree is the one it had before the fold
+    commit_passing(repo, "b.py", "More")  # its tree is the one it had before the fold
+    commit(repo, "c.py", "Last")
+    (repo / ".git" / "trees").unlink()
 
     done = build_state(repo, "finish")
 
     assert done.returncode == 0, done.stderr
     trees = (repo / ".git" / "trees").read_text().split()
-    assert trees == [git(repo, "rev-parse", "HEAD~1^{tree}").strip()]
+    assert trees == [git(repo, "rev-parse", "HEAD~2^{tree}").strip()]
 
 
 def test_each_commit_is_checked_on_a_clean_tree_whatever_a_check_leaves(repo):
@@ -1013,8 +1108,10 @@ def test_each_commit_is_checked_on_a_clean_tree_whatever_a_check_leaves(repo):
     )
     build_state(repo, "start")
     work = commit(repo, "a.py", "Work")
-    commit(repo, "b.py", "More")
+    more = commit(repo, "b.py", "More")
+    commit(repo, "c.py", "Last")
     commit(repo, "a.py", "fix work", f"--fixup={work}")
+    commit(repo, "b.py", "fix more", f"--fixup={more}")
 
     done = build_state(repo, "finish")
 
@@ -1027,6 +1124,7 @@ def test_finish_keeps_a_branch_that_a_tag_shares_its_name_with(repo):
     git(repo, "tag", "main")
     build_state(repo, "start")
     work = commit(repo, "a.py", "Work")
+    commit(repo, "b.py", "More")
     commit(repo, "a.py", "fix work", f"--fixup={work}")
 
     assert build_state(repo, "finish").returncode == 0
@@ -1053,6 +1151,7 @@ def test_the_check_runs_at_the_top_of_the_tree(repo):
     (repo / "sub").mkdir()
     build_state(repo, "start")
     work = commit(repo, "a.py", "Work")
+    commit(repo, "b.py", "More")
     commit(repo, "a.py", "fix work", f"--fixup={work}")
 
     done = build_state(repo / "sub", "finish")
@@ -1106,10 +1205,12 @@ def running(pid):
     return not (stat.exists() and stat.read_text().split(") ")[1].startswith("Z"))
 
 
-def test_finish_runs_no_check_without_a_fix_to_fold(repo):
+def test_finish_runs_no_check_when_every_commit_passed(repo):
     checked = agent_check(repo, "exit 0")
     build_state(repo, "start")
-    commit(repo, "a.py", "Work")
+    commit_passing(repo, "a.py", "Work")
+    commit_passing(repo, "b.py", "More")
+    checked.unlink()
 
     done = build_state(repo, "finish")
     assert done.returncode == 0
@@ -1122,6 +1223,7 @@ def test_finish_finds_the_agent_check_from_a_subdirectory(repo):
     (repo / "sub").mkdir()
     build_state(repo, "start")
     work = commit(repo, "a.py", "Work")
+    commit(repo, "b.py", "More")
     commit(repo, "a.py", "fix work", f"--fixup={work}")
 
     done = build_state(repo / "sub", "finish")

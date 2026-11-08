@@ -47,6 +47,10 @@ The browser is Playwright's Chromium. When the cached browser is not the build
 this Playwright wants, the newest cached Chromium is used instead, so no
 download is needed; with none cached it prints the install command.
 
+Exit status: 0; 1 when the page doesn't load or an action fails, with one line
+saying which, after what came before it is printed; 2 for a bad argument or no
+Chromium; 3 when the page had errors.
+
 Examples:
   web-shot report/page.html
   web-shot --do "click #legend button[data-series=human]" --do "shot chart #trajectory" report/page.html
@@ -183,6 +187,18 @@ class Action:
     verb: str
     args: tuple
 
+    def __str__(self):
+        return " ".join((self.verb, *self.args))
+
+
+class Failed(Exception):
+    """The page didn't load, or an action failed in it."""
+
+
+def first_line(error):
+    """The first line of a Playwright error, which goes on with a call log."""
+    return str(error).strip().splitlines()[0]
+
 
 def parse_action(text):
     """'shot chart #trajectory .card' -> Action('shot', ('chart', '#trajectory .card')). A selector or
@@ -226,9 +242,8 @@ class Findings:
         try:
             lines = sideways_report(tab)
         except Error as error:
-            reason = str(error).strip().splitlines()[0]
             self.unchecked.append(
-                f"couldn't check sideways scrolling at {moment}: {reason}"
+                f"couldn't check sideways scrolling at {moment}: {first_line(error)}"
             )
             return
         if lines:
@@ -476,8 +491,9 @@ def launch(playwright):
 
 
 def run(page, actions, out, size, cookies, found):
-    """Opens PAGE and runs ACTIONS, then the final shot, adding what it finds to FOUND."""
-    from playwright.sync_api import sync_playwright
+    """Opens PAGE and runs ACTIONS, then the final shot, adding what it finds to FOUND. Raises Failed
+    when the page doesn't load or an action fails."""
+    from playwright.sync_api import Error, sync_playwright
 
     width, height = size
     with sync_playwright() as playwright:
@@ -502,36 +518,41 @@ def run(page, actions, out, size, cookies, found):
                 and found.errors.append(f"console error: {msg.text}")
             ),
         )
-        tab.goto(url, wait_until="load")
+        try:
+            tab.goto(url, wait_until="load")
+        except Error as error:
+            raise Failed(f"couldn't load {page}: {first_line(error)}") from None
         found.check_sideways(tab, "load")
         for action in actions + [Action("shot", ("final",))]:
-            if action.verb == "click":
-                tab.click(action.args[0])
-            elif action.verb == "wait":
-                tab.wait_for_timeout(int(action.args[0]))
-            elif action.verb == "eval":
-                print(eval_json(tab, action.args[0]), flush=True)
-            elif action.verb == "text":
-                print(
-                    visible_text(tab, action.args[0] if action.args else None),
-                    flush=True,
-                )
-            elif action.verb == "links":
-                for text, href in tab.evaluate(
-                    LINKS_JS, action.args[0] if action.args else ""
-                ):
-                    print(f"{text} -> {href}", flush=True)
-            elif action.verb == "scroll-all":
-                scroll_all(tab, network)
-            else:
-                found.check_sideways(tab, f"shot {action.args[0]}")
-                path = out / f"{action.args[0]}.png"
-                if len(action.args) == 2:
-                    png = tab.locator(action.args[1]).first.screenshot(path=str(path))
-                else:
-                    png = tab.screenshot(path=str(path), full_page=True)
-                found.shots += [path, *save_pieces(path, png)]
+            try:
+                perform(action, tab, network, out, found)
+            except Error as error:
+                raise Failed(f"{action} failed: {first_line(error)}") from None
         browser.close()
+
+
+def perform(action, tab, network, out, found):
+    if action.verb == "click":
+        tab.click(action.args[0])
+    elif action.verb == "wait":
+        tab.wait_for_timeout(int(action.args[0]))
+    elif action.verb == "eval":
+        print(eval_json(tab, action.args[0]), flush=True)
+    elif action.verb == "text":
+        print(visible_text(tab, action.args[0] if action.args else None), flush=True)
+    elif action.verb == "links":
+        for text, href in tab.evaluate(LINKS_JS, action.args[0] if action.args else ""):
+            print(f"{text} -> {href}", flush=True)
+    elif action.verb == "scroll-all":
+        scroll_all(tab, network)
+    else:
+        found.check_sideways(tab, f"shot {action.args[0]}")
+        path = out / f"{action.args[0]}.png"
+        if len(action.args) == 2:
+            png = tab.locator(action.args[1]).first.screenshot(path=str(path))
+        else:
+            png = tab.screenshot(path=str(path), full_page=True)
+        found.shots += [path, *save_pieces(path, png)]
 
 
 def cookie_arg(text):
@@ -596,6 +617,9 @@ def main(argv=None):
     except UsageError as error:
         print(f"web-shot: {error}", file=sys.stderr)
         return 2
+    except Failed as error:
+        print(f"web-shot: {error}", file=sys.stderr)
+        return 1
     return 3 if found.errors else 0
 
 

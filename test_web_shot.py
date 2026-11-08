@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import json
 import re
+import socket
 import subprocess
 import threading
 from pathlib import Path
@@ -460,11 +461,28 @@ def test_an_action_that_fails_keeps_what_came_before(tmp_path):
     )
     assert run.returncode == 1
     assert run.stdout.splitlines() == [str(tmp_path / "out" / "early.png")]
-    assert run.stderr.startswith(
-        "scrolls sideways (load, shot early): page 500px wide, viewport 390px\n"
-        '  div "w" reaches 500px\n'
-    )
-    assert "stop" in run.stderr
+    lines = run.stderr.splitlines()
+    assert lines[:2] == [
+        "scrolls sideways (load, shot early): page 500px wide, viewport 390px",
+        '  div "w" reaches 500px',
+    ]
+    assert len(lines) == 3, run.stderr  # one line says what failed
+    assert lines[2].startswith("web-shot: eval throw new Error('stop') failed: ")
+    assert lines[2].endswith("Error: stop")
+
+
+@pytest.mark.skipif(
+    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
+)
+def test_a_page_that_does_not_load_says_so_in_one_line(tmp_path):
+    with socket.socket() as closed:  # bound but not listening: connections are refused
+        closed.bind(("127.0.0.1", 0))
+        url = f"http://127.0.0.1:{closed.getsockname()[1]}/"
+        run = cli("--out", tmp_path / "out", url)
+    assert run.returncode == 1
+    assert run.stdout == ""
+    assert run.stderr.startswith(f"web-shot: couldn't load {url}: ")
+    assert len(run.stderr.splitlines()) == 1, run.stderr
 
 
 @pytest.mark.skipif(

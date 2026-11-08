@@ -684,27 +684,21 @@ def committing(tmp_path_factory):
         proc.wait(timeout=10)
 
 
-def machine_busy():
-    """Whether the load average is above the core count, which can stall a test's
-    subprocess past any deadline the test sets."""
-    return os.getloadavg()[0] > os.cpu_count()
-
-
-def waited(condition, what, seconds=20):
-    """Poll `condition` until it holds: True. When `seconds` pass first, fail saying
-    `what` didn't happen, or on a busy machine warn instead and return False, for the
-    test to end there."""
+def wait_or_warn(condition, what, seconds=20):
+    """Poll `condition` until it holds, and return True. When `seconds` pass first,
+    fail saying `what` didn't happen; but on a busy machine, its load average above its
+    core count, which can stall a subprocess past any deadline, warn instead and
+    return False, for the test to end there."""
     deadline = time.monotonic() + seconds
     while not condition():
         if time.monotonic() >= deadline:
             message = f"{what} within {seconds} s"
-            if not machine_busy():
+            load, cores = os.getloadavg()[0], os.cpu_count()
+            if load <= cores:
                 pytest.fail(message)
-            load = os.getloadavg()[0]
             warnings.warn(
-                f"{message}, on a busy machine (load {load:.1f}, {os.cpu_count()}"
-                " cores), so the test ends without judging the rest",
-                stacklevel=2,
+                f"{message}, on a busy machine (load {load:.1f}, {cores} cores), so"
+                " the test ends without judging the rest"
             )
             return False
         time.sleep(0.05)
@@ -715,21 +709,22 @@ def in_queue(lane):
     return any(p.name[:1].isdigit() for p in lane.iterdir())
 
 
-def waits_in_line(commit_run, lane):
-    """Whether the commit's check joined the queue and heavy said it waits for the
-    lane. Only then is heavy inside its wait loop: it writes its entry before it first
-    looks at the lane, and a lane freed in that gap is never waited for."""
-    return waited(lambda: in_queue(lane), "the check never joined the queue") and (
-        waited(
-            lambda: "waiting for the normal lane" in commit_run.err(),
-            "heavy never said the check waits for the lane",
-        )
+def queues_or_warns(commit_run, lane):
+    """Wait, as wait_or_warn does, for the commit's check to join the queue and for
+    heavy to say it waits for the lane. Only then is heavy inside its wait loop: it
+    writes its entry before it first looks at the lane, and a lane freed in that gap
+    is never waited for."""
+    return wait_or_warn(
+        lambda: in_queue(lane), "the check never joined the queue"
+    ) and wait_or_warn(
+        lambda: "waiting for the normal lane" in commit_run.err(),
+        "heavy never said the check waits for the lane",
     )
 
 
-def finished(commit_run, seconds=30):
-    return waited(
-        lambda: commit_run.poll() is not None, "the commit never finished", seconds
+def finishes_or_warns(commit_run):
+    return wait_or_warn(
+        lambda: commit_run.poll() is not None, "the commit never finished", 30
     )
 
 
@@ -737,13 +732,13 @@ def test_an_agent_check_waits_its_turn_in_heavys_queue(
     installed, held_lane, committing
 ):
     commit_run = committing(installed)
-    waiting = waits_in_line(commit_run, held_lane.lane)
+    waiting = queues_or_warns(commit_run, held_lane.lane)
     # Whether heavy said so or the wait ran out, neither check ran while the lane was held.
     assert ran(installed) == [], commit_run.err()
     if not waiting:
         return
     held_lane.kill()  # not reaped: a zombie, which has ended all the same
-    if not finished(commit_run):
+    if not finishes_or_warns(commit_run):
         return
     err = commit_run.err()
 
@@ -756,10 +751,10 @@ def test_stopping_a_check_that_waits_leaves_the_queue_in_one_line(
     installed, held_lane, committing
 ):
     commit_run = committing(installed)
-    if not waits_in_line(commit_run, held_lane.lane):
+    if not queues_or_warns(commit_run, held_lane.lane):
         return
     os.killpg(commit_run.pid, signal.SIGINT)  # Ctrl-C reaches the whole group
-    if not finished(commit_run):
+    if not finishes_or_warns(commit_run):
         return
     err = commit_run.err()
 

@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import wait_or_warn
+
 ROOT = Path(__file__).resolve().parent
 SCRIPT = ROOT / "bin" / "heavy"
 sys.path.insert(0, str(ROOT / "lib"))
@@ -439,16 +441,15 @@ def test_a_slot_that_names_no_process_is_cleared(box, text):
     assert not held(tmp_path)
 
 
-def test_a_job_that_arrives_to_a_free_quiet_lane_starts_at_once(box):
-    _, _, env = box
+def test_a_job_that_arrives_to_a_free_quiet_lane_starts_at_once(background):
+    # One sample, not the window: a job that waited 600 s can't end in time, however
+    # slowly a busy machine starts heavy, so no time bound has to allow for load.
+    job = background("--", "true", HEAVY_QUIET_SECONDS="600")
+    if not wait_or_warn(lambda: job.poll() is not None, "heavy never ran the job", 60):
+        return
+    status, _, err = finish(job)
 
-    started = time.monotonic()
-    done = heavy(env, "--", "true", HEAVY_QUIET_SECONDS="30", HEAVY_POLL="0.2")
-
-    assert done.returncode == 0, done.stderr
-    # One sample, not the 30 s window, with room for a start slowed by a busy
-    # machine: one took 5.9 s.
-    assert time.monotonic() - started < 15
+    assert status == 0, err
 
 
 def test_a_job_that_waited_still_needs_the_quiet_window(box, background):

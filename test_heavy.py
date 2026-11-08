@@ -18,11 +18,20 @@ import cores
 import fifo
 
 
+def set_busy(busy, share):
+    """Put `share` in the busy file whole, by a rename: heavy reads the file while a
+    test may be changing it, and a plain write shows it an empty file between the
+    truncate and the write."""
+    part = busy.with_name(f"{busy.name}.part")
+    part.write_text(f"{share}\n")
+    part.replace(busy)
+
+
 @pytest.fixture
 def box(tmp_path):
     """The queue folder, the busy file (quiet to start) and an env to run heavy in."""
     busy = tmp_path / "busy"
-    busy.write_text("0.0\n")
+    set_busy(busy, "0.0")
     env = os.environ | {
         "HEAVY_DIR": str(tmp_path / "heavy"),
         "HEAVY_BUSY": str(busy),
@@ -171,13 +180,13 @@ def test_jobs_run_one_at_a_time_in_the_order_they_came(box, background):
 
 def test_the_head_waits_for_its_cores_to_go_quiet(box, background):
     tmp_path, busy, _ = box
-    busy.write_text("0.9\n")
+    set_busy(busy, "0.9")
     ran, log = tmp_path / "ran", tmp_path / "err"
 
     job = background("--", "touch", str(ran), stderr=log)
     wait_until(lambda: "waiting for quiet cores" in log.read_text(), "the busy reading")
     assert not ran.exists()
-    busy.write_text("0.1\n")
+    set_busy(busy, "0.1")
     status, _, _ = finish(job)
 
     assert status == 0, log.read_text()
@@ -249,7 +258,7 @@ def test_stopping_a_running_job_stops_its_command_and_frees_the_slot(box, backgr
 @pytest.mark.parametrize("stop", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
 def test_stopping_a_waiting_job_leaves_the_queue(box, background, stop):
     tmp_path, busy, _ = box
-    busy.write_text("0.9\n")
+    set_busy(busy, "0.9")
 
     job = background("--", "true")
     wait_until(lambda: entries(tmp_path), "the job to queue")
@@ -335,14 +344,14 @@ def test_the_pr_hint_comes_with_the_third_job_not_the_second(box, background):
 
 def test_a_head_stalled_on_busy_cores_hints_at_a_pr_once(box, background):
     tmp_path, busy, _ = box
-    busy.write_text("0.9\n")
+    set_busy(busy, "0.9")
     log = tmp_path / "err"
 
     job = background("--", "true", HEAVY_STALL_SECONDS="0.2", stderr=log)
     wait_until(lambda: "PR" in log.read_text(), "the stall's hint")
     # Some polls after the hint, which mustn't repeat it.
     wait_until(lambda: len(entries(tmp_path)) == 1, "the job still queued")
-    busy.write_text("0.1\n")
+    set_busy(busy, "0.1")
     status, _, _ = finish(job)
 
     err = log.read_text()
@@ -410,13 +419,13 @@ def test_a_job_that_arrives_to_a_free_quiet_lane_starts_at_once(box):
 
 def test_a_job_that_waited_still_needs_the_quiet_window(box, background):
     tmp_path, busy, _ = box
-    busy.write_text("0.9\n")
+    set_busy(busy, "0.9")
     log = tmp_path / "err"
 
     job = background("--", "true", HEAVY_QUIET_SECONDS="0.6", stderr=log)
     wait_until(lambda: "waiting for quiet cores" in log.read_text(), "the busy reading")
     quiet = time.monotonic()
-    busy.write_text("0.1\n")
+    set_busy(busy, "0.1")
     status, _, _ = finish(job)
 
     assert status == 0, log.read_text()
@@ -480,7 +489,7 @@ def test_a_long_and_a_normal_job_starting_together_never_share_cores(box, backgr
     cpus = sorted(os.sched_getaffinity(0))
     if len(cpus) < 4:
         pytest.skip("needs at least 4 CPUs to split")
-    busy.write_text("0.9\n")  # both wait as heads, then go quiet at the same moment
+    set_busy(busy, "0.9")  # both wait as heads, then go quiet at the same moment
     long_cmd, long_out, long_release = affinity_of(tmp_path, "long")
     normal_cmd, normal_out, normal_release = affinity_of(tmp_path, "normal")
     long_log = tmp_path / "long.err"
@@ -489,7 +498,7 @@ def test_a_long_and_a_normal_job_starting_together_never_share_cores(box, backgr
     wait_until(
         lambda: entries(tmp_path, "long") and entries(tmp_path, "normal"), "both queued"
     )
-    busy.write_text("0.1\n")
+    set_busy(busy, "0.1")
     # Either both start, on cores apart, or the normal job took every core first and
     # the long job waits for its quarter.
     wait_until(

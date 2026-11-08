@@ -22,7 +22,8 @@ stops the loop when agent-pre-commit runs pre-commit itself. The line runs the
 check through `--run`; an agent without agent-commit-gate on PATH, such as a
 teammate's, runs the check directly instead, every time. An older line is
 replaced. A check `--run` runs waits its turn in heavy's queue (bin/heavy), so
-agents' commit checks never run at once, and prints heavy's waiting lines.
+agents' commit checks never run at once, and prints heavy's waiting lines; one
+that needs no build or test can skip the queue, as below.
 wt-ship and build-state finish recheck through `--run` too.
 
 `--run` records each tree that passes in agent-pre-commit-passed, in the repo's
@@ -51,6 +52,20 @@ CHECK_BASE runs in full, as does any check when no base is found. The pass line
 names the base it was given. agent-quick-check gets CHECK_BASE too: the nearest
 commit that passed agent-pre-commit, whose checks include the quick ones.
 
+A check that runs only what the change needs may need no build or test at all, as
+for a docs-only commit, and then has no reason to wait behind other sessions' builds.
+Such a check says so by naming $CHECK_QUEUE_EXIT anywhere in its file (agent-pre-commit
+or agent-quick-check). `--run` then runs it first outside heavy's queue, pinned to one
+core with CARGO_BUILD_JOBS=1, and with CHECK_QUEUE_EXIT=75. Before it starts a build or
+a test, the check exits with that code, after printing a line saying why; `--run`
+shows the line, waits its turn in the queue as for any other check, and runs it again
+there without the variable. Any other exit is the check's outcome, and a pass line
+then says it ran outside heavy's queue. A check that doesn't name it waits in the
+queue (agent-pre-commit) or runs outside it (agent-quick-check), as before, and never
+sees an inherited CHECK_QUEUE_EXIT. The one core keeps a check whose handling broke
+from loading the machine; beyond that the queue works on trust, as the --no-verify
+refusal below does.
+
 Without arguments it is a Claude Code PreToolUse hook (install.py registers it
 in ~/.claude/settings.json) that refuses `git commit --no-verify` (or `-n`),
 which would skip the check. It catches a mistake, not an agent set on getting
@@ -72,7 +87,7 @@ import shlex
 import subprocess
 import sys
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -228,6 +243,18 @@ def commits(command):
 FIX_SUBJECT = ("fixup!", "squash!", "amend!")
 # The optional fast check a small fix commit runs instead of HOOK_NAME, beside it.
 QUICK_NAME = "agent-quick-check"
+# A check that names this variable runs first outside heavy's queue, with it set to
+# QUEUE_EXIT, the exit status that asks for the queue (sysexits' EX_TEMPFAIL).
+QUEUE_EXIT_NAME = "CHECK_QUEUE_EXIT"
+QUEUE_EXIT = 75
+
+
+def asks_for_queue(content):
+    """Whether a check, from its bytes, runs first outside heavy's queue: it names
+    QUEUE_EXIT_NAME."""
+    return QUEUE_EXIT_NAME.encode() in content
+
+
 # A fix commit is small when it changes at most this many lines, only in files it
 # modifies, none of them a test.
 SMALL_FIX_LINES = 20
@@ -428,47 +455,86 @@ def install(repo):
     return None
 
 
-def run_quiet(path, name, base, queue=True):
+def check_env(env, base):
+    """`env` for a check: CHECK_BASE set to `base` (None: unset), and no CHECK_QUEUE_EXIT
+    but the one the gate gives."""
+    env = {k: v for k, v in env.items() if k not in ("CHECK_BASE", QUEUE_EXIT_NAME)}
+    if base:
+        env["CHECK_BASE"] = base
+    return env
+
+
+def on_one_core():
+    """In the run outside the queue, before the check starts: pin it to the last core
+    this process may use, so a build it starts by mistake can't load the machine."""
+    with suppress(OSError):
+        os.sched_setaffinity(0, {max(os.sched_getaffinity(0))})
+
+
+def run_once(path, env, **options):
+    """The check's run: its exit code, and its output with stderr merged in."""
+    # `path` as given: Path() would drop a leading ./ and send it to a PATH lookup.
+    return subprocess.run(
+        [path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        env=env,
+        **options,
+    )
+
+
+def report(name, base, run, took, outside=False):
+    """Print the check's pass line, or its output and the refusal; return its code."""
+    code = run.returncode
+    if code == 0:
+        where = ", outside heavy's queue" if outside else ""
+        given = f", given CHECK_BASE {base[:12]}" if base else ""
+        print(f"{name}: passed ({took:.0f}s{where}{given})", file=sys.stderr)
+    else:
+        sys.stderr.write(run.stdout.decode(errors="replace"))
+        print(f"COMMIT REFUSED: {name} failed (exit {code})", file=sys.stderr)
+    return code
+
+
+def run_quiet(path, name, base, queue=True, ask=False):
     """Run the check at `path`, named `name` in what it prints, with CHECK_BASE set to
     `base` (None: unset, whatever this process inherited), and return its exit code.
     Its output shows only when it fails: agents filtered a noisy pass with greps, and
-    the greps hid failed commits. With queue, it runs once it's its turn in heavy's
-    queue, whose waiting lines print as they come."""
+    the greps hid failed commits. With ask, it runs first outside heavy's queue, on
+    one core, with CHECK_QUEUE_EXIT set; that run's outcome is the check's, unless it
+    exits with QUEUE_EXIT, when what it printed shows as its reason and it runs again
+    as with queue. With queue, it runs once it's its turn in heavy's queue, whose
+    waiting lines print as they come."""
+    if ask:
+        started = time.monotonic()
+        env = check_env(os.environ, base) | {
+            QUEUE_EXIT_NAME: str(QUEUE_EXIT),
+            "CARGO_BUILD_JOBS": "1",
+        }
+        # The gate runs no threads, so preexec_fn is safe here.
+        run = run_once(path, env, preexec_fn=on_one_core)
+        if run.returncode != QUEUE_EXIT:
+            return report(name, base, run, time.monotonic() - started, outside=True)
+        sys.stderr.write(run.stdout.decode(errors="replace"))
+        queue = True
     with ExitStack() as stack:
-        env, job = dict(os.environ), None
+        env, job = os.environ, None
         try:
             if queue:
                 job = stack.enter_context(heavyqueue.turn(command=name, hint=False))
                 job.pin()  # the check inherits the job's cores
-                env = dict(job.env)
+                env = job.env
         except heavyqueue.QueueError as error:
             print(
                 f"heavy: can't use its queue ({error}), so the check runs without it.",
                 file=sys.stderr,
             )
-        env.pop("CHECK_BASE", None)
-        if base:
-            env["CHECK_BASE"] = base
         started = time.monotonic()
-        # `path` as given: Path() would drop a leading ./ and send it to a PATH lookup.
-        run = subprocess.run(
-            [path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-            env=env,
-        )
+        run = run_once(path, check_env(env, base))
         if job is not None:
             job.exited(run.returncode)  # a passing check goes into heavy's history
-    code = run.returncode
-    if code == 0:
-        given = f", given CHECK_BASE {base[:12]}" if base else ""
-        took = time.monotonic() - started
-        print(f"{name}: passed ({took:.0f}s{given})", file=sys.stderr)
-    else:
-        sys.stderr.write(run.stdout.decode(errors="replace"))
-        print(f"COMMIT REFUSED: {name} failed (exit {code})", file=sys.stderr)
-    return code
+    return report(name, base, run, time.monotonic() - started)
 
 
 def record_path():
@@ -561,15 +627,18 @@ def run_check(path):
         return 1
     record = record_path()
     passed = set(recorded(record)) if record else set()
-    fingerprint = hashlib.sha1(hook.read_bytes()).hexdigest()
+    content = hook.read_bytes()
+    fingerprint = hashlib.sha1(content).hexdigest()
     base = check_base(passed, fingerprint)
     fix = (args := running_commit_args()) is not None and is_fix_commit(args)
     if fix and is_small_fix():
         # Beside `path` as given, so a ./ path stays one.
         quick = os.path.join(os.path.dirname(path), QUICK_NAME)
         if os.path.isfile(quick) and os.access(quick, os.X_OK):
-            # Fast static checks only, no tests: not worth a place in heavy's queue.
-            return run_quiet(quick, QUICK_NAME, base, queue=False)
+            # Fast static checks only, no tests: not worth a place in heavy's queue,
+            # unless it asks for one.
+            asks = asks_for_queue(Path(quick).read_bytes())
+            return run_quiet(quick, QUICK_NAME, base, queue=False, ask=asks)
         print(
             f"{HOOK_NAME}: skipped for a small fix commit; build-state finish runs it on "
             "each commit the fold rewrites",
@@ -584,7 +653,7 @@ def run_check(path):
         )
         return 0
     clean = subprocess.run(["git", "diff", "--quiet"], check=False).returncode == 0
-    code = run_quiet(path, HOOK_NAME, base)
+    code = run_quiet(path, HOOK_NAME, base, ask=asks_for_queue(content))
     if code == 0 and clean and key and record:
         remember(record, key)
     return code

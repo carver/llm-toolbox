@@ -260,7 +260,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `install.py` also registers it as a Claude Code hook that refuses `git commit
   --no-verify`, except in a repo with no agent check, such as a scratch repo.
   The check runs once it's its turn in `heavy`'s queue, whose waiting lines
-  print as they come.
+  print as they come. A check whose change may need no build or test, such as
+  filedrawer's for a docs-only commit, can skip the queue by naming
+  `$CHECK_QUEUE_EXIT` in its file: it then runs first outside the queue, on one
+  core with `CARGO_BUILD_JOBS=1`, with that variable set to 75. Before it starts
+  a build or a test it exits 75, printing why, and waits its turn to run again
+  in the queue; any other exit is its outcome. This holds for
+  `agent-quick-check` too, which otherwise runs outside the queue.
 - **heavy**: `heavy -- CMD` runs a CPU-heavy command once it's its turn and its
   cores are quiet. Every session on the VM shares two lanes, each running one
   job at a time at full priority, first come first served: `heavy --long` jobs

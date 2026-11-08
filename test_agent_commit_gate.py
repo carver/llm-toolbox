@@ -846,14 +846,14 @@ def committing(tmp_path_factory):
     and reaped at the end."""
     procs = []
 
-    def start(repo):
+    def start(repo, *args):
         env = without_repo_vars(os.environ)
         env["PATH"] = os.pathsep.join([str(SCRIPT.parent), env["PATH"]])
         env["AI_AGENT"] = "test-agent"
         err = tmp_path_factory.mktemp("commit") / "stderr"
         with err.open("w") as sink:
             proc = subprocess.Popen(
-                ["git", "commit", "-q", "-m", "x"],
+                ["git", "commit", "-q", "-m", "x", *args],
                 cwd=repo,
                 env=env,
                 stdout=subprocess.DEVNULL,
@@ -980,3 +980,179 @@ def test_only_a_check_that_passes_goes_into_heavys_history(installed):
 
     assert refused.returncode != 0
     assert history.read_text() == after_pass
+
+
+def asking_check(repo, name="agent-pre-commit", word="agent"):
+    """Make the repo's check `name` one that needs heavy's queue: run with
+    CHECK_QUEUE_EXIT set, it notes `ask`, says why, and exits with it; run without, it
+    notes `word` and passes."""
+    hook(
+        repo,
+        name,
+        'if [ -n "${CHECK_QUEUE_EXIT:-}" ]; then\n'
+        '  echo ask >> "$(git rev-parse --git-dir)/ran"\n'
+        "  echo 'needs a build: src/main.rs'\n"
+        '  exit "$CHECK_QUEUE_EXIT"\n'
+        "fi\n"
+        f'echo {word} >> "$(git rev-parse --git-dir)/ran"',
+    )
+
+
+def light_check(repo, body=""):
+    """Make the repo's agent check one that needs no queue: it names CHECK_QUEUE_EXIT,
+    notes `light-` and the value it was given, then runs `body`."""
+    hook(
+        repo,
+        "agent-pre-commit",
+        'echo "light-${CHECK_QUEUE_EXIT:-unset}" >> "$(git rev-parse --git-dir)/ran"\n'
+        + body,
+    )
+
+
+def test_a_check_that_needs_no_queue_passes_while_the_lane_is_held(
+    installed, held_lane, committing
+):
+    light_check(installed)
+    commit_run = committing(installed)
+    if not finishes_or_warns(commit_run):
+        return
+    err = commit_run.err()
+
+    assert commit_run.returncode == 0, err
+    assert ran(installed) == ["light-75", "fast"]
+    assert "agent-pre-commit: passed" in err and "outside heavy's queue" in err
+    assert "waiting" not in err
+
+
+def test_a_check_that_asks_for_the_queue_waits_its_turn_then_runs_in_it(
+    installed, held_lane, committing
+):
+    asking_check(installed)
+    commit_run = committing(installed)
+    waiting = queues_or_warns(commit_run, held_lane.lane)
+    # Whether heavy said so or the wait ran out, it didn't run again while it was held.
+    assert "agent" not in ran(installed), commit_run.err()
+    if not waiting:
+        return
+    assert ran(installed) == ["ask"]
+    held_lane.kill()
+    if not finishes_or_warns(commit_run):
+        return
+    err = commit_run.err()
+
+    assert commit_run.returncode == 0, err
+    assert ran(installed) == ["ask", "agent", "fast"]
+    # Its reason shows before heavy's waiting lines.
+    assert err.index("needs a build: src/main.rs") < err.index("waiting for the")
+    assert "outside heavy's queue" not in err
+
+
+def test_the_run_outside_the_queue_gets_one_core_and_one_cargo_job(installed):
+    light_check(
+        installed,
+        'sed -n "s/^Cpus_allowed_list:[[:space:]]*/cores-/p" /proc/$$/status'
+        ' >> "$(git rev-parse --git-dir)/ran"\n'
+        'echo "jobs-${CARGO_BUILD_JOBS:-unset}" >> "$(git rev-parse --git-dir)/ran"',
+    )
+
+    run = commit(installed)
+
+    assert run.returncode == 0, run.stderr
+    _, cores, jobs, _ = ran(installed)
+    assert cores == f"cores-{max(os.sched_getaffinity(0))}"  # the last it may use
+    assert jobs == "jobs-1"
+
+
+def test_a_pass_outside_the_queue_is_recorded(installed):
+    light_check(installed)
+    assert commit(installed).returncode == 0
+
+    run = commit(installed, "--amend")
+
+    assert run.returncode == 0, run.stderr
+    assert "already passed" in run.stderr
+    assert ran(installed) == ["light-75", "fast", "fast"]
+
+
+def test_stopping_a_check_outside_the_queue_refuses_in_one_line(installed, committing):
+    light_check(installed, 'touch "$(git rev-parse --git-dir)/started"\nsleep 30')
+    commit_run = committing(installed)
+    started = installed / ".git" / "started"
+    if not wait_or_warn(started.exists, "the check never started"):
+        return
+    os.killpg(commit_run.pid, signal.SIGINT)  # Ctrl-C reaches the whole group
+    if not finishes_or_warns(commit_run):
+        return
+    err = commit_run.err()
+
+    assert commit_run.returncode != 0
+    assert "Traceback" not in err, err
+    assert "COMMIT REFUSED" in err
+
+
+def test_a_check_that_fails_outside_the_queue_is_refused_without_queueing(installed):
+    light_check(installed, "echo 'lint: x is unused'\nexit 1")
+
+    run = commit(installed)
+
+    assert run.returncode != 0
+    assert ran(installed) == ["light-75"]
+    assert run.stderr.index("lint: x is unused") < run.stderr.index("COMMIT REFUSED")
+
+
+def test_a_check_that_asks_again_in_the_queue_is_refused(installed):
+    hook(
+        installed,
+        "agent-pre-commit",
+        "# exits 75 whether CHECK_QUEUE_EXIT is set or not\n"
+        'echo again >> "$(git rev-parse --git-dir)/ran"\n'
+        "exit 75",
+    )
+
+    run = commit(installed)
+
+    assert run.returncode != 0
+    assert ran(installed) == ["again", "again"]
+    assert run.stderr.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")
+
+
+def test_an_inherited_check_queue_exit_reaches_no_check_that_does_not_name_it(
+    installed,
+):
+    # [X] keeps the check from naming the variable, which would opt it in.
+    hook(
+        installed,
+        "agent-pre-commit",
+        "env | sed -n 's/^CHECK_QUEUE_E[X]IT=/inherited-/p'"
+        ' >> "$(git rev-parse --git-dir)/ran"\n'
+        'echo agent >> "$(git rev-parse --git-dir)/ran"',
+    )
+
+    run = commit(installed, env={"CHECK_QUEUE_EXIT": "75"})
+
+    assert run.returncode == 0, run.stderr
+    assert ran(installed) == ["agent", "fast"]
+
+
+def test_a_quick_check_that_asks_for_the_queue_waits_its_turn_too(
+    installed, held_lane, committing
+):
+    light_check(installed)
+    assert commit(installed).returncode == 0  # outside the queue, so past the lane
+    asking_check(installed, "agent-quick-check", word="quick")
+    edit(installed, "still good\n")
+    commit_run = committing(installed, "--fixup=HEAD")
+    waiting = queues_or_warns(commit_run, held_lane.lane)
+    # Whether heavy said so or the wait ran out, it didn't run again while it was held.
+    assert "quick" not in ran(installed), commit_run.err()
+    if not waiting:
+        return
+    assert ran(installed) == ["light-75", "fast", "ask"]
+    held_lane.kill()
+    if not finishes_or_warns(commit_run):
+        return
+    err = commit_run.err()
+
+    assert commit_run.returncode == 0, err
+    assert ran(installed) == ["light-75", "fast", "ask", "quick", "fast"]
+    assert "needs a build: src/main.rs" in err

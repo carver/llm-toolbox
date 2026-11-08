@@ -68,6 +68,12 @@ HOOKS = [
         {"timeout": 10},
     ),
     (
+        "PreToolUse",
+        "Bash",
+        "heavy-gate",
+        {"timeout": 10},
+    ),
+    (
         "PostToolUse",
         "Bash",
         "issue-view-hint",

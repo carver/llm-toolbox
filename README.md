@@ -332,6 +332,16 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   one, or `sys.argv[i]` from the command line, directly or through a name
   bound once; a shell variable counts when it's set once, before the python
   command, to a plain value.
+- **heavy-gate**: a Claude Code hook, which `install.py` registers, that
+  refuses a Bash call running `heavy -- CMD` unless it was made with
+  `run_in_background: true`, since heavy's queue has no time limit and the
+  Bash tool kills a call at its own; the refusal names `bgrun --wait -o LOG --
+  heavy -- CMD` as a background call. Background or not, it refuses heavy
+  around bgrun, git commit or wt-ship. It reads the command as shell words and
+  looks only at what runs, through wrappers such as `timeout` and `nice`,
+  `bash -c`, a heredoc fed to a shell and `$(...)`. A word that only mentions
+  heavy passes, as do `heavy status`, `heavy -h`, `bgrun` without `--wait`, and
+  a heavy with `HEAVY_DIR` or `HEAVY_SLOT` set in front of it.
 - **issue-view-hint**: a Claude Code hook, which `install.py` registers. After a
   `gh issue view` that printed task-list boxes, or any with `--comments`, it
   adds a note for the agent: the body and the comments come out separately, and

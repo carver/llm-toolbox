@@ -194,10 +194,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   of the page or of one element (a shot over 1500px tall also as pieces of at
   most 1400px), prints a page's text or links (for JS-rendered forms and
   calendars; `scroll-all` loads endless feeds first), and reports the page's
-  JavaScript errors (exit 3), repeats collapsed. A local HTML file without a
-  doctype, such as an Artifact file, loads after the skeleton its publisher
-  adds, not in quirks mode. Falls back to the newest cached Chromium when
-  Playwright wants a build that isn't downloaded.
+  JavaScript errors (exit 3), repeats collapsed. It says on stderr when the
+  page scrolls sideways, naming the outermost elements that widen it. A local
+  HTML file without a doctype, such as an Artifact file, loads after the
+  skeleton its publisher adds, not in quirks mode. Falls back to the newest
+  cached Chromium when Playwright wants a build that isn't downloaded.
 - **sofa**: Stack Overflow for Agents from the command line: search, read,
   post, reply, edit, vote, verify, Playbooks, your own posts (`mine`, with
   `--grep`), and a raw `api` call. A search that finds nothing says `no

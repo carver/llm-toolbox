@@ -27,6 +27,15 @@ The page's uncaught errors and console errors go to stderr, repeats collapsed
 to one line with a count, and make the exit status 3 once the screenshots are
 saved.
 
+Every run checks whether the page scrolls sideways, after it loads and at each
+shot, and says so on stderr: the page's width against the viewport's, then up
+to 5 elements that widen it, the furthest-reaching first, each with the start of
+its text and its right edge. Only what widens the page counts: nothing laid out
+inside a box that clips or scrolls sideways, nothing fixed to the viewport, and
+only the outermost culprit, not its descendants. A report seen at several
+moments prints once, naming them. It doesn't change the exit status. A page
+whose scripts break the check gets a line saying so instead.
+
 A local .html file that doesn't start with a doctype, such as an Artifact file,
 would load in quirks mode. It loads instead after the skeleton the Artifact
 publisher adds: <!doctype html>, a UTF-8 charset meta, a viewport meta and a
@@ -58,7 +67,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ARITY = {
@@ -102,6 +111,69 @@ LINKS_JS = """pattern => [...document.querySelectorAll('a[href]')]
   .filter(([text, href]) => !pattern || new RegExp(pattern, 'i').test(text + ' ' + href))"""
 
 
+# What makes the page scroll sideways: null when it doesn't, else its scroll width, the viewport's
+# width and the culprits. A culprit is an element whose box reaches past the viewport's right edge, or
+# whose own text does when its box fits; not one laid out inside a box that clips or scrolls
+# sideways, nor one fixed to the viewport, and none inside a culprit. Its argument is how many
+# characters of a culprit's text to send.
+SIDEWAYS_JS = r"""keep => {
+  const root = document.documentElement, body = document.body;
+  const width = root.clientWidth, scrollWidth = root.scrollWidth;
+  if (scrollWidth <= width) return null;
+  // The viewport takes html's overflow, or body's when html's is visible, and that element's own box
+  // doesn't clip. Chromium reports the wide scroll width of a viewport that hides it.
+  const overflowSource = getComputedStyle(root).overflowX !== 'visible' ? root : body;
+  const viewportX = overflowSource ? getComputedStyle(overflowSource).overflowX : 'visible';
+  if (viewportX === 'hidden' || viewportX === 'clip') return null;
+  const clips = (el, style) => el !== overflowSource && (style.overflowX !== 'visible'
+    || /paint|content|strict/.test(style.contain) || ['auto', 'hidden'].includes(style.contentVisibility));
+  // The tree the page is laid out by: a shadow host shows its shadow root, where a slot shows what
+  // is assigned to it (or its own children, without any), in place of the host's children
+  const kids = el => el.shadowRoot ? el.shadowRoot.children
+    : el.localName === 'slot' && el.assignedElements().length ? el.assignedElements({flatten: true})
+    : el.children;
+  const up = el => el.assignedSlot ?? el.parentElement ?? el.getRootNode().host ?? null;
+  const clipAround = el => {  // the nearest box at or above el that clips
+    for (; el && el !== root; el = up(el)) if (clips(el, getComputedStyle(el))) return el;
+    return null;
+  };
+  const reach = rects => Math.max(-Infinity, ...Array.from(rects, r => r.right)) + scrollX;
+  const label = el => el.localName + (el.id ? '#' + el.id : '')
+    + Array.from(el.classList).slice(0, 2).map(c => '.' + c).join('');
+  const snippet = text => text.trim().replace(/\s+/g, ' ').slice(0, keep);
+  const range = document.createRange();
+  const culprits = [];
+  const culprit = (name, text, right) => culprits.push({name, text: snippet(text), right: Math.round(right)});
+  // clip: the clipping box around the one el is laid out in, or null
+  const walk = (el, clip) => {
+    const style = getComputedStyle(el);
+    if (style.display === 'none') return;
+    // Fixed to the viewport, so it can't widen the page. (A body's offsetParent is always null.)
+    if (style.position === 'fixed' && el.offsetParent === null) return;
+    // Laid out in its containing block, which may be outside the clipping box around it
+    if ((style.position === 'fixed' || style.position === 'absolute') && el.offsetParent)
+      clip = clipAround(el.offsetParent);
+    if (!clip) {
+      const right = reach(el.getClientRects());
+      if (right > width + 0.5) return culprit(label(el), el.innerText ?? el.textContent, right);
+      for (const node of el.childNodes) {
+        if (node.nodeType !== Node.TEXT_NODE || !node.data.trim()) continue;
+        range.selectNodeContents(node);
+        const right = reach(range.getClientRects());
+        if (right > width + 0.5) return culprit('text in ' + label(el), node.data, right);
+      }
+    }
+    // Inside a clipping box, the walk goes on only to find what escapes it
+    const inner = clips(el, style) ? el : clip;
+    for (const child of kids(el)) walk(child, inner);
+  };
+  walk(root, null);
+  return {scrollWidth, width, culprits};
+}"""
+SIDEWAYS_SHOWN = 5  # culprits named; the rest are counted
+SNIPPET = 40  # characters of a culprit's text
+
+
 class UsageError(Exception):
     pass
 
@@ -134,6 +206,71 @@ def parse_action(text):
     if verb == "wait" and not args[0].isdigit():
         raise UsageError(f"wait takes milliseconds: {text!r}")
     return Action(verb, tuple(a.strip() for a in args))
+
+
+@dataclass
+class Findings:
+    """What a run found, kept as it goes, so an action that fails doesn't lose what came before."""
+
+    shots: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
+    # a sideways report's lines -> the moments it was seen
+    sideways: dict = field(default_factory=dict)
+    # why a sideways check failed, each time one did
+    unchecked: list = field(default_factory=list)
+
+    def check_sideways(self, tab, moment):
+        """A check the page breaks, such as by replacing getComputedStyle, is noted and skipped."""
+        from playwright.sync_api import Error
+
+        try:
+            lines = sideways_report(tab)
+        except Error as error:
+            reason = str(error).strip().splitlines()[0]
+            self.unchecked.append(
+                f"couldn't check sideways scrolling at {moment}: {reason}"
+            )
+            return
+        if lines:
+            self.sideways.setdefault(lines, []).append(moment)
+
+    def show(self):
+        """Prints the shots' paths on stdout, and on stderr each sideways report once, naming the
+        moments it was seen, then the page's errors."""
+        if self.shots:
+            print("\n".join(map(str, self.shots)))
+        for line in self.unchecked:
+            print(line, file=sys.stderr)
+        for (head, *rest), moments in self.sideways.items():
+            print(
+                f"scrolls sideways ({', '.join(moments)}): {head}",
+                *rest,
+                sep="\n",
+                file=sys.stderr,
+            )
+        for error in collapse(self.errors):
+            print(error, file=sys.stderr)
+
+
+def sideways_report(tab):
+    """What makes the page scroll sideways, as lines: its width against the viewport's, then the
+    furthest-reaching culprits. () when the page fits."""
+    found = tab.evaluate(SIDEWAYS_JS, SNIPPET + 1)  # one more, to know when to cut it
+    if not found:
+        return ()
+    culprits = sorted(found["culprits"], key=lambda culprit: -culprit["right"])
+    lines = [f"page {found['scrollWidth']}px wide, viewport {found['width']}px"]
+    for culprit in culprits[:SIDEWAYS_SHOWN]:
+        text = culprit["text"]
+        if len(text) > SNIPPET:
+            text = text[:SNIPPET] + "..."
+        quoted = f' "{text}"' if text else ""
+        lines.append(f"  {culprit['name']}{quoted} reaches {culprit['right']}px")
+    if len(culprits) > SIDEWAYS_SHOWN:
+        lines.append(f"  and {len(culprits) - SIDEWAYS_SHOWN} more")
+    if not culprits:
+        lines.append("  found no element that reaches past the viewport")
+    return tuple(lines)
 
 
 def collapse(lines):
@@ -313,11 +450,11 @@ def launch(playwright):
     return playwright.chromium.launch(executable_path=str(fallback))
 
 
-def run(page, actions, out, size, cookies):
+def run(page, actions, out, size, cookies, found):
+    """Opens PAGE and runs ACTIONS, then the final shot, adding what it finds to FOUND."""
     from playwright.sync_api import sync_playwright
 
     width, height = size
-    errors, shots = [], []
     with sync_playwright() as playwright:
         browser = launch(playwright)
         context = browser.new_context(viewport={"width": width, "height": height})
@@ -332,14 +469,16 @@ def run(page, actions, out, size, cookies):
         tab.on("request", network.started)
         tab.on("requestfinished", network.ended)
         tab.on("requestfailed", network.ended)
-        tab.on("pageerror", lambda error: errors.append(f"page error: {error}"))
+        tab.on("pageerror", lambda error: found.errors.append(f"page error: {error}"))
         tab.on(
             "console",
             lambda msg: (
-                msg.type == "error" and errors.append(f"console error: {msg.text}")
+                msg.type == "error"
+                and found.errors.append(f"console error: {msg.text}")
             ),
         )
         tab.goto(url, wait_until="load")
+        found.check_sideways(tab, "load")
         for action in actions + [Action("shot", ("final",))]:
             if action.verb == "click":
                 tab.click(action.args[0])
@@ -360,14 +499,14 @@ def run(page, actions, out, size, cookies):
             elif action.verb == "scroll-all":
                 scroll_all(tab, network)
             else:
+                found.check_sideways(tab, f"shot {action.args[0]}")
                 path = out / f"{action.args[0]}.png"
                 if len(action.args) == 2:
                     png = tab.locator(action.args[1]).first.screenshot(path=str(path))
                 else:
                     png = tab.screenshot(path=str(path), full_page=True)
-                shots += [path, *save_pieces(path, png)]
+                found.shots += [path, *save_pieces(path, png)]
         browser.close()
-    return shots, errors
 
 
 def cookie_arg(text):
@@ -418,20 +557,21 @@ def main(argv=None):
         help="viewport WxH (default 1280x900)",
     )
     args = parser.parse_args(argv)
+    found = Findings()
     try:
         actions = [parse_action(a) for a in args.do]
         if args.cookie and not page_url(args.page).startswith(("http://", "https://")):
             raise UsageError("--cookie needs an http(s) page, not a file")
         out = args.out or Path(tempfile.mkdtemp(prefix="web-shot-"))
         out.mkdir(parents=True, exist_ok=True)
-        shots, errors = run(args.page, actions, out, args.size, args.cookie)
+        try:
+            run(args.page, actions, out, args.size, args.cookie, found)
+        finally:
+            found.show()
     except UsageError as error:
         print(f"web-shot: {error}", file=sys.stderr)
         return 2
-    print("\n".join(map(str, shots)))
-    for error in collapse(errors):
-        print(error, file=sys.stderr)
-    return 3 if errors else 0
+    return 3 if found.errors else 0
 
 
 if __name__ == "__main__":

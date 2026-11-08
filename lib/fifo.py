@@ -6,14 +6,23 @@ Each entry and each slot names the process holding it, on its first line:
 on this host and has ended is cleared, under a lock in the queue's folder, so two
 waiters never clear the same dead slot and delete the next holder's. Lines after the
 first are the tool's own (heavy keeps the job's folder and command there).
+
+The lock is held briefly, many times a second across the VM, so its holder must never
+stop while it holds it: the stop signals a terminal sends (Ctrl-Z's SIGTSTP, SIGTTIN,
+SIGTTOU) wait, blocked, until it lets go. SIGSTOP can't wait, so the holder records
+itself in `.lock.holder` beside the lock, and a process that has waited for the lock
+FIFO_LOCK_SECONDS (5; the tests shorten it) prints a line on stderr naming the holder,
+and how to continue it when it's stopped, then keeps waiting.
 """
 
 import fcntl
 import os
 import re
+import signal
 import socket
+import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -21,20 +30,41 @@ from typing import NamedTuple
 # An entry is named for when its waiter joined, so names sort in queue order. Other
 # names (the lock, an entry still being written) aren't entries.
 ENTRY = re.compile(r"\d{20}-\d+")
+# What a terminal sends to stop a process; SIGSTOP can't be blocked.
+TERMINAL_STOPS = {signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU}
+HOLDER = ".lock.holder"  # the lock's holder's record, beside the lock
+FIRST_NAP, LAST_NAP = 0.001, 0.05  # seconds between tries for a held lock
+
+
+def stat_fields(pid):
+    """Process pid's /proc/PID/stat fields from its state on (field 3), None when
+    there is no such process, [] when it can't be read (a /proc that hides other
+    users')."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return []
+    return stat.rsplit(")", 1)[1].split()
 
 
 def started(pid):
     """When process pid started (field 22 of /proc/PID/stat); None when there is no
     such process or it has ended (a zombie its parent hasn't reaped), "" when it
     can't be read (a /proc that hides other users')."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    fields = stat_fields(pid)
+    if fields is None:
         return None
-    except OSError:
+    if not fields:
         return ""
-    state, *rest = stat.rsplit(")", 1)[1].split()
-    return None if state == "Z" else rest[18]
+    return None if fields[0] == "Z" else fields[19]
+
+
+def stopped(pid):
+    """Whether process pid is stopped (state T), as SIGSTOP or Ctrl-Z leaves it."""
+    fields = stat_fields(pid)
+    return bool(fields) and fields[0] == "T"
 
 
 class Holder(NamedTuple):
@@ -107,10 +137,98 @@ def read(path):
 
 @contextmanager
 def locked(folder):
-    """Hold the queue's lock while clearing a dead slot."""
+    """Hold the lock in folder, with the terminal's stop signals blocked until it's
+    released. One already blocked stays so: a lock taken inside another keeps the
+    outer one's block."""
+    record = folder / HOLDER
     with (folder / ".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, TERMINAL_STOPS)
+        try:
+            wait_for(lock, folder, callers_mask=before)
+            try:
+                with suppress(OSError):
+                    write_whole(record, Holder.mine().line())
+                yield
+            finally:
+                with suppress(OSError):
+                    record.unlink(missing_ok=True)
+        finally:
+            # Also when an exception came between the flock and the try above. A
+            # lock not held is a no-op.
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            signal.pthread_sigmask(signal.SIG_SETMASK, before)
+
+
+def wait_for(lock, folder, callers_mask):
+    """Take the lock on file lock, called with the stop signals blocked, and return
+    with them blocked still. flock has no timeout, so a held lock is tried again after
+    naps that grow to LAST_NAP, with the caller's signal mask back for each nap: a
+    Ctrl-Z stops a waiter that holds no other lock at once, and one inside another
+    lock once it lets go of that. Every FIFO_LOCK_SECONDS of the wait, it names a
+    holder not named yet."""
+    patience = float(os.environ.get("FIFO_LOCK_SECONDS", "5"))
+    look_at = time.monotonic() + patience
+    watch = Watch(folder)
+    nap = FIRST_NAP
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            pass
+        if time.monotonic() >= look_at:
+            watch.look()
+            look_at = time.monotonic() + patience
+        signal.pthread_sigmask(signal.SIG_SETMASK, callers_mask)
+        time.sleep(nap)
+        signal.pthread_sigmask(signal.SIG_BLOCK, TERMINAL_STOPS)
+        nap = min(nap * 2, LAST_NAP)
+
+
+class Watch:
+    """A waiter's looks at the holder of the lock in folder. It names each holder
+    once, on stderr, and a holder with no record only at the second look in a row
+    that finds none: a holder has none for a moment as it takes the lock and as it
+    lets go."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.named = set()  # the holders' record lines, None for no record
+        self.unrecorded = False  # the last look found no record
+
+    def look(self):
+        holder = recorded(self.folder / HOLDER)
+        again, self.unrecorded = self.unrecorded, holder is None
+        key = None if holder is None else holder.line()
+        if (holder is None and not again) or key in self.named:
+            return
+        self.named.add(key)
+        print(holder_line(self.folder, holder), file=sys.stderr, flush=True)
+
+
+def recorded(path):
+    """The holder the record at path names, or None when it can't be read or its
+    process has ended (killed while it held the lock)."""
+    try:
+        holder = Holder.parse(path.read_text())
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None if holder.pid is None or holder.gone() else holder
+
+
+def holder_line(folder, holder):
+    """The line naming the holder of the lock in folder (None: it left no record)."""
+    me = f"{Path(sys.argv[0]).name}: waiting for the lock in {folder}"
+    if holder is None:
+        return f"{me}, whose holder left no record of itself."
+    where = "" if holder.host == socket.gethostname() else f" on {holder.host}"
+    line = (
+        f"{me}, held since {holder.since[11:19]} by PID {holder.pid}{where}"
+        f" (session {holder.session})"
+    )
+    if not where and stopped(holder.pid):
+        line += f", which is stopped: `kill -CONT {holder.pid}` continues it"
+    return line + "."
 
 
 def join(folder, holder, details=""):

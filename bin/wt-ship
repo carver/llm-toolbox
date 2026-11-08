@@ -50,8 +50,10 @@ other runs (a subagent's) included, it waits its turn in a first-come-first-serv
 queue in the repo's common git dir, printing a line when whom it waits on changes,
 and gives up after WT_SHIP_WAIT seconds, naming what held it up; --no-wait gives up
 at once when the flag is held or anyone is queued. Under a lock in the queue folder,
-it clears a flag, or an entry, whose process ran on this host and has ended. A flag
-it can't judge, an old-style one or one from another host, it only waits on.
+it clears a flag, or an entry, whose process ran on this host and has ended; a wait of
+FIFO_LOCK_SECONDS for that lock names the process holding it, and when that process is
+stopped, how to continue it. A flag it can't judge, an old-style one or one from
+another host, it only waits on.
 When another session landed during the check, it rebases and checks again, up to 10
 times, still holding the claim, then merges. When the main tree's uncommitted changes
 touch the files the merge changes, it stops, merging nothing: ask the user. The flag
@@ -59,9 +61,11 @@ it made, and its place in the queue, go once the merge is done or has failed, or
 run is stopped. It must run in a linked worktree.
 
 Environment:
-  WT_SHIP_WAIT   seconds --local waits for the main tree (default 1800)
-  WT_SHIP_POLL   seconds between its looks at the flag and the queue (default 5;
-                 the tests shorten both)
+  WT_SHIP_WAIT       seconds --local waits for the main tree (default 1800)
+  WT_SHIP_POLL       seconds between its looks at the flag and the queue (default 5;
+                     the tests shorten both)
+  FIFO_LOCK_SECONDS  seconds of waiting for the queue folder's lock before naming its
+                     holder (default 5; the tests shorten it)
 
 Exit status: 0 shipped, landed or nothing to do; 1 a step failed (the message says
 what to do); 2 a usage error; with --local, 3 another session held the main tree's

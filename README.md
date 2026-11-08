@@ -194,8 +194,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   first. While another session holds the flag it waits its turn in a queue in
   the git dir, for up to `$WT_SHIP_WAIT` seconds (30 minutes; `--no-wait` stops
   at once), looking every `$WT_SHIP_POLL` seconds, and clears a flag or entry
-  whose process on this host has ended. It stops on uncommitted changes in the
-  main tree that touch the same files.
+  whose process on this host has ended. A wait of `$FIFO_LOCK_SECONDS` (5) for
+  the queue folder's lock names the process holding it, and how to continue it
+  when it's stopped. It stops on uncommitted changes in the main tree that touch
+  the same files.
 - **gui-shot**: runs a GUI app on a headless display (Xvfb, or weston for
   Wayland), clicks and types into it, and saves screenshots. For checking a
   desktop app's UI from a sandbox with no screen. `gui-shot -h` lists the
@@ -314,10 +316,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   (600), gets a hint to push a topic branch and open a PR for CI's results
   instead. A heavy inside a job (`$HEAVY_SLOT`) runs at once, and wt-ship's
   `--check` queues too. The queue and its history live in `$HEAVY_DIR`
-  (`/tmp/heavy`). For the tests, `$HEAVY_BUSY` names a file that stands in for
-  how busy the cores are, `$HEAVY_MEMINFO` and `$HEAVY_VMSTAT` ones for
-  `/proc/meminfo` and `/proc/vmstat`, and `$HEAVY_CORES_USED` a run's measured
-  cores. A command that fails while the out-of-memory killer ends a process
+  (`/tmp/heavy`). A Ctrl-Z while heavy holds the queue's lock, a moment at each
+  look, stops it once it lets go; a wait of `$FIFO_LOCK_SECONDS` (5) for that lock
+  names the process holding it, and how to continue it when it's stopped. For
+  the tests, `$HEAVY_BUSY` names a file that stands in for how busy the cores
+  are, `$HEAVY_MEMINFO` and `$HEAVY_VMSTAT` ones for `/proc/meminfo` and
+  `/proc/vmstat`, and `$HEAVY_CORES_USED` a run's measured cores. A command that fails while the out-of-memory killer ends a process
   hears so, and to run it again if the failure looks odd.
 - **issue-todo**: a GitHub issue's task-list items across its body and every
   comment (`issue-todo show N`), which `gh issue view` splits between two

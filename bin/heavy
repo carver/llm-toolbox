@@ -56,6 +56,11 @@ cleared from the queue. Stopping heavy (SIGINT, SIGTERM, SIGHUP) stops CMD's pro
 group, with SIGKILL after HEAVY_GRACE seconds, and frees its place; CMD also gets
 SIGTERM should heavy die.
 
+heavy takes the queue's lock for a moment at each look, and a Ctrl-Z that comes while
+it holds it stops heavy only once it lets go. A heavy that has waited
+FIFO_LOCK_SECONDS for the lock names the process holding it on stderr, and when that
+process is stopped, how to continue it.
+
 Environment:
   HEAVY_DIR            the queue's folder (default /tmp/heavy)
   HEAVY_QUIET_SECONDS  how long the cores must stay quiet (default 10)
@@ -63,6 +68,8 @@ Environment:
   HEAVY_SHARE_SECONDS  how long a holder must idle before anyone shares (default 90)
   HEAVY_STALL_SECONDS  how long a head waits before suggesting a PR (default 600)
   HEAVY_GRACE          seconds CMD gets to stop before SIGKILL (default 5)
+  FIFO_LOCK_SECONDS    seconds of waiting for the queue's lock before naming its
+                       holder (default 5; the tests shorten it)
   HEAVY_BUSY           a file whose number stands in for how busy the cores are (tests)
   HEAVY_MEMINFO        a file that stands in for /proc/meminfo (tests)
   HEAVY_VMSTAT         a file that stands in for /proc/vmstat (tests)

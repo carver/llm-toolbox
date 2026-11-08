@@ -359,6 +359,57 @@ def test_a_formatted_commit_is_the_next_ones_check_base(installed):
     assert bases(installed) == ["none", formatted]
 
 
+def test_a_check_that_changes_whats_staged_refuses_the_commit(installed):
+    """It didn't see what would be committed: what it staged itself, or an agent's git
+    add while it ran."""
+    hook(
+        installed,
+        "agent-pre-commit",
+        f'echo "${{CHECK_BASE:-none}}" >> "$(git rev-parse --git-dir)/bases"\n{SQUEEZE}',
+    )
+    edit(installed, "a  b\n")
+
+    refused = commit(installed)
+
+    assert refused.returncode != 0
+    assert refused.stderr.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")
+    assert git(installed, "rev-parse", "HEAD", check=False).returncode != 0
+    # The next commit has nothing left to change, so the check passes.
+    retried = commit(installed)
+    assert retried.returncode == 0, retried.stderr
+    passed = head(installed)
+    # A person commits the tree the refused check started on, which never passed.
+    edit(installed, "a  b\n")
+    assert commit(installed, agent=False).returncode == 0
+    edit(installed, "c\n")
+    assert commit(installed).returncode == 0
+    assert bases(installed) == ["none", "none", passed]
+
+
+def test_a_quick_check_that_changes_whats_staged_refuses_the_fix_commit(installed):
+    assert commit(installed).returncode == 0
+    quick_check(installed, SQUEEZE)
+    edit(installed, "a  b\n")
+
+    run = commit(installed, "--fixup=HEAD")
+
+    assert run.returncode != 0
+    assert run.stderr.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")
+
+
+def test_a_check_that_dirties_the_work_tree_is_not_remembered(installed):
+    hook(
+        installed,
+        "agent-pre-commit",
+        'echo agent >> "$(git rev-parse --git-dir)/ran"\necho scribbled > a',
+    )
+    assert commit(installed).returncode == 0
+
+    assert commit(installed, "--amend").returncode == 0
+
+    assert ran(installed) == ["fast", "agent", "fast", "agent"]
+
+
 def test_a_failing_agent_check_blocks_the_commit_and_shows_why(installed):
     (installed / "a").write_text("bad\n")
     git(installed, "add", "a")
@@ -1011,6 +1062,24 @@ def test_an_agent_check_waits_its_turn_in_heavys_queue(
     assert commit_run.returncode == 0, err
     assert ran(installed) == ["fast", "agent"]
     assert "waiting for the normal lane" in err and "cargo test" in err
+
+
+def test_a_git_add_while_the_check_waits_its_turn_refuses_the_commit(
+    installed, held_lane, committing
+):
+    """git reads the index again after the hook, so the add would go in unchecked."""
+    commit_run = committing(installed)
+    if not queues_or_warns(commit_run, held_lane.lane):
+        return
+    edit(installed, "added while it waited\n")
+    held_lane.kill()
+    if not finishes_or_warns(commit_run):
+        return
+    err = commit_run.err()
+
+    assert commit_run.returncode != 0, err
+    assert err.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")
+    assert git(installed, "rev-parse", "HEAD", check=False).returncode != 0
 
 
 def test_stopping_a_check_that_waits_leaves_the_queue_in_one_line(

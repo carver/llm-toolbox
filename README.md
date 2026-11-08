@@ -264,8 +264,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   hook to do this, so `--install` moves it to the top when a command sits
   above it, and replaces an older line. The trees that passed go on a record
   in the repo's common git dir, which every worktree shares, keyed by the tree
-  and the check's bytes; a pass with unstaged changes to tracked files isn't
-  recorded. When the tree
+  and the check's bytes; a pass with unstaged changes to tracked files, before
+  the check or after it, isn't recorded. A check that changes what's staged,
+  itself or through a `git add` while it waits its turn, refuses the commit:
+  it didn't check what git would commit. When the tree
   being checked is HEAD's own and on the record, as in an amend that changes
   only the message, the check is skipped. Otherwise the check gets
   `$CHECK_BASE`, the nearest of HEAD's last 100 first-parent commits whose tree

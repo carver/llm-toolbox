@@ -28,19 +28,23 @@ with a command above it to the top (comments above it may stay), and replaces an
 older line, wherever it is, with this one at the top. The line runs the check
 through `--run`; an agent without agent-commit-gate on PATH, such as a
 teammate's, runs the check directly instead, every time. A check `--run` runs
-waits its turn in heavy's queue (bin/heavy), so
-agents' commit checks never run at once, and prints heavy's waiting lines; one
-that needs no build or test can skip the queue, as below.
+waits its turn in heavy's queue (bin/heavy), so agents' commit checks never run
+at once, and prints heavy's waiting lines; one that needs no build or test can
+skip the queue, as below.
 wt-ship and build-state finish recheck through `--run` too.
 
 `--run` records each tree that passes in agent-pre-commit-passed, in the repo's
 common git dir, which every worktree shares: the last 1,000, each with the SHA-1
 of agent-pre-commit's bytes, so an edited check reuses no pass of its old self.
-A pass counts only with no unstaged changes to tracked files, since some checks
-read the working tree. When the tree being checked is HEAD's own and on the
-record, the check is skipped: an amend that changes only the message, or a
-recheck with nothing rebased. Any other tree runs it, a revert to a tree that
-passed included, since a check may read more than the tree.
+A pass counts only with no unstaged changes to tracked files, before the check
+and after it, since some checks read the working tree. A check that passes but
+leaves what's staged changed refuses the commit: it didn't see what git would
+commit. That happens when a check restages a file itself, or when a `git add`
+runs while the check waits its turn, since git reads the index again after the
+hook. When the tree being checked is HEAD's own and on the record, the check is
+skipped: an amend that changes only the message, or a recheck with nothing
+rebased. Any other tree runs it, a revert to a tree that passed included, since
+a check may read more than the tree.
 
 Before it runs the check, `--run` looks through HEAD's first-parent history,
 HEAD and up to 99 commits before it, for the nearest commit whose tree passed
@@ -611,13 +615,39 @@ def check_base(passed, fingerprint):
     return None
 
 
+def staged():
+    """What the index holds, entry by entry. Unlike write-tree, ls-files takes no lock,
+    so another git command running at once can't make it fail."""
+    return git_out("ls-files", "--stage", "-z")
+
+
+def refuse_if_staged_changed(code, before, name):
+    """The check's exit code `code`, or 1 when the check passed but what's staged
+    differs from `before`: the check didn't see what would be committed."""
+    if code == 0 and staged() != before:
+        print(
+            f"COMMIT REFUSED: what's staged changed while {name} ran (it restaged a"
+            " file, or a git add ran meanwhile), so its pass doesn't cover what would"
+            " be committed; run it again on what's staged now",
+            file=sys.stderr,
+        )
+        return 1
+    return code
+
+
+def no_unstaged_changes():
+    """Whether tracked files in the work tree match the index."""
+    return subprocess.run(["git", "diff", "--quiet"], check=False).returncode == 0
+
+
 def run_check(path):
     """Run the agent check at `path`, unless HEAD's tree is the tree being checked and
     passed this check already, as when an amend changes only the message or wt-ship
     rechecks a commit it didn't rebase. The key is the tree and the check's own content,
     on a record every worktree shares. A pass counts only with no unstaged changes to
     tracked files, since some checks read the working tree rather than the index. The
-    check gets CHECK_BASE, the nearest first-parent commit whose tree passed it."""
+    check gets CHECK_BASE, the nearest first-parent commit whose tree passed it. A
+    check that passes but leaves what's staged changed refuses the commit."""
     hook = Path(path)
     if not (hook.is_file() and os.access(hook, os.X_OK)):
         print(f"{path}: no executable agent check", file=sys.stderr)
@@ -628,6 +658,7 @@ def run_check(path):
     content = hook.read_bytes()
     fingerprint = passrecord.fingerprint(content)
     base = check_base(passed, fingerprint)
+    before = staged()
     fix = (args := running_commit_args()) is not None and is_fix_commit(args)
     if fix and is_small_fix():
         # Beside `path` as given, so a ./ path stays one.
@@ -636,8 +667,10 @@ def run_check(path):
             # Fast static checks only, no tests: not worth a place in heavy's queue,
             # unless it asks for one.
             if names_queue_exit(Path(quick).read_bytes()):
-                return run_outside_first(quick, QUICK_NAME, base)
-            return run_quiet(quick, QUICK_NAME, base, queue=False)
+                code = run_outside_first(quick, QUICK_NAME, base)
+            else:
+                code = run_quiet(quick, QUICK_NAME, base, queue=False)
+            return refuse_if_staged_changed(code, before, QUICK_NAME)
         print(
             f"{HOOK_NAME}: skipped for a small fix commit; build-state finish runs it on "
             "each commit the fold rewrites",
@@ -651,10 +684,11 @@ def run_check(path):
             f"{HOOK_NAME}: skipped, tree {tree[:12]} already passed it", file=sys.stderr
         )
         return 0
-    clean = subprocess.run(["git", "diff", "--quiet"], check=False).returncode == 0
+    clean = no_unstaged_changes()
     run = run_outside_first if names_queue_exit(content) else run_quiet
-    code = run(path, HOOK_NAME, base)
-    if code == 0 and clean and key and record:
+    code = refuse_if_staged_changed(run(path, HOOK_NAME, base), before, HOOK_NAME)
+    # Some checks read the work tree, so it must match the index from start to end.
+    if code == 0 and clean and no_unstaged_changes() and key and record:
         passrecord.remember(record, key)
     return code
 

@@ -826,14 +826,12 @@ def finish(proc):
     return proc.returncode, proc.out(), proc.err()
 
 
-def waits_to_land(proc, held_by=""):
-    """Wait for wt-ship to say it waits to land. Only then is it in its wait loop: it
-    joins the queue before it first looks at the flag, so a flag freed or a signal
-    sent in that gap meets a run that never waited."""
-    wait_until(
-        lambda: f"Waiting to land: first in the queue{held_by}" in proc.out(),
-        "wt-ship to say it waits",
-    )
+def waits_to_land(proc):
+    """Wait for wt-ship to say it waits to land. Only then is it in its wait loop, its
+    queue entry in hand: it joins the queue before it first looks at the flag, so a
+    flag freed in that gap meets a run that never waits, and a signal there can stop
+    it before it holds the entry it would remove."""
+    wait_until(lambda: "Waiting to land" in proc.out(), "wt-ship to say it waits")
 
 
 def test_local_clears_a_flag_whose_process_is_gone_and_lands(setup, holder):
@@ -860,7 +858,7 @@ def test_local_waits_while_another_landing_holds_the_flag_then_lands(
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
     waiting = background(wt, "--local", "--check", "true")
-    waits_to_land(waiting, "; the main tree is held by s-other")
+    waits_to_land(waiting)
     flag(main).unlink()  # that landing finished
     status, out, err = finish(waiting)
 

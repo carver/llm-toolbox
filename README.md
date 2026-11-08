@@ -253,15 +253,19 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   retry. `pre-commit-run --install REPO` copies it into `REPO/bin/` and adds its
   call to the repo's hook, for a new project or an old one.
 - **agent-commit-gate**: gives agents' commits a repo's slow checks.
-  `agent-commit-gate --install REPO...` adds a line to the top of the repo's
-  pre-commit hook: when `$AI_AGENT` is set, as Claude Code sets it, the hook
-  first runs `agent-pre-commit`, an executable kept beside it, and fails the
-  commit if that fails. People keep the quick hook; the agent also gets the
-  slow checks, such as the whole test suite. Git runs the hook after `commit
-  -a` or `commit PATHS` updates the index, so the check sees what is
-  committed. The trees that passed go on a record in the repo's common git
-  dir, which every worktree shares, keyed by the tree and the check's bytes; a
-  pass with unstaged changes to tracked files isn't recorded. When the tree
+  `agent-commit-gate --install REPO...` puts a line first in the repo's
+  pre-commit hook: when `$AI_AGENT` is set, as Claude Code sets it, the line
+  runs the rest of the hook, then `agent-pre-commit`, an executable kept
+  beside it, and fails the commit if either fails. People keep the quick hook;
+  the agent also gets the slow checks, such as the whole test suite. The check
+  starts once the hook's formatters have rewritten and staged what they
+  change, and git runs the hook after `commit -a` or `commit PATHS` updates
+  the index, so the check sees what is committed. The line reruns the whole
+  hook to do this, so `--install` moves it to the top when a command sits
+  above it, and replaces an older line. The trees that passed go on a record
+  in the repo's common git dir, which every worktree shares, keyed by the tree
+  and the check's bytes; a pass with unstaged changes to tracked files isn't
+  recorded. When the tree
   being checked is HEAD's own and on the record, as in an amend that changes
   only the message, the check is skipped. Otherwise the check gets
   `$CHECK_BASE`, the nearest of HEAD's last 100 first-parent commits whose tree
@@ -541,7 +545,7 @@ test that passes in the repo but reads its git state fails there. `install.py` p
 `pre-commit` runs the two ruff checks on what's staged. When only formatting fails, it formats each staged file that has no unstaged changes,
 stages the result and names the file; any other unformatted file refuses the commit, as does every
 file of a `git commit PATH`. `agent-pre-commit` adds the tests (about half a minute, most of it build-paper's builds), and
-`pre-commit` runs it first when an agent commits. Both run the tools
+`pre-commit` runs it after its own checks when an agent commits. Both run the tools
 through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.
 

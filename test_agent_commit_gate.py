@@ -177,17 +177,74 @@ def test_checked_in_hooks_carry_the_current_line(path):
     assert gate.LINE in (SCRIPT.parent.parent / path).read_text()
 
 
-def test_install_upgrades_the_old_line(repo):
-    hook(repo, "agent-pre-commit", "exit 0")
-    old = (
+# The comment --install wrote above its line before this one, and those lines, oldest
+# first.
+OLD_COMMENT = "# Agents' commits also run the slower agent-pre-commit (llm-toolbox agent-commit-gate)."
+OLD_LINES = {
+    "before --run": (
         'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
         'AGENT_PRE_COMMIT=1 "$(dirname "$0")/agent-pre-commit" || exit; fi'
+    ),
+    "before the refusal": (
+        'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
+        "if command -v agent-commit-gate >/dev/null; then "
+        'AGENT_PRE_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/agent-pre-commit"; '
+        'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/agent-pre-commit"; fi || exit; fi'
+    ),
+    "before the rerun": (
+        'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
+        "if command -v agent-commit-gate >/dev/null; then "
+        'AGENT_PRE_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/agent-pre-commit" || exit; '
+        'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/agent-pre-commit" || '
+        '{ echo "COMMIT REFUSED: agent-pre-commit failed" >&2; exit 1; }; fi; fi'
+    ),
+}
+
+
+@pytest.mark.parametrize("where", ["top", "bottom"])
+@pytest.mark.parametrize("old", OLD_LINES.values(), ids=OLD_LINES.keys())
+def test_install_puts_an_old_lines_successor_at_the_top(repo, old, where):
+    """The line runs the whole hook again, so whatever sits above it would run twice."""
+    hook(repo, "agent-pre-commit", "exit 0")
+    lines, body = [OLD_COMMENT, old], ["set -e", "echo fast"]
+    pre = hook(
+        repo, "pre-commit", "\n".join(lines + body if where == "top" else body + lines)
     )
-    pre = hook(repo, "pre-commit", f"{gate.COMMENT}\n{old}\necho fast")
-    assert install(repo).returncode == 0
-    text = pre.read_text()
-    assert old not in text and gate.LINE in text
-    assert text.splitlines() == ["#!/bin/sh", gate.COMMENT, gate.LINE, "echo fast"]
+
+    run = install(repo)
+
+    assert run.returncode == 0, run.stderr
+    assert pre.read_text().splitlines() == ["#!/bin/sh", gate.COMMENT, gate.LINE, *body]
+
+
+def test_install_moves_a_line_below_a_command_to_the_top(repo):
+    hook(repo, "agent-pre-commit", "exit 0")
+    pre = hook(repo, "pre-commit", f"echo fast\n{gate.COMMENT}\n{gate.LINE}")
+
+    run = install(repo)
+
+    assert run.returncode == 0, run.stderr
+    assert "moved" in run.stdout
+    assert pre.read_text().splitlines() == [
+        "#!/bin/sh",
+        gate.COMMENT,
+        gate.LINE,
+        "echo fast",
+    ]
+
+
+def test_install_leaves_a_line_with_only_comments_above_it(repo):
+    hook(repo, "agent-pre-commit", "exit 0")
+    text = f"#!/bin/sh\n# My checks.\n\n{gate.COMMENT}\n{gate.LINE}\necho fast\n"
+    pre = repo / ".githooks" / "pre-commit"
+    pre.write_text(text)
+    pre.chmod(0o755)
+
+    run = install(repo)
+
+    assert run.returncode == 0, run.stderr
+    assert "already installed" in run.stdout
+    assert pre.read_text() == text
 
 
 def test_install_creates_a_missing_pre_commit(repo):
@@ -241,9 +298,65 @@ def ran(repo):
     return path.read_text().split() if path.exists() else []
 
 
-def test_an_agent_commit_runs_the_agent_check_then_the_fast_one(installed):
+def test_an_agent_commit_runs_the_fast_check_then_the_agent_check(installed):
     assert commit(installed).returncode == 0
-    assert ran(installed) == ["agent", "fast"]
+    assert ran(installed) == ["fast", "agent"]
+
+
+def install_fast_check(repo, body):
+    """Make the repo's pre-commit note `fast`, then run `body`, with the gate's line
+    installed above them."""
+    hook(repo, "pre-commit", f'echo fast >> "$(git rev-parse --git-dir)/ran"\n{body}')
+    assert install(repo).returncode == 0
+
+
+def test_a_failing_fast_check_refuses_before_the_agent_check(installed):
+    install_fast_check(installed, "exit 1")
+
+    assert commit(installed).returncode != 0
+
+    assert ran(installed) == ["fast"]
+
+
+# A formatter that squeezes the runs of spaces in the staged `a` and stages the result.
+SQUEEZE = (
+    "if git show :a | grep -q '  '; then git show :a | tr -s ' ' > a; git add a; fi"
+)
+
+
+def install_formatter(repo):
+    """Make the repo's pre-commit squeeze the spaces in `a` and stage the result, as a
+    formatter that restages does."""
+    install_fast_check(repo, SQUEEZE)
+
+
+def test_the_agent_check_sees_what_the_formatter_staged(installed):
+    install_formatter(installed)
+    hook(
+        installed,
+        "agent-pre-commit",
+        "if git show :a | grep -q '  '; then seen=unformatted; else seen=formatted; fi\n"
+        'echo "$seen" >> "$(git rev-parse --git-dir)/ran"',
+    )
+    edit(installed, "a  b\n")
+
+    assert commit(installed).returncode == 0
+
+    assert ran(installed) == ["fast", "formatted"]
+
+
+def test_a_formatted_commit_is_the_next_ones_check_base(installed):
+    install_formatter(installed)
+    noting_bases(installed)
+    edit(installed, "a  b\n")
+    assert commit(installed).returncode == 0
+    formatted = head(installed)
+    edit(installed, "c  d\n")
+
+    run = commit(installed)
+
+    assert run.returncode == 0, run.stderr
+    assert bases(installed) == ["none", formatted]
 
 
 def test_a_failing_agent_check_blocks_the_commit_and_shows_why(installed):
@@ -276,7 +389,7 @@ def test_an_unchanged_tree_skips_the_agent_check_it_already_passed(installed):
     assert commit(installed).returncode == 0
     reworded = commit(installed, "--amend")
     assert reworded.returncode == 0
-    assert ran(installed) == ["agent", "fast", "fast"]
+    assert ran(installed) == ["fast", "agent", "fast"]
     assert "already passed" in reworded.stderr
 
 
@@ -284,14 +397,14 @@ def test_a_teammates_agent_without_the_gate_runs_the_check_every_time(installed)
     """The hook is shared; agent-commit-gate is one person's tool."""
     assert commit(installed, gate_on_path=False).returncode == 0
     assert commit(installed, "--amend", gate_on_path=False).returncode == 0
-    assert ran(installed) == ["agent", "fast", "agent", "fast"]
+    assert ran(installed) == ["fast", "agent", "fast", "agent"]
 
 
 def test_a_changed_tree_runs_the_agent_check_again(installed):
     assert commit(installed).returncode == 0
     (installed / "a").write_text("better\n")
     assert commit(installed, "--amend", "-a").returncode == 0
-    assert ran(installed) == ["agent", "fast", "agent", "fast"]
+    assert ran(installed) == ["fast", "agent", "fast", "agent"]
 
 
 def test_a_failed_agent_check_runs_again_on_the_same_tree(installed):
@@ -299,7 +412,7 @@ def test_a_failed_agent_check_runs_again_on_the_same_tree(installed):
     git(installed, "add", "a")
     assert commit(installed).returncode != 0
     assert commit(installed).returncode != 0
-    assert ran(installed) == ["agent", "agent"]
+    assert ran(installed) == ["fast", "agent", "fast", "agent"]
 
 
 def test_a_pass_with_unstaged_changes_is_not_remembered(installed):
@@ -310,7 +423,7 @@ def test_a_pass_with_unstaged_changes_is_not_remembered(installed):
     (installed / "a").write_text("unstaged\n")
     assert commit(installed).returncode == 0
     assert commit(installed, "--amend").returncode == 0
-    assert ran(installed) == ["agent", "fast", "agent", "fast", "agent", "fast"]
+    assert ran(installed) == ["fast", "agent", "fast", "agent", "fast", "agent"]
 
 
 def test_a_changed_agent_check_runs_again_on_the_same_tree(installed):
@@ -318,7 +431,7 @@ def test_a_changed_agent_check_runs_again_on_the_same_tree(installed):
     check = installed / ".githooks" / "agent-pre-commit"
     check.write_text(check.read_text() + "\n# stricter now\n")
     assert commit(installed, "--amend").returncode == 0
-    assert ran(installed) == ["agent", "fast", "agent", "fast"]
+    assert ran(installed) == ["fast", "agent", "fast", "agent"]
 
 
 def test_an_agent_check_that_runs_pre_commit_does_not_loop(repo):
@@ -330,7 +443,7 @@ def test_an_agent_check_that_runs_pre_commit_does_not_loop(repo):
     hook(repo, "pre-commit", 'echo fast >> "$(git rev-parse --git-dir)/ran"')
     install(repo)
     assert commit(repo, "--allow-empty").returncode == 0
-    assert ran(repo) == ["agent", "fast", "fast"]
+    assert ran(repo) == ["fast", "agent", "fast"]
 
 
 def test_a_passing_agent_check_prints_one_line(installed):
@@ -368,7 +481,7 @@ def test_a_small_fix_commit_without_a_quick_check_skips_the_agent_check(
         "skipped for a small fix commit" in run.stderr
         and "build-state finish" in run.stderr
     )
-    assert ran(installed) == ["agent", "fast", "fast"]
+    assert ran(installed) == ["fast", "agent", "fast"]
 
 
 def quick_check(repo, body='echo quick >> "$(git rev-parse --git-dir)/ran"'):
@@ -384,7 +497,7 @@ def test_a_small_fix_commit_runs_the_quick_check_not_the_agent_check(installed):
     run = commit(installed, "--fixup=HEAD")
 
     assert run.returncode == 0, run.stderr
-    assert ran(installed) == ["agent", "fast", "quick", "fast"]
+    assert ran(installed) == ["fast", "agent", "fast", "quick"]
     assert "agent-quick-check: passed" in run.stderr
 
 
@@ -429,8 +542,8 @@ def retarget(link, target):
     link.symlink_to(target)
 
 
-QUICK = ["quick", "fast"]
-FULL = ["agent", "fast"]
+QUICK = ["fast", "quick"]
+FULL = ["fast", "agent"]
 
 
 @pytest.mark.parametrize(
@@ -527,7 +640,7 @@ def test_a_fixup_subject_given_with_m_skips_the_agent_check(installed):
     run = git(installed, "commit", "-q", "-m", "fixup! x", env=env, check=False)
 
     assert run.returncode == 0, run.stderr
-    assert ran(installed) == ["agent", "fast", "fast"]
+    assert ran(installed) == ["fast", "agent", "fast"]
 
 
 def run_hook_in(monkeypatch, capsys, command, cwd):
@@ -605,20 +718,6 @@ def test_the_missing_agent_check_refusal_ends_with_commit_refused(tmp_path, caps
     assert (
         capsys.readouterr().err.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")
     )
-
-
-def test_install_upgrades_the_line_without_the_refusal(repo):
-    hook(repo, "agent-pre-commit", "exit 0")
-    pre = hook(repo, "pre-commit", f"{gate.COMMENT}\n{gate.OLD_LINES[1]}\necho fast")
-
-    assert install(repo).returncode == 0
-
-    assert pre.read_text().splitlines() == [
-        "#!/bin/sh",
-        gate.COMMENT,
-        gate.LINE,
-        "echo fast",
-    ]
 
 
 def test_without_the_gate_a_refusal_still_ends_with_commit_refused(installed):
@@ -899,8 +998,9 @@ def test_an_agent_check_waits_its_turn_in_heavys_queue(
 ):
     commit_run = committing(installed)
     waiting = queues_or_warns(commit_run, held_lane.lane)
-    # Whether heavy said so or the wait ran out, neither check ran while the lane was held.
-    assert ran(installed) == [], commit_run.err()
+    # Whether heavy said so or the wait ran out, the agent check didn't run while the
+    # lane was held; the fast one ran before it.
+    assert ran(installed) == ["fast"], commit_run.err()
     if not waiting:
         return
     held_lane.kill()  # not reaped: a zombie, which has ended all the same
@@ -909,7 +1009,7 @@ def test_an_agent_check_waits_its_turn_in_heavys_queue(
     err = commit_run.err()
 
     assert commit_run.returncode == 0, err
-    assert ran(installed) == ["agent", "fast"]
+    assert ran(installed) == ["fast", "agent"]
     assert "waiting for the normal lane" in err and "cargo test" in err
 
 
@@ -943,7 +1043,7 @@ def test_a_heavy_inside_an_agent_check_runs_at_once(installed, committing):
     commit_run.wait(timeout=30)
 
     assert commit_run.returncode == 0, commit_run.err()
-    assert ran(installed) == ["agent", "fast"]
+    assert ran(installed) == ["fast", "agent"]
 
 
 def test_only_a_check_that_passes_goes_into_heavys_history(installed):
@@ -998,7 +1098,7 @@ def test_a_check_that_needs_no_queue_passes_while_the_lane_is_held(
     err = commit_run.err()
 
     assert commit_run.returncode == 0, err
-    assert ran(installed) == ["light-75", "fast"]
+    assert ran(installed) == ["fast", "light-75"]
     assert "agent-pre-commit: passed" in err and "outside heavy's queue" in err
     assert "waiting" not in err
 
@@ -1013,14 +1113,14 @@ def test_a_check_that_asks_for_the_queue_waits_its_turn_then_runs_in_it(
     assert "agent" not in ran(installed), commit_run.err()
     if not waiting:
         return
-    assert ran(installed) == ["ask"]
+    assert ran(installed) == ["fast", "ask"]
     held_lane.kill()
     if not finishes_or_warns(commit_run):
         return
     err = commit_run.err()
 
     assert commit_run.returncode == 0, err
-    assert ran(installed) == ["ask", "agent", "fast"]
+    assert ran(installed) == ["fast", "ask", "agent"]
     # Its reason shows before heavy's waiting lines.
     assert err.index("needs a build: src/main.rs") < err.index("waiting for the")
     assert "outside heavy's queue" not in err
@@ -1037,7 +1137,7 @@ def test_the_run_outside_the_queue_gets_one_core_and_one_cargo_job(installed):
     run = commit(installed)
 
     assert run.returncode == 0, run.stderr
-    _, cores, jobs, _ = ran(installed)
+    _, _, cores, jobs = ran(installed)
     assert cores == f"cores-{max(os.sched_getaffinity(0))}"  # the last it may use
     assert jobs == "jobs-1"
 
@@ -1050,7 +1150,7 @@ def test_a_pass_outside_the_queue_is_recorded(installed):
 
     assert run.returncode == 0, run.stderr
     assert "already passed" in run.stderr
-    assert ran(installed) == ["light-75", "fast", "fast"]
+    assert ran(installed) == ["fast", "light-75", "fast"]
 
 
 def test_stopping_a_check_outside_the_queue_refuses_in_one_line(installed, committing):
@@ -1075,7 +1175,7 @@ def test_a_check_that_fails_outside_the_queue_is_refused_without_queueing(instal
     run = commit(installed)
 
     assert run.returncode != 0
-    assert ran(installed) == ["light-75"]
+    assert ran(installed) == ["fast", "light-75"]
     assert run.stderr.index("lint: x is unused") < run.stderr.index("COMMIT REFUSED")
 
 
@@ -1091,7 +1191,7 @@ def test_a_check_that_asks_again_in_the_queue_is_refused(installed):
     run = commit(installed)
 
     assert run.returncode != 0
-    assert ran(installed) == ["again", "again"]
+    assert ran(installed) == ["fast", "again", "again"]
     assert run.stderr.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")
 
 
@@ -1110,7 +1210,7 @@ def test_an_inherited_check_queue_exit_reaches_no_check_that_does_not_name_it(
     run = commit(installed, env={"CHECK_QUEUE_EXIT": "75"})
 
     assert run.returncode == 0, run.stderr
-    assert ran(installed) == ["agent", "fast"]
+    assert ran(installed) == ["fast", "agent"]
 
 
 def test_a_quick_check_that_asks_for_the_queue_waits_its_turn_too(
@@ -1126,14 +1226,14 @@ def test_a_quick_check_that_asks_for_the_queue_waits_its_turn_too(
     assert "quick" not in ran(installed), commit_run.err()
     if not waiting:
         return
-    assert ran(installed) == ["light-75", "fast", "ask"]
+    assert ran(installed) == ["fast", "light-75", "fast", "ask"]
     held_lane.kill()
     if not finishes_or_warns(commit_run):
         return
     err = commit_run.err()
 
     assert commit_run.returncode == 0, err
-    assert ran(installed) == ["light-75", "fast", "ask", "quick", "fast"]
+    assert ran(installed) == ["fast", "light-75", "fast", "ask", "quick"]
     assert "needs a build: src/main.rs" in err
 
 
@@ -1164,7 +1264,7 @@ def test_a_check_never_shares_a_lane(installed, held_lane, committing, monkeypat
     # fixed sleep: many share windows, in which a check that shares would start
     time.sleep(1)
 
-    assert ran(installed) == [], commit_run.err()  # it still waits its turn
+    assert ran(installed) == ["fast"], commit_run.err()  # it still waits its turn
     if not waiting:
         return
     held_lane.kill()

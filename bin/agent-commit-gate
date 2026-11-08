@@ -13,15 +13,22 @@ beside it instead, the repo's fast static checks, or nothing when the repo has
 none: `build-state finish` runs the full check on each commit a fold rewrites. Any
 other fix commit runs the full check.
 
-`--install REPO...` adds one line to the top of each repo's pre-commit hook
-(creating the hook if needed). When `$AI_AGENT` is set, as Claude Code sets it
-in its shells, that line runs agent-pre-commit first and fails the commit if it
-fails. Git runs the hook after `commit -a` or `commit PATHS` has updated the
-index, so the check sees exactly what is being committed. AGENT_PRE_COMMIT
-stops the loop when agent-pre-commit runs pre-commit itself. The line runs the
-check through `--run`; an agent without agent-commit-gate on PATH, such as a
-teammate's, runs the check directly instead, every time. An older line is
-replaced. A check `--run` runs waits its turn in heavy's queue (bin/heavy), so
+`--install REPO...` puts one line first in each repo's pre-commit hook (creating
+the hook if needed). When `$AI_AGENT` is set, as Claude Code sets it in its
+shells, that line exports AGENT_PRE_COMMIT=1 and runs the whole hook again, which
+skips the line; once that passes, it runs agent-pre-commit and fails the commit
+if it fails. So the hook's own checks run first, in whatever language, and what
+its formatters rewrite and stage is in the index before the agent check starts:
+the check sees what is committed, and the tree it records is the commit's. Git
+runs the hook after `commit -a` or `commit PATHS` has updated the index, so this
+holds for those too. The rerun's parent is the hook's shell, not git, and it sees
+AGENT_PRE_COMMIT, which also stops the loop when agent-pre-commit runs pre-commit
+itself. Whatever ran above the line would run twice, so --install moves a line
+with a command above it to the top (comments above it may stay), and replaces an
+older line, wherever it is, with this one at the top. The line runs the check
+through `--run`; an agent without agent-commit-gate on PATH, such as a
+teammate's, runs the check directly instead, every time. A check `--run` runs
+waits its turn in heavy's queue (bin/heavy), so
 agents' commit checks never run at once, and prints heavy's waiting lines; one
 that needs no build or test can skip the queue, as below.
 wt-ship and build-state finish recheck through `--run` too.
@@ -70,8 +77,9 @@ never waits.
 Without arguments it is a Claude Code PreToolUse hook (install.py registers it
 in ~/.claude/settings.json) that refuses `git commit --no-verify` (or `-n`),
 which would skip the check. It catches a mistake, not an agent set on getting
-around the check (`AI_AGENT= git commit`, `git -c core.hooksPath=...`, or a
-line written into the pass record by hand, which every worktree then trusts).
+around the check (`AI_AGENT= git commit`, `AGENT_PRE_COMMIT=1 git commit`, `git
+-c core.hooksPath=...`, or a line written into the pass record by hand, which
+every worktree then trusts).
 
     agent-commit-gate --install REPO...    # add the line to each repo's pre-commit
     agent-commit-gate --run HOOK           # as the line calls it
@@ -94,18 +102,28 @@ import heavyqueue
 import passrecord
 
 HOOK_NAME = "agent-pre-commit"
-COMMENT = f"# Agents' commits also run the slower {HOOK_NAME} (llm-toolbox agent-commit-gate)."
-# The hook is shared, so an agent without llm-toolbox runs the check directly, every time,
-# and its refusal still ends with the line --run prints.
+COMMENT = (
+    "# For an agent's commit, the next line reruns this whole hook, then the slower"
+    f" {HOOK_NAME} on what it staged; keep it first (llm-toolbox agent-commit-gate)."
+)
+# The line runs the whole hook again as a program, where it skips itself, so what the
+# hook formats and stages is in the index before the check starts. The hook is shared,
+# so an agent without llm-toolbox runs the check directly, every time, and its refusal
+# still ends with the line --run prints.
 LINE = (
     'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
+    'export AGENT_PRE_COMMIT=1; "$0" || exit; '
     "if command -v agent-commit-gate >/dev/null; then "
-    f'AGENT_PRE_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}" || exit; '
-    f'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}" || '
-    f'{{ echo "COMMIT REFUSED: {HOOK_NAME} failed" >&2; exit 1; }}; fi; fi'
+    f'agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}"; '
+    f'else "$(dirname "$0")/{HOOK_NAME}" || '
+    f'{{ echo "COMMIT REFUSED: {HOOK_NAME} failed" >&2; exit 1; }}; fi; exit; fi'
 )
-# Earlier versions of LINE, which --install replaces: before --run, then before the
-# refusal line.
+# Earlier comments above LINE, which --install removes with the line below them.
+OLD_COMMENTS = (
+    f"# Agents' commits also run the slower {HOOK_NAME} (llm-toolbox agent-commit-gate).",
+)
+# Earlier versions of LINE, which --install replaces: before --run, before the refusal
+# line, then before the line ran the hook first.
 OLD_LINES = (
     (
         'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
@@ -116,6 +134,13 @@ OLD_LINES = (
         "if command -v agent-commit-gate >/dev/null; then "
         f'AGENT_PRE_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}"; '
         f'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}"; fi || exit; fi'
+    ),
+    (
+        'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
+        "if command -v agent-commit-gate >/dev/null; then "
+        f'AGENT_PRE_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}" || exit; '
+        f'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}" || '
+        f'{{ echo "COMMIT REFUSED: {HOOK_NAME} failed" >&2; exit 1; }}; fi; fi'
     ),
 )
 # How many of HEAD's first-parent commits, HEAD included, --run looks through for one
@@ -416,8 +441,14 @@ def hooks_dir(repo):
     return None if hooks is None else Path(repo, hooks)
 
 
+def is_inert(line):
+    """Whether a hook's line runs nothing: blank, or a comment."""
+    return not line.strip() or line.lstrip().startswith("#")
+
+
 def install(repo):
-    """Add LINE to the repo's pre-commit hook; returns an error message or None."""
+    """Put LINE first in the repo's pre-commit hook, replacing an older line; returns an
+    error message or None."""
     hooks = hooks_dir(repo)
     if hooks is None:
         return f"{repo}: not a git repository"
@@ -426,26 +457,36 @@ def install(repo):
         return f"{repo}: no executable {agent}"
     pre = hooks / "pre-commit"
     exists = pre.exists()
-    text = pre.read_text() if exists else "#!/bin/sh\n"
-    if LINE in text:
+    lines = (pre.read_text() if exists else "#!/bin/sh\n").splitlines()
+    shebang = lines[0][2:].split() if lines and lines[0].startswith("#!") else []
+    at = 1 if shebang else 0
+    found = next(
+        (i for i, line in enumerate(lines) if line.strip() in (LINE, *OLD_LINES)), None
+    )
+    # The line runs the whole hook again, so whatever runs above it would run twice.
+    first = found is not None and all(map(is_inert, lines[at:found]))
+    if first and lines[found].strip() == LINE:
         print(f"{pre}: already installed")
         return None
-    if old := next((line for line in OLD_LINES if line in text), None):
-        pre.write_text(text.replace(old, LINE))
-        print(f"{pre}: upgraded")
-        return None
-    lines = text.splitlines()
-    shebang = lines[0][2:].split() if lines and lines[0].startswith("#!") else []
     if shebang and Path(shebang[0]).name == "env":
         shebang = shebang[1:]
     if shebang and Path(shebang[0]).name not in SHELLS:
         return f"{pre}: not a shell script, so add the agent check by hand"
-    at = 1 if shebang else 0
+    done = []
+    if found is not None:
+        if lines[found].strip() != LINE:
+            done.append("upgraded")
+        if not first:
+            done.append(f"moved the line from line {found + 1} to the top")
+        start = found
+        if found > at and lines[found - 1].strip() in (COMMENT, *OLD_COMMENTS):
+            start -= 1  # its comment goes with it
+        del lines[start : found + 1]
     lines[at:at] = [COMMENT, LINE]
     pre.write_text("\n".join(lines) + "\n")
     if not exists:
         pre.chmod(0o755)
-    print(f"{pre}: installed")
+    print(f"{pre}: {', '.join(done) or 'installed'}")
     return None
 
 

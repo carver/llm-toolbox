@@ -160,8 +160,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   never stages the file.
 - **wt-ship**: ships a worktree's commits. In a repo that pushes, it rebases
   onto the remote branch (the main tree's, by default), refuses leftover
-  conflict markers, runs the repo's `agent-pre-commit` (or `--check CMD`),
-  pushes with one retry when another push wins the race, and confirms the
+  conflict markers, runs the repo's `agent-pre-commit` through
+  `agent-commit-gate --run`, which hands it `CHECK_BASE`, usually the main
+  branch's tip (or runs `--check CMD`, without it), pushes with one retry when
+  another push wins the race, and confirms the
   remote holds HEAD. Then it prints the range, a notice for other sessions and
   whether the main tree is behind; `--remove` removes the worktree, and `-C DIR`
   runs it on the worktree DIR from outside, so the call's shell isn't left in
@@ -234,9 +236,16 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   commit if that fails. People keep the quick hook; the agent also gets the
   slow checks, such as the whole test suite. Git runs the hook after `commit
   -a` or `commit PATHS` updates the index, so the check sees what is
-  committed. A tree that already passed the check, as in an amend that
-  changes only the message, skips it; an agent without llm-toolbox, such as
-  a teammate's, runs the check every time. The check's output shows only when
+  committed. The trees that passed go on a record in the repo's common git
+  dir, which every worktree shares, keyed by the tree and the check's bytes.
+  When HEAD's own tree is on it, as in an amend that changes only the message,
+  the check is skipped. Otherwise the check gets `$CHECK_BASE`, the nearest of
+  HEAD's last 100 first-parent commits whose tree passed it, and may run only
+  what the changes since need: `git diff --cached --name-only "$CHECK_BASE"`
+  lists them at commit time and on a `wt-ship` or `build-state finish` recheck.
+  A check that ignores it runs in full, as does any with no base found. An
+  agent without llm-toolbox, such as a teammate's, runs the check every time.
+  The check's output shows only when
   it fails, ending with `COMMIT REFUSED`; a pass prints one line. A small
   fixup!, squash! or amend! commit (found from the running `git commit`'s
   arguments) runs `agent-quick-check` instead, when the repo keeps one beside
@@ -311,8 +320,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   folds `fixup!` commits into the commits they fix, leaving every other commit
   separate and the tree as it was (a fix that conflicts gets the later commit
   it was made on top of and the `reword` command that points it there), and
-  runs the repo's `agent-pre-commit` on
-  each commit the fold rewrote, checked out in turn, so a fix folded into a
+  runs the repo's `agent-pre-commit` through `agent-commit-gate --run` on
+  each commit the fold rewrote, checked out in turn, with `CHECK_BASE` usually
+  the commit before, so a fix folded into a
   commit before the code it needs fails naming that commit; HEAD ends back on
   its branch either way. Then it lists the commits since the
   base and the test files changed since the refactor base, and fails naming

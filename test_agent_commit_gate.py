@@ -121,8 +121,8 @@ def install(*repos):
     )
 
 
-def commit(repo, *args, agent=True, gate_on_path=True):
-    env = without_repo_vars(os.environ)
+def commit(repo, *args, agent=True, gate_on_path=True, env=None):
+    env = without_repo_vars(os.environ) | (env or {})
     # The hook line calls agent-commit-gate from PATH: this checkout's, not the installed one.
     dirs = [
         d for d in env["PATH"].split(os.pathsep) if not Path(d, SCRIPT.name).exists()
@@ -632,6 +632,195 @@ def test_without_the_gate_a_refusal_still_ends_with_commit_refused(installed):
 
     assert run.returncode != 0
     assert run.stderr.rstrip().splitlines()[-1].startswith("COMMIT REFUSED")
+
+
+def head(repo, rev="HEAD"):
+    return git(repo, "rev-parse", rev).stdout.strip()
+
+
+def noting_bases(repo, name="agent-pre-commit"):
+    """Make the repo's check `name` pass and note the CHECK_BASE it was given, `none`
+    without one, in bases(repo)."""
+    hook(repo, name, 'echo "${CHECK_BASE:-none}" >> "$(git rev-parse --git-dir)/bases"')
+
+
+def bases(repo):
+    path = Path(git(repo, "rev-parse", "--absolute-git-dir").stdout.strip(), "bases")
+    return path.read_text().split() if path.exists() else []
+
+
+def edit(repo, text):
+    (repo / "a").write_text(text)
+    git(repo, "add", "a")
+
+
+def test_the_check_gets_the_commit_it_builds_on_as_check_base(installed):
+    noting_bases(installed)
+    assert commit(installed).returncode == 0
+    first = head(installed)
+    edit(installed, "better\n")
+
+    run = commit(installed)
+
+    assert run.returncode == 0, run.stderr
+    assert bases(installed) == ["none", first]
+    assert f"given CHECK_BASE {first[:12]}" in run.stderr
+
+
+def test_check_base_is_the_nearest_commit_that_passed(installed):
+    noting_bases(installed)
+    assert commit(installed).returncode == 0
+    passed = head(installed)
+    edit(installed, "a person's\n")
+    assert commit(installed, agent=False).returncode == 0  # runs no agent check
+    edit(installed, "an agent's\n")
+
+    assert commit(installed).returncode == 0
+
+    assert bases(installed) == ["none", passed]
+
+
+def test_a_changed_check_gets_no_base_its_old_self_passed(installed):
+    noting_bases(installed)
+    assert commit(installed).returncode == 0
+    check = installed / ".githooks" / "agent-pre-commit"
+    check.write_text(check.read_text() + "# stricter now\n")
+    edit(installed, "better\n")
+
+    assert commit(installed).returncode == 0
+
+    assert bases(installed) == ["none", "none"]
+
+
+def commits_without_checks(repo, count):
+    """`count` commits on HEAD's branch, each a new `b`, made by fast-import, which
+    runs no hook: none of them passed the check."""
+    ref = git(repo, "symbolic-ref", "HEAD").stdout.strip()
+    stream = []
+    for n in range(count):
+        stream += [f"commit {ref}", "committer t <t@t> 0 +0000", "data 0"]
+        if n == 0:
+            stream.append(f"from {head(repo)}")
+        stream += ["M 100644 inline b", f"data {len(str(n))}", str(n)]
+    subprocess.run(
+        ["git", "-C", str(repo), "fast-import", "--quiet"],
+        input="\n".join(stream) + "\n",
+        text=True,
+        check=True,
+        env=without_repo_vars(os.environ),
+    )
+    git(repo, "reset", "-q", "--hard")
+
+
+@pytest.mark.parametrize("between, found", [(99, True), (100, False)])
+def test_the_search_for_a_base_looks_back_100_commits(installed, between, found):
+    noting_bases(installed)
+    assert commit(installed).returncode == 0
+    passed = head(installed)
+    commits_without_checks(installed, between)
+    edit(installed, "better\n")
+
+    assert commit(installed).returncode == 0
+
+    assert bases(installed) == ["none", passed if found else "none"]
+
+
+def test_a_signed_commit_shown_with_its_signature_still_gives_a_base(installed):
+    """log.showSignature adds lines on the signature to every git log's output."""
+    key = installed / ".git" / "key"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True
+    )
+    for name, value in (
+        ("gpg.format", "ssh"),
+        ("user.signingkey", str(key)),
+        ("gpg.ssh.allowedSignersFile", os.devnull),
+        ("log.showSignature", "true"),
+    ):
+        git(installed, "config", name, value)
+    noting_bases(installed)
+    assert commit(installed, "-S").returncode == 0
+    signed = head(installed)
+    edit(installed, "better\n")
+
+    run = commit(installed)
+
+    assert run.returncode == 0, run.stderr
+    assert bases(installed) == ["none", signed]
+
+
+def test_an_inherited_check_base_does_not_reach_the_check(installed):
+    noting_bases(installed)
+
+    assert commit(installed, env={"CHECK_BASE": "deadbeef"}).returncode == 0
+
+    assert bases(installed) == ["none"]
+
+
+def test_a_small_fix_commit_gets_the_base_that_passed_the_full_check(installed):
+    noting_bases(installed, "agent-quick-check")
+    assert commit(installed).returncode == 0
+    passed = head(installed)
+    edit(installed, "still good\n")
+
+    assert commit(installed, "--fixup=HEAD").returncode == 0
+
+    assert bases(installed) == [passed]
+
+
+def test_a_tree_that_passed_in_another_worktree_skips_the_check_there(installed):
+    git(installed, "add", ".githooks")
+    assert commit(installed).returncode == 0
+    other = installed.parent / f"{installed.name}-wt"
+    git(installed, "worktree", "add", "-q", "--detach", str(other))
+
+    run = commit(other, "--allow-empty")
+
+    assert run.returncode == 0, run.stderr
+    assert "already passed" in run.stderr
+    assert ran(installed) == ["agent", "fast"]
+
+
+def test_any_recorded_tree_of_heads_skips_the_check_not_only_the_last(installed):
+    assert commit(installed).returncode == 0
+    edit(installed, "better\n")
+    assert commit(installed).returncode == 0
+    git(installed, "reset", "-q", "--hard", "HEAD~1")
+
+    run = commit(installed, "--amend")
+
+    assert run.returncode == 0, run.stderr
+    assert "already passed" in run.stderr
+
+
+def test_a_tree_that_passed_but_is_not_heads_runs_the_check(installed):
+    """A revert brings back a tree that passed, but a check may read more than the
+    tree, so only HEAD's own tree skips it; the revert runs it against HEAD."""
+    noting_bases(installed)
+    assert commit(installed).returncode == 0
+    edit(installed, "better\n")
+    assert commit(installed).returncode == 0
+    edit(installed, "good\n")
+
+    assert commit(installed).returncode == 0
+
+    assert bases(installed) == [
+        "none",
+        head(installed, "HEAD~2"),
+        head(installed, "HEAD~1"),
+    ]
+
+
+def test_the_record_keeps_the_last_1000_passes(installed):
+    record = installed / ".git" / gate.PASS_RECORD
+    record.write_text("".join(f"{n:040x} old\n" for n in range(1500)))
+
+    assert commit(installed).returncode == 0
+
+    kept = record.read_text().splitlines()
+    assert len(kept) == 1000
+    assert kept[0] == f"{501:040x} old"
+    assert kept[-1].split()[0] == head(installed, "HEAD^{tree}")
 
 
 @pytest.fixture

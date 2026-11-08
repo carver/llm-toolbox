@@ -18,8 +18,10 @@ In order, it:
    progress: resolve the hunks (`conflicts -h`), `git rebase --continue`, then run it
    again;
 3. refuses leftover conflict markers in what it would push;
-4. runs the check: --check CMD (through sh), else the repo's agent-pre-commit hook
-   (through agent-commit-gate --run when it's on PATH), else none, and says so;
+4. runs the check: --check CMD (through sh, without CHECK_BASE), else the repo's
+   agent-pre-commit hook through agent-commit-gate --run, which skips a tree that
+   passed it and hands it CHECK_BASE, usually the main branch's tip (`agent-commit-gate
+   -h`), so the check can run only what the landing changed; else none, and says so;
 5. pushes HEAD to REMOTE/BRANCH. When another session's push wins the race (a
    non-fast-forward rejection), it fetches, rebases, checks and pushes again, up to
    10 tries in all, then stops saying to run it again;
@@ -71,7 +73,6 @@ ran out, another session's pushes or commits winning each of 10 (run it again la
 import argparse
 import os
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -97,6 +98,7 @@ class Stop(Exception):
 
 
 HEAVY = Path(__file__).resolve().parent / "heavy"
+GATE = HEAVY.with_name("agent-commit-gate")
 
 # This run's command line, so a stop can say to run the same thing again; main sets it.
 RERUN = "wt-ship"
@@ -212,14 +214,14 @@ def run_check(command, mode):
                 "No check: the repo has no agent-pre-commit hook and no --check was given."
             )
             return
-        gate = shutil.which("agent-commit-gate")
-        argv = [gate, "--run", str(hook)] if gate else [str(hook)]
         env = os.environ | {"AGENT_PRE_COMMIT": "1"}
-        code = run_stoppable(argv, env)
+        code = run_stoppable([str(GATE), "--run", str(hook)], env)
         name = "agent-pre-commit"
     else:
-        # Through heavy, so a --check waits its turn with every other heavy job.
-        code = run_stoppable([str(HEAVY), "--", "sh", "-c", command])
+        # Through heavy, so a --check waits its turn with every other heavy job. The
+        # gate's CHECK_BASE is for the repo's own check, so none is passed on.
+        env = {k: v for k, v in os.environ.items() if k != "CHECK_BASE"}
+        code = run_stoppable([str(HEAVY), "--", "sh", "-c", command], env)
         name = repr(command)
     if code != 0:
         raise Stop(f"The check {name} failed (exit {code}); nothing was {mode.done}.")

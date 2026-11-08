@@ -19,16 +19,43 @@ in its shells, that line runs agent-pre-commit first and fails the commit if it
 fails. Git runs the hook after `commit -a` or `commit PATHS` has updated the
 index, so the check sees exactly what is being committed. AGENT_PRE_COMMIT
 stops the loop when agent-pre-commit runs pre-commit itself. The line runs the
-check through `--run`, which skips it when it already passed on the same tree,
-as when an amend changes only the message; an agent without agent-commit-gate
-on PATH, such as a teammate's, runs the check directly instead. An older line
-is replaced. A check `--run` runs waits its turn in heavy's queue (bin/heavy), so
+check through `--run`; an agent without agent-commit-gate on PATH, such as a
+teammate's, runs the check directly instead, every time. An older line is
+replaced. A check `--run` runs waits its turn in heavy's queue (bin/heavy), so
 agents' commit checks never run at once, and prints heavy's waiting lines.
+wt-ship and build-state finish recheck through `--run` too.
+
+`--run` records each tree that passes in agent-pre-commit-passed, in the repo's
+common git dir, which every worktree shares: the last 1,000, each with the SHA-1
+of agent-pre-commit's bytes, so an edited check reuses no pass of its old self.
+A pass counts only with no unstaged changes to tracked files, since some checks
+read the working tree. When the tree being checked is HEAD's own and on the
+record, the check is skipped: an amend that changes only the message, or a
+recheck with nothing rebased. Any other tree runs it, a revert to a tree that
+passed included, since a check may read more than the tree.
+
+Before it runs the check, `--run` looks through HEAD's first-parent history,
+HEAD and up to 99 commits before it, for the nearest commit whose tree passed
+this same check, and exports it as $CHECK_BASE (a full SHA; unset when none
+is found). A repo's check may then run only what the changes since that commit
+need. To list the changed paths, use
+    git diff --cached --name-only "$CHECK_BASE"
+which works at commit time, when the index holds what's staged, and on a
+recheck, when the index matches the commit being checked. Add -z for paths git
+would quote, --no-renames to list both sides of a rename, and run it before
+unsetting git's variables or changing directory: `commit -a` and `commit
+PATHS` stage into an index of their own, which GIT_INDEX_FILE names. After
+wt-ship's rebase the base is usually the main branch's tip, which passed when
+it landed; in build-state finish, the commit before. A check that ignores
+CHECK_BASE runs in full, as does any check when no base is found. The pass line
+names the base it was given. agent-quick-check gets CHECK_BASE too: the nearest
+commit that passed agent-pre-commit, whose checks include the quick ones.
 
 Without arguments it is a Claude Code PreToolUse hook (install.py registers it
 in ~/.claude/settings.json) that refuses `git commit --no-verify` (or `-n`),
 which would skip the check. It catches a mistake, not an agent set on getting
-around the check (`AI_AGENT= git commit`, `git -c core.hooksPath=...`).
+around the check (`AI_AGENT= git commit`, `git -c core.hooksPath=...`, or a
+line written into the pass record by hand, which every worktree then trusts).
 
     agent-commit-gate --install REPO...    # add the line to each repo's pre-commit
     agent-commit-gate --run HOOK           # as the line calls it
@@ -36,6 +63,7 @@ around the check (`AI_AGENT= git commit`, `git -c core.hooksPath=...`).
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -75,8 +103,15 @@ OLD_LINES = (
         f'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}"; fi || exit; fi'
     ),
 )
-# In the git dir: the last tree and agent check that passed together.
+# In the repo's common git dir, shared by its worktrees: a line for each tree that passed
+# the agent check, `<tree> <the check's fingerprint>`, newest last, the last RECORD_SIZE.
 PASS_RECORD = "agent-pre-commit-passed"
+RECORD_SIZE = 1000
+# How long a pass waits for another's write to the record before it goes unrecorded.
+RECORD_LOCK_SECONDS = 5
+# How many of HEAD's first-parent commits, HEAD included, --run looks through for one
+# whose tree passed the check: the check's CHECK_BASE.
+BASE_SEARCH = 100
 REDIRECT = re.compile(r"^\d*[<>]")
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -393,23 +428,27 @@ def install(repo):
     return None
 
 
-def run_quiet(path, name, queue=True):
-    """Run the check at `path`, named `name` in what it prints, and return its exit
-    code. Its output shows only when it fails: agents filtered a noisy pass with greps,
-    and the greps hid failed commits. With queue, it runs once it's its turn in heavy's
+def run_quiet(path, name, base, queue=True):
+    """Run the check at `path`, named `name` in what it prints, with CHECK_BASE set to
+    `base` (None: unset, whatever this process inherited), and return its exit code.
+    Its output shows only when it fails: agents filtered a noisy pass with greps, and
+    the greps hid failed commits. With queue, it runs once it's its turn in heavy's
     queue, whose waiting lines print as they come."""
     with ExitStack() as stack:
-        env = None
+        env = dict(os.environ)
         try:
             if queue:
                 job = stack.enter_context(heavyqueue.turn(command=name, hint=False))
                 job.pin()  # the check inherits the job's cores
-                env = job.env
+                env = dict(job.env)
         except heavyqueue.QueueError as error:
             print(
                 f"heavy: can't use its queue ({error}), so the check runs without it.",
                 file=sys.stderr,
             )
+        env.pop("CHECK_BASE", None)
+        if base:
+            env["CHECK_BASE"] = base
         started = time.monotonic()
         # `path` as given: Path() would drop a leading ./ and send it to a PATH lookup.
         run = subprocess.run(
@@ -421,30 +460,97 @@ def run_quiet(path, name, queue=True):
         )
     code = run.returncode
     if code == 0:
-        print(f"{name}: passed ({time.monotonic() - started:.0f}s)", file=sys.stderr)
+        given = f", given CHECK_BASE {base[:12]}" if base else ""
+        took = time.monotonic() - started
+        print(f"{name}: passed ({took:.0f}s{given})", file=sys.stderr)
     else:
         sys.stderr.write(run.stdout.decode(errors="replace"))
         print(f"COMMIT REFUSED: {name} failed (exit {code})", file=sys.stderr)
     return code
 
 
+def record_path():
+    """The pass record's path, in the common git dir; None outside a repository."""
+    common = git_out("rev-parse", "--path-format=absolute", "--git-common-dir")
+    return None if common is None else Path(common, PASS_RECORD)
+
+
+def recorded(record):
+    """The record's keys, oldest first; none when it's missing or can't be read, which
+    only costs fuller runs."""
+    try:
+        return record.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+
+
+def check_base(passed, fingerprint):
+    """The nearest of HEAD's first BASE_SEARCH first-parent commits, HEAD included,
+    whose tree passed the check with this fingerprint; None when there's none."""
+    log = git_out(
+        "log",
+        "--no-show-signature",
+        "--first-parent",
+        f"-n{BASE_SEARCH}",
+        "--format=%H %T",
+        "HEAD",
+    )
+    for line in (log or "").splitlines():
+        # Only `<commit> <tree>`, whatever else a config adds to git log's output.
+        if len(words := line.split()) == 2 and f"{words[1]} {fingerprint}" in passed:
+            return words[0]
+    return None
+
+
+def remember(record, key):
+    """Add key to the record, newest last, keeping the last RECORD_SIZE: rewritten
+    whole and renamed into place, under a lock beside it so passes in two worktrees
+    keep both. A lock held past RECORD_LOCK_SECONDS, or a failed write, leaves the pass
+    unrecorded, which costs a fuller run later, and says so."""
+    deadline = time.monotonic() + RECORD_LOCK_SECONDS
+    part = record.with_name(f"{record.name}.{os.getpid()}")
+    try:
+        with open(record.with_name(f"{record.name}.lock"), "a") as lock:
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise OSError("another commit holds its lock") from None
+                    time.sleep(0.05)
+            kept = [line for line in recorded(record) if line != key]
+            kept = [*kept[-(RECORD_SIZE - 1) :], key]
+            part.write_text("".join(f"{line}\n" for line in kept))
+            part.replace(record)
+    except OSError as error:
+        part.unlink(missing_ok=True)
+        print(f"{HOOK_NAME}: passed; couldn't record it: {error}", file=sys.stderr)
+
+
 def run_check(path):
-    """Run the agent check at `path`, unless it passed on this exact tree already, as
-    when an amend changes only the message. The key is the tree being committed and the
-    check's own content. A pass counts only with no unstaged changes to tracked files,
-    since some checks read the working tree rather than the index."""
+    """Run the agent check at `path`, unless HEAD's tree is the tree being checked and
+    passed this check already, as when an amend changes only the message or wt-ship
+    rechecks a commit it didn't rebase. The key is the tree and the check's own content,
+    on a record every worktree shares. A pass counts only with no unstaged changes to
+    tracked files, since some checks read the working tree rather than the index. The
+    check gets CHECK_BASE, the nearest first-parent commit whose tree passed it."""
     hook = Path(path)
     if not (hook.is_file() and os.access(hook, os.X_OK)):
         print(f"{path}: no executable agent check", file=sys.stderr)
         print(f"COMMIT REFUSED: no {HOOK_NAME} to run", file=sys.stderr)
         return 1
+    record = record_path()
+    passed = set(recorded(record)) if record else set()
+    fingerprint = hashlib.sha1(hook.read_bytes()).hexdigest()
+    base = check_base(passed, fingerprint)
     fix = (args := running_commit_args()) is not None and is_fix_commit(args)
     if fix and is_small_fix():
         # Beside `path` as given, so a ./ path stays one.
         quick = os.path.join(os.path.dirname(path), QUICK_NAME)
         if os.path.isfile(quick) and os.access(quick, os.X_OK):
             # Fast static checks only, no tests: not worth a place in heavy's queue.
-            return run_quiet(quick, QUICK_NAME, queue=False)
+            return run_quiet(quick, QUICK_NAME, base, queue=False)
         print(
             f"{HOOK_NAME}: skipped for a small fix commit; build-state finish runs it on "
             "each commit the fold rewrites",
@@ -452,23 +558,16 @@ def run_check(path):
         )
         return 0
     tree = git_out("write-tree")
-    record = git_out("rev-parse", "--git-path", PASS_RECORD)
-    key = None
-    if tree and record:
-        key = f"{tree} {hashlib.sha1(hook.read_bytes()).hexdigest()}"
-        if Path(record).is_file() and Path(record).read_text() == key:
-            print(
-                f"{HOOK_NAME}: skipped, tree {tree[:12]} already passed it",
-                file=sys.stderr,
-            )
-            return 0
+    key = f"{tree} {fingerprint}" if tree else None
+    if key in passed and tree == git_out("rev-parse", "-q", "--verify", "HEAD^{tree}"):
+        print(
+            f"{HOOK_NAME}: skipped, tree {tree[:12]} already passed it", file=sys.stderr
+        )
+        return 0
     clean = subprocess.run(["git", "diff", "--quiet"], check=False).returncode == 0
-    code = run_quiet(path, HOOK_NAME)
-    if code == 0 and clean and key:
-        try:
-            Path(record).write_text(key)
-        except OSError as error:
-            print(f"{HOOK_NAME}: passed; couldn't record it: {error}", file=sys.stderr)
+    code = run_quiet(path, HOOK_NAME, base)
+    if code == 0 and clean and key and record:
+        remember(record, key)
     return code
 
 
@@ -485,7 +584,7 @@ def main(argv=None):
     parser.add_argument(
         "--run",
         metavar="HOOK",
-        help="run the agent check HOOK, unless it passed on this exact tree already",
+        help="run the agent check HOOK with CHECK_BASE, unless HEAD's tree passed it",
     )
     args = parser.parse_args(argv)
     if args.run:

@@ -37,11 +37,11 @@ def ship_env(session="s-mine", wait="10", **extra):
     }
 
 
-def ship(cwd, *args, session="s-mine", wait="10"):
+def ship(cwd, *args, session="s-mine", wait="10", env=None):
     return subprocess.run(
         [str(SCRIPT), *args],
         cwd=cwd,
-        env=ship_env(session, wait),
+        env=ship_env(session, wait, **(env or {})),
         capture_output=True,
         text=True,
         check=False,
@@ -188,6 +188,53 @@ def test_the_default_check_is_the_repos_agent_pre_commit(setup):
 
     assert done.returncode == 1 and "hook ran" in done.stdout + done.stderr
     assert remote_main(origin) == before
+
+
+GATE = SCRIPT.parent / "agent-commit-gate"
+
+
+def without_the_gate_on_path():
+    """PATH without any agent-commit-gate, so a tool that finds it there can't."""
+    dirs = os.environ["PATH"].split(os.pathsep)
+    return {"PATH": os.pathsep.join(d for d in dirs if not Path(d, GATE.name).exists())}
+
+
+def test_the_recheck_gets_the_main_tip_it_rebased_onto_as_check_base(setup):
+    _, main, wt, _ = setup
+    seen = main.parent / "bases"
+    install_hook(main, "agent-pre-commit", f'echo "${{CHECK_BASE:-none}}" >> "{seen}"')
+    hooks = Path(git(main, "rev-parse", "--absolute-git-dir")) / "hooks"
+    commit(main, "b.py", "y = 2\n", "Add b")
+    # The main tree's tip passes the check, as it does when it lands.
+    passed = subprocess.run(
+        [str(GATE), "--run", str(hooks / "agent-pre-commit")], cwd=main, check=False
+    )
+    assert passed.returncode == 0
+    tip = main_head(main)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local", env=without_the_gate_on_path())
+
+    assert done.returncode == 0, done.stderr
+    assert seen.read_text().split() == ["none", tip]
+    assert f"given CHECK_BASE {tip[:12]}" in done.stderr
+
+
+def test_a_check_given_with_check_gets_no_check_base(setup):
+    _, main, wt, _ = setup
+    seen = main.parent / "base"
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(
+        wt,
+        "--local",
+        "--check",
+        f'echo "${{CHECK_BASE:-none}}" > "{seen}"',
+        env={"CHECK_BASE": main_head(main)},
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert seen.read_text().split() == ["none"]
 
 
 def test_a_push_that_loses_one_race_rebases_and_retries(setup):

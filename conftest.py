@@ -63,8 +63,9 @@ def without_repo_vars(env):
     return {k: v for k, v in env.items() if not redirects_git(k)}
 
 
-# Set when an agent commits; a test's pre-commit hook would rerun the suite.
-AGENT_VARS = ("AI_AGENT", "AGENT_PRE_COMMIT")
+# Set when an agent commits; a test's pre-commit hook would rerun the suite. CHECK_BASE
+# names a commit of the repo being committed, which the gate hands the suite's own check.
+AGENT_VARS = ("AI_AGENT", "AGENT_PRE_COMMIT", "CHECK_BASE")
 
 
 @pytest.fixture(scope="session", autouse=True)

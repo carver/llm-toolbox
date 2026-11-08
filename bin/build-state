@@ -44,9 +44,12 @@ into, up to HEAD. A fix folded into an earlier commit than the code it needs lea
 commit broken while HEAD passes. Commits the fold left alone, and rewritten ones whose
 tree a commit other than a fix had before the fold, passed the check when they were made.
 Each commit is checked out for its check, forced, since some checks read or write the
-work tree; then HEAD goes back to the branch's folded tip, also when finish is stopped
-by Ctrl-C, SIGTERM or SIGHUP, which stop the check too. The first failure names its
-commit, keeps the build open and leaves the branch folded.
+work tree, and checked through agent-commit-gate --run, which hands it CHECK_BASE:
+the nearest commit before it that passed, usually the one just before, so the check
+can run only what that commit changed. Then HEAD goes back to the branch's folded
+tip, also when finish is stopped by Ctrl-C, SIGTERM or SIGHUP, which stop the check
+too. The first failure names its commit, keeps the build open and leaves the branch
+folded.
 
 The fingerprint is every ref except the work branch and its upstream, the stash, and the
 branches checked out in other linked worktrees at start or at finish, which other sessions
@@ -70,7 +73,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -84,6 +86,7 @@ TEST_FILE = re.compile(
 )
 # The subjects of commits that finish folds into the commits they name.
 FIXES = ("fixup! ", "squash! ", "amend! ")
+GATE = Path(__file__).resolve().parent / "agent-commit-gate"
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -420,15 +423,14 @@ def back_at_head() -> Iterator[None]:
 
 
 def agent_check() -> list[str] | None:
-    """The command that runs the repo's agent-pre-commit, through agent-commit-gate
-    when it's on PATH; None when the repo has none."""
+    """The command that runs the repo's agent-pre-commit, through the agent-commit-gate
+    beside this script, which hands it CHECK_BASE; None when the repo has none."""
     # --git-path is relative to the current directory, which may be a subdirectory.
     hooks = Path(git("rev-parse", "--git-path", "hooks").stdout.strip()).resolve()
     hook = hooks / "agent-pre-commit"
     if not (hook.is_file() and os.access(hook, os.X_OK)):
         return None
-    gate = shutil.which("agent-commit-gate")
-    return [gate, "--run", str(hook)] if gate else [str(hook)]
+    return [str(GATE), "--run", str(hook)]
 
 
 def passes(argv: list[str], top: str) -> bool:

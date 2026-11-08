@@ -43,9 +43,14 @@ def commit(repo, path, message, *flags):
     return git(repo, "rev-parse", "HEAD").strip()
 
 
-def build_state(repo, *args):
+def build_state(repo, *args, env=None):
     return subprocess.run(
-        [str(SCRIPT), *args], cwd=repo, capture_output=True, text=True, check=False
+        [str(SCRIPT), *args],
+        cwd=repo,
+        env=os.environ | (env or {}),
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 
@@ -785,6 +790,29 @@ def agent_check(repo, body):
     )
     hook.chmod(0o755)
     return repo / ".git" / "checked"
+
+
+def test_finish_gives_each_commit_it_checks_the_one_before_as_check_base(repo):
+    bases = repo / ".git" / "bases"
+    hook = repo / ".git" / "hooks" / "agent-pre-commit"
+    agent_check(repo, f'echo "${{CHECK_BASE:-none}}" >> "{bases}"')
+    gate = SCRIPT.parent / "agent-commit-gate"
+    start = git(repo, "rev-parse", "HEAD").strip()
+    # The commit the build starts from passed the check when it was made.
+    passed = subprocess.run([str(gate), "--run", str(hook)], cwd=repo, check=False)
+    assert passed.returncode == 0
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "b.py", "More")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+    dirs = os.environ["PATH"].split(os.pathsep)
+    path = os.pathsep.join(d for d in dirs if not Path(d, gate.name).exists())
+
+    done = build_state(repo, "finish", env={"PATH": path})
+
+    assert done.returncode == 0, done.stderr
+    folded_work = git(repo, "rev-parse", "HEAD~1").strip()
+    assert bases.read_text().split() == ["none", start, folded_work]
 
 
 def test_finish_checks_the_folded_result_when_it_folded_a_fix(repo):

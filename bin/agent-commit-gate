@@ -63,8 +63,9 @@ there without the variable. Any other exit is the check's outcome, and a pass li
 then says it ran outside heavy's queue. A check that doesn't name it waits in the
 queue (agent-pre-commit) or runs outside it (agent-quick-check), as before, and never
 sees an inherited CHECK_QUEUE_EXIT. The one core keeps a check whose handling broke
-from loading the machine; beyond that the queue works on trust, as the --no-verify
-refusal below does.
+from loading the machine. Beyond that the queue works on trust, as the --no-verify
+refusal below does: a check that names the variable and never exits with its code
+never waits.
 
 Without arguments it is a Claude Code PreToolUse hook (install.py registers it
 in ~/.claude/settings.json) that refuses `git commit --no-verify` (or `-n`),
@@ -249,9 +250,9 @@ QUEUE_EXIT_NAME = "CHECK_QUEUE_EXIT"
 QUEUE_EXIT = 75
 
 
-def asks_for_queue(content):
-    """Whether a check, from its bytes, runs first outside heavy's queue: it names
-    QUEUE_EXIT_NAME."""
+def names_queue_exit(content):
+    """Whether a check, from its bytes, names QUEUE_EXIT_NAME, and so runs first
+    outside heavy's queue."""
     return QUEUE_EXIT_NAME.encode() in content
 
 
@@ -456,32 +457,49 @@ def install(repo):
 
 
 def check_env(env, base):
-    """`env` for a check: CHECK_BASE set to `base` (None: unset), and no CHECK_QUEUE_EXIT
-    but the one the gate gives."""
+    """`env` for a check: CHECK_BASE set to `base` (None: unset), and CHECK_QUEUE_EXIT
+    left out."""
     env = {k: v for k, v in env.items() if k not in ("CHECK_BASE", QUEUE_EXIT_NAME)}
     if base:
         env["CHECK_BASE"] = base
     return env
 
 
+@contextmanager
 def on_one_core():
-    """In the run outside the queue, before the check starts: pin it to the last core
-    this process may use, so a build it starts by mistake can't load the machine."""
-    with suppress(OSError):
-        os.sched_setaffinity(0, {max(os.sched_getaffinity(0))})
+    """Pin this process, and so the check it starts, to the last core it may use, so
+    a build the check starts outside the queue by mistake can't load the machine; its
+    cores come back after."""
+    cores = os.sched_getaffinity(0)
+    try:
+        os.sched_setaffinity(0, {max(cores)})
+    except OSError as error:
+        print(
+            f"agent-commit-gate: can't pin to one core ({error.strerror}), so the run"
+            " outside heavy's queue runs on any.",
+            file=sys.stderr,
+        )
+        yield
+        return
+    try:
+        yield
+    finally:
+        with suppress(OSError):
+            os.sched_setaffinity(0, cores)
 
 
-def run_once(path, env, **options):
-    """The check's run: its exit code, and its output with stderr merged in."""
+def run_once(path, env):
+    """The check's run, its output with stderr merged in, and how long it took."""
+    started = time.monotonic()
     # `path` as given: Path() would drop a leading ./ and send it to a PATH lookup.
-    return subprocess.run(
+    run = subprocess.run(
         [path],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         check=False,
         env=env,
-        **options,
     )
+    return run, time.monotonic() - started
 
 
 def report(name, base, run, took, outside=False):
@@ -497,27 +515,29 @@ def report(name, base, run, took, outside=False):
     return code
 
 
-def run_quiet(path, name, base, queue=True, ask=False):
+def run_outside_first(path, name, base):
+    """Run the check as run_quiet does, but first outside heavy's queue, on one core,
+    with CHECK_QUEUE_EXIT set. That run's outcome is the check's, unless it exits with
+    QUEUE_EXIT: then what it printed shows, as its reason, and it runs again in the
+    queue."""
+    env = check_env(os.environ, base) | {
+        QUEUE_EXIT_NAME: str(QUEUE_EXIT),
+        "CARGO_BUILD_JOBS": "1",
+    }
+    with on_one_core():
+        run, took = run_once(path, env)
+    if run.returncode != QUEUE_EXIT:
+        return report(name, base, run, took, outside=True)
+    sys.stderr.write(run.stdout.decode(errors="replace"))
+    return run_quiet(path, name, base)
+
+
+def run_quiet(path, name, base, queue=True):
     """Run the check at `path`, named `name` in what it prints, with CHECK_BASE set to
     `base` (None: unset, whatever this process inherited), and return its exit code.
     Its output shows only when it fails: agents filtered a noisy pass with greps, and
-    the greps hid failed commits. With ask, it runs first outside heavy's queue, on
-    one core, with CHECK_QUEUE_EXIT set; that run's outcome is the check's, unless it
-    exits with QUEUE_EXIT, when what it printed shows as its reason and it runs again
-    as with queue. With queue, it runs once it's its turn in heavy's queue, whose
-    waiting lines print as they come."""
-    if ask:
-        started = time.monotonic()
-        env = check_env(os.environ, base) | {
-            QUEUE_EXIT_NAME: str(QUEUE_EXIT),
-            "CARGO_BUILD_JOBS": "1",
-        }
-        # The gate runs no threads, so preexec_fn is safe here.
-        run = run_once(path, env, preexec_fn=on_one_core)
-        if run.returncode != QUEUE_EXIT:
-            return report(name, base, run, time.monotonic() - started, outside=True)
-        sys.stderr.write(run.stdout.decode(errors="replace"))
-        queue = True
+    the greps hid failed commits. With queue, it runs once it's its turn in heavy's
+    queue, whose waiting lines print as they come."""
     with ExitStack() as stack:
         env, job = os.environ, None
         try:
@@ -530,11 +550,10 @@ def run_quiet(path, name, base, queue=True, ask=False):
                 f"heavy: can't use its queue ({error}), so the check runs without it.",
                 file=sys.stderr,
             )
-        started = time.monotonic()
-        run = run_once(path, check_env(env, base))
+        run, took = run_once(path, check_env(env, base))
         if job is not None:
             job.exited(run.returncode)  # a passing check goes into heavy's history
-    return report(name, base, run, time.monotonic() - started)
+    return report(name, base, run, took)
 
 
 def record_path():
@@ -637,8 +656,9 @@ def run_check(path):
         if os.path.isfile(quick) and os.access(quick, os.X_OK):
             # Fast static checks only, no tests: not worth a place in heavy's queue,
             # unless it asks for one.
-            asks = asks_for_queue(Path(quick).read_bytes())
-            return run_quiet(quick, QUICK_NAME, base, queue=False, ask=asks)
+            if names_queue_exit(Path(quick).read_bytes()):
+                return run_outside_first(quick, QUICK_NAME, base)
+            return run_quiet(quick, QUICK_NAME, base, queue=False)
         print(
             f"{HOOK_NAME}: skipped for a small fix commit; build-state finish runs it on "
             "each commit the fold rewrites",
@@ -653,7 +673,8 @@ def run_check(path):
         )
         return 0
     clean = subprocess.run(["git", "diff", "--quiet"], check=False).returncode == 0
-    code = run_quiet(path, HOOK_NAME, base, ask=asks_for_queue(content))
+    run = run_outside_first if names_queue_exit(content) else run_quiet
+    code = run(path, HOOK_NAME, base)
     if code == 0 and clean and key and record:
         remember(record, key)
     return code

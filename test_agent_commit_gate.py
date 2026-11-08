@@ -1156,3 +1156,19 @@ def test_a_quick_check_that_asks_for_the_queue_waits_its_turn_too(
     assert commit_run.returncode == 0, err
     assert ran(installed) == ["light-75", "fast", "ask", "quick", "fast"]
     assert "needs a build: src/main.rs" in err
+
+
+def test_a_check_that_fails_as_the_oom_killer_acts_says_to_run_it_again(
+    installed, monkeypatch
+):
+    vmstat = installed / ".git" / "vmstat"  # outside the work tree
+    vmstat.write_text("oom_kill 0\n")
+    monkeypatch.setenv("HEAVY_VMSTAT", str(vmstat))
+    # As a test runner exits when the OOM killer takes one of its workers.
+    hook(installed, "agent-pre-commit", f'echo "oom_kill 1" > "{vmstat}"; exit 1')
+    git(installed, "add", ".githooks/agent-pre-commit")
+
+    run = commit(installed)
+
+    assert run.returncode != 0
+    assert "out-of-memory killer" in run.stderr, run.stderr

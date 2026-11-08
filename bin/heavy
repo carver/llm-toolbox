@@ -40,6 +40,10 @@ joins a lane that already holds two jobs, or has headed its lane for
 HEAVY_STALL_SECONDS without quiet cores, it suggests getting build and test results
 from GitHub instead: push a topic branch and open a PR (never main).
 
+A command that fails while /proc/vmstat's oom_kill count rises hears on stderr that the
+out-of-memory killer may have taken one of its processes, and to run it again if the
+failure looks odd.
+
 A heavy started inside a job (HEAVY_SLOT names the job's slot) runs at once, so a
 check that calls heavy never waits on itself. A job whose process has ended is
 cleared from the queue. Stopping heavy (SIGINT, SIGTERM, SIGHUP) stops CMD's process
@@ -55,6 +59,7 @@ Environment:
   HEAVY_GRACE          seconds CMD gets to stop before SIGKILL (default 5)
   HEAVY_BUSY           a file whose number stands in for how busy the cores are (tests)
   HEAVY_MEMINFO        a file that stands in for /proc/meminfo (tests)
+  HEAVY_VMSTAT         a file that stands in for /proc/vmstat (tests)
   HEAVY_CORES_USED     a number that stands in for the cores a run used (tests)
   HEAVY_SLOT           set for CMD, to the slot it holds
 

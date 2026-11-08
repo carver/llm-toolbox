@@ -290,8 +290,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   instead. A heavy inside a job (`$HEAVY_SLOT`) runs at once, and wt-ship's
   `--check` queues too. The queue and its history live in `$HEAVY_DIR`
   (`/tmp/heavy`). For the tests, `$HEAVY_BUSY` names a file that stands in for
-  how busy the cores are, `$HEAVY_MEMINFO` one for `/proc/meminfo`, and
-  `$HEAVY_CORES_USED` a run's measured cores.
+  how busy the cores are, `$HEAVY_MEMINFO` and `$HEAVY_VMSTAT` ones for
+  `/proc/meminfo` and `/proc/vmstat`, and `$HEAVY_CORES_USED` a run's measured
+  cores. A command that fails while the out-of-memory killer ends a process
+  hears so, and to run it again if the failure looks odd.
 - **issue-todo**: a GitHub issue's task-list items across its body and every
   comment (`issue-todo show N`), which `gh issue view` splits between two
   commands, and ticking one where it lives (`issue-todo tick N MATCH --note

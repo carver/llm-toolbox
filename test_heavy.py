@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -1373,3 +1374,62 @@ def test_a_slot_says_when_its_job_started_not_when_it_joined(box, background):
         finish(proc)
 
     assert datetime.fromisoformat(fifo.Holder.parse(slot).since) >= freed, slot
+
+
+def failing(vmstat, ending, oom=True):
+    """A command that ends as `ending` says (a shell line), first counting one more
+    OOM kill in the stand-in vmstat when oom is set."""
+    count = f'echo "oom_kill 1" > "{vmstat}"; ' if oom else ""
+    return ["sh", "-c", count + ending]
+
+
+@pytest.mark.parametrize(
+    "ending, oom, status, told",
+    [
+        ("kill -9 $$", True, 128 + signal.SIGKILL, True),  # the command itself
+        ("exit 101", True, 101, True),  # as cargo exits when a rustc is killed
+        ("kill -9 $$", False, 128 + signal.SIGKILL, False),  # a person's SIGKILL
+        ("exit 0", True, 0, False),  # another job's process was killed
+    ],
+)
+def test_a_job_that_fails_while_the_oom_killer_acts_says_to_run_it_again(
+    box, ending, oom, status, told
+):
+    tmp_path, _, env = box
+    vmstat = tmp_path / "vmstat"
+    vmstat.write_text("pgfault 10\noom_kill 0\n")
+
+    done = heavy(env, "--", *failing(vmstat, ending, oom), HEAVY_VMSTAT=str(vmstat))
+
+    assert done.returncode == status
+    assert ("out-of-memory killer" in done.stderr) is told, done.stderr
+    assert ("run it again" in done.stderr) is told, done.stderr
+
+
+def test_a_heavy_inside_a_job_leaves_the_oom_line_to_the_job(box):
+    tmp_path, _, env = box
+    vmstat = tmp_path / "vmstat"
+    vmstat.write_text("oom_kill 0\n")
+    inner = shlex.join([str(SCRIPT), "--", *failing(vmstat, "exit 1")])
+
+    done = heavy(env, "--", "sh", "-c", inner, HEAVY_VMSTAT=str(vmstat))
+
+    assert done.returncode == 1
+    assert done.stderr.count("out-of-memory killer") == 1, done.stderr
+
+
+def test_a_sharer_the_oom_killer_hit_hears_why_it_went_first(box, background, sharing):
+    tmp_path, _, _ = box
+    vmstat = tmp_path / "vmstat"
+    vmstat.write_text("oom_kill 0\n")
+    holder = job_report(tmp_path, "holder")
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    s = background("--", *failing(vmstat, "exit 1"), HEAVY_VMSTAT=str(vmstat))
+    status, _, err = finish(s)
+    holder[2].touch()
+    finish(h)
+
+    assert status == 1
+    assert "A job sharing a lane" in err, err

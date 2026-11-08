@@ -26,9 +26,10 @@ share cores.
 
 It reads HEAVY_DIR, HEAVY_QUIET_SECONDS, HEAVY_POLL (seconds per sample),
 HEAVY_SHARE_SECONDS, HEAVY_STALL_SECONDS (before the PR hint), HEAVY_BUSY (the tests'
-stand-in for measuring) and HEAVY_MEMINFO (the tests' stand-in for /proc/meminfo), as
-bin/heavy's -h describes them; HEAVY_SLOT, which a job's environment carries so a heavy
-inside it runs at once; and RUSTC_WRAPPER, to start sccache's server before pinning.
+stand-in for measuring), HEAVY_MEMINFO and HEAVY_VMSTAT (the tests' stand-ins for
+/proc/meminfo and /proc/vmstat), as bin/heavy's -h describes them; HEAVY_SLOT, which a
+job's environment carries so a heavy inside it runs at once; and RUSTC_WRAPPER, to
+start sccache's server before pinning.
 """
 
 import math
@@ -38,7 +39,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -136,6 +137,21 @@ def free_memory():
     return None
 
 
+def oom_kills():
+    """How many processes the out-of-memory killer has ended since the VM booted,
+    from /proc/vmstat (or the HEAVY_VMSTAT file), or None when it can't be read."""
+    source = os.environ.get("HEAVY_VMSTAT") or "/proc/vmstat"
+    try:
+        text = Path(source).read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        name, _, count = line.partition(" ")
+        if name == "oom_kill" and count.strip().isdigit():
+            return int(count)
+    return None
+
+
 def stamped(text):
     """A waiter's text with the time on its first line made now, for the slot it
     takes: its entry's says when it joined the queue, its slot's when it started."""
@@ -201,13 +217,15 @@ def lower_priority(nice):
 class Job:
     """What a job runs with: its cores, an environment that lets a heavy inside it
     run at once and caps cargo's parallelism, and its nice. nested: it runs inside
-    another job, which holds the slot. Its caller tells it how CMD exited."""
+    another job, which holds the slot. Its caller tells it how CMD exited. oom_kills:
+    the VM's count of out-of-memory kills when it started."""
 
     cpus: list
     env: dict
     nice: int = 0
     nested: bool = False
     status: int | None = None
+    oom_kills: int | None = field(default_factory=oom_kills)
 
     def pin(self):
         """Pin this process to the job's cores, and nice it for a sharer; what it
@@ -225,8 +243,25 @@ class Job:
             lower_priority(self.nice)
 
     def exited(self, status):
-        """Say how CMD ended: a run that exits 0 goes into the command's history."""
+        """Say how CMD ended: a run that exits 0 goes into the command's history. One
+        that fails while the VM's count of OOM kills rose hears that the killer may
+        have taken one of its processes: the command on top seldom shows it (cargo
+        exits 101 when a rustc is killed, pytest 1 when a worker is). A heavy inside
+        a job leaves that line to the job's, which hears the same failure."""
         self.status = status
+        if status == 0 or self.nested:
+            return
+        now = oom_kills()
+        if None in (self.oom_kills, now) or now <= self.oom_kills:
+            return
+        sharing = (
+            " A job sharing a lane, as this one did, goes first." if self.nice else ""
+        )
+        note(
+            "heavy: the out-of-memory killer ended a process while this job ran,"
+            f" perhaps one of the job's.{sharing} If the failure looks odd, run it"
+            " again."
+        )
 
 
 class Start(NamedTuple):

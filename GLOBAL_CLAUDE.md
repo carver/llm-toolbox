@@ -35,7 +35,7 @@ While a background job runs, don't poll it from the foreground. Each `until grep
 
 Start a background job with `bgrun -o LOG -- CMD`. It prints the job's own PID, where `cd DIR && nohup CMD &` gives `$!` a subshell's PID. Then `kill` or `waitone --pid` that PID. A non-empty LOG from an earlier run is moved aside to `LOG.<time of its last write>`, not overwritten. To be told when it ends, run `bgrun --wait -o LOG -- CMD` as a background call: it prints the PID, then the job's exit status and LOG's last lines.
 
-To make several text replacements in one or more files, pipe blocks to `apply-edits` rather than writing a Python heredoc script: a `--- PATH` line starts each file, then each block is `<<<<<<< SEARCH`, the old text, `=======`, the new text, `>>>>>>> REPLACE`, every marker on its own line. It applies all or nothing, and a miss shows the closest text.
+To make several text replacements in one or more files, pipe blocks to `apply-edits` rather than writing a Python heredoc script: a `--- PATH` line starts each file, then each block is `<<<<<<< SEARCH`, the old text, `=======`, the new text, `>>>>>>> REPLACE`, every marker on its own line. It applies all or nothing, and a miss shows the closest text. With `--cached` it edits only the staged copy, in git's index, to commit part of a change.
 
 When ruff reports a line too long (E501) in a docstring or a comment, run `rewrap FILE...` rather than rewrapping by hand: it reflows only the paragraphs past the line length, and lists the lines it can't fix.
 

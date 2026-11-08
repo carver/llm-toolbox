@@ -1,8 +1,10 @@
 """apply-edits replaces old text with new across files, all or nothing."""
 
+import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -10,20 +12,36 @@ import pytest
 SCRIPT = Path(__file__).resolve().parent / "bin" / "apply-edits"
 
 
-def apply(cwd: Path, edits: str) -> subprocess.CompletedProcess[str]:
+def apply(
+    cwd: Path, edits: str, *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(SCRIPT)], input=edits, cwd=cwd, text=True, capture_output=True, check=False
+        [str(SCRIPT), *args],
+        input=edits,
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
     )
+
+
+A_PY = "def a():\n    return 1\n\n\ndef b():\n    return 2\n"
+NOTES = "# Notes\n\nOld line."
+NEW_NOTES = "# Notes\n\nNew line."
+
+
+def sources(folder: Path) -> Path:
+    """The folder, with src/a.py and notes.md written into it."""
+    (folder / "src").mkdir()
+    (folder / "src" / "a.py").write_text(A_PY)
+    (folder / "notes.md").write_text(NOTES)
+    return folder
 
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "a.py").write_text(
-        "def a():\n    return 1\n\n\ndef b():\n    return 2\n"
-    )
-    (tmp_path / "notes.md").write_text("# Notes\n\nOld line.")
-    return tmp_path
+    return sources(tmp_path)
 
 
 def test_blocks_across_files_apply_in_order(repo: Path) -> None:
@@ -1068,3 +1086,313 @@ def test_whitespace_that_can_change_meaning_still_misses_in_other_files(
     assert result.returncode == 1, (tmp_path / "f.txt").read_text()
     assert "closest is" in result.stderr
     assert (tmp_path / "f.txt").read_text() == source
+
+
+OLD_TO_NEW = "<<<<<<<\nOld line.\n=======\nNew line.\n>>>>>>>\n"
+
+
+def git(repo: Path, *args: str, stdin: str | None = None) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        input=stdin,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+
+
+@pytest.fixture(scope="module")
+def committed(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A repo whose one commit holds src/a.py and notes.md, made once: each test copies
+    it."""
+    repo = sources(tmp_path_factory.mktemp("committed"))
+    git(repo, "init", "-q")
+    git(repo, "add", ".")
+    git(
+        repo,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "commit",
+        "-qm",
+        "a",
+    )
+    return repo
+
+
+@pytest.fixture
+def git_repo(committed: Path, tmp_path: Path) -> Path:
+    shutil.copytree(committed, tmp_path, symlinks=True, dirs_exist_ok=True)
+    return tmp_path
+
+
+def test_cached_stages_one_change_and_leaves_the_work_tree(git_repo: Path) -> None:
+    both = "def a():\n    return 10\n\n\ndef b():\n    return 20\n"
+    (git_repo / "src" / "a.py").write_text(both)
+
+    result = apply(
+        git_repo,
+        "--- src/a.py\n<<<<<<<\n    return 1\n=======\n    return 10\n>>>>>>>\n",
+        "--cached",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["src/a.py: 1 edit"]
+    assert git(git_repo, "show", ":src/a.py") == (
+        "def a():\n    return 10\n\n\ndef b():\n    return 2\n"
+    )
+    assert (git_repo / "src" / "a.py").read_text() == both
+
+
+def test_cached_stages_blocks_across_files(git_repo: Path) -> None:
+    result = apply(
+        git_repo,
+        f"--- notes.md\n{OLD_TO_NEW}"
+        "--- src/a.py\n<<<<<<<\n    return 2\n=======\n    return 3\n>>>>>>>\n",
+        "--cached",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["notes.md: 1 edit", "src/a.py: 1 edit"]
+    assert git(git_repo, "show", ":notes.md") == NEW_NOTES
+    assert git(git_repo, "show", ":src/a.py").endswith("    return 3\n")
+    assert (git_repo / "notes.md").read_text() == NOTES
+    assert (git_repo / "src" / "a.py").read_text() == A_PY
+
+
+def test_cached_matches_the_staged_text_and_a_miss_stages_nothing(
+    git_repo: Path,
+) -> None:
+    work = "def a():\n    return 10\n\n\ndef b():\n    return 2\n"
+    (git_repo / "src" / "a.py").write_text(work)
+    index = git(git_repo, "ls-files", "--stage")
+
+    result = apply(
+        git_repo,
+        f"--- notes.md\n{OLD_TO_NEW}"
+        "--- src/a.py\n<<<<<<<\n    return 10\n=======\n    return 11\n>>>>>>>\n",
+        "--cached",
+    )
+
+    assert result.returncode == 1
+    assert "src/a.py block 1" in result.stderr and "staged" in result.stderr
+    assert "closest is lines 2-2" in result.stderr
+    assert "  +    return 1" in result.stderr.splitlines()
+    assert git(git_repo, "ls-files", "--stage") == index
+    assert (git_repo / "src" / "a.py").read_text() == work
+    assert (git_repo / "notes.md").read_text() == NOTES
+
+
+def test_cached_refuses_a_file_not_in_the_index_and_stages_nothing(
+    git_repo: Path,
+) -> None:
+    (git_repo / "new.md").write_text(NOTES)
+    index = git(git_repo, "ls-files", "--stage")
+
+    result = apply(
+        git_repo, f"--- notes.md\n{OLD_TO_NEW}--- new.md\n{OLD_TO_NEW}", "--cached"
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.splitlines() == [
+        (
+            "apply-edits: new.md: not in the index; --cached edits only a tracked "
+            "file (git add a new one whole)"
+        )
+    ]
+    assert git(git_repo, "ls-files", "--stage") == index
+    assert (git_repo / "new.md").read_text() == NOTES
+
+
+def test_cached_keeps_the_files_mode(git_repo: Path) -> None:
+    git(git_repo, "update-index", "--chmod=+x", "notes.md")
+
+    result = apply(git_repo, f"--- notes.md\n{OLD_TO_NEW}", "--cached")
+
+    assert result.returncode == 0, result.stderr
+    assert git(git_repo, "ls-files", "--stage", "notes.md").startswith("100755 ")
+    assert git(git_repo, "show", ":notes.md") == NEW_NOTES
+
+
+def test_cached_takes_paths_from_the_current_directory(git_repo: Path) -> None:
+    result = apply(
+        git_repo / "src",
+        "--- a.py\n<<<<<<<\n    return 2\n=======\n    return 3\n>>>>>>>\n"
+        f"--- ../notes.md\n{OLD_TO_NEW}",
+        "--cached",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert git(git_repo, "show", ":src/a.py").endswith("    return 3\n")
+    assert git(git_repo, "show", ":notes.md") == NEW_NOTES
+
+
+def test_cached_edits_the_blob_as_git_stores_it(git_repo: Path) -> None:
+    """With eol=crlf the work tree has \\r\\n line breaks and the blob \\n ones; the
+    staged copy is the blob, unconverted, and stays so."""
+    (git_repo / ".gitattributes").write_text("notes.md eol=crlf\n")
+    (git_repo / "notes.md").write_bytes(NOTES.replace("\n", "\r\n").encode())
+
+    result = apply(git_repo, f"--- notes.md\n{OLD_TO_NEW}", "--cached")
+
+    assert result.returncode == 0, result.stderr
+    blob = git(git_repo, "rev-parse", ":notes.md").strip()
+    assert git(git_repo, "cat-file", "blob", blob) == NEW_NOTES
+
+
+def symlinked(repo: Path) -> None:
+    (repo / "link.md").symlink_to("notes.md")
+    git(repo, "add", "link.md")
+
+
+def gitlinked(repo: Path) -> None:
+    commit = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{commit},sub")
+
+
+def binary(repo: Path) -> None:
+    (repo / "blob.bin").write_bytes(b"\xff\xfe\x00Old line.\n")
+    git(repo, "add", "blob.bin")
+
+
+def unmerged(repo: Path) -> None:
+    blob = git(repo, "rev-parse", ":notes.md").strip()
+    git(
+        repo,
+        "update-index",
+        "--index-info",
+        stdin=f"0 {'0' * 40}\tnotes.md\n"
+        + "".join(f"100644 {blob} {stage}\tnotes.md\n" for stage in (1, 2, 3)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "setup", "says"),
+    [
+        ("src", lambda repo: None, "not in the index"),
+        ("link.md", symlinked, "a symlink in the index"),
+        ("sub", gitlinked, "a submodule in the index"),
+        ("blob.bin", binary, "as text"),
+        ("notes.md", unmerged, "unmerged"),
+        (
+            "notes.md",
+            lambda repo: git(repo, "update-index", "--skip-worktree", "notes.md"),
+            "skip-worktree",
+        ),
+        (
+            "notes.md",
+            lambda repo: git(repo, "update-index", "--assume-unchanged", "notes.md"),
+            "assume-unchanged",
+        ),
+        ("../outside.md", lambda repo: None, "outside the repository"),
+    ],
+    ids=[
+        "directory",
+        "symlink",
+        "submodule",
+        "binary",
+        "unmerged",
+        "skip-worktree",
+        "assume-unchanged",
+        "outside",
+    ],
+)
+def test_cached_refuses_a_path_with_no_staged_text(
+    git_repo: Path, path: str, setup: Callable[[Path], object], says: str
+) -> None:
+    setup(git_repo)
+    index = git(git_repo, "ls-files", "--stage")
+
+    result = apply(git_repo, f"--- {path}\n{OLD_TO_NEW}", "--cached")
+
+    assert result.returncode == 2
+    assert result.stderr.startswith(f"apply-edits: {path}: ")
+    assert says in result.stderr and "Traceback" not in result.stderr
+    assert git(git_repo, "ls-files", "--stage") == index
+
+
+def test_cached_refuses_a_symlink_named_after_its_target(git_repo: Path) -> None:
+    symlinked(git_repo)
+    index = git(git_repo, "ls-files", "--stage")
+
+    result = apply(
+        git_repo,
+        f"--- notes.md\n{OLD_TO_NEW}--- link.md\n<<<<<<<\n# Notes\n=======\n# Log\n>>>>>>>\n",
+        "--cached",
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.startswith("apply-edits: link.md: a symlink in the index")
+    assert git(git_repo, "ls-files", "--stage") == index
+
+
+def test_cached_reads_a_path_as_a_name_not_a_pattern(git_repo: Path) -> None:
+    """A leading colon starts pathspec magic, which would make `:odd.md` mean
+    odd.md."""
+    (git_repo / ":odd.md").write_text(NOTES)
+    (git_repo / "odd.md").write_text(NOTES)
+    git(git_repo, "add", "--", "./:odd.md", "odd.md")
+
+    result = apply(git_repo, f"--- :odd.md\n{OLD_TO_NEW}", "--cached")
+
+    assert result.returncode == 0, result.stderr
+    assert git(git_repo, "show", ":0::odd.md") == NEW_NOTES
+    assert git(git_repo, "show", ":0:odd.md") == NOTES
+
+
+def test_cached_sets_every_entry_in_one_write_of_the_index(
+    git_repo: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A git whose update-index refuses any listing that holds src/a.py: written one
+    entry at a time, notes.md's would land before src/a.py's failed."""
+    fakes = tmp_path_factory.mktemp("fakes")
+    real = shutil.which("git")
+    (fakes / "git").write_text(
+        "#!/bin/sh\n"
+        'case " $* " in *" update-index "*)\n'
+        '  listing=$(mktemp); cat > "$listing"\n'
+        '  if grep -qa src/a.py "$listing"; then\n'
+        '    echo "fatal: refused src/a.py" >&2; exit 128\n'
+        "  fi\n"
+        f'  exec {real} "$@" < "$listing" ;;\n'
+        "esac\n"
+        f'exec {real} "$@"\n'
+    )
+    (fakes / "git").chmod(0o755)
+    env = {**os.environ, "PATH": f"{fakes}{os.pathsep}{os.environ['PATH']}"}
+    index = git(git_repo, "ls-files", "--stage")
+
+    result = apply(
+        git_repo,
+        f"--- notes.md\n{OLD_TO_NEW}"
+        "--- src/a.py\n<<<<<<<\n    return 2\n=======\n    return 3\n>>>>>>>\n",
+        "--cached",
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "refused src/a.py" in result.stderr
+    assert result.stderr.splitlines()[-1] == "Nothing was staged."
+    assert git(git_repo, "ls-files", "--stage") == index
+
+
+def test_cached_outside_a_git_work_tree_is_a_usage_error(repo: Path) -> None:
+    env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(repo.parent)}
+
+    result = apply(repo, f"--- notes.md\n{OLD_TO_NEW}", "--cached", env=env)
+
+    assert result.returncode == 2
+    assert "git work tree" in result.stderr and "Traceback" not in result.stderr
+    assert (repo / "notes.md").read_text() == NOTES
+
+
+def test_an_unknown_argument_is_a_usage_error(git_repo: Path) -> None:
+    index = git(git_repo, "ls-files", "--stage")
+
+    result = apply(git_repo, f"--- notes.md\n{OLD_TO_NEW}", "--staged")
+
+    assert result.returncode == 2
+    assert git(git_repo, "ls-files", "--stage") == index
+    assert (git_repo / "notes.md").read_text() == NOTES

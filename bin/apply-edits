@@ -60,8 +60,20 @@ A line that is exactly one of the markers can't appear inside a block; edit such
 line another way. Files keep their line endings (\\n or \\r\\n). A symlink is edited
 through to its target.
 
+With --cached, the blocks edit each file's staged copy, the one in git's index, and
+leave the work tree as it is. To commit part of a work-tree change, write blocks that
+turn the staged text into that part, then commit. Old texts are matched against the
+staged copy, and a miss shows the staged copy's closest text. The staged copy is the
+blob as git stores it, with no filter or line-ending conversion either way. Each path
+needs an entry of its own in the index of the git work tree that holds the current
+directory: an untracked file or a directory is refused, and so is a path that is
+unmerged, a symlink or a submodule there, or marked skip-worktree or assume-unchanged,
+flags a new entry would clear. The mode is kept, and the index takes every file's new
+copy in one write, or none.
+
 Exit status: 0 applied, 1 a block didn't apply (nothing written), 2 usage error (bad
-input, a missing or unreadable file).
+input, a missing or unreadable file, or with --cached, a path with no staged copy to
+edit).
 """
 
 import ast
@@ -69,6 +81,7 @@ import difflib
 import io
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import tokenize
@@ -76,7 +89,7 @@ import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 USAGE = 2
 MISSED = 1
@@ -108,9 +121,10 @@ class FileEdits:
     blocks: list[Block] = field(default_factory=list)
 
 
-def parse(text: str) -> list[FileEdits]:
+def parse(text: str, through_links: bool = True) -> list[FileEdits]:
     """The files and their blocks, in order; a path given twice gets one entry with both
-    sections' blocks. Raises UsageError."""
+    sections' blocks. With `through_links`, so does a path through a symlink to one
+    given before. Raises UsageError."""
     files: dict[Path, FileEdits] = {}
     current: FileEdits | None = None
     lines = list(enumerate(text.splitlines(), 1))
@@ -128,7 +142,8 @@ def parse(text: str) -> list[FileEdits]:
                 raise UsageError(f"line {number}: a block with no old text")
             current.blocks.append(Block(len(current.blocks) + 1, old, new))
         elif (path := header(line, number, opens_block(lines, at))) is not None:
-            current = files.setdefault(path.resolve(), FileEdits(path))
+            key = path.resolve() if through_links else Path(os.path.abspath(path))
+            current = files.setdefault(key, FileEdits(path))
         elif line.strip() and not is_fence(line):
             raise UsageError(f"line {number}: {EXPECTED}, got {line!r}")
     edited = [f for f in files.values() if f.blocks]
@@ -778,7 +793,7 @@ def closest(old: str, text: str) -> str:
     return f"  closest is lines {best_at + 1}-{best_at + size} ({best:.0%} alike):\n{shown}"
 
 
-def staged(path: Path, text: str) -> str:
+def temp_beside(path: Path, text: str) -> str:
     """A temp file beside the file's real target, holding the new text with the file's
     permissions, ready to rename into place."""
     target = path.resolve()
@@ -789,17 +804,146 @@ def staged(path: Path, text: str) -> str:
     return temp
 
 
+class WorkTree:
+    """The files on disk, edited through a symlink to its target."""
+
+    nothing = missed = "Nothing was written."
+
+    def read(self, path: Path) -> str:
+        """Raises UsageError."""
+        if not path.is_file():
+            raise UsageError(f"no such file: {path}")
+        return read(path)
+
+    def write(self, texts: list[tuple[Path, str]]) -> None:
+        """Raises OSError, having written nothing, when it can't make a temp file."""
+        temps = []
+        try:
+            for path, text in texts:
+                temps.append((temp_beside(path, text), path.resolve()))
+        except OSError:
+            for temp, _ in temps:
+                os.unlink(temp)
+            raise
+        for temp, target in temps:
+            os.replace(temp, target)
+
+
+class Entry(NamedTuple):
+    """A file's entry in the index, as `write` needs it."""
+
+    mode: str
+    name: str  # from the top of the work tree
+
+
+REGULAR = ("100644", "100755")
+"""The index modes of a file that isn't a symlink or a submodule."""
+NOT_FILES = {
+    "120000": "a symlink in the index; name the file it points to",
+    "160000": "a submodule in the index; run apply-edits --cached inside it",
+}
+
+
+def git(top: Path | None, *args: str, stdin: bytes | None = None) -> bytes:
+    """Git's output, run at `top` with pathspecs read as literal paths. Raises
+    UsageError with git's message."""
+    done = subprocess.run(
+        ["git", "--literal-pathspecs", *args],
+        cwd=top,
+        input=stdin,
+        capture_output=True,
+        check=False,
+    )
+    if done.returncode:
+        said = done.stderr.decode(errors="replace").strip().splitlines()
+        raise UsageError(f"git {args[0]}: {said[0] if said else 'failed'}")
+    return done.stdout
+
+
+class Index:
+    """The staged copies of files, in the index of the git work tree that holds the
+    current directory: each blob as git stores it, read and written without filters or
+    line-ending conversion. Raises UsageError outside a work tree."""
+
+    nothing = "Nothing was staged."
+    missed = (
+        "Nothing was staged; --cached matches blocks against the staged copy, "
+        "not the work tree."
+    )
+
+    def __init__(self) -> None:
+        try:
+            top = git(None, "rev-parse", "--show-toplevel")
+        except UsageError as e:
+            raise UsageError(f"--cached needs a git work tree: {e}") from e
+        self.top = Path(os.fsdecode(top.strip()))
+        self.entries: dict[Path, Entry] = {}  # each path read so far
+
+    def read(self, path: Path) -> str:
+        """The path's staged text. Raises UsageError when it has no index entry of its
+        own, is unmerged, isn't a regular file there, or has a flag that a new entry
+        would clear."""
+        name = os.path.relpath(os.path.abspath(path), self.top)
+        if Path(name).parts[:1] == ("..",):
+            raise UsageError(f"{path}: outside the repository at {self.top}")
+        listed = git(self.top, "ls-files", "--stage", "-v", "-z", "--", name)
+        found = []
+        for line in os.fsdecode(listed).split("\0"):
+            info, _, at = line.partition("\t")
+            if at == name:
+                found.append(info.split())
+        if not found:
+            raise UsageError(
+                f"{path}: not in the index; --cached edits only a tracked file "
+                "(git add a new one whole)"
+            )
+        # -v tags a skip-worktree entry S, and an assume-unchanged one in lower case
+        tag, mode, blob, stage = found[0]
+        if stage != "0":
+            raise UsageError(
+                f"{path}: unmerged in the index; resolve the conflict first"
+            )
+        if mode not in REGULAR:
+            kind = NOT_FILES.get(mode, f"mode {mode} in the index, not a file")
+            raise UsageError(f"{path}: {kind}")
+        flag = "skip-worktree" if tag in "Ss" else "assume-unchanged"
+        if tag in "Ss" or tag.islower():
+            raise UsageError(
+                f"{path}: marked {flag} in the index, which --cached would clear; "
+                f"git update-index --no-{flag} it first"
+            )
+        self.entries[path] = Entry(mode, name)
+        try:
+            return git(self.top, "cat-file", "blob", blob).decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise UsageError(f"{path}: can't read the staged copy as text: {e}") from e
+
+    def write(self, texts: list[tuple[Path, str]]) -> None:
+        """Stores each text as a blob, then points every file's entry at its blob in one
+        write of the index. Each path must have been read. Raises UsageError, having
+        changed no entry."""
+        entries = []
+        for path, text in texts:
+            mode, name = self.entries[path]
+            blob = git(self.top, "hash-object", "-w", "--stdin", stdin=text.encode())
+            entries.append(f"{mode} {blob.decode().strip()}\t{name}\0")
+        listing = os.fsencode("".join(entries))
+        git(self.top, "update-index", "-z", "--index-info", stdin=listing)
+
+
 def main() -> int:
-    if len(sys.argv) > 1:
-        asked = sys.argv[1] in ("-h", "--help")
-        print(__doc__, file=sys.stdout if asked else sys.stderr)
-        return 0 if asked else USAGE
+    args = sys.argv[1:]
+    if {"-h", "--help"} & set(args):
+        print(__doc__)
+        return 0
+    if set(args) - {"--cached"}:
+        print(__doc__, file=sys.stderr)
+        return USAGE
+    cached = "--cached" in args
     try:
-        files = parse(sys.stdin.read())
-        for edits in files:
-            if not edits.path.is_file():
-                raise UsageError(f"no such file: {edits.path}")
-        texts = [read(edits.path) for edits in files]
+        files = parse(sys.stdin.read(), through_links=not cached)
+        store = Index() if cached else WorkTree()
+        texts = [store.read(edits.path) for edits in files]
     except UsageError as e:
         print(f"apply-edits: {e}", file=sys.stderr)
         return USAGE
@@ -809,19 +953,14 @@ def main() -> int:
         results.append((edits, new_text, note))
         problems += missed
     if problems:
-        print("\n".join(problems) + "\nNothing was written.", file=sys.stderr)
+        print("\n".join(problems + [store.missed]), file=sys.stderr)
         return MISSED
-    temps = []
     try:
-        for edits, text, _ in results:
-            temps.append((staged(edits.path, text), edits.path.resolve()))
-    except OSError as e:
-        for temp, _ in temps:
-            os.unlink(temp)
-        print(f"apply-edits: {e}\nNothing was written.", file=sys.stderr)
+        store.write([(edits.path, text) for edits, text, _ in results])
+    except (OSError, UsageError) as e:
+        print(f"apply-edits: {e}\n{store.nothing}", file=sys.stderr)
         return USAGE
-    for (temp, target), (edits, _, note) in zip(temps, results, strict=True):
-        os.replace(temp, target)
+    for edits, _, note in results:
         count = len(edits.blocks)
         print(f"{edits.path}: {count} edit{'' if count == 1 else 's'}{note}")
     return 0

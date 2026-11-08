@@ -127,7 +127,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   across a line break between two words or after a `;`, and every line keeps
   its depth against the first. Either kind of loose
   match must be unique, and the output names it. For edits that would otherwise
-  be a heredoc Python script.
+  be a heredoc Python script. `--cached` edits each file's staged copy in git's
+  index instead and leaves the work tree alone, to commit part of a change: the
+  blocks turn the staged text into the part to commit. It refuses a path with no
+  index entry of its own, an unmerged one, a symlink or submodule, and one marked
+  skip-worktree or assume-unchanged.
   `apply-edits -h` shows the format.
 - **slop-lint**: flags the tells from the unslop skill that a regex can catch,
   in markdown and text files: em and en dashes, curly quotes, and fixed AI

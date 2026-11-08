@@ -14,6 +14,10 @@ cannot wait for. When several match and one started another, as a job and
 the wrapper shell that launched it do, the listing marks it "(started by
 PID)" and suggests anchoring the pattern with ^.
 
+Environment:
+  WAITONE_PICKED  a file waitone writes the PID it picked to, as a line, before it
+                  starts waiting (tests)
+
 Exit status: 0 the process exited (or had already exited, with --pid),
 1 nothing matched, 2 several matched (listed, waited for none),
 4 still running at --timeout. The process's own exit status is not
@@ -21,6 +25,7 @@ available, since it is not our child.
 """
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -77,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
             return found
         pid, cmdline = found
     cmdline = shortened(cmdline, args.pattern or "", args.full)
+    if picked := os.environ.get("WAITONE_PICKED"):
+        Path(picked).write_text(f"{pid}\n")
 
     start = time.monotonic()
     if not wait_gone(pid, args.timeout, args.interval):

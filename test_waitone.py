@@ -1,10 +1,13 @@
 """waitone waits for exactly one matching process and never for its own caller."""
 
+import os
+import signal
 import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -12,21 +15,77 @@ import pytest
 SCRIPT = Path(__file__).resolve().parent / "bin" / "waitone"
 
 
-def waitone(*args: str, shell: bool = False) -> subprocess.CompletedProcess[str]:
+def command(*args: str, shell: bool = False) -> list[str]:
     if shell:
         # The pattern sits in the calling shell's own command line, which is
         # what makes `while pgrep -f ...` loops wait forever.
-        command = " ".join([str(SCRIPT), *args])
-        return subprocess.run(
-            ["bash", "-c", command],
-            text=True,
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
+        return ["bash", "-c", " ".join([str(SCRIPT), *args])]
+    return [str(SCRIPT), *args]
+
+
+def waitone(*args: str, shell: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(SCRIPT), *args], text=True, capture_output=True, timeout=30, check=False
+        command(*args, shell=shell),
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
     )
+
+
+class Waiting:
+    """waitone running in the background, writing the PID it picks to a file. It runs
+    in a process group of its own, since uv starts its Python as a child."""
+
+    def __init__(self, picked: Path, *args: str, shell: bool) -> None:
+        self.file = picked
+        self.proc = subprocess.Popen(
+            command(*args, shell=shell),
+            env=os.environ | {"WAITONE_PICKED": str(picked)},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+
+    def picked(self) -> int:
+        """The PID waitone picked, once it has written it. Fails with waitone's own
+        output when it exits first, or after 30 s."""
+        deadline = time.monotonic() + 30
+        while not (self.file.is_file() and self.file.read_text().endswith("\n")):
+            if self.proc.poll() is not None:
+                out, err = self.proc.communicate()
+                pytest.fail(f"waitone exited {self.proc.returncode} first: {out}{err}")
+            assert time.monotonic() < deadline, "waitone never picked a process"
+            time.sleep(0.05)
+        return int(self.file.read_text())
+
+    def finish(self) -> tuple[int, str, str]:
+        out, err = self.proc.communicate(timeout=30)
+        return self.proc.returncode, out, err
+
+
+@pytest.fixture
+def waiting(tmp_path: Path) -> Iterator[Callable[..., Waiting]]:
+    """Start waitone in the background; every run's process group is killed and
+    reaped at the end."""
+    runs: list[Waiting] = []
+
+    def start_waitone(*args: str, shell: bool = False) -> Waiting:
+        run = Waiting(tmp_path / f"picked{len(runs)}", *args, shell=shell)
+        runs.append(run)
+        return run
+
+    yield start_waitone
+    for run in runs:
+        with suppress(ProcessLookupError):
+            os.killpg(run.proc.pid, signal.SIGKILL)
+        run.proc.communicate()
+
+
+def end(proc: subprocess.Popen[bytes]) -> None:
+    proc.kill()
+    proc.wait()
 
 
 @pytest.fixture
@@ -34,8 +93,7 @@ def sleepers() -> Iterator[list[subprocess.Popen[bytes]]]:
     started: list[subprocess.Popen[bytes]] = []
     yield started
     for proc in started:
-        proc.kill()
-        proc.wait()
+        end(proc)
 
 
 def start(
@@ -49,21 +107,36 @@ def start(
     return proc
 
 
-def test_returns_once_the_match_exits(sleepers: list[subprocess.Popen[bytes]]) -> None:
+# The match exits only once waitone has picked it: one that ended on a timer of its own
+# was gone before a waitone slowed by a busy machine first looked.
+def test_returns_once_the_match_exits(
+    sleepers: list[subprocess.Popen[bytes]], waiting: Callable[..., Waiting]
+) -> None:
     marker = uuid.uuid4().hex
-    proc = start(sleepers, marker, 1)
-    result = waitone("-f", marker, "--timeout", "10")
-    assert result.returncode == 0, result.stderr
-    assert f"{proc.pid} exited" in result.stdout
+    proc = start(sleepers, marker, 300)
+    run = waiting("-f", marker, "--timeout", "10")
+    assert run.picked() == proc.pid
+    end(proc)
+
+    status, out, err = run.finish()
+
+    assert status == 0, err
+    assert f"{proc.pid} exited" in out
 
 
 def test_the_calling_shell_is_never_a_match(
-    sleepers: list[subprocess.Popen[bytes]],
+    sleepers: list[subprocess.Popen[bytes]], waiting: Callable[..., Waiting]
 ) -> None:
     marker = uuid.uuid4().hex
-    start(sleepers, marker, 1)
-    result = waitone("-f", f"'{marker}'", "--timeout", "10", shell=True)
-    assert result.returncode == 0, result.stderr
+    proc = start(sleepers, marker, 300)
+    run = waiting("-f", f"'{marker}'", "--timeout", "10", shell=True)
+    assert run.picked() == proc.pid
+    end(proc)
+
+    status, out, err = run.finish()
+
+    assert status == 0, err
+    assert f"{proc.pid} exited" in out
 
 
 def test_times_out_while_the_match_runs(

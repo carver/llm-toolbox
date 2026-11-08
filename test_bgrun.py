@@ -348,8 +348,13 @@ def test_wait_prints_the_pid_before_the_job_ends_and_killing_it_leaves_the_job(
     tmp_path, started
 ):
     log = tmp_path / "out.log"
-    marker = tmp_path / "done"
-    script = f"import time, pathlib; time.sleep(1.5); pathlib.Path({str(marker)!r}).write_text('x')"
+    marker, release = tmp_path / "done", tmp_path / "release"
+    # The job ends when the test says, so a slow machine can't end it inside the window.
+    script = (
+        "import pathlib, time\n"
+        f"while not pathlib.Path({str(release)!r}).exists(): time.sleep(0.05)\n"
+        f"pathlib.Path({str(marker)!r}).write_text('x')"
+    )
     waiter = subprocess.Popen(
         [str(SCRIPT), "--wait", "-o", str(log), "--", sys.executable, "-c", script],
         stdout=subprocess.PIPE,
@@ -359,12 +364,15 @@ def test_wait_prints_the_pid_before_the_job_ends_and_killing_it_leaves_the_job(
         pid = int(waiter.stdout.readline())
         started.append(pid)
         assert not marker.exists()
+        # fixed sleep: a window in which a --wait that doesn't wait returns
         time.sleep(0.5)
         assert waiter.poll() is None, "bgrun --wait returned before the job ended"
         waiter.kill()
         waiter.wait()
+        release.touch()
         wait_for_file(marker)
     finally:
+        release.touch()  # the job ends even when the test fails before its pid is read
         waiter.kill()
 
 

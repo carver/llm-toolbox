@@ -1160,7 +1160,8 @@ def test_a_check_never_shares_a_lane(installed, held_lane, committing, monkeypat
     monkeypatch.setenv("HEAVY_SHARE_SECONDS", "0.05")
     commit_run = committing(installed)
     waiting = queues_or_warns(commit_run, held_lane.lane)
-    time.sleep(1)  # many share windows, in which a check that shares would start
+    # fixed sleep: many share windows, in which a check that shares would start
+    time.sleep(1)
 
     assert ran(installed) == [], commit_run.err()  # it still waits its turn
     if not waiting:

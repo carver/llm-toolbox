@@ -1236,8 +1236,8 @@ def test_a_waiter_watches_the_holder_anew_once_the_sharer_ends(
     wait_until(sharer[1].exists, "a job to share")
     w = background("--share", "--", *waiter[0], HEAVY_SHARE_SECONDS="1.5", stderr=log)
     wait_until(has_text(log, "already shares"), "the waiter to see the place taken")
-    # Long enough for the waiter to gather a whole window while the sharer runs; the
-    # samples it took then mustn't count once the sharer ends.
+    # The samples the waiter takes while the sharer runs mustn't count once it ends.
+    # fixed sleep: long enough to gather a whole window of them, which heavy doesn't say
     time.sleep(1.6)
     sharer[2].touch()
     ended = time.monotonic()
@@ -1282,7 +1282,7 @@ def test_a_holder_with_no_history_lets_nobody_in_by_history(box, background, sha
     )
     # Some polls with a full history window, in which a waiter that took the
     # holder's load for 0 cores would share.
-    time.sleep(0.5)
+    time.sleep(0.5)  # fixed sleep: it must not share in them
     assert not waiter[1].exists()
     holder[2].touch()
     waiter[2].touch()

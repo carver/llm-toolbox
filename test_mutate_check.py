@@ -319,10 +319,19 @@ def test_a_timeout_stops_the_commands_children_too(repo: Path) -> None:
 
     assert result.returncode == 3, result.stdout + result.stderr
     child = int((repo / "child").read_text())
-    time.sleep(0.2)
-    with pytest.raises(ProcessLookupError):
-        os.kill(child, 0)
+    deadline = time.monotonic() + 10
+    while running(child):
+        assert time.monotonic() < deadline, "the command's child outlived the timeout"
+        time.sleep(0.05)
     assert (repo / "calc.py").read_text() == CODE
+
+
+def running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def test_an_endless_timeout_is_a_usage_error(repo: Path) -> None:

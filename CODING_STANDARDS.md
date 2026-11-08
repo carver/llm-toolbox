@@ -27,6 +27,7 @@ The rules a reviewer holds this repo's code to. The global standards in `~/.agen
 - A change to the repo's prose alone (`README.md`, `skills/` and the other paths in the map at the top of `.githooks/agent-pre-commit`) runs only the tests the map names for it. A test that reads one of those paths goes on that path's line, or a change to the path won't run it.
 - The suite runs in parallel (`pytest.ini`), so tests share no files, ports or global state.
 - A test waits for a condition by polling it with a deadline, never with a fixed sleep. A test that starts a process cleans it up even when it fails.
+- A sleep of 0.2 s or more that is the scenario itself, a window in which something must not happen, says why in a `# fixed sleep: <why>` comment on its line or the line above; a slow machine may then let a bug pass, but must never fail the test. A use of SIGSTOP says why in a `# SIGSTOP: <why>` comment on its line: the stopped process may hold a lock the rest of the test waits on (`test_timing_rules.py`).
 - Expected values come from the tool's documented behaviour, not from pasting what it printed.
 
 ## Skills

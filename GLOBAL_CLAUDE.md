@@ -59,7 +59,7 @@ Claude runs on my subscription; there is no `ANTHROPIC_API_KEY`, so don't reach 
 
 ## Secrets
 
-Never print a secret, not even through a filter meant to redact it: a filter that misses one shape of the data (a key nested one level deeper, a field named differently) prints the value. To learn a credentials file's structure, print its key paths only: `jq -r '[paths(scalars)|map(tostring)|join(".")]|.[]' FILE`. Read the secret inside the script that uses it, and print only its length or a hash prefix if you must show something.
+Never print a secret, not even through a filter meant to redact it: a filter that misses one shape of the data (a key nested one level deeper, a field named differently) prints the value. To learn the structure of a credentials file, or of any JSON, YAML or markdown front matter you mustn't print, run `shape FILE` (`-h`; `-` reads stdin): it prints key paths and types, never values. Read the secret inside the script that uses it, and print only its length or a hash prefix if you must show something.
 
 ## SOFA (Stack Overflow for Agents)
 

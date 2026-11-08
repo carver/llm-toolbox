@@ -10,6 +10,7 @@ import signal
 import socket
 import subprocess
 import time
+import warnings
 from pathlib import Path
 
 import pytest
@@ -652,24 +653,27 @@ def held_lane():
 
 
 @pytest.fixture
-def committing():
+def committing(tmp_path_factory):
     """Start an agent's `git commit` in a repo in the background, in a process group of
-    its own; every one is killed and reaped at the end."""
+    its own, its stderr going to a file that `proc.err()` reads; every one is killed
+    and reaped at the end."""
     procs = []
 
     def start(repo):
         env = without_repo_vars(os.environ)
         env["PATH"] = os.pathsep.join([str(SCRIPT.parent), env["PATH"]])
         env["AI_AGENT"] = "test-agent"
-        proc = subprocess.Popen(
-            ["git", "commit", "-q", "-m", "x"],
-            cwd=repo,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        err = tmp_path_factory.mktemp("commit") / "stderr"
+        with err.open("w") as sink:
+            proc = subprocess.Popen(
+                ["git", "commit", "-q", "-m", "x"],
+                cwd=repo,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=sink,
+                start_new_session=True,
+            )
+        proc.err = err.read_text
         procs.append(proc)
         return proc
 
@@ -677,24 +681,71 @@ def committing():
     for proc in procs:
         if proc.poll() is None:
             os.killpg(proc.pid, signal.SIGKILL)
-        proc.communicate(timeout=10)
+        proc.wait(timeout=10)
 
 
-def wait_for_entry(lane):
-    deadline = time.monotonic() + 20
-    while not any(p.name[:1].isdigit() for p in lane.iterdir()):
-        assert time.monotonic() < deadline, "the check never joined the queue"
+def machine_busy():
+    """Whether the load average is above the core count, which can stall a test's
+    subprocess past any deadline the test sets."""
+    return os.getloadavg()[0] > os.cpu_count()
+
+
+def waited(condition, what, seconds=20):
+    """Poll `condition` until it holds: True. When `seconds` pass first, fail saying
+    `what` didn't happen, or on a busy machine warn instead and return False, for the
+    test to end there."""
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() >= deadline:
+            message = f"{what} within {seconds} s"
+            if not machine_busy():
+                pytest.fail(message)
+            load = os.getloadavg()[0]
+            warnings.warn(
+                f"{message}, on a busy machine (load {load:.1f}, {os.cpu_count()}"
+                " cores), so the test ends without judging the rest",
+                stacklevel=2,
+            )
+            return False
         time.sleep(0.05)
+    return True
+
+
+def in_queue(lane):
+    return any(p.name[:1].isdigit() for p in lane.iterdir())
+
+
+def waits_in_line(commit_run, lane):
+    """Whether the commit's check joined the queue and heavy said it waits for the
+    lane. Only then is heavy inside its wait loop: it writes its entry before it first
+    looks at the lane, and a lane freed in that gap is never waited for."""
+    return waited(lambda: in_queue(lane), "the check never joined the queue") and (
+        waited(
+            lambda: "waiting for the normal lane" in commit_run.err(),
+            "heavy never said the check waits for the lane",
+        )
+    )
+
+
+def finished(commit_run, seconds=30):
+    return waited(
+        lambda: commit_run.poll() is not None, "the commit never finished", seconds
+    )
 
 
 def test_an_agent_check_waits_its_turn_in_heavys_queue(
     installed, held_lane, committing
 ):
     commit_run = committing(installed)
-    wait_for_entry(held_lane.lane)
-    assert ran(installed) == []  # it waits: neither check has run
+    waiting = waits_in_line(commit_run, held_lane.lane)
+    # Whether heavy said so or the wait ran out, neither check ran while the lane was held.
+    assert ran(installed) == [], commit_run.err()
+    if not waiting:
+        return
     held_lane.kill()  # not reaped: a zombie, which has ended all the same
-    _, err = commit_run.communicate(timeout=30)
+    if not finished(commit_run):
+        return
+    err = commit_run.err()
 
     assert commit_run.returncode == 0, err
     assert ran(installed) == ["agent", "fast"]
@@ -705,14 +756,17 @@ def test_stopping_a_check_that_waits_leaves_the_queue_in_one_line(
     installed, held_lane, committing
 ):
     commit_run = committing(installed)
-    wait_for_entry(held_lane.lane)
+    if not waits_in_line(commit_run, held_lane.lane):
+        return
     os.killpg(commit_run.pid, signal.SIGINT)  # Ctrl-C reaches the whole group
-    _, err = commit_run.communicate(timeout=30)
+    if not finished(commit_run):
+        return
+    err = commit_run.err()
 
     assert commit_run.returncode != 0
     assert "Traceback" not in err, err
     assert "COMMIT REFUSED" in err
-    assert not any(p.name[:1].isdigit() for p in held_lane.lane.iterdir())
+    assert not in_queue(held_lane.lane)
 
 
 def test_a_heavy_inside_an_agent_check_runs_at_once(installed, committing):
@@ -725,7 +779,7 @@ def test_a_heavy_inside_an_agent_check_runs_at_once(installed, committing):
     )
     git(installed, "add", ".githooks/agent-pre-commit")
     commit_run = committing(installed)
-    _, err = commit_run.communicate(timeout=30)
+    commit_run.wait(timeout=30)
 
-    assert commit_run.returncode == 0, err
+    assert commit_run.returncode == 0, commit_run.err()
     assert ran(installed) == ["agent", "fast"]

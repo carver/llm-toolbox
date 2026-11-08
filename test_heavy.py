@@ -1468,3 +1468,34 @@ def test_a_sharer_the_oom_killer_hit_hears_why_it_went_first(box, background, sh
 
     assert status == 1
     assert "A job sharing a lane" in err, err
+
+
+def test_a_stopped_waiter_ahead_holds_up_sharing_only_a_while(box, background, sharing):
+    tmp_path, _, env = box
+    command = same_job(tmp_path)
+    (tmp_path / "learn.release").touch()
+    learned = heavy(env, "--", *command, JOB="learn", HEAVY_CORES_USED="1")
+    assert learned.returncode == 0, learned.stderr
+    history_only = {"HEAVY_SHARE_SECONDS": "600"}
+    holder = background("--", *command, JOB="holder")
+    wait_until((tmp_path / "holder.report").exists, "the holder to start")
+    sharer = background("--", *command, JOB="sharer", **history_only)
+    wait_until((tmp_path / "sharer.report").exists, "a job to share")
+    stopped = background("--", *command, JOB="stopped", **history_only)
+    wait_until(lambda: len(entries(tmp_path)) == 1, "a waiter to queue")
+    stopped.send_signal(signal.SIGSTOP)  # it fits, but can't take the place
+    behind = background("--", *command, JOB="behind", **history_only)
+    wait_until(lambda: len(entries(tmp_path)) == 2, "a waiter behind it to queue")
+
+    (tmp_path / "sharer.release").touch()
+    freed = time.monotonic()
+    wait_until((tmp_path / "behind.report").exists, "the waiter behind to share")
+    waited = time.monotonic() - freed
+    stopped.send_signal(signal.SIGCONT)
+    for name in ("holder", "behind", "stopped"):
+        (tmp_path / f"{name}.release").touch()
+    for proc in (holder, sharer, behind, stopped):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    assert waited >= 4, waited  # it stepped aside for the stopped one a while

@@ -14,8 +14,10 @@ A waiter starts beside the holder, as its lane's sharer, when the share slot is 
 neither job runs `--alone`, 4 GiB of memory are free, and either both jobs' history
 says the waiter's usual cores fit in 75% of the holder's cores beside the holder's
 load, or the holder's cores have averaged under 30% busy for HEAVY_SHARE_SECONDS. The
-first waiter in line that may share does: each waiter that may posts so in its entry,
-and steps aside for a fresh post ahead of it. A sharer runs on the holder's cores, at
+first waiter in line that may share does: a waiter that may steps aside for one ahead
+of it that fits too, by its own samples and their history, for up to SHARE_PATIENCE
+seconds, so the order holds however late each one's polls come. A sharer runs on the
+holder's cores, at
 nice 10 and first in line for the OOM killer, with CARGO_BUILD_JOBS capped at the
 cores the holder leaves.
 
@@ -59,7 +61,11 @@ SHARE_MEMORY = 4 * 2**30  # bytes of MemAvailable a sharer needs
 # More, for a waiter that last found too little: memory that hovers at the floor
 # doesn't flip its reason, and its waiting line, at every poll.
 SHARE_MEMORY_AGAIN = SHARE_MEMORY + 2**29
-FRESH_POST = 1.0  # seconds, at least, that a waiter's post to share stays fresh
+# Seconds, and polls, at least, that a waiter steps aside for one ahead of it that fits
+# too: long enough for a starved one to take its place, short enough that one stopped
+# (or running an older heavy, which never shares) holds up sharing only that long.
+SHARE_PATIENCE = 5.0
+SHARE_PATIENCE_POLLS = 5
 PR_HINT = (
     "heavy: the queue is busy. For build and test results without the wait, you can"
     " push a topic branch and open a PR, so GitHub's CI runs them (never main)."
@@ -409,37 +415,36 @@ class Watch:
 
 class Bid:
     """A waiter's bid to share its lane: it watches the holder's cores at each poll,
-    judges whether it fits beside the holder, posts so in its entry, and takes the
-    share slot unless a waiter ahead of it posted first."""
+    judges whether it fits beside the holder, and takes the share slot unless a waiter
+    ahead of it fits too."""
 
     def __init__(self, lane, folder, text, entry, cpus, say):
         self.lane, self.folder, self.text, self.entry = lane, folder, text, entry
         self.cpus, self.say = cpus, say
+        self.key = fields(text).get("key")
         poll = knob("HEAVY_POLL", 1)
         windows = (knob("HEAVY_QUIET_SECONDS", 10), knob("HEAVY_SHARE_SECONDS", 90))
         self.watch = Watch(max(1, *(round(w / poll) for w in windows)))
-        self.posted = False  # whether it posted, at the last poll, that it may share
         self.short_of_memory = False  # whether it last found too little free memory
+        self.fit_since = {}  # waiters ahead that fit too: since when, by entry name
 
     def poll(self, seen):
         """Watch the holder in seen for a poll and, when this waiter may share its
-        lane and no waiter ahead of it has just said it may, start beside it: the
-        Start, or None."""
+        lane and is the first in line that may, start beside it: the Start, or
+        None."""
         holder_cpus = unspan(fields(seen.held).get("cores", ""))
         holder_cpus = holder_cpus or lane_cores(self.lane, self.cpus)
         subject = (first_line(seen.held), first_line(seen.shared or ""))
         self.watch.add(subject, busy_now(holder_cpus))
-        verdict = self.refusal(seen) or self.fit(seen, holder_cpus)
+        history = heavyhistory.History(base())
+        verdict = self.refusal(seen) or self.fit(seen, holder_cpus, self.key, history)
         if verdict.load is None:
             self.say("share", verdict.key, verdict.line)
-            self.posted = False
+            self.fit_since = {}
             return None
-        now = time.monotonic()
-        posted_before, self.posted = self.posted, True
-        fifo.write_whole(self.entry, self.text + f"share-ok={now}\n")
-        # Read the line again: a waiter ahead may have posted while this one sampled.
+        # Read the line again: it may have changed while this waiter sampled.
         ahead = fifo.ahead(self.folder, self.entry)
-        if not posted_before or self.fresh_post_ahead(ahead, now):
+        if not self.first_in_line(seen, holder_cpus, ahead, history):
             return None
         return self.take(seen.held, holder_cpus, verdict.load)
 
@@ -468,12 +473,12 @@ class Bid:
             return Verdict(None, "memory", line)
         return None
 
-    def fit(self, seen, holder_cpus):
-        """Whether this waiter fits beside the holder, by both jobs' history and the
-        watch's recent samples, or else by the holder's cores idling."""
+    def fit(self, seen, holder_cpus, key, history):
+        """Whether the command known as key fits beside the holder, by both jobs'
+        history and the watch's recent samples, or else by the holder's cores
+        idling. The lines say why not for this waiter's own command."""
         count = len(holder_cpus)
-        history = heavyhistory.History(base())
-        mine = history.usual(fields(self.text).get("key"))
+        mine = history.usual(key)
         theirs = history.usual(fields(seen.held).get("key"))
         recent = self.watch.mean(knob("HEAVY_QUIET_SECONDS", 10))
         known = None not in (mine, theirs, recent)
@@ -500,15 +505,23 @@ class Bid:
             return Verdict(None, "fit", line)
         return Verdict(None, "watch", f"heavy: {later}.")
 
-    def fresh_post_ahead(self, ahead, now):
-        """Whether a waiter ahead of this one said, at a recent poll, that it may
-        share: it goes first."""
-        fresh = max(FRESH_POST, 2 * knob("HEAVY_POLL", 1))
-        for _, text in ahead:
-            with suppress(ValueError):
-                if now - float(fields(text).get("share-ok", "")) <= fresh:
-                    return True
-        return False
+    def first_in_line(self, seen, holder_cpus, ahead, history):
+        """Whether no waiter ahead of this one fits beside the holder too, as this
+        waiter's samples and their history see it, or each that does has fit for
+        SHARE_PATIENCE without taking the place. Whether one ahead fits doesn't
+        depend on when its own polls come, so a starved one keeps its turn."""
+        now = time.monotonic()
+        patience = max(SHARE_PATIENCE, SHARE_PATIENCE_POLLS * knob("HEAVY_POLL", 1))
+        fitting = {}
+        for path, text in ahead:
+            about = fields(text)
+            if about.get("alone"):
+                continue
+            if self.fit(seen, holder_cpus, about.get("key"), history).load is None:
+                continue
+            fitting[path.name] = self.fit_since.get(path.name, now)
+        self.fit_since = fitting
+        return all(now - since >= patience for since in fitting.values())
 
     def take(self, held, holder_cpus, load):
         """Take the share slot beside the holder whose slot text is held, under the

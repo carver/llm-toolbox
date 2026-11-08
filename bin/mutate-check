@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Break code briefly and see whether a command catches it, then put the code back.
 
-  mutate-check -- uv run pytest -q tests/test_watch.py -k seen_before <<'EOF'
+  mutate-check -- uv run pytest -q tests/test_watch.py -k seen_before <<'EDITS'
   --- src/app/watch.py
   <<<<<<< SEARCH
                   and p.listing.id not in sketchy
   =======
   >>>>>>> REPLACE
-  EOF
+  EDITS
 
   mutate-check [--timeout SECONDS] -- CMD...
+
+Pick a heredoc delimiter that isn't a line of the blocks: a line EOF in the text ends
+<<'EOF' early, and the shell runs the rest as commands.
 
 Stdin holds apply-edits blocks (`apply-edits -h` shows the format), which apply-edits
 applies all or nothing. Then the command runs, and every file the blocks name is put

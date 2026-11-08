@@ -4,7 +4,7 @@
 # ///
 """Replace old text with new in files, all or nothing, from blocks on stdin.
 
-  apply-edits <<'EOF'
+  apply-edits <<'EDITS'
   --- src/app.py
   <<<<<<< SEARCH
   old text, exactly as in the file, any number of lines
@@ -14,7 +14,10 @@
   --- README.md
   <<<<<<< SEARCH
   ...
-  EOF
+  EDITS
+
+Pick a heredoc delimiter that isn't a line of the blocks: a line EOF in the text ends
+<<'EOF' early, and the shell runs the rest as commands.
 
 Each `--- PATH` (relative to the current directory) starts a file's blocks; a file
 takes any number, applied in order, each to the text the ones before it left. Every

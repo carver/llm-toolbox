@@ -12,15 +12,14 @@ waiting.
 
 A waiter that asks to (`--share`) starts beside the holder, as its lane's sharer,
 when the share slot is free, the holder doesn't run `--alone`, 4 GiB of memory are
-free, and either both jobs' history
-says the waiter's usual cores fit in 75% of the holder's cores beside the holder's
-load, or the holder's cores have averaged under 30% busy for HEAVY_SHARE_SECONDS. The
-first waiter in line that may share does: a waiter that may steps aside for each one
-ahead of it that asked to share and fits too, by its own samples and their history,
-for SHARE_PATIENCE seconds times its place among them, so the order holds however late
-each one's polls come. A sharer runs on the holder's cores, at nice 10 and first in
-line for the OOM killer, with CARGO_BUILD_JOBS capped at the
-cores the holder leaves.
+free, and either both jobs' history says the waiter's usual cores fit in 75% of the
+holder's cores beside the holder's load, or the holder's cores have averaged under 30%
+busy for HEAVY_SHARE_SECONDS. The first waiter in line that may share does: a waiter
+that may steps aside for each one ahead of it that asked to share and fits too, by its
+own samples and their history, for SHARE_PATIENCE seconds times its place among them,
+so the order holds however late each one's polls come. A sharer runs on the holder's
+cores, at nice 10 and first in line for the OOM killer, with CARGO_BUILD_JOBS capped
+at the cores the holder leaves.
 
 Each lane is a lib/fifo.py queue in HEAVY_DIR/<lane>/, its holder's slot the file
 `slot` there and its sharer's `share`. A job's cores are decided, and its slot taken,
@@ -163,9 +162,8 @@ def oom_kills():
 def stamped(text):
     """A waiter's text with the time on its first line made now, for the slot it
     takes: its entry's says when it joined the queue, its slot's when it started."""
-    now = datetime.now().astimezone().isoformat(timespec="seconds")
     rest = text.split("\n", 1)[1] if "\n" in text else ""
-    return Holder.parse(text)._replace(since=now).line() + rest
+    return Holder.parse(text)._replace(since=fifo.stamp()).line() + rest
 
 
 def first_line(text):
@@ -225,15 +223,15 @@ def lower_priority(nice):
 class Job:
     """What a job runs with: its cores, an environment that lets a heavy inside it
     run at once and caps cargo's parallelism, and its nice. nested: it runs inside
-    another job, which holds the slot. Its caller tells it how CMD exited. oom_kills:
-    the VM's count of out-of-memory kills when it started."""
+    another job, which holds the slot. Its caller tells it how CMD exited.
+    oom_kills_at_start: the VM's count of out-of-memory kills when it started."""
 
     cpus: list
     env: dict
     nice: int = 0
     nested: bool = False
     status: int | None = None
-    oom_kills: int | None = field(default_factory=oom_kills)
+    oom_kills_at_start: int | None = field(default_factory=oom_kills)
 
     def pin(self):
         """Pin this process to the job's cores, and nice it for a sharer; what it
@@ -260,10 +258,12 @@ class Job:
         if status == 0 or self.nested:
             return
         now = oom_kills()
-        if None in (self.oom_kills, now) or now <= self.oom_kills:
+        if None in (self.oom_kills_at_start, now) or now <= self.oom_kills_at_start:
             return
         sharing = (
-            " A job sharing a lane, as this one did, goes first." if self.nice else ""
+            " A job sharing a lane, as this one did, is the first the killer takes."
+            if self.nice
+            else ""
         )
         note(
             "heavy: the out-of-memory killer ended a process while this job ran,"
@@ -336,8 +336,8 @@ def turn(long=False, command="", hint=True, alone=False, share=False):
     yielding the Job to run with. Inside a job that holds a slot, yield at once.
     hint=False leaves out the PR hint, for a commit check, which has nothing to push
     yet. alone: no job shares the lane beside this one. A body that calls
-    job.exited(0) has its run remembered. Raises QueueError
-    when the queue's folder can't be used."""
+    job.exited(0) has its run remembered. Raises QueueError when the queue's folder
+    can't be used."""
     if inside_job():
         if alone:
             note("heavy: --alone does nothing inside a job, which runs at once.")

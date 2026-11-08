@@ -50,8 +50,7 @@ class Holder(NamedTuple):
     @classmethod
     def now(cls, session):
         pid = str(os.getpid())
-        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-        return cls(session, stamp, socket.gethostname(), pid, started(pid))
+        return cls(session, stamp(), socket.gethostname(), pid, started(pid))
 
     @classmethod
     def mine(cls):
@@ -91,6 +90,11 @@ class Holder(NamedTuple):
 
     def __str__(self):
         return f"{self.session}, since {self.since}"
+
+
+def stamp():
+    """Now, as a holder's `since`: local time to the second, with its offset."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def read(path):

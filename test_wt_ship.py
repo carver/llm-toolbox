@@ -50,15 +50,20 @@ def ship(cwd, *args, session="s-mine", wait="10", env=None):
     )
 
 
-def ship_in_background(cwd, *args, session="s-mine", wait="10"):
-    return subprocess.Popen(
-        [str(SCRIPT), *args],
-        cwd=cwd,
-        env=ship_env(session, wait),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+def ship_in_background(cwd, logs, *args, session="s-mine", wait="10"):
+    """Start wt-ship with its stdout and stderr going to files in the folder `logs`,
+    which `proc.out()` and `proc.err()` read while it runs."""
+    out, err = logs / "out", logs / "err"
+    with out.open("w") as out_file, err.open("w") as err_file:
+        proc = subprocess.Popen(
+            [str(SCRIPT), *args],
+            cwd=cwd,
+            env=ship_env(session, wait),
+            stdout=out_file,
+            stderr=err_file,
+        )
+    proc.out, proc.err = out.read_text, err.read_text
+    return proc
 
 
 def wait_until(condition, what, seconds=20):
@@ -817,8 +822,18 @@ def queued_sessions(main):
 
 
 def finish(proc):
-    out, err = proc.communicate(timeout=30)
-    return proc.returncode, out, err
+    proc.wait(timeout=30)
+    return proc.returncode, proc.out(), proc.err()
+
+
+def waits_to_land(proc, held_by=""):
+    """Wait for wt-ship to say it waits to land. Only then is it in its wait loop: it
+    joins the queue before it first looks at the flag, so a flag freed or a signal
+    sent in that gap meets a run that never waited."""
+    wait_until(
+        lambda: f"Waiting to land: first in the queue{held_by}" in proc.out(),
+        "wt-ship to say it waits",
+    )
 
 
 def test_local_clears_a_flag_whose_process_is_gone_and_lands(setup, holder):
@@ -845,7 +860,7 @@ def test_local_waits_while_another_landing_holds_the_flag_then_lands(
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
     waiting = background(wt, "--local", "--check", "true")
-    wait_until(lambda: queue(main), "the waiter to join the queue")
+    waits_to_land(waiting, "; the main tree is held by s-other")
     flag(main).unlink()  # that landing finished
     status, out, err = finish(waiting)
 
@@ -934,7 +949,7 @@ def test_a_killed_waiter_doesnt_hold_up_the_queue(setup, holder, background):
     killed = background(wt, "--local", "--check", "true", session="s-one")
     wait_until(lambda: len(queue(main)) == 1, "the first waiter to join")
     killed.kill()  # no chance to clean up: its entry stays behind
-    killed.communicate()
+    killed.wait()
     assert queued_sessions(main) == ["s-one"]
     two = background(second_wt, "--local", "--check", "true", session="s-two")
     # The second waiter drops the killed one's entry as it joins.
@@ -954,7 +969,7 @@ def test_a_waiter_stopped_while_waiting_leaves_the_queue(setup, holder, backgrou
     commit(wt, "a.py", "x = 1\n", "Add a")
 
     waiting = background(wt, "--local", "--check", "true")
-    wait_until(lambda: queue(main), "the waiter to join the queue")
+    waits_to_land(waiting)
     waiting.send_signal(signal.SIGTERM)
     status, _, _ = finish(waiting)
 
@@ -964,12 +979,13 @@ def test_a_waiter_stopped_while_waiting_leaves_the_queue(setup, holder, backgrou
 
 
 @pytest.fixture
-def background():
+def background(tmp_path_factory):
     """Start wt-ship in the background; every run is killed and reaped at the end."""
     procs = []
 
     def start(cwd, *args, session="s-mine", wait="10"):
-        proc = ship_in_background(cwd, *args, session=session, wait=wait)
+        logs = tmp_path_factory.mktemp("ship")
+        proc = ship_in_background(cwd, logs, *args, session=session, wait=wait)
         procs.append(proc)
         return proc
 
@@ -977,7 +993,7 @@ def background():
     for proc in procs:
         if proc.poll() is None:
             proc.kill()
-        proc.communicate()
+        proc.wait()
 
 
 def queue_entry(main, proc, session="s-ahead"):
@@ -1086,7 +1102,7 @@ def test_a_waiter_stopped_with_ctrl_c_leaves_quietly(setup, holder, background):
     commit(wt, "a.py", "x = 1\n", "Add a")
 
     waiting = background(wt, "--local", "--check", "true")
-    wait_until(lambda: queue(main), "the waiter to join the queue")
+    waits_to_land(waiting)
     waiting.send_signal(signal.SIGINT)
     status, _, err = finish(waiting)
 

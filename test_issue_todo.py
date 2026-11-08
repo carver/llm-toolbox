@@ -51,7 +51,8 @@ def test_undo_unticks_an_item_and_keeps_its_text():
 
 
 class FakeGh:
-    """Serves issue 7 of owner/repo, with a comment holding two items, and records every PATCH."""
+    """Serves issue 7 of owner/repo, with a comment holding two items, and records every call
+    and every PATCH."""
 
     def __init__(self, body=BODY):
         self.issue = {
@@ -76,8 +77,10 @@ class FakeGh:
         ]
         self.listing = []  # the open issues and pull requests, as GitHub lists them
         self.patched = []
+        self.calls = []
 
     def __call__(self, *args, stdin=None):
+        self.calls.append(args)
         if args[:2] == ("repo", "view"):
             return "owner/repo\n"
         if "-X" in args:
@@ -222,6 +225,55 @@ def test_open_lists_each_open_issues_open_items_and_names_the_issues_with_none(
     assert not any("A missing control" in line for line in out)  # ticked
     assert not any("#9" in line or "not an issue" in line for line in out)
     assert out[-1] == "no open items: #8"
+
+
+def test_open_titles_prints_each_open_issue_on_one_line_with_its_open_item_count(
+    fake, capsys
+):
+    fake.listing = [
+        fake.issue | {"comments": 2, "assignees": [{"login": "carver"}]},
+        {"number": 8, "title": "Past research", "body": "- [x] done", "comments": 0},
+        {
+            "number": 9,
+            "title": "A pull request",
+            "body": "- [ ] not an issue's",
+            "comments": 0,
+            "pull_request": {},
+        },
+        {"number": 10, "title": "One step", "body": "- [ ] the step", "comments": 0},
+    ]
+
+    assert tool.main(["open", "--titles"]) == 0
+
+    # 7: two open in the body (ticked and fenced ones left out), two in comment 12
+    assert capsys.readouterr().out.splitlines() == [
+        "#7 Criterion: consistent (4 open items)",
+        "#8 Past research",
+        "#10 One step (1 open item)",
+    ]
+
+
+def test_open_titles_prints_a_long_title_in_full(fake, capsys):
+    title = "Site design " + "with a long subtitle " * 8
+    fake.listing = [{"number": 8, "title": title, "body": "", "comments": 0}]
+
+    assert tool.main(["open", "--titles"]) == 0
+
+    assert capsys.readouterr().out == f"#8 {title}\n"
+
+
+def test_open_titles_reads_comments_only_for_issues_that_have_some(fake):
+    fake.listing = [
+        fake.issue | {"comments": 2},
+        {"number": 8, "title": "No comments", "body": "", "comments": 0},
+    ]
+
+    assert tool.main(["open", "--titles", "--repo", "other/thing"]) == 0
+
+    assert [args[-1].split("?")[0] for args in fake.calls] == [
+        "repos/other/thing/issues",  # the listing
+        "repos/other/thing/issues/7/comments",
+    ]
 
 
 def test_show_cuts_a_long_item_to_one_line(fake, capsys):

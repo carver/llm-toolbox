@@ -442,10 +442,12 @@ def test_a_job_that_arrives_to_a_free_quiet_lane_starts_at_once(box):
     _, _, env = box
 
     started = time.monotonic()
-    done = heavy(env, "--", "true", HEAVY_QUIET_SECONDS="5", HEAVY_POLL="0.2")
+    done = heavy(env, "--", "true", HEAVY_QUIET_SECONDS="30", HEAVY_POLL="0.2")
 
     assert done.returncode == 0, done.stderr
-    assert time.monotonic() - started < 3  # one sample, not the 5 s window
+    # One sample, not the 30 s window: room for a start slowed by a busy machine,
+    # as when the suite runs as a commit check sharing a lane at nice 10.
+    assert time.monotonic() - started < 15
 
 
 def test_a_job_that_waited_still_needs_the_quiet_window(box, background):

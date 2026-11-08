@@ -18,8 +18,9 @@ SCRIPT = Path(__file__).resolve().parent / "bin" / "waitone"
 def command(*args: str, shell: bool = False) -> list[str]:
     if shell:
         # The pattern sits in the calling shell's own command line, which is
-        # what makes `while pgrep -f ...` loops wait forever.
-        return ["bash", "-c", " ".join([str(SCRIPT), *args])]
+        # what makes `while pgrep -f ...` loops wait forever. bash runs a lone
+        # command in its own place, so a second one keeps the shell there.
+        return ["bash", "-c", " ".join([str(SCRIPT), *args]) + "; exit $?"]
     return [str(SCRIPT), *args]
 
 

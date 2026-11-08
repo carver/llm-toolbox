@@ -27,6 +27,13 @@ The page's uncaught errors and console errors go to stderr, repeats collapsed
 to one line with a count, and make the exit status 3 once the screenshots are
 saved.
 
+A local .html file that doesn't start with a doctype, such as an Artifact file,
+would load in quirks mode. It loads instead after the skeleton the Artifact
+publisher adds: <!doctype html>, a UTF-8 charset meta, a viewport meta and a
+[hidden]{display:none!important} rule. The page keeps the file's URL, so
+relative links and #anchors work, and nothing is written to disk. stderr says
+so.
+
 The browser is Playwright's Chromium. When the cached browser is not the build
 this Playwright wants, the newest cached Chromium is used instead, so no
 download is needed; with none cached it prints the install command.
@@ -40,6 +47,7 @@ Examples:
 """
 
 import argparse
+import codecs
 import glob
 import io
 import json
@@ -48,6 +56,8 @@ import re
 import sys
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,6 +87,16 @@ UNENDING = {"eventsource", "websocket", "media"}
 # without scaling them down: a 1280x6353 shot showed at 403x2000.
 SPLIT_ABOVE = 1500
 PIECE_HEIGHT = 1400
+# What an Artifact's publisher wraps its file in. Without a doctype a page loads in quirks mode.
+SKELETON = (
+    b"<!doctype html>\n"
+    b'<meta charset="utf-8">\n'
+    b'<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n'
+    b"<style>[hidden]{display:none!important}</style>\n"
+)
+# What may come before a doctype that still takes effect: whitespace, comments, and an XML
+# declaration, which HTML reads as a comment
+BEFORE_DOCTYPE = re.compile(rb"(?:\s|<!--.*?-->|<\?[^>]*>)*", re.DOTALL)
 LINKS_JS = """pattern => [...document.querySelectorAll('a[href]')]
   .map(a => [a.innerText.trim().replace(/\\s+/g, ' '), a.href])
   .filter(([text, href]) => !pattern || new RegExp(pattern, 'i').test(text + ' ' + href))"""
@@ -217,6 +237,55 @@ def save_pieces(path, png):
     return pieces
 
 
+def file_path(url):
+    """The resolved path a file:// URL names, else None."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "file":
+        return None
+    return Path(urllib.request.url2pathname(parts.path)).resolve()
+
+
+def local_html(page):
+    """The resolved path of the local .html or .htm file PAGE names, as a path or a file:// URL, or
+    None."""
+    path = file_path(page_url(page))
+    if path and path.suffix.lower() in (".html", ".htm") and path.is_file():
+        return path
+    return None
+
+
+def in_skeleton(content):
+    """CONTENT, a page's bytes, after SKELETON, or None when a doctype starts it. A UTF-16 file is left
+    alone too: this look at its bytes can't read it."""
+    if content.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return None
+    content = content.removeprefix(codecs.BOM_UTF8)
+    start = BEFORE_DOCTYPE.match(content).end()
+    if content[start : start + 9].lower() == b"<!doctype":
+        return None
+    return SKELETON + content
+
+
+def serve_in_skeleton(context, path, body):
+    """Answers every request for the file at PATH with BODY, keeping its URL, and says so on stderr the
+    first time."""
+    told = False
+
+    def answer(route):
+        nonlocal told
+        if not told:
+            print(
+                f"no doctype in {path.name}: loaded it inside a standard skeleton"
+                " (doctype, charset, viewport, [hidden] rule)",
+                file=sys.stderr,
+                flush=True,
+            )
+            told = True
+        route.fulfill(body=body, content_type="text/html")
+
+    context.route(lambda url: file_path(url) == path, answer)
+
+
 def page_url(page):
     path = Path(page)
     return path.resolve().as_uri() if "://" not in page and path.exists() else page
@@ -254,6 +323,10 @@ def run(page, actions, out, size, cookies):
         context = browser.new_context(viewport={"width": width, "height": height})
         url = page_url(page)
         context.add_cookies([{"name": n, "value": v, "url": url} for n, v in cookies])
+        html = local_html(page)
+        body = html and in_skeleton(html.read_bytes())
+        if body:
+            serve_in_skeleton(context, html, body)
         tab = context.new_page()
         network = Network()
         tab.on("request", network.started)

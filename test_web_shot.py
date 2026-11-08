@@ -3,6 +3,7 @@
 import http.server
 import importlib.machinery
 import importlib.util
+import json
 import subprocess
 import threading
 from pathlib import Path
@@ -251,6 +252,70 @@ def test_a_shot_taller_than_1500px_is_also_saved_in_pieces(tmp_path):
     ]
 
 
+@pytest.mark.skipif(
+    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
+)
+def test_a_file_without_a_doctype_loads_inside_a_standard_skeleton(tmp_path):
+    """As an Artifact file, which its publisher wraps. Its relative URLs and #links still work, and no
+    file is written beside it."""
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "app.js").write_text("document.getElementById('r').textContent = 'ran'")
+    (site / "style.css").write_text("#r { color: rgb(0, 128, 0) }")
+    (site / "dot.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"/>'
+    )
+    (site / "page.html").write_text(
+        '<title>Art</title><link rel="stylesheet" href="style.css">'
+        '<p id="r">not run</p><img id="i" src="dot.svg">'
+        '<div id="h" hidden style="display: block">hidden</div>'
+        '<a id="go" href="#far">far</a><div style="height: 2000px"></div><h2 id="far">far</h2>'
+        '<script src="app.js"></script>',
+        encoding="utf-8",
+    )
+    run = cli(
+        "--out",
+        tmp_path / "out",
+        "--size",
+        "200x300",
+        "--do",
+        "click #go",
+        "--do",
+        "eval [document.compatMode, document.characterSet,"
+        " document.querySelector('meta[name=viewport]').content,"
+        " getComputedStyle(document.getElementById('h')).display,"
+        " document.getElementById('r').textContent,"
+        " getComputedStyle(document.getElementById('r')).color,"
+        " document.getElementById('i').naturalWidth,"
+        " location.href, scrollY > 0]",
+        site / "page.html",
+    )
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout.splitlines()[0]) == [
+        "CSS1Compat",
+        "UTF-8",
+        "width=device-width, initial-scale=1, viewport-fit=cover",
+        "none",
+        "ran",
+        "rgb(0, 128, 0)",
+        3,
+        (site / "page.html").as_uri() + "#far",
+        True,
+    ]
+    assert run.stderr.splitlines() == [
+        (
+            "no doctype in page.html: loaded it inside a standard skeleton"
+            " (doctype, charset, viewport, [hidden] rule)"
+        )
+    ]
+    assert sorted(p.name for p in site.iterdir()) == [
+        "app.js",
+        "dot.svg",
+        "page.html",
+        "style.css",
+    ]
+
+
 def test_repeated_errors_collapse_to_one_line_with_a_count():
     assert web_shot.collapse(["a", "b", "a", "a"]) == ["a (x3)", "b"]
 
@@ -261,7 +326,7 @@ def test_repeated_errors_collapse_to_one_line_with_a_count():
 def test_prints_text_and_links_after_loading_an_endless_page(tmp_path):
     page = tmp_path / "p.html"
     page.write_text(
-        '<main><h1>Form</h1><a href="https://airtable.com/f">Apply now</a><a href="/about">About</a></main>'
+        '<!doctype html><main><h1>Form</h1><a href="https://airtable.com/f">Apply now</a><a href="/about">About</a></main>'
         '<div id="feed"></div><script>'
         'let n = 0; function more() { if (n >= 30) return; const d = document.createElement("p");'
         ' d.style.height = "400px"; d.textContent = "item " + (++n); feed.appendChild(d); }'

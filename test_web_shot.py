@@ -153,6 +153,7 @@ def test_clicks_shoots_and_reports_page_errors(tmp_path):
     )
     assert run.returncode == 3, run.stderr
     assert "boom" in run.stderr
+    assert "no doctype in p.html" in run.stderr  # a path, as well as a file:// URL
     shots = run.stdout.split()
     assert [Path(s).name for s in shots] == ["text.png", "final.png"]
     assert all(Path(s).stat().st_size > 0 for s in shots)
@@ -268,8 +269,9 @@ def test_a_shot_taller_than_1500px_is_also_saved_in_pieces(tmp_path):
 )
 def test_a_file_without_a_doctype_loads_inside_a_standard_skeleton(tmp_path):
     """As an Artifact file, which its publisher wraps. Its relative URLs and #links still work, and no
-    file is written beside it."""
-    site = tmp_path / "site"
+    file is written beside it. Given as a file:// URL with a fragment and an unescaped space, it still
+    matches, and loading it again doesn't repeat the note."""
+    site = tmp_path / "my site"
     site.mkdir()
     (site / "app.js").write_text("document.getElementById('r').textContent = 'ran'")
     (site / "style.css").write_text("#r { color: rgb(0, 128, 0) }")
@@ -281,7 +283,7 @@ def test_a_file_without_a_doctype_loads_inside_a_standard_skeleton(tmp_path):
         '<p id="r">not run</p><img id="i" src="dot.svg">'
         '<div id="h" hidden style="display: block">hidden</div>'
         '<a id="go" href="#far">far</a><div style="height: 2000px"></div><h2 id="far">far</h2>'
-        '<script src="app.js"></script>',
+        '<a id="again" href="page.html">again</a><script src="app.js"></script>',
         encoding="utf-8",
     )
     run = cli(
@@ -299,10 +301,15 @@ def test_a_file_without_a_doctype_loads_inside_a_standard_skeleton(tmp_path):
         " getComputedStyle(document.getElementById('r')).color,"
         " document.getElementById('i').naturalWidth,"
         " location.href, scrollY > 0]",
-        site / "page.html",
+        "--do",
+        "click #again",
+        "--do",
+        "eval [location.href, document.compatMode]",
+        f"file://{site / 'page.html'}#top",
     )
     assert run.returncode == 0, run.stderr
-    assert json.loads(run.stdout.splitlines()[0]) == [
+    first, again = run.stdout.splitlines()[:2]
+    assert json.loads(first) == [
         "CSS1Compat",
         "UTF-8",
         "width=device-width, initial-scale=1, viewport-fit=cover",
@@ -313,6 +320,7 @@ def test_a_file_without_a_doctype_loads_inside_a_standard_skeleton(tmp_path):
         (site / "page.html").as_uri() + "#far",
         True,
     ]
+    assert json.loads(again) == [(site / "page.html").as_uri(), "CSS1Compat"]
     assert run.stderr.splitlines() == [
         (
             "no doctype in page.html: loaded it inside a standard skeleton"
@@ -477,6 +485,49 @@ def test_a_page_that_breaks_the_sideways_check_still_gets_its_shots(tmp_path):
         "couldn't check sideways scrolling at shot final",
     ]
     assert all("mine" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"<!doctype html><p>hi",
+        b"\xef\xbb\xbf<!DOCTYPE html><p>hi",
+        b" \n<!-- a mockup -->\n<?xml version='1.0'?>\n<!DocType html><p>hi",
+        "<!doctype html><p>hi".encode("utf-16"),
+        "<p>hi".encode("utf-16"),
+    ],
+)
+def test_a_page_that_starts_with_a_doctype_or_is_utf16_is_left_alone(content):
+    assert web_shot.in_skeleton(content) is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"<p>hi",
+        b"\xef\xbb\xbf<p>hi",
+        b"<!-- <!doctype html> --><p>hi",
+        b"<!-- <!doctype html>",
+    ],
+)
+def test_a_page_without_a_doctype_goes_after_the_skeleton_without_its_bom(content):
+    page = web_shot.in_skeleton(content)
+    assert page.startswith(b'<!doctype html>\n<meta charset="utf-8">\n')
+    assert page.endswith(content.removeprefix(b"\xef\xbb\xbf"))
+    assert b"\xef\xbb\xbf" not in page
+
+
+def test_only_a_local_html_file_gets_the_skeleton(tmp_path):
+    for name in ("a.HTM", "b.svg", "c.txt"):
+        (tmp_path / name).write_text("<p>hi")
+    assert web_shot.local_html(str(tmp_path / "a.HTM")) == tmp_path / "a.HTM"
+    assert (
+        web_shot.local_html((tmp_path / "a.HTM").as_uri() + "#x") == tmp_path / "a.HTM"
+    )
+    assert web_shot.local_html(str(tmp_path / "b.svg")) is None
+    assert web_shot.local_html(str(tmp_path / "c.txt")) is None
+    assert web_shot.local_html(str(tmp_path / "missing.html")) is None
+    assert web_shot.local_html("https://example.com/a.html") is None
 
 
 def test_repeated_errors_collapse_to_one_line_with_a_count():

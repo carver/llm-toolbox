@@ -36,12 +36,12 @@ only the outermost culprit, not its descendants. A report seen at several
 moments prints once, naming them. It doesn't change the exit status. A page
 whose scripts break the check gets a line saying so instead.
 
-A local .html file that doesn't start with a doctype, such as an Artifact file,
-would load in quirks mode. It loads instead after the skeleton the Artifact
-publisher adds: <!doctype html>, a UTF-8 charset meta, a viewport meta and a
-[hidden]{display:none!important} rule. The page keeps the file's URL, so
-relative links and #anchors work, and nothing is written to disk. stderr says
-so.
+A local .html or .htm file that doesn't start with a doctype, such as an
+Artifact file, would load in quirks mode. It loads instead after the skeleton
+the Artifact publisher adds: <!doctype html>, a UTF-8 charset meta, a viewport
+meta and a [hidden]{display:none!important} rule. The page keeps the file's
+URL, so relative links and #anchors work, and nothing is written to disk.
+stderr says so.
 
 The browser is Playwright's Chromium. When the cached browser is not the build
 this Playwright wants, the newest cached Chromium is used instead, so no

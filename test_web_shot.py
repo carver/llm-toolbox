@@ -156,6 +156,53 @@ def test_clicks_shoots_and_reports_page_errors(tmp_path):
     assert all(Path(s).stat().st_size > 0 for s in shots)
 
 
+def cli(*args):
+    return subprocess.run(
+        [str(SCRIPT), *map(str, args)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+
+@pytest.mark.skipif(
+    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
+)
+def test_eval_prints_its_value_as_json_where_it_runs(tmp_path):
+    """A doctype after a comment still counts, so this page loads as it is."""
+    page = tmp_path / "p.html"
+    page.write_text(
+        "<!-- a mockup -->\n<!DOCTYPE html><meta charset=utf-8><title>Tëst</title><p id=t>hello</p>",
+        encoding="utf-8",
+    )
+    run = cli(
+        "--out",
+        tmp_path / "out",
+        "--do",
+        "eval document.title",
+        "--do",
+        "text #t",
+        "--do",
+        "eval [1, {a: null}, document.compatMode]",
+        "--do",
+        "eval console.log('ignored')",
+        "--do",
+        "eval Promise.resolve(2)",
+        page,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.splitlines() == [
+        '"Tëst"',
+        "hello",
+        '[1, {"a": null}, "CSS1Compat"]',
+        "undefined",
+        "2",
+        str(tmp_path / "out" / "final.png"),
+    ]
+    assert run.stderr == ""
+
+
 def test_repeated_errors_collapse_to_one_line_with_a_count():
     assert web_shot.collapse(["a", "b", "a", "a"]) == ["a (x3)", "b"]
 

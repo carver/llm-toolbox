@@ -11,14 +11,15 @@ PAGE is a URL or a local file path.
 Actions (--do, repeatable, run in order once the page has loaded):
   click SELECTOR         click the first element matching a CSS selector
   wait MS                wait, e.g. for an animation or a fetch
-  eval JS                run JavaScript in the page
+  eval JS                run JavaScript in the page and print its value as JSON, or undefined;
+                         console.log output isn't shown, so make the value what you want to see
   shot NAME [SELECTOR]   screenshot to OUT/NAME.png: the matching element, else the full page
   text [SELECTOR]        print the visible text of the matching element, else the whole page
   links [REGEX]          print "text -> url" for each link whose text or url matches REGEX
   scroll-all             scroll to the bottom until the page stops growing (endless feeds)
 
-A final full-page screenshot, OUT/final.png, is always taken. Printed text and
-links go to stdout as their actions run, then the paths of the screenshots.
+A final full-page screenshot, OUT/final.png, is always taken. Text, links and
+eval values go to stdout as their actions run, then the paths of the screenshots.
 The page's uncaught errors and console errors go to stderr, repeats collapsed
 to one line with a count, and make the exit status 3 once the screenshots are
 saved.
@@ -36,6 +37,7 @@ Examples:
 """
 
 import argparse
+import json
 import sys
 import tempfile
 import time
@@ -172,6 +174,15 @@ def visible_text(tab, selector):
     return "\n".join(line.strip() for line in text.splitlines() if line.strip())
 
 
+def eval_json(tab, script):
+    """SCRIPT's value in the page as one line of JSON, or "undefined". Playwright awaits a promise and
+    calls a function, as evaluate does; a value JSON can't hold, such as a Date, prints as text."""
+    value = tab.evaluate_handle(script)
+    if value.evaluate("v => v === undefined"):
+        return "undefined"
+    return json.dumps(value.json_value(), ensure_ascii=False, default=str)
+
+
 def page_url(page):
     path = Path(page)
     return path.resolve().as_uri() if "://" not in page and path.exists() else page
@@ -228,7 +239,7 @@ def run(page, actions, out, size, cookies):
             elif action.verb == "wait":
                 tab.wait_for_timeout(int(action.args[0]))
             elif action.verb == "eval":
-                tab.evaluate(action.args[0])
+                print(eval_json(tab, action.args[0]), flush=True)
             elif action.verb == "text":
                 print(
                     visible_text(tab, action.args[0] if action.args else None),

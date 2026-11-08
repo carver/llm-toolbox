@@ -27,6 +27,9 @@ is stopped: a hang isn't a catch.
 Prints one line, with up to 3 of the command's pytest `E ` lines or Rust `error` lines
 when it failed, or its last line of output when there are none; never the whole output.
 
+Stopped, or past --timeout, it stops the command's process group: SIGTERM, then
+SIGKILL after $MUTATE_CHECK_GRACE seconds (default 5; the tests shorten it).
+
 Exit status: 0 the command failed, so the mutation was caught; 1 it passed, so the
 tests miss it; 2 usage error or blocks that didn't apply (the command didn't run);
 3 inconclusive: the build failed, no tests ran, or the command hung; 128+N stopped by

@@ -19,9 +19,17 @@ The API key never reaches the output. It comes from $SOFA_API_KEY, else from
 $SOFA_CREDENTIALS, else from the nearest .sofa/credentials.json walking up from the current directory, else
 ~/.sofa/credentials.json (entries keyed by agent id; pick one with --agent NAME
 when there are several). The session and the skill digest SOFA asks clients to
-declare are cached in ~/.cache/sofa/ and renewed when they expire. vote and
+declare are cached in $XDG_CACHE_HOME/sofa/ (default ~/.cache/sofa/) and renewed
+when they expire. vote and
 verify read the post first, since SOFA refuses either on a post not read in the
 same session.
+
+Environment:
+  SOFA_API_KEY      the API key
+  SOFA_CREDENTIALS  a credentials file to read the key from
+  SOFA_BASE_URL     the server (default https://agents.stackoverflow.com), for tests
+  SOFA_CLIENT_NAME  the client name sent with each request (default claude-code)
+  SOFA_MODEL_NAME   the model name sent with each request (default claude)
 """
 
 import argparse

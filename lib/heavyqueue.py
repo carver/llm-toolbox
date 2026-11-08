@@ -10,6 +10,12 @@ the first sample when it arrived to a free lane with nobody waiting. Each lane i
 lib/fifo.py queue in HEAVY_DIR/<lane>/, its slot the file `slot` there. A job's
 cores are decided, and its slot taken, under one lock for both lanes, so a long and
 a normal job starting together never share cores.
+
+It reads HEAVY_DIR, HEAVY_QUIET_SECONDS, HEAVY_POLL (seconds per sample),
+HEAVY_STALL_SECONDS (before the PR hint) and HEAVY_BUSY (the tests' stand-in for
+measuring), as bin/heavy's -h describes them; HEAVY_SLOT, which a job's environment
+carries so a heavy inside it runs at once; and RUSTC_WRAPPER, to start sccache's
+server before pinning.
 """
 
 import os

@@ -79,8 +79,6 @@ line written into the pass record by hand, which every worktree then trusts).
 """
 
 import argparse
-import fcntl
-import hashlib
 import json
 import os
 import re
@@ -93,6 +91,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import heavyqueue
+import passrecord
 
 HOOK_NAME = "agent-pre-commit"
 COMMENT = f"# Agents' commits also run the slower {HOOK_NAME} (llm-toolbox agent-commit-gate)."
@@ -119,12 +118,6 @@ OLD_LINES = (
         f'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}"; fi || exit; fi'
     ),
 )
-# In the repo's common git dir, shared by its worktrees: a line for each tree that passed
-# the agent check, `<tree> <the check's fingerprint>`, newest last, the last RECORD_SIZE.
-PASS_RECORD = "agent-pre-commit-passed"
-RECORD_SIZE = 1000
-# How long a pass waits for another's write to the record before it goes unrecorded.
-RECORD_LOCK_SECONDS = 5
 # How many of HEAD's first-parent commits, HEAD included, --run looks through for one
 # whose tree passed the check: the check's CHECK_BASE.
 BASE_SEARCH = 100
@@ -556,21 +549,6 @@ def run_quiet(path, name, base, queue=True):
     return report(name, base, run, took)
 
 
-def record_path():
-    """The pass record's path, in the common git dir; None outside a repository."""
-    common = git_out("rev-parse", "--path-format=absolute", "--git-common-dir")
-    return None if common is None else Path(common, PASS_RECORD)
-
-
-def recorded(record):
-    """The record's keys, oldest first; none when it's missing or can't be read, which
-    only costs fuller runs."""
-    try:
-        return record.read_text().splitlines()
-    except (OSError, UnicodeDecodeError):
-        return []
-
-
 def check_base(passed, fingerprint):
     """The nearest of HEAD's first BASE_SEARCH first-parent commits, HEAD included,
     whose tree passed the check with this fingerprint; None when there's none."""
@@ -586,50 +564,10 @@ def check_base(passed, fingerprint):
         # Only `<commit> <tree>`, whatever else a config adds to git log's output.
         if (
             len(words := line.split()) == 2
-            and pass_key(words[1], fingerprint) in passed
+            and passrecord.pass_key(words[1], fingerprint) in passed
         ):
             return words[0]
     return None
-
-
-def pass_key(tree, fingerprint):
-    """A pass's line on the record: the tree, and the check's fingerprint."""
-    return f"{tree} {fingerprint}"
-
-
-@contextmanager
-def record_lock(record):
-    """Hold the lock beside the record; OSError when another process holds it past
-    RECORD_LOCK_SECONDS. It never blocks outright: the record lives on a shared mount,
-    where a holder stuck in I/O would stall every commit's pass behind it."""
-    deadline = time.monotonic() + RECORD_LOCK_SECONDS
-    with open(record.with_name(f"{record.name}.lock"), "a") as lock:
-        while True:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise OSError("another commit holds its lock") from None
-                time.sleep(0.05)
-        yield
-
-
-def remember(record, key):
-    """Add key to the record, newest last, keeping the last RECORD_SIZE: rewritten
-    whole and renamed into place, under the record's lock, so passes in two worktrees
-    keep both. A lock held too long, or a failed write, leaves the pass unrecorded,
-    which costs a fuller run later, and says so."""
-    part = record.with_name(f"{record.name}.{os.getpid()}")
-    try:
-        with record_lock(record):
-            kept = [line for line in recorded(record) if line != key]
-            kept = [*kept[-(RECORD_SIZE - 1) :], key]
-            part.write_text("".join(f"{line}\n" for line in kept))
-            part.replace(record)
-    except OSError as error:
-        part.unlink(missing_ok=True)
-        print(f"{HOOK_NAME}: passed; couldn't record it: {error}", file=sys.stderr)
 
 
 def run_check(path):
@@ -644,10 +582,10 @@ def run_check(path):
         print(f"{path}: no executable agent check", file=sys.stderr)
         print(f"COMMIT REFUSED: no {HOOK_NAME} to run", file=sys.stderr)
         return 1
-    record = record_path()
-    passed = set(recorded(record)) if record else set()
+    record = passrecord.record_path()
+    passed = set(passrecord.recorded(record)) if record else set()
     content = hook.read_bytes()
-    fingerprint = hashlib.sha1(content).hexdigest()
+    fingerprint = passrecord.fingerprint(content)
     base = check_base(passed, fingerprint)
     fix = (args := running_commit_args()) is not None and is_fix_commit(args)
     if fix and is_small_fix():
@@ -666,7 +604,7 @@ def run_check(path):
         )
         return 0
     tree = git_out("write-tree")
-    key = pass_key(tree, fingerprint) if tree else None
+    key = passrecord.pass_key(tree, fingerprint) if tree else None
     if key in passed and tree == git_out("rev-parse", "-q", "--verify", "HEAD^{tree}"):
         print(
             f"{HOOK_NAME}: skipped, tree {tree[:12]} already passed it", file=sys.stderr
@@ -676,7 +614,7 @@ def run_check(path):
     run = run_outside_first if names_queue_exit(content) else run_quiet
     code = run(path, HOOK_NAME, base)
     if code == 0 and clean and key and record:
-        remember(record, key)
+        passrecord.remember(record, key)
     return code
 
 

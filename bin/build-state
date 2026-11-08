@@ -18,7 +18,11 @@
                             sources, and code-review's standards section and its
                             Standards and Spec briefs, copied verbatim from its
                             SKILL.md (fails when they can't be found there); on stderr,
-                            a nudge to write a CODING_STANDARDS.md when the repo has none
+                            a nudge to write a CODING_STANDARDS.md when the repo has none.
+                            When agent-commit-gate's record shows the repo's
+                            agent-pre-commit, as its bytes are now, passed HEAD's tree,
+                            the file says so and tells the reviewer to run only the
+                            tests a finding needs, not the whole suite
     build-state reword SHA [FILE]
                             replace commit SHA's message with FILE's text (stdin
                             without FILE), keeping every tree; refuses with
@@ -79,6 +83,9 @@ import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import passrecord
 
 # tests/x.py, test/x.py, spec/x.rb, test_x.py, x_test.go, x.test.ts, x.spec.js
 TEST_FILE = re.compile(
@@ -422,15 +429,19 @@ def back_at_head() -> Iterator[None]:
             signal.signal(signum, handler)
 
 
-def agent_check() -> list[str] | None:
-    """The command that runs the repo's agent-pre-commit, through the agent-commit-gate
-    beside this script, which hands it CHECK_BASE; None when the repo has none."""
+def agent_hook() -> Path | None:
+    """The repo's agent-pre-commit; None when it has none."""
     # --git-path is relative to the current directory, which may be a subdirectory.
     hooks = Path(git("rev-parse", "--git-path", "hooks").stdout.strip()).resolve()
     hook = hooks / "agent-pre-commit"
-    if not (hook.is_file() and os.access(hook, os.X_OK)):
-        return None
-    return [str(GATE), "--run", str(hook)]
+    return hook if hook.is_file() and os.access(hook, os.X_OK) else None
+
+
+def agent_check() -> list[str] | None:
+    """The command that runs the repo's agent-pre-commit, through the agent-commit-gate
+    beside this script, which hands it CHECK_BASE; None when the repo has none."""
+    hook = agent_hook()
+    return None if hook is None else [str(GATE), "--run", str(hook)]
 
 
 def passes(argv: list[str], top: str) -> bool:
@@ -589,6 +600,12 @@ POINTER = """\
 Your instructions for this review are in {path}. Read that whole file first, then \
 follow it. Report only: edit no files and make no commits.
 """
+# In the review prompt when the repo's agent check passed the tree under review.
+PASSED = """
+The repo's agent check, agent-pre-commit, already passed on this commit's tree, so \
+don't run the whole test suite: run the tests a finding needs, and `mutate-check` to \
+see whether a test catches a break.
+"""
 REVIEW_PROMPT = """\
 Review the changes in {top} since {base}, up to {sha}. Report only: edit no files and \
 make no commits.
@@ -605,7 +622,7 @@ fine. Run tools at the versions the repo pins (its hooks, pre-commit config or l
 files), not whatever `uvx` or `PATH` gives: another version reports what the repo's \
 checks don't. To see whether a test catches a break, use `mutate-check -- CMD` \
 (`mutate-check -h`), which puts the code back, rather than a scripted edit.
-
+{passed}
 Run two separate reviews and report them under the headings `## Standards` and `## Spec`. \
 Don't merge or rerank findings across the two.
 
@@ -685,6 +702,8 @@ def review_prompt(args: argparse.Namespace) -> int:
         GLOBAL_STANDARDS,
         *(str(top / n) for n in REPO_STANDARDS if (top / n).is_file()),
     ]
+    hook = agent_hook()
+    passed = hook is not None and passrecord.passed(tree_of(sha), hook)
     prompt_file = state_file().parent / REVIEW_FILE
     prompt_file.write_text(
         REVIEW_PROMPT.format(
@@ -693,6 +712,7 @@ def review_prompt(args: argparse.Namespace) -> int:
             sha=sha,
             commits=git("log", "--oneline", "--reverse", f"{base}..{sha}").stdout,
             brief=args.brief.resolve(),
+            passed=PASSED if passed else "",
             sources=", ".join(sources),
             sources_section=section(text, SOURCES_HEADING),
             standards=briefs["Standards"],

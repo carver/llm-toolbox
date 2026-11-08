@@ -380,7 +380,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   BRIEF` writes the review subagent's prompt for the commit at HEAD to the git
   dir, with `/code-review`'s two briefs and its standards section copied from
   its SKILL.md, and prints a short prompt pointing at that file, to pass to the
-  subagent; it says on stderr when the repo has no `CODING_STANDARDS.md`.
+  subagent; it says on stderr when the repo has no `CODING_STANDARDS.md`. When
+  `agent-commit-gate`'s record shows the repo's `agent-pre-commit` (as its bytes
+  are now) passed the commit's tree, the prompt says so, and tells the reviewer
+  to run only the tests a finding needs rather than the whole suite.
   `reword SHA [FILE]` replaces a commit's message (FILE, or stdin), keeping
   every tree; it refuses during a rebase, with uncommitted changes, with merges
   after the commit, a later `fixup!` naming it, or the commit already pushed.

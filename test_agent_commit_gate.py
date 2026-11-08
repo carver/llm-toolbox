@@ -22,6 +22,7 @@ spec = importlib.util.spec_from_loader("agent_commit_gate", loader)
 gate = importlib.util.module_from_spec(spec)
 loader.exec_module(gate)
 import fifo  # from lib/, which loading the gate put on the path
+import passrecord
 
 
 def run_hook(monkeypatch, capsys, command, tool="Bash"):
@@ -809,7 +810,7 @@ def test_a_tree_that_passed_but_is_not_heads_runs_the_check(installed):
 
 
 def test_the_record_keeps_the_last_1000_passes(installed):
-    record = installed / ".git" / gate.PASS_RECORD
+    record = installed / ".git" / passrecord.PASS_RECORD
     record.write_text("".join(f"{n:040x} old\n" for n in range(1500)))
 
     assert commit(installed).returncode == 0

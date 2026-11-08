@@ -770,6 +770,95 @@ def test_review_prompt_names_mutate_check_and_allows_the_repos_build(repo, tmp_p
     assert "build" in prompt and "ignore" in prompt
 
 
+GATE = SCRIPT.parent / "agent-commit-gate"
+
+
+def pass_the_agent_check(repo):
+    """Run the repo's agent check through agent-commit-gate, as an agent's commit does,
+    so the tree it checks goes on the gate's record of passes."""
+    hook = repo / ".git" / "hooks" / "agent-pre-commit"
+    run = subprocess.run(
+        [str(GATE), "--run", str(hook)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+
+
+def says_the_check_passed(prompt):
+    return "already passed" in prompt and "whole test suite" in prompt
+
+
+def test_review_prompt_says_when_the_agent_check_passed_the_commits_tree(
+    repo, tmp_path
+):
+    agent_check(repo, "exit 0")
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    pass_the_agent_check(repo)
+
+    prompt = review_prompt_for(repo, tmp_path)
+
+    assert says_the_check_passed(prompt)
+    assert "mutate-check" in prompt
+
+
+def no_agent_check(repo):
+    commit(repo, "parser.py", "Parse dates")
+
+
+def no_pass_recorded(repo):
+    agent_check(repo, "exit 0")
+    commit(repo, "parser.py", "Parse dates")
+
+
+def another_tree_passed(repo):
+    agent_check(repo, "exit 0")
+    pass_the_agent_check(repo)  # the base's tree
+    commit(repo, "parser.py", "Parse dates")
+
+
+def the_check_changed_since(repo):
+    agent_check(repo, "exit 0")
+    commit(repo, "parser.py", "Parse dates")
+    pass_the_agent_check(repo)
+    agent_check(repo, "exit 0  # a later version of the check")
+
+
+def the_check_cant_be_read(repo):
+    agent_check(repo, "exit 0")
+    commit(repo, "parser.py", "Parse dates")
+    pass_the_agent_check(repo)
+    (repo / ".git" / "hooks" / "agent-pre-commit").chmod(0o100)  # run, not read
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        no_agent_check,
+        no_pass_recorded,
+        another_tree_passed,
+        the_check_changed_since,
+        pytest.param(
+            the_check_cant_be_read,
+            marks=pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file"),
+        ),
+    ],
+)
+def test_review_prompt_says_nothing_of_a_pass_the_record_doesnt_show(
+    repo, tmp_path, setup
+):
+    build_state(repo, "start")
+    setup(repo)
+
+    prompt = review_prompt_for(repo, tmp_path)
+
+    assert not says_the_check_passed(prompt)
+    assert "mutate-check" in prompt
+
+
 def test_a_worktree_removed_during_the_build_still_may_have_moved_its_branch(
     repo, tmp_path
 ):
@@ -796,19 +885,16 @@ def agent_check(repo, body):
 
 def test_finish_gives_each_commit_it_checks_the_one_before_as_check_base(repo):
     bases = repo / ".git" / "bases"
-    hook = repo / ".git" / "hooks" / "agent-pre-commit"
     agent_check(repo, f'echo "${{CHECK_BASE:-none}}" >> "{bases}"')
-    gate = SCRIPT.parent / "agent-commit-gate"
     start = git(repo, "rev-parse", "HEAD").strip()
     # The commit the build starts from passed the check when it was made.
-    passed = subprocess.run([str(gate), "--run", str(hook)], cwd=repo, check=False)
-    assert passed.returncode == 0
+    pass_the_agent_check(repo)
     build_state(repo, "start")
     work = commit(repo, "a.py", "Work")
     commit(repo, "b.py", "More")
     commit(repo, "a.py", "fix work", f"--fixup={work}")
 
-    done = build_state(repo, "finish", env={"PATH": path_without(gate.name)})
+    done = build_state(repo, "finish", env={"PATH": path_without(GATE.name)})
 
     assert done.returncode == 0, done.stderr
     folded_work = git(repo, "rev-parse", "HEAD~1").strip()

@@ -271,6 +271,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **openrouter-credits**: prints an OpenRouter account's credits, bought, used
   and left. The key comes from `OPENROUTER_API_KEY`, else from `./.env` (or
   `--env-file`); it is never printed.
+- **shape**: `shape FILE...` prints a file's structure and none of its values,
+  for a file an agent mustn't print, such as credentials or private data: each
+  key path with its type and list lengths (`.runs[].score float|null (2 of
+  3)`), in JSON, YAML or a markdown file's front matter, whose header counts the
+  body lines after it. `-` reads stdin, such as a server's reply. A key that
+  doesn't look like a field name (a title or an email used as a key) is counted
+  under `.*`, not shown. A file it can't parse fails in one line that names the
+  file and quotes none of it.
 - **edit-script-gate**: a Claude Code hook, which `install.py` registers, that
   refuses a Bash command running inline Python (a heredoc or `-c`) whose code
   reads a file, `.replace()`s text and writes that same file back, and points

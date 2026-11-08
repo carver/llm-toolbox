@@ -1,0 +1,256 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["pyyaml==6.0.3"]
+# ///
+"""Print a file's structure without its values: each key path with its type.
+
+  shape FILE...   JSON, YAML, or a markdown file's front matter
+  shape -         stdin, as in `curl ... | shape -`
+
+For learning the layout of a file you mustn't print: credentials, private data, a
+server's reply. The name picks the format: .json is JSON, .yaml and .yml are YAML,
+.md and .markdown are markdown, whose front matter (the YAML between a first line
+`---` and the next line that is `---` or `...`) is read. Any other name, and stdin,
+is JSON when it parses as JSON and YAML otherwise. A YAML stream of several
+documents is a list of them.
+
+Each file prints a header, `FILE: FORMAT`, then one line per path, in the order the
+paths first appear, each followed by the paths inside it:
+
+  runs.yaml: yaml
+    . map
+    .name str
+    .runs list[3]
+    .runs[] map
+    .runs[].id str
+    .runs[].score float|null (2 of 3)
+    .runs[].tags list[0..4]
+    .runs[].tags[] str
+    .by_title map
+    .by_title.* int (7 keys)
+
+`.` is the root, `.key` a key, and `[]` every item of a list, merged into one path.
+A type is str, int, float, bool, null, map, YAML's date, datetime or bytes, or
+list[N] with its length (list[MIN..MAX] when the lists at a path differ), which a
+YAML set, omap or pairs is too; a path that holds more than one type joins them
+with |. (K of N) says the key is in K of the N maps at the path above it. The header
+also says how many documents a YAML stream holds, how many body lines follow the
+front matter, or that a markdown file has no front matter.
+
+A key is shown only when it looks like a field name: a letter or _, then letters,
+digits, _ or -, 32 characters at most. Any other key (a title, an email, a date or a
+number used as a key) is data: its value is merged under `.*`, whose line counts the
+keys. A slug or an id used as a key can look like a field name, and then it shows. No
+value is printed, not even a string's length.
+
+A file it can't read or parse gets one line on stderr, `shape: FILE: REASON`, with
+the line and column where there is one and never text from the file; the other
+files are still shown.
+
+Exit status: 0 every file shown, 1 a file couldn't be read or parsed, 2 usage error.
+"""
+
+import argparse
+import datetime
+import json
+import re
+import sys
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+FIELD_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}")
+HIDDEN = ".*"
+ITEMS = "[]"
+# bool before int, and datetime before date: each is a subclass of the other.
+SCALARS = (
+    (bool, "bool"),
+    (int, "int"),
+    (float, "float"),
+    (str, "str"),
+    (type(None), "null"),
+    (datetime.datetime, "datetime"),
+    (datetime.date, "date"),
+    (bytes, "bytes"),
+)
+
+
+class Unparsable(Exception):
+    """A file shape can't show. The message is shape's own words, never the file's."""
+
+
+@dataclass
+class Node:
+    """Every value found at one path, merged."""
+
+    kinds: dict[str, None] = field(default_factory=dict)  # an ordered set
+    count: int = 0
+    maps: int = 0
+    shortest: int | None = None
+    longest: int | None = None
+    children: dict[str, "Node"] = field(default_factory=dict)
+
+    def add(self, value: object) -> None:
+        self.count += 1
+        if isinstance(value, dict):
+            self.kinds["map"] = None
+            self.maps += 1
+            for key, item in value.items():
+                shown = isinstance(key, str) and FIELD_NAME.fullmatch(key)
+                self.child(f".{key}" if shown else HIDDEN).add(item)
+        elif isinstance(value, (list, tuple, set)):
+            self.kinds["list"] = None
+            length = len(value)
+            if self.shortest is None or self.longest is None:
+                self.shortest = self.longest = length
+            self.shortest = min(self.shortest, length)
+            self.longest = max(self.longest, length)
+            for item in value:
+                self.child(ITEMS).add(item)
+        else:
+            self.kinds[scalar(value)] = None
+
+    def child(self, segment: str) -> "Node":
+        return self.children.setdefault(segment, Node())
+
+    def types(self) -> str:
+        span = (
+            f"{self.shortest}"
+            if self.shortest == self.longest
+            else f"{self.shortest}..{self.longest}"
+        )
+        return "|".join(f"list[{span}]" if k == "list" else k for k in self.kinds)
+
+    def lines(self, path: str = "", note: str = "") -> Iterator[str]:
+        yield f"  {path if path.startswith('.') else '.' + path} {self.types()}{note}"
+        for segment, child in self.children.items():
+            if segment == HIDDEN:
+                child_note = f" ({counted(child.count, 'key')})"
+            elif segment != ITEMS and child.count < self.maps:
+                child_note = f" ({child.count} of {self.maps})"
+            else:
+                child_note = ""
+            yield from child.lines(path + segment, child_note)
+
+
+def scalar(value: object) -> str:
+    for kind, name in SCALARS:
+        if isinstance(value, kind):
+            return name
+    return type(value).__name__
+
+
+def counted(number: int, noun: str) -> str:
+    return f"{number} {noun}{'' if number == 1 else 's'}"
+
+
+def read(name: str) -> str:
+    try:
+        data = sys.stdin.buffer.read() if name == "-" else Path(name).read_bytes()
+    except FileNotFoundError:
+        raise Unparsable("no such file") from None
+    except OSError as error:
+        raise Unparsable((error.strerror or "can't read it").lower()) from None
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise Unparsable("not UTF-8 text") from None
+
+
+def load_json(text: str) -> object:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        raise Unparsable(
+            f"not valid JSON (line {error.lineno}, column {error.colno})"
+        ) from None
+    except ValueError:  # an int past Python's digit limit
+        raise Unparsable("not valid JSON") from None
+
+
+def load_yaml(text: str, problem: str = "not valid YAML", offset: int = 0) -> list:
+    """Every document in the text. A parse error's message quotes the text, so only its
+    position is kept, `offset` lines down for text that starts below the file's top."""
+    try:
+        return list(yaml.safe_load_all(text))
+    except yaml.MarkedYAMLError as error:
+        if mark := error.problem_mark or error.context_mark:
+            problem += f" (line {mark.line + 1 + offset}, column {mark.column + 1})"
+        raise Unparsable(problem) from None
+    except (yaml.YAMLError, ValueError):  # a date such as 2026-13-45, a huge int
+        raise Unparsable(problem) from None
+
+
+def front_matter(text: str) -> tuple[str, list]:
+    lines = text.splitlines()
+    if not lines or lines[0].rstrip() != "---":
+        return f"no front matter, {counted(len(lines), 'line')}", []
+    for number, line in enumerate(lines[1:], 1):
+        if line.rstrip() in ("---", "..."):
+            yaml_text = "\n".join(lines[1:number])
+            documents = load_yaml(yaml_text, "front matter isn't valid YAML", offset=1)
+            body = counted(len(lines) - number - 1, "body line")
+            return f"front matter, {body}", [documents[0] if documents else None]
+    raise Unparsable("front matter has no closing --- line")
+
+
+def documents(name: str, text: str) -> tuple[str, list]:
+    """The header and the values to show: none, or the one root."""
+    suffix = "" if name == "-" else Path(name).suffix.lower()
+    if suffix in (".md", ".markdown"):
+        return front_matter(text)
+    if suffix == ".json":
+        return "json", [load_json(text)]
+    if suffix not in (".yaml", ".yml"):
+        try:
+            return "json", [json.loads(text)]
+        except ValueError:
+            pass
+    found = load_yaml(text)
+    if len(found) > 1:
+        return f"yaml, {counted(len(found), 'document')}", [found]
+    return "yaml", [found[0] if found else None]
+
+
+def shape(name: str) -> list[str]:
+    header, roots = documents(name, read(name))
+    lines = [f"{name}: {header}"]
+    for root in roots:
+        node = Node()
+        node.add(root)
+        lines.extend(node.lines())
+    return lines
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="shape",
+        description=__doc__.split("\n\n")[0],
+        epilog=__doc__.split("\n\n", 1)[1],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("files", nargs="+", metavar="FILE")
+    args = parser.parse_args(argv)
+    status = 0
+    for name in args.files:
+        try:
+            print("\n".join(shape(name)))
+            continue
+        except Unparsable as error:
+            reason = str(error)
+        except RecursionError:  # deep nesting, or YAML that refers to itself
+            reason = "nested too deep"
+        # Any other error's message may quote the file, and so may a traceback's: only
+        # its class is shown.
+        except Exception as error:  # noqa: BLE001
+            reason = f"failed ({type(error).__name__})"
+        print(f"shape: {name}: {reason}", file=sys.stderr)
+        status = 1
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

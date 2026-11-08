@@ -114,17 +114,19 @@ def join(folder, holder, details=""):
     first, written whole so a reader never sees it half written. Its path."""
     folder.mkdir(parents=True, exist_ok=True)
     entry = folder / f"{time.time_ns():020d}-{os.getpid()}"
-    part = folder / f".{entry.name}.part"
-    part.write_text(holder.line() + details)
-    part.rename(entry)
+    write_whole(entry, holder.line() + details)
     return entry
 
 
-def rewrite(entry, text):
-    """Replace the text of this process's entry, whole, keeping its place in line."""
-    part = entry.parent / f".{entry.name}.part"
-    part.write_text(text)
-    part.rename(entry)
+def write_whole(path, text):
+    """Write text to path whole: beside it first, then renamed into place, so a
+    reader never finds it half written. An entry rewritten so keeps its place."""
+    part = path.parent / f".{path.name}.{os.getpid()}.part"
+    try:
+        part.write_text(text)
+        part.rename(path)
+    finally:
+        part.unlink(missing_ok=True)
 
 
 def ahead(folder, entry):

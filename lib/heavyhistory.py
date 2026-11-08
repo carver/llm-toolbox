@@ -92,16 +92,14 @@ class History:
 def record(queue, command_key, cores, seconds):
     """Add a run to the command's history, under the queue's lock. A history that
     can't be saved (a full disk, the queue's folder gone) is noted and left be."""
-    part = Path(queue) / f".history.{os.getpid()}.part"
     try:
         with fifo.locked(Path(queue)):
             data = read(queue)
             if isinstance(data.get("version"), int) and data["version"] > VERSION:
                 return  # a newer heavy's file: leave it be
-            part.write_text(json.dumps(added(data, command_key, cores, seconds)))
-            part.rename(path(queue))
+            new = json.dumps(added(data, command_key, cores, seconds))
+            fifo.write_whole(path(queue), new)
     except OSError as error:
-        part.unlink(missing_ok=True)
         print(
             f"heavy: can't save its history ({error.strerror}), so this run"
             " isn't remembered.",

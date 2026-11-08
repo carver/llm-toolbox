@@ -73,7 +73,7 @@ def sharing(box):
 def background(box):
     """Start heavy in the background; every run is killed and reaped at the end."""
     procs = []
-    _, _, env = box
+    tmp_path, _, env = box
 
     def start(*args, session="s-test", stderr=None, cwd=None, **extra):
         """stderr: a file to write heavy's stderr to, to read while it runs."""
@@ -83,7 +83,7 @@ def background(box):
             stdout=subprocess.PIPE,
             stderr=stderr.open("w") if stderr else subprocess.PIPE,
             text=True,
-            cwd=cwd,
+            cwd=cwd or tmp_path,
         )
         procs.append(proc)
         return proc
@@ -102,6 +102,8 @@ def background(box):
 
 
 def heavy(env, *args, cwd=None, **extra):
+    """Run heavy to its end, by default in the test's folder: heavy asks git for the
+    repo of the folder it runs in, and a test leaves this checkout alone."""
     return subprocess.run(
         [str(SCRIPT), *args],
         env=env | extra,
@@ -109,7 +111,7 @@ def heavy(env, *args, cwd=None, **extra):
         text=True,
         timeout=60,
         check=False,
-        cwd=cwd,
+        cwd=cwd or Path(env["HEAVY_DIR"]).parent,
     )
 
 
@@ -472,6 +474,7 @@ def test_a_command_that_reads_the_terminal_isnt_stopped(box):
         ["script", "-qec", command, "/dev/null"],
         input="hello\n",
         env=env,
+        cwd=tmp_path,
         capture_output=True,
         text=True,
         timeout=30,
@@ -565,6 +568,7 @@ def test_a_long_job_on_too_few_cores_to_split_takes_the_normal_lane(box):
             f'ls "{tmp_path}/heavy/normal" > "{seen}"',
         ],
         env=env,
+        cwd=tmp_path,
         capture_output=True,
         text=True,
         timeout=60,
@@ -1137,6 +1141,7 @@ def test_a_niced_heavy_leaves_sccache_alone(box):
     done = subprocess.run(
         ["nice", "-n", "5", str(SCRIPT), "--", "true"],
         env=env | extra,
+        cwd=tmp_path,
         capture_output=True,
         text=True,
         timeout=60,

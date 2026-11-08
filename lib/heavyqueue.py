@@ -325,7 +325,7 @@ def turn(long=False, command="", hint=True, alone=False):
             fifo.release(started.slot, started.text)
 
 
-class Queue(NamedTuple):
+class Snapshot(NamedTuple):
     """A lane as a waiter saw it at one poll: its holder's and sharer's slot texts
     (None when free), and the waiters ahead, as fifo.ahead gives them."""
 
@@ -364,141 +364,55 @@ class Watch:
         return sum(self.samples[-count:]) / count
 
 
-class Waiter:
-    """One job's wait: to head its lane's queue with the slot free and its cores
-    quiet, or for room beside the lane's holder."""
+class Bid:
+    """A waiter's bid to share its lane: it watches the holder's cores at each poll,
+    judges whether it fits beside the holder, posts so in its entry, and takes the
+    share slot unless a waiter ahead of it posted first."""
 
-    def __init__(self, lane, folder, text, entry, hint, cpus, alone):
+    def __init__(self, lane, folder, text, entry, cpus, say):
         self.lane, self.folder, self.text, self.entry = lane, folder, text, entry
-        self.hint, self.cpus, self.alone = hint, cpus, alone
-        self.said = {}
+        self.cpus, self.say = cpus, say
         poll = knob("HEAVY_POLL", 1)
         windows = (knob("HEAVY_QUIET_SECONDS", 10), knob("HEAVY_SHARE_SECONDS", 90))
         self.watch = Watch(max(1, *(round(w / poll) for w in windows)))
         self.posted = False  # whether it posted, at the last poll, that it may share
         self.short_of_memory = False  # whether it last found too little free memory
 
-    def wait(self):
-        """The Start of the job, once it has taken a slot."""
-        quiet_for = knob("HEAVY_QUIET_SECONDS", 10)
-        stall_after = knob("HEAVY_STALL_SECONDS", 600)
-        crowd = self.crowd()
-        hinted = not self.hint or crowd >= 2
-        if self.hint and crowd >= 2:
-            note(PR_HINT)
-        # A job that arrives to a free lane, nobody waiting, starts at the first quiet
-        # sample; one that waited, or saw its cores busy, needs the whole window.
-        waited = crowd > 0
-        head_since = quiet_since = None
-        while True:
-            queue = self.look()
-            blocker = self.blocker(queue)
-            if blocker is not None:
-                self.say("lane", *blocker)
-                waited, head_since, quiet_since = True, None, None
-                started = self.share(queue)
-                if started is not None:
-                    return started
-                continue
-            head_since = head_since or time.monotonic()
-            measured = lane_cores(self.lane, self.cpus)
-            share = busy_now(measured)
-            if share < QUIET_SHARE:
-                quiet_since = quiet_since or time.monotonic()
-                if not waited or time.monotonic() - quiet_since >= quiet_for:
-                    started = self.start()
-                    if started is not None:
-                        self.entry.unlink(missing_ok=True)
-                        return started
-                    waited, quiet_since = True, None  # taken first, or cores in use
-                continue
-            waited, quiet_since = True, None
-            self.say(
-                "lane",
-                "quiet",
-                f"heavy: waiting for quiet cores: {span(measured)} are {share:.0%} busy,"
-                f" and need to stay under {QUIET_SHARE:.0%} for {quiet_for:g} s.",
-            )
-            if not hinted and time.monotonic() - head_since >= stall_after:
-                note(PR_HINT)
-                hinted = True
-
-    def look(self):
-        return Queue(
-            slot_text(self.lane),
-            slot_text(self.lane, "share"),
-            fifo.ahead(self.folder, self.entry),
-        )
-
-    def crowd(self):
-        """The jobs already in this lane: its holder and the waiters ahead."""
-        held = slot_text(self.lane) is not None
-        return held + len(fifo.ahead(self.folder, self.entry))
-
-    def blocker(self, queue):
-        """(a key, a line) naming what this job waits on, or None when it heads its
-        lane and its slot is free: the holder's, and for `--alone` the sharer's too."""
-        held, ahead = queue.held, queue.ahead
-        if held is None and not ahead:
-            if not (self.alone and queue.shared is not None):
-                return None
-            sharer = Holder.parse(queue.shared)
-            return (first_line(queue.shared), 0), (
-                f"heavy: waiting for {sharer.session}'s {doing(queue.shared)}, which"
-                f" shares the {self.lane} lane, to end: --alone shares no cores."
-            )
-        first = held if held is not None else ahead[0][1]
-        holder = Holder.parse(first)
-        if held is not None:
-            line = (
-                f"{holder.session} is running {doing(first)}"
-                f" since {holder.since[11:16]}"
-            )
-            if ahead:
-                line += f"; {len(ahead)} waiting ahead"
-        else:
-            line = f"{len(ahead)} ahead, the first {holder.session}'s {doing(first)}"
-        key = (first_line(first), len(ahead))
-        return key, f"heavy: waiting for the {self.lane} lane: {line}."
-
-    def share(self, queue):
-        """Watch the lane's holder for a poll and, when this waiter may share its
+    def poll(self, seen):
+        """Watch the holder in seen for a poll and, when this waiter may share its
         lane and no waiter ahead of it has just said it may, start beside it: the
         Start, or None."""
-        if queue.held is None or self.alone:
-            time.sleep(knob("HEAVY_POLL", 1))
-            return None
-        holder_cpus = unspan(fields(queue.held).get("cores", ""))
+        holder_cpus = unspan(fields(seen.held).get("cores", ""))
         holder_cpus = holder_cpus or lane_cores(self.lane, self.cpus)
-        subject = (first_line(queue.held), first_line(queue.shared or ""))
+        subject = (first_line(seen.held), first_line(seen.shared or ""))
         self.watch.add(subject, busy_now(holder_cpus))
-        verdict = self.verdict(queue, holder_cpus)
+        verdict = self.refusal(seen) or self.fit(seen, holder_cpus)
         if verdict.load is None:
             self.say("share", verdict.key, verdict.line)
             self.posted = False
             return None
         now = time.monotonic()
         posted_before, self.posted = self.posted, True
-        fifo.rewrite(self.entry, self.text + f"share-ok={now}\n")
+        fifo.write_whole(self.entry, self.text + f"share-ok={now}\n")
         # Read the line again: a waiter ahead may have posted while this one sampled.
         ahead = fifo.ahead(self.folder, self.entry)
         if not posted_before or self.fresh_post_ahead(ahead, now):
             return None
-        return self.start_sharing(queue.held, holder_cpus, verdict.load)
+        return self.take(seen.held, holder_cpus, verdict.load)
 
-    def verdict(self, queue, holder_cpus):
-        """Whether this waiter may share the holder's lane now, by the samples of its
-        watch."""
-        if fields(queue.held).get("alone"):
+    def refusal(self, seen):
+        """The Verdict when nothing may share the lane now, whoever asks: an `--alone`
+        holder, a sharer already there, too little free memory; or None."""
+        if fields(seen.held).get("alone"):
             line = "heavy: the lane's holder runs --alone, so nothing shares it."
             return Verdict(None, "alone", line)
-        if queue.shared is not None:
-            sharer = Holder.parse(queue.shared)
+        if seen.shared is not None:
+            sharer = Holder.parse(seen.shared)
             line = (
-                f"heavy: {sharer.session}'s {doing(queue.shared)} already shares"
+                f"heavy: {sharer.session}'s {doing(seen.shared)} already shares"
                 f" the {self.lane} lane."
             )
-            return Verdict(None, ("taken", first_line(queue.shared)), line)
+            return Verdict(None, ("taken", first_line(seen.shared)), line)
         memory = free_memory()
         floor = SHARE_MEMORY_AGAIN if self.short_of_memory else SHARE_MEMORY
         self.short_of_memory = memory is None or memory < floor
@@ -509,10 +423,15 @@ class Waiter:
                 f" takes {SHARE_MEMORY // 2**30} GiB)."
             )
             return Verdict(None, "memory", line)
+        return None
+
+    def fit(self, seen, holder_cpus):
+        """Whether this waiter fits beside the holder, by both jobs' history and the
+        watch's recent samples, or else by the holder's cores idling."""
         count = len(holder_cpus)
         history = heavyhistory.History(base())
         mine = history.usual(fields(self.text).get("key"))
-        theirs = history.usual(fields(queue.held).get("key"))
+        theirs = history.usual(fields(seen.held).get("key"))
         recent = self.watch.mean(knob("HEAVY_QUIET_SECONDS", 10))
         known = None not in (mine, theirs, recent)
         if known:
@@ -548,7 +467,7 @@ class Waiter:
                     return True
         return False
 
-    def start_sharing(self, held, holder_cpus, load):
+    def take(self, held, holder_cpus, load):
         """Take the share slot beside the holder whose slot text is held, under the
         lock both lanes share: the Start, or None when the holder changed, runs
         alone, or another waiter shares first."""
@@ -573,6 +492,103 @@ class Waiter:
             f" {jobs} cargo jobs."
         )
         return Start(self.folder / "share", text, cpus, jobs, SHARE_NICE)
+
+
+class Waiter:
+    """One job's wait: to head its lane's queue with the slot free and its cores
+    quiet, or for room beside the lane's holder."""
+
+    def __init__(self, lane, folder, text, entry, hint, cpus, alone):
+        self.lane, self.folder, self.text, self.entry = lane, folder, text, entry
+        self.hint, self.cpus, self.alone = hint, cpus, alone
+        self.said = {}
+        self.bid = None if alone else Bid(lane, folder, text, entry, cpus, self.say)
+
+    def wait(self):
+        """The Start of the job, once it has taken a slot."""
+        quiet_for = knob("HEAVY_QUIET_SECONDS", 10)
+        stall_after = knob("HEAVY_STALL_SECONDS", 600)
+        crowd = self.crowd()
+        hinted = not self.hint or crowd >= 2
+        if self.hint and crowd >= 2:
+            note(PR_HINT)
+        # A job that arrives to a free lane, nobody waiting, starts at the first quiet
+        # sample; one that waited, or saw its cores busy, needs the whole window.
+        waited = crowd > 0
+        head_since = quiet_since = None
+        while True:
+            seen = self.look()
+            blocker = self.blocker(seen)
+            if blocker is not None:
+                self.say("lane", *blocker)
+                waited, head_since, quiet_since = True, None, None
+                if self.bid is None or seen.held is None:
+                    time.sleep(knob("HEAVY_POLL", 1))
+                    continue
+                started = self.bid.poll(seen)
+                if started is not None:
+                    return started
+                continue
+            head_since = head_since or time.monotonic()
+            measured = lane_cores(self.lane, self.cpus)
+            share = busy_now(measured)
+            if share < QUIET_SHARE:
+                quiet_since = quiet_since or time.monotonic()
+                if not waited or time.monotonic() - quiet_since >= quiet_for:
+                    started = self.start()
+                    if started is not None:
+                        self.entry.unlink(missing_ok=True)
+                        return started
+                    waited, quiet_since = True, None  # taken first, or cores in use
+                continue
+            waited, quiet_since = True, None
+            self.say(
+                "lane",
+                "quiet",
+                f"heavy: waiting for quiet cores: {span(measured)} are {share:.0%} busy,"
+                f" and need to stay under {QUIET_SHARE:.0%} for {quiet_for:g} s.",
+            )
+            if not hinted and time.monotonic() - head_since >= stall_after:
+                note(PR_HINT)
+                hinted = True
+
+    def look(self):
+        return Snapshot(
+            slot_text(self.lane),
+            slot_text(self.lane, "share"),
+            fifo.ahead(self.folder, self.entry),
+        )
+
+    def crowd(self):
+        """The jobs already in this lane: its holder and the waiters ahead."""
+        held = slot_text(self.lane) is not None
+        return held + len(fifo.ahead(self.folder, self.entry))
+
+    def blocker(self, seen):
+        """(a key, a line) naming what this job waits on, or None when it heads its
+        lane and its slot is free: the holder's, and for `--alone` the sharer's too."""
+        held, ahead = seen.held, seen.ahead
+        if held is None and not ahead:
+            if not (self.alone and seen.shared is not None):
+                return None
+            sharer = Holder.parse(seen.shared)
+            return (first_line(seen.shared), 0), (
+                f"heavy: waiting for {sharer.session}'s {doing(seen.shared)}, which"
+                f" shares the {self.lane} lane, to end: --alone shares no cores."
+            )
+        first = held if held is not None else ahead[0][1]
+        holder = Holder.parse(first)
+        if held is not None:
+            line = (
+                f"{holder.session} is running {doing(first)}"
+                f" since {holder.since[11:16]}"
+            )
+            if ahead:
+                line += f"; {len(ahead)} waiting ahead"
+        else:
+            line = f"{len(ahead)} ahead, the first {holder.session}'s {doing(first)}"
+        key = (first_line(first), len(ahead))
+        return key, f"heavy: waiting for the {self.lane} lane: {line}."
 
     def start(self):
         """Decide the job's cores and take the slot, under the lock both lanes share:

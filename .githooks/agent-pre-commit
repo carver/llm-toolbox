@@ -1,13 +1,82 @@
 #!/bin/sh
 # The agent's commit check, which pre-commit runs when $AI_AGENT is set (see
-# bin/agent-commit-gate): the pre-commit hook, then every test, on what's staged.
-# Also the repo's whole check, run by hand.
+# bin/agent-commit-gate): the pre-commit hook, then the tests the change needs, on
+# what's staged. Run by hand, without CHECK_BASE, it is the repo's whole check.
+# The change is what the index holds against $CHECK_BASE, the nearest commit whose
+# tree passed this check, which agent-commit-gate sets (`agent-commit-gate -h`). A
+# change to the paths tests_for lists runs the tests it names. Any other path runs
+# every test, and so does a missing CHECK_BASE, one git can't diff against, or no
+# change at all. The map lives in this file, so a change to it runs every test too.
+# This file names $CHECK_QUEUE_EXIT, so the gate runs it first outside heavy's queue,
+# on one core, with that variable set. The check then exits with it before it starts
+# the whole suite, after saying why, and the gate runs it again in the queue.
 set -e
 # So the pre-commit hook does not run this script again.
 export AGENT_PRE_COMMIT=1
+
+# The tests that read each path a change can touch without running every test. Found
+# by tracing each test file's opens with strace (2026-11-08): test_install.py lists
+# skill-patches/, and no test reads CLAUDE.md or CODING_STANDARDS.md. A test that
+# starts reading one of these paths joins its line. The named tests run outside
+# heavy's queue, so each must take at most a second or two on one core; a path
+# whose tests take longer stays out of the map. A name git quotes, as it does one
+# with a tab or a newline in it, matches no line, so it runs every test.
+tests_for() {
+  case $1 in
+    # What the whole suite collects wherever it lies: Python, and doctests.
+    *.py | */test*.txt) return 1 ;;
+    README.md) echo test_readme_env.py test_skill_refs.py ;;
+    GLOBAL_CLAUDE.md | skills/*) echo test_skill_refs.py ;;
+    skill-patches/*) echo test_install.py test_skill_refs.py ;;
+    CLAUDE.md | CODING_STANDARDS.md) ;;
+    *) return 1 ;;
+  esac
+}
+
+every=
+tests=
+if [ -z "${CHECK_BASE:-}" ]; then
+  every="no CHECK_BASE, so no commit known to pass"
+elif ! changed=$(git -c core.quotePath=false diff --cached --name-only --no-renames "$CHECK_BASE" --); then
+  every="git can't diff against CHECK_BASE $CHECK_BASE"
+elif [ -z "$changed" ]; then
+  every="nothing changed since CHECK_BASE"
+else
+  while IFS= read -r path; do
+    if ! more=$(tests_for "$path"); then
+      every="$path changed"
+      break
+    fi
+    for test in $more; do
+      case " $tests " in *" $test "*) ;; *) tests="$tests $test" ;; esac
+    done
+  done <<EOF
+$changed
+EOF
+fi
+
+# Only an exit status from 1 to 255 asks for the queue; any other value counts as
+# unset. sh keeps only the low 8 bits, so 256 would exit 0, a pass.
+queue_exit=${CHECK_QUEUE_EXIT:-}
+case $queue_exit in '' | *[!0-9]* | 0*) queue_exit= ;; esac
+[ -z "$queue_exit" ] || [ "$queue_exit" -le 255 ] || queue_exit=
+if [ -n "$every" ] && [ -n "$queue_exit" ]; then
+  echo "agent-pre-commit: needs heavy's queue for every test ($every)" >&2
+  exit "$queue_exit"
+fi
+unset CHECK_BASE CHECK_QUEUE_EXIT
+
 "$(dirname "$0")/pre-commit"
-tree=$(mktemp -d)
-trap 'rm -rf "$tree"' EXIT
-git checkout-index -a --prefix="$tree/"
-cd "$tree"
-uv run -q --no-project --with-requirements requirements-dev.txt pytest -q -p no:cacheprovider
+[ -n "$every" ] || [ -n "$tests" ] || exit 0
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+git checkout-index -a --prefix="$work/tree/"
+cd "$work/tree"
+if [ -n "$every" ]; then
+  uv run -q --no-project --with-requirements requirements-dev.txt pytest -q -p no:cacheprovider
+else
+  # A temp folder of their own: at exit, pytest deletes the oldest runs' folders in
+  # its shared one, thousands of files after a full run, a minute or more on one core.
+  # shellcheck disable=SC2086 # one word per test file
+  uv run -q --no-project --with-requirements requirements-dev.txt pytest -q -p no:cacheprovider -n0 --basetemp="$work/tmp" $tests
+fi

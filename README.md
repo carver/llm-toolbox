@@ -500,6 +500,15 @@ file of a `git commit PATH`. `agent-pre-commit` adds the tests (about half a min
 through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.
 
+At an agent's commit, `agent-commit-gate` hands `agent-pre-commit` a `CHECK_BASE`,
+and the hook runs only the tests the change since then can affect. A change to
+`README.md`, `GLOBAL_CLAUDE.md`, `skills/` or `skill-patches/` runs the one to three
+tests that read those files, under two seconds on one core, so the commit doesn't
+wait for heavy's queue. A change to `CLAUDE.md` or `CODING_STANDARDS.md`
+runs none. Any other path, the hook itself included, runs every test, and the hook
+first asks the gate for heavy's queue (`CHECK_QUEUE_EXIT`, `agent-commit-gate -h`).
+The map is at the top of the hook.
+
 ## Guidelines
 
 `GLOBAL_CLAUDE.md` is named that way, rather than `CLAUDE.md`, so an agent working in

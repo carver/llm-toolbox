@@ -24,6 +24,7 @@ The rules a reviewer holds this repo's code to. The global standards in `~/.agen
 
 - Every tool has tests, and they run it the way an agent does: as a subprocess, through its arguments, stdin and environment, checking its exit status and output. A shared module in `lib/` may be tested by import.
 - No test touches the network, the user's home directory or this repository. Fakes go first on `PATH` or behind the tool's override variable. A test that needs a git repository makes one in `tmp_path`; `conftest.py` strips the `GIT_*` variables a hook or rebase would leak. The commit hook runs the suite in a copy of the index outside any checkout, so a test that reads this repo's git state fails there.
+- A change to the repo's prose alone (`README.md`, `skills/` and the other paths in the map at the top of `.githooks/agent-pre-commit`) runs only the tests the map names for it. A test that reads one of those paths goes on that path's line, or a change to the path won't run it.
 - The suite runs in parallel (`pytest.ini`), so tests share no files, ports or global state.
 - A test waits for a condition by polling it with a deadline, never with a fixed sleep. A test that starts a process cleans it up even when it fails.
 - Expected values come from the tool's documented behaviour, not from pasting what it printed.
@@ -35,4 +36,4 @@ The rules a reviewer holds this repo's code to. The global standards in `~/.agen
 
 ## Checks
 
-`.githooks/pre-commit` runs `ruff check` and `ruff format --check` on what's staged, and formats a staged file with no unstaged changes. `ruff.toml` brings the extensionless scripts in `bin/` into both. An agent's commit also runs `.githooks/agent-pre-commit`, the full test suite. The README's Checks section has the details.
+`.githooks/pre-commit` runs `ruff check` and `ruff format --check` on what's staged, and formats a staged file with no unstaged changes. `ruff.toml` brings the extensionless scripts in `bin/` into both. An agent's commit also runs `.githooks/agent-pre-commit`: every test, or for a change to the repo's prose alone, the few its map names. The README's Checks section has the details.

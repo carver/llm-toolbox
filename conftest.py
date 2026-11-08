@@ -71,8 +71,9 @@ def path_without(tool, path=None):
 
 
 # Set when an agent commits; a test's pre-commit hook would rerun the suite. CHECK_BASE
-# names a commit of the repo being committed, which the gate hands the suite's own check.
-AGENT_VARS = ("AI_AGENT", "AGENT_PRE_COMMIT", "CHECK_BASE")
+# names a commit of the repo being committed, which the gate hands the suite's own check,
+# and CHECK_QUEUE_EXIT asks that check to leave heavy's queue.
+AGENT_VARS = ("AI_AGENT", "AGENT_PRE_COMMIT", "CHECK_BASE", "CHECK_QUEUE_EXIT")
 
 
 @pytest.fixture(scope="session", autouse=True)

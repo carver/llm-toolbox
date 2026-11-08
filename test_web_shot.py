@@ -218,6 +218,39 @@ def test_eval_prints_its_value_as_json_where_it_runs(tmp_path):
     assert run.stderr == ""
 
 
+@needs_chromium
+@pytest.mark.parametrize(
+    "flags, look",
+    [
+        ([], ["rgb(255, 255, 255)", "2s"]),
+        (["--color-scheme", "light"], ["rgb(255, 255, 255)", "2s"]),
+        (["--color-scheme", "dark", "--reduced-motion"], ["rgb(0, 0, 0)", "0s"]),
+    ],
+)
+def test_the_page_sees_the_color_scheme_and_motion_asked_for(tmp_path, flags, look):
+    """A page's prefers-color-scheme and prefers-reduced-motion media queries match the flags; without
+    them, light and full motion, as before."""
+    page = tmp_path / "p.html"
+    page.write_text(
+        "<!doctype html><style>"
+        "body { background: rgb(1, 2, 3); transition: color 2s }"
+        "@media (prefers-color-scheme: light) { body { background: rgb(255, 255, 255) } }"
+        "@media (prefers-color-scheme: dark) { body { background: rgb(0, 0, 0) } }"
+        "@media (prefers-reduced-motion: reduce) { body { transition-duration: 0s } }"
+        "</style><p>hi</p>"
+    )
+    run = cli(
+        "--out",
+        tmp_path / "out",
+        *flags,
+        "--do",
+        "eval (s => [s.backgroundColor, s.transitionDuration])(getComputedStyle(document.body))",
+        page,
+    )
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout.splitlines()[0]) == look
+
+
 def png_size(path):
     """(width, height) from a PNG's header."""
     header = Path(path).read_bytes()[16:24]

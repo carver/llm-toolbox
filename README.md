@@ -192,7 +192,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   leaves the first commit to you.
 
 - **web-shot**: opens a URL or HTML file in headless Chromium (with
-  `--cookie NAME=VALUE` for an app that keeps your login in a cookie), clicks
+  `--cookie NAME=VALUE` for an app that keeps your login in a cookie, and
+  `--color-scheme dark` or `--reduced-motion` for what the page's
+  `prefers-color-scheme` and `prefers-reduced-motion` media queries see), clicks
   and runs scripts in it (`eval` prints the value as JSON), saves screenshots
   of the page or of one element (a shot over 1500px tall also as pieces of at
   most 1400px), prints a page's text or links (for JS-rendered forms and

@@ -27,6 +27,11 @@ The page's uncaught errors and console errors go to stderr, repeats collapsed
 to one line with a count, and make the exit status 3 once the screenshots are
 saved.
 
+--color-scheme and --reduced-motion set what the page's prefers-color-scheme
+and prefers-reduced-motion media queries see, such as to shoot its dark look.
+Without them it sees Playwright's defaults: a light scheme, and no preference
+about motion.
+
 Every run checks whether the page scrolls sideways, after it loads and at each
 shot, and says so on stderr: the page's width against the viewport's, then up
 to 5 elements that widen it, the furthest-reaching first, each with the start of
@@ -55,6 +60,7 @@ Examples:
   web-shot report/page.html
   web-shot --do "click #legend button[data-series=human]" --do "shot chart #trajectory" report/page.html
   web-shot --size 390x844 https://example.com
+  web-shot --color-scheme dark --do "shot dark" https://example.com
   web-shot --do "wait 5000" --do text https://airtable.com/app.../form     # read a JS-rendered form
   web-shot --do scroll-all --do "links /event/" https://example.com/calendar
 """
@@ -490,15 +496,14 @@ def launch(playwright):
     return playwright.chromium.launch(executable_path=str(fallback))
 
 
-def run(page, actions, out, size, cookies, found):
-    """Opens PAGE and runs ACTIONS, then the final shot, adding what it finds to FOUND. Raises Failed
-    when the page doesn't load or an action fails."""
+def run(page, actions, out, options, cookies, found):
+    """Opens PAGE in a browser context made with OPTIONS and runs ACTIONS, then the final shot, adding
+    what it finds to FOUND. Raises Failed when the page doesn't load or an action fails."""
     from playwright.sync_api import Error, sync_playwright
 
-    width, height = size
     with sync_playwright() as playwright:
         browser = launch(playwright)
-        context = browser.new_context(viewport={"width": width, "height": height})
+        context = browser.new_context(**options)
         url = page_url(page)
         context.add_cookies([{"name": n, "value": v, "url": url} for n, v in cookies])
         html = local_html(page)
@@ -571,6 +576,18 @@ def size_arg(text):
     return int(width), int(height)
 
 
+def context_options(args):
+    """new_context's arguments for ARGS: the viewport, and the media features asked for. A feature
+    not asked for is left out, so the page sees Playwright's default."""
+    width, height = args.size
+    options = {"viewport": {"width": width, "height": height}}
+    if args.color_scheme:
+        options["color_scheme"] = args.color_scheme
+    if args.reduced_motion:
+        options["reduced_motion"] = "reduce"
+    return options
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
@@ -602,6 +619,16 @@ def main(argv=None):
         default=(1280, 900),
         help="viewport WxH (default 1280x900)",
     )
+    parser.add_argument(
+        "--color-scheme",
+        choices=("light", "dark"),
+        help="what the page's prefers-color-scheme media queries see (default: light)",
+    )
+    parser.add_argument(
+        "--reduced-motion",
+        action="store_true",
+        help="have the page's prefers-reduced-motion media queries see reduce",
+    )
     args = parser.parse_args(argv)
     found = Findings()
     try:
@@ -611,7 +638,7 @@ def main(argv=None):
         out = args.out or Path(tempfile.mkdtemp(prefix="web-shot-"))
         out.mkdir(parents=True, exist_ok=True)
         try:
-            run(args.page, actions, out, args.size, args.cookie, found)
+            run(args.page, actions, out, context_options(args), args.cookie, found)
         finally:
             found.show()
     except UsageError as error:

@@ -351,6 +351,21 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   doesn't look like a field name (a title or an email used as a key) is counted
   under `.*`, not shown. A file it can't parse fails in one line that names the
   file and quotes none of it.
+- **scratch-usage**: lists what fills Claude Code's scratch folders under
+  `/tmp/claude-<uid>/`, which share the sandbox's small disk and are never
+  cleaned up. Each line is a session folder, or anything else an agent left
+  directly under the root or a project folder, biggest first: its disk usage,
+  the age of its newest write, its absolute path (the folders' names start
+  with `-`, which `du` and `find` read as an option), and the oldest live
+  process using it (its cwd is there or it holds a file there open; a running
+  session's claude process holds its `tasks` folder). `--limit N` lines (10),
+  then the total and the free space on the root's filesystem. It deletes
+  nothing. `--warn-if-full` prints one line naming the tool when the
+  filesystem holding /tmp is at least 90% used, as df counts it, and nothing
+  otherwise; `install.py` registers it as a SessionStart hook, so every
+  session hears when the disk is nearly full. For the tests,
+  `$SCRATCH_USAGE_ROOT` stands in for the root and `$SCRATCH_USAGE_DF` names a
+  file of the filesystem's size, used and available bytes.
 - **edit-script-gate**: a Claude Code hook, which `install.py` registers, that
   refuses a Bash command running inline Python (a heredoc or `-c`) whose code
   reads a file, `.replace()`s text and writes that same file back, and points

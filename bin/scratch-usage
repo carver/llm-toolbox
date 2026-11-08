@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""List what takes the space in Claude Code's scratch folders, biggest first.
+
+Claude Code keeps a folder per project under /tmp/claude-<uid>/, named for the
+session's working directory (`-home-carver-code-claudedev-filedrawer`), and a folder
+per session inside it, which holds the session's scratchpad and its task output.
+They are never cleaned up, and /tmp shares the sandbox's small disk.
+
+Each line is one session folder, or another entry directly under the root or a
+project folder (files an agent wrote there by hand): its disk usage, the age of its
+newest write, its absolute path, which `du` and `rm` can't read as an option, and the
+oldest live process using it (its cwd is there, or it holds an open file there; a
+running session's claude process holds one on its `tasks` folder). Then the total,
+and the free space on the filesystem holding the root. It deletes nothing: ask the
+user before removing a folder, and leave a live one alone.
+
+Only the user's own processes can be seen, so a folder that only another user's
+process uses (a root-owned docker container's mount) shows as not in use. A session
+nobody is running holds nothing open, even one someone may resume, so read the age
+beside it. A folder it can't read is left out of the sizes, and a line says how many.
+
+With --warn-if-full it prints one line naming this tool when the filesystem holding
+/tmp is at least 90% used (used over used plus available, rounded up, as df counts
+it), and nothing otherwise. install.py registers that as a Claude Code SessionStart
+hook, whose output joins the session's context.
+
+Environment, for the tests:
+    SCRATCH_USAGE_ROOT   the folder to list, instead of /tmp/claude-<uid>
+    SCRATCH_USAGE_DF     a file holding three numbers, the filesystem's size, used
+                         and available bytes, read instead of asking the filesystem
+
+Exit status: 0, also when the root doesn't exist, and always with --warn-if-full;
+1 when the root can't be listed (not a folder, or not readable); 2 on a usage error.
+"""
+
+import argparse
+import math
+import os
+import sys
+import time
+from pathlib import Path
+from typing import NamedTuple
+
+THRESHOLD = 90  # percent used, as df shows it, from which --warn-if-full warns
+
+
+def disk(path: Path) -> tuple[int, int, int]:
+    """The size, used and available bytes of the filesystem holding `path`."""
+    fake = os.environ.get("SCRATCH_USAGE_DF")
+    if fake:
+        size, used, avail = (int(n) for n in Path(fake).read_text().split())
+        return size, used, avail
+    fs = os.statvfs(path)
+    return (
+        fs.f_blocks * fs.f_frsize,
+        (fs.f_blocks - fs.f_bfree) * fs.f_frsize,
+        fs.f_bavail * fs.f_frsize,
+    )
+
+
+def percent_used(used: int, avail: int) -> int:
+    """df's Use%: used over used plus available, rounded up."""
+    return -(-used * 100 // (used + avail)) if used + avail else 0
+
+
+def human(n: float) -> str:
+    """Bytes as du -h and df -h write them: powers of 1024, rounded up, with a tenth
+    below 10 (512B, 4.0K, 3.2M, 20G)."""
+    for unit in "BKMGT":
+        if n < 1024 or unit == "T":
+            break
+        n /= 1024
+    if unit == "B":
+        return f"{int(n)}B"
+    tenths = math.ceil(n * 10)
+    return f"{tenths / 10:.1f}{unit}" if tenths < 100 else f"{math.ceil(n)}{unit}"
+
+
+def ago(seconds: float) -> str:
+    minutes = max(0, int(seconds // 60))
+    if minutes < 60:
+        return f"{minutes}m ago"
+    if minutes < 48 * 60:
+        return f"{minutes // 60}h ago"
+    return f"{minutes // (24 * 60)}d ago"
+
+
+def warn_if_full() -> int:
+    try:
+        _, used, avail = disk(Path("/tmp"))
+        percent = percent_used(used, avail)
+        if percent >= THRESHOLD:
+            print(
+                f"The disk holding /tmp is {percent}% full, {human(avail)} free. "
+                "Run `scratch-usage` to see which Claude Code scratch folders take "
+                "the space, then tell the user and ask before deleting any."
+            )
+    except Exception as e:  # noqa: BLE001 -- a SessionStart hook must not stop the session
+        print(
+            f"scratch-usage --warn-if-full failed: {e}; "
+            "`df -h /tmp` shows how full the disk is."
+        )
+    return 0
+
+
+class Walk:
+    """Disk usage and the newest mtime of paths, each inode counted once."""
+
+    def __init__(self):
+        self.seen: set[tuple[int, int]] = set()
+        self.unreadable = 0
+
+    def usage(self, st: os.stat_result) -> int:
+        """The bytes on disk of what `st` describes, or 0 when its inode was counted."""
+        key = (st.st_dev, st.st_ino)
+        if key in self.seen:
+            return 0
+        self.seen.add(key)
+        return st.st_blocks * 512
+
+    def measure(self, path: Path) -> tuple[int, float] | None:
+        """None when `path` is gone."""
+        try:
+            st = path.lstat()
+        except OSError:
+            return None
+        size, newest = self.usage(st), st.st_mtime
+        stack = [path] if path.is_dir() and not path.is_symlink() else []
+        while stack:
+            try:
+                with os.scandir(stack.pop()) as it:
+                    children = list(it)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                self.unreadable += 1
+                continue
+            for child in children:
+                try:
+                    st = child.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                size += self.usage(st)
+                newest = max(newest, st.st_mtime)
+                if child.is_dir(follow_symlinks=False):
+                    stack.append(Path(child.path))
+        return size, newest
+
+
+def entries(root: Path) -> tuple[list[Path], list[Path]]:
+    """The project folders (named `-...`), and the entries to list: each session
+    folder (ROOT/-project/session), and each other entry directly under the root or a
+    project folder. A project folder it can't list is an entry itself."""
+    projects, found = [], []
+    for child in sorted(root.iterdir()):
+        if child.name.startswith("-") and child.is_dir() and not child.is_symlink():
+            try:
+                found += sorted(child.iterdir())
+                projects.append(child)
+            except OSError:
+                found.append(child)
+        else:
+            found.append(child)
+    return projects, found
+
+
+class Entry(NamedTuple):
+    size: int
+    newest: float  # mtime
+    path: Path
+
+
+def open_paths(root: Path) -> dict[int, list[str]]:
+    """pid -> the paths under `root` that the process's cwd or open fds point at,
+    for every process but this one that has any."""
+    prefix = f"{root}/"
+    found = {}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit() or int(proc.name) == os.getpid():
+            continue
+        links = [proc / "cwd"]
+        try:
+            links += list((proc / "fd").iterdir())
+        except OSError:
+            pass
+        targets = []
+        for link in links:
+            try:
+                target = os.readlink(link)
+            except OSError:
+                continue
+            if target.startswith(prefix):
+                targets.append(target)
+        if targets:
+            found[int(proc.name)] = targets
+    return found
+
+
+def started(pid: int) -> int:
+    """When `pid` started, in clock ticks since boot (field 22 of its stat), or a
+    late time once it's gone."""
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text()
+    except OSError:
+        return sys.maxsize
+    return int(stat[stat.rindex(")") + 2 :].split()[19])
+
+
+def in_use(path: Path, using: dict[int, list[str]]) -> str:
+    """'  in use by pid N (NAME)', naming the oldest process using `path`, or ''."""
+    inside = f"{path}/"
+    pids = [
+        pid
+        for pid, targets in using.items()
+        if any(t == str(path) or t.startswith(inside) for t in targets)
+    ]
+    if not pids:
+        return ""
+    oldest = min(pids, key=lambda pid: (started(pid), pid))
+    try:
+        name = (Path("/proc") / str(oldest) / "comm").read_text().strip()
+    except OSError:
+        name = "?"
+    more = f" and {len(pids) - 1} more" if len(pids) > 1 else ""
+    return f"  in use by pid {oldest} ({name}){more}"
+
+
+def mount_point(path: Path) -> Path:
+    dev = path.stat().st_dev
+    while path != path.parent and path.parent.stat().st_dev == dev:
+        path = path.parent
+    return path
+
+
+def plural(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def report(root: Path, limit: int) -> int:
+    if not root.exists():
+        print(f"no scratch folders: {root} does not exist")
+        return 0
+    try:
+        return listing(root, limit)
+    except OSError as e:
+        print(
+            f"scratch-usage: cannot list {e.filename or root}: {e.strerror or e}; "
+            "check it is a folder you can read",
+            file=sys.stderr,
+        )
+        return 1
+
+
+def listing(root: Path, limit: int) -> int:
+    walk = Walk()
+    total = walk.usage(root.lstat())
+    projects, paths = entries(root)
+    for project in projects:
+        try:
+            total += walk.usage(project.lstat())
+        except OSError:
+            continue
+    found = []
+    for path in paths:
+        measured = walk.measure(path)
+        if measured is not None:
+            found.append(Entry(*measured, path))
+            total += measured[0]
+    found.sort(key=lambda e: (-e.size, str(e.path)))
+    using = open_paths(root)
+    now = time.time()
+    for e in found[:limit]:
+        print(
+            f"{human(e.size):>5}  {ago(now - e.newest):>7}  {e.path}"
+            + in_use(e.path, using)
+        )
+    rest = found[limit:]
+    if rest:
+        print(f"... and {len(rest)} more: {human(sum(e.size for e in rest))}")
+    if walk.unreadable:
+        print(
+            plural(walk.unreadable, "folder", "folders")
+            + " could not be read, so the sizes leave "
+            + ("it" if walk.unreadable == 1 else "them")
+            + " out"
+        )
+    print(
+        f"total {human(total)} under {root} ({plural(len(found), 'entry', 'entries')})"
+    )
+    size, used, avail = disk(root)
+    print(
+        f"filesystem {mount_point(root)}: {human(avail)} free of {human(size)}, "
+        f"{percent_used(used, avail)}% used"
+    )
+    return 0
+
+
+def count(text: str) -> int:
+    n = int(text)
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"{text} is below 0")
+    return n
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--limit",
+        type=count,
+        default=10,
+        metavar="N",
+        help="lines to print, biggest first (default 10); one more counts the rest",
+    )
+    parser.add_argument(
+        "--warn-if-full",
+        action="store_true",
+        help="only warn, in one line, when the disk holding /tmp is 90%% used",
+    )
+    args = parser.parse_args(argv)
+    if args.warn_if_full:
+        return warn_if_full()
+    root = os.environ.get("SCRATCH_USAGE_ROOT") or f"/tmp/claude-{os.getuid()}"
+    return report(Path(root).resolve(), args.limit)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -224,6 +224,30 @@ def test_hooks_register_once_beside_existing_settings(settings):
     ]
 
 
+def test_the_disk_warning_registers_once_as_a_session_start_hook_on_every_source(
+    settings,
+):
+    settings.parent.mkdir(parents=True)
+    other = {"matcher": "startup", "hooks": [{"type": "command", "command": "greet"}]}
+    settings.write_text(json.dumps({"hooks": {"SessionStart": [other]}}))
+    assert install.register_hooks() == 0
+    assert install.register_hooks() == 0
+    groups = json.loads(settings.read_text())["hooks"]["SessionStart"]
+    assert groups == [
+        other,
+        {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{install.BIN_DST / 'scratch-usage'} --warn-if-full",
+                    "timeout": 10,
+                }
+            ],
+        },
+    ]
+
+
 def test_hooks_create_a_missing_settings_file(settings):
     assert install.register_hooks() == 0
     assert "agent-commit-gate" in settings.read_text()

@@ -53,7 +53,7 @@ GUIDELINES_DSTS = [
     Path.home() / ".agents" / "AGENTS.md",
 ]
 SETTINGS = Path.home() / ".claude" / "settings.json"
-# (event, matcher, tool in bin/, hook fields beyond the command)
+# (event, matcher, tool in bin/ with its arguments, hook fields beyond the command)
 HOOKS = [
     (
         "PreToolUse",
@@ -82,6 +82,7 @@ HOOKS = [
             "if": "Bash(gh issue *)",
         },  # starts the script only for gh issue
     ),
+    ("SessionStart", "*", "scratch-usage --warn-if-full", {"timeout": 10}),
 ]
 # (key path, value, why). Claude Code reads these only at user scope.
 SETTINGS_VALUES = [

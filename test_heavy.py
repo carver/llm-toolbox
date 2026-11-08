@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -1481,7 +1482,42 @@ def test_a_sharer_the_oom_killer_hit_hears_why_it_went_first(box, background, sh
     assert "A job sharing a lane" in err, err
 
 
-def test_a_stopped_waiter_ahead_holds_up_sharing_only_a_while(box, background, sharing):
+def key_of(slot):
+    """The command key heavy wrote into a slot."""
+    lines = slot.read_text().splitlines()
+    return next(line.removeprefix("key=") for line in lines if line.startswith("key="))
+
+
+@pytest.fixture
+def stuck(box):
+    """Add a queue entry for a waiter that asked to share and runs the command known
+    by a key, held by a live process that never takes its place: a stopped heavy,
+    without the chance that one stops while it holds the queue's lock. It returns the
+    process: killing it clears the entry. Its processes end with the test."""
+    tmp_path, _, _ = box
+    procs = []
+
+    def add(key):
+        proc = subprocess.Popen(["sleep", "120"])
+        procs.append(proc)
+        since = datetime.now().astimezone().isoformat(timespec="seconds")
+        pid = str(proc.pid)
+        holder = fifo.Holder(
+            "s-stuck", since, socket.gethostname(), pid, fifo.started(pid)
+        )
+        about = f"cwd={tmp_path}\ncmd=stuck\nkey={key}\nshare=1\n"
+        fifo.join(lane(tmp_path), holder, about)
+        return proc
+
+    yield add
+    for proc in procs:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_stuck_waiter_ahead_holds_up_sharing_only_a_while(
+    box, background, sharing, stuck
+):
     tmp_path, _, env = box
     command = same_job(tmp_path)
     (tmp_path / "learn.release").touch()
@@ -1492,9 +1528,7 @@ def test_a_stopped_waiter_ahead_holds_up_sharing_only_a_while(box, background, s
     wait_until((tmp_path / "holder.report").exists, "the holder to start")
     sharer = background("--share", "--", *command, JOB="sharer", **history_only)
     wait_until((tmp_path / "sharer.report").exists, "a job to share")
-    stopped = background("--share", "--", *command, JOB="stopped", **history_only)
-    wait_until(lambda: len(entries(tmp_path)) == 1, "a waiter to queue")
-    stopped.send_signal(signal.SIGSTOP)  # it fits, but can't take the place
+    stuck(key_of(lane(tmp_path) / "slot"))  # it fits, but never takes the place
     behind = background("--share", "--", *command, JOB="behind", **history_only)
     wait_until(lambda: len(entries(tmp_path)) == 2, "a waiter behind it to queue")
 
@@ -1502,14 +1536,13 @@ def test_a_stopped_waiter_ahead_holds_up_sharing_only_a_while(box, background, s
     freed = time.monotonic()
     wait_until((tmp_path / "behind.report").exists, "the waiter behind to share")
     waited = time.monotonic() - freed
-    stopped.send_signal(signal.SIGCONT)
-    for name in ("holder", "behind", "stopped"):
+    for name in ("holder", "behind"):
         (tmp_path / f"{name}.release").touch()
-    for proc in (holder, sharer, behind, stopped):
+    for proc in (holder, sharer, behind):
         status, _, err = finish(proc)
         assert status == 0, err
 
-    assert waited >= 4, waited  # it stepped aside for the stopped one a while
+    assert waited >= 4, waited  # it stepped aside for the stuck one a while
 
 
 def test_a_job_shares_only_when_it_asks_to(box, background, sharing):
@@ -1574,8 +1607,8 @@ def test_a_waiter_that_never_shares_holds_up_no_sharer(box, background, sharing)
     assert waited < 4, waited  # no stepping aside for one that can't share
 
 
-def test_behind_a_stopped_waiter_the_next_in_line_still_goes_first(
-    box, background, sharing
+def test_behind_a_stuck_waiter_the_next_in_line_still_goes_first(
+    box, background, sharing, stuck
 ):
     tmp_path, _, env = box
     command = learned_same_job(tmp_path, env)
@@ -1584,10 +1617,17 @@ def test_behind_a_stopped_waiter_the_next_in_line_still_goes_first(
     wait_until((tmp_path / "holder.report").exists, "the holder to start")
     sharer = background("--share", "--", *command, JOB="sharer", **history_only)
     wait_until((tmp_path / "sharer.report").exists, "a job to share")
-    stopped = background("--share", "--", *command, JOB="stopped", **history_only)
-    wait_until(lambda: len(entries(tmp_path)) == 1, "a waiter to queue")
-    stopped.send_signal(signal.SIGSTOP)
-    second = background("--share", "--", *command, JOB="second", **history_only)
+    stuck_one = stuck(key_of(lane(tmp_path) / "slot"))
+    # The second's window is longer, so the third sees the stuck one fit first, and
+    # would pass it, and the second, before the second can take the place.
+    second = background(
+        "--share",
+        "--",
+        *command,
+        JOB="second",
+        HEAVY_QUIET_SECONDS="1",
+        **history_only,
+    )
     wait_until(lambda: len(entries(tmp_path)) == 2, "a second waiter to queue")
     third = background("--share", "--", *command, JOB="third", **history_only)
     wait_until(lambda: len(entries(tmp_path)) == 3, "a third waiter to queue")
@@ -1596,18 +1636,18 @@ def test_behind_a_stopped_waiter_the_next_in_line_still_goes_first(
     reports = [tmp_path / f"{name}.report" for name in ("second", "third")]
     wait_until(lambda: any(r.exists() for r in reports), "a waiter behind to share")
     went = "second" if reports[0].exists() else "third"
-    stopped.send_signal(signal.SIGCONT)
-    for name in ("holder", "stopped", "second", "third"):
+    stuck_one.kill()  # or, heading the line once the holder ends, it holds up the rest
+    for name in ("holder", "second", "third"):
         (tmp_path / f"{name}.release").touch()
-    for proc in (holder, sharer, stopped, second, third):
+    for proc in (holder, sharer, second, third):
         status, _, err = finish(proc)
         assert status == 0, err
 
     assert went == "second"
 
 
-def test_a_waiter_whose_fit_flickers_still_passes_a_stopped_one(
-    box, background, sharing
+def test_a_waiter_whose_fit_flickers_still_passes_a_stuck_one(
+    box, background, sharing, stuck
 ):
     tmp_path, busy, env = box
     command = learned_same_job(tmp_path, env)
@@ -1616,9 +1656,7 @@ def test_a_waiter_whose_fit_flickers_still_passes_a_stopped_one(
     wait_until((tmp_path / "holder.report").exists, "the holder to start")
     sharer = background("--share", "--", *command, JOB="sharer", **history_only)
     wait_until((tmp_path / "sharer.report").exists, "a job to share")
-    stopped = background("--share", "--", *command, JOB="stopped", **history_only)
-    wait_until(lambda: len(entries(tmp_path)) == 1, "a waiter to queue")
-    stopped.send_signal(signal.SIGSTOP)
+    stuck(key_of(lane(tmp_path) / "slot"))
     # A one-sample window, so the waiter fits at a quiet sample and not at a busy one.
     behind = background(
         "--share",
@@ -1639,10 +1677,9 @@ def test_a_waiter_whose_fit_flickers_still_passes_a_stopped_one(
             time.sleep(0.06)
     set_busy(busy, "0.0")
     shared = report.exists()
-    stopped.send_signal(signal.SIGCONT)
-    for name in ("holder", "stopped", "behind"):
+    for name in ("holder", "behind"):
         (tmp_path / f"{name}.release").touch()
-    for proc in (holder, sharer, stopped, behind):
+    for proc in (holder, sharer, behind):
         finish(proc)
 
-    assert shared, "the waiter behind never passed the stopped one"
+    assert shared, "the waiter behind never passed the stuck one"

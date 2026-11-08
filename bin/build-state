@@ -48,7 +48,8 @@ into, up to HEAD. A fix folded into an earlier commit than the code it needs lea
 commit broken while HEAD passes. Commits the fold left alone, and rewritten ones whose
 tree a commit other than a fix had before the fold, passed the check when they were made.
 Each commit is checked out for its check, forced, since some checks read or write the
-work tree, and checked through agent-commit-gate --run, which hands it CHECK_BASE:
+work tree, and finish says so as it starts: until it ends, the tree holds that commit,
+not the branch's folded tip. Each is checked through agent-commit-gate --run, which hands it CHECK_BASE:
 the nearest commit before it that passed, usually the one just before, so the check
 can run only what that commit changed. Then HEAD goes back to the branch's folded
 tip, also when finish is stopped by Ctrl-C, SIGTERM or SIGHUP, which stop the check
@@ -564,7 +565,9 @@ def finish(args: argparse.Namespace) -> int:
     if argv:
         print(
             f"Checking the {len(rewritten)} commit{'' if len(rewritten) == 1 else 's'} "
-            "the fold rewrote with agent-pre-commit...",
+            "the fold rewrote with agent-pre-commit, each checked out here in turn: until "
+            "finish ends, the tree holds that commit, not the folded tip, so read or "
+            "change nothing in it.",
             flush=True,
         )
     if argv and (broken := first_failing(argv, rewritten)):

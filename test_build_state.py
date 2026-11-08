@@ -913,6 +913,20 @@ def test_finish_checks_the_folded_result_when_it_folded_a_fix(repo):
     assert checked.read_text().split() == ["checked"]
 
 
+def test_finish_says_the_work_tree_holds_each_commit_it_checks(repo):
+    # An agent that reads the tree meanwhile would see that commit, not HEAD.
+    agent_check(repo, "exit 0")
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "not the folded tip" in done.stdout, done.stdout
+    assert "read or change nothing" in done.stdout, done.stdout
+
+
 def test_a_failing_check_after_folding_keeps_the_build_open(repo):
     agent_check(
         repo, "git show :a.py | grep -q bad && { echo a.py is bad; exit 1; }; exit 0"
@@ -1097,8 +1111,10 @@ def test_finish_runs_no_check_without_a_fix_to_fold(repo):
     build_state(repo, "start")
     commit(repo, "a.py", "Work")
 
-    assert build_state(repo, "finish").returncode == 0
+    done = build_state(repo, "finish")
+    assert done.returncode == 0
     assert not checked.exists()
+    assert "folded tip" not in done.stdout
 
 
 def test_finish_finds_the_agent_check_from_a_subdirectory(repo):

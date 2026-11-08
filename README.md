@@ -374,7 +374,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   separate and the tree as it was (a fix that conflicts gets the later commit
   it was made on top of and the `reword` command that points it there), and
   runs the repo's `agent-pre-commit` through `agent-commit-gate --run` on
-  each commit the fold rewrote, checked out in turn, with `CHECK_BASE` usually
+  each commit the fold rewrote, checked out in turn (it says so: meanwhile the
+  tree holds that commit, not the folded tip), with `CHECK_BASE` usually
   the commit before, so a fix folded into a
   commit before the code it needs fails naming that commit; HEAD ends back on
   its branch either way. Then it lists the commits since the

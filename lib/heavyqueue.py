@@ -10,8 +10,9 @@ holder once its cores have stayed under half busy at every sample for
 HEAVY_QUIET_SECONDS, or at the first sample when it arrived to a free lane with nobody
 waiting.
 
-A waiter starts beside the holder, as its lane's sharer, when the share slot is free,
-neither job runs `--alone`, 4 GiB of memory are free, and either both jobs' history
+A waiter that asks to (`--share`) starts beside the holder, as its lane's sharer,
+when the share slot is free, the holder doesn't run `--alone`, 4 GiB of memory are
+free, and either both jobs' history
 says the waiter's usual cores fit in 75% of the holder's cores beside the holder's
 load, or the holder's cores have averaged under 30% busy for HEAVY_SHARE_SECONDS. The
 first waiter in line that may share does: a waiter that may steps aside for one ahead
@@ -328,12 +329,13 @@ def inside_job():
 
 
 @contextmanager
-def turn(long=False, command="", hint=True, alone=False):
-    """Wait for this job's turn in its lane and for its cores to go quiet, or for room
-    beside its lane's holder, then hold the slot while the body runs, yielding the Job
-    to run with. Inside a job that holds a slot, yield at once. hint=False leaves out
-    the PR hint, for a commit check, which has nothing to push yet. alone: never share
-    a lane. A body that calls job.exited(0) has its run remembered. Raises QueueError
+def turn(long=False, command="", hint=True, alone=False, share=False):
+    """Wait for this job's turn in its lane and for its cores to go quiet, or, with
+    share, for room beside its lane's holder; then hold the slot while the body runs,
+    yielding the Job to run with. Inside a job that holds a slot, yield at once.
+    hint=False leaves out the PR hint, for a commit check, which has nothing to push
+    yet. alone: no job shares the lane beside this one. A body that calls
+    job.exited(0) has its run remembered. Raises QueueError
     when the queue's folder can't be used."""
     if inside_job():
         if alone:
@@ -357,7 +359,7 @@ def turn(long=False, command="", hint=True, alone=False):
     started = None
     try:
         started = Waiter(
-            lane, folder, me.line() + about, entry, hint, cpus, alone
+            lane, folder, me.line() + about, entry, hint, cpus, alone, share
         ).wait()
         env = dict(os.environ) | {
             "HEAVY_SLOT": first_line(started.text),
@@ -554,11 +556,11 @@ class Waiter:
     """One job's wait: to head its lane's queue with the slot free and its cores
     quiet, or for room beside the lane's holder."""
 
-    def __init__(self, lane, folder, text, entry, hint, cpus, alone):
+    def __init__(self, lane, folder, text, entry, hint, cpus, alone, share):
         self.lane, self.folder, self.text, self.entry = lane, folder, text, entry
         self.hint, self.cpus, self.alone = hint, cpus, alone
         self.said = {}
-        self.bid = None if alone else Bid(lane, folder, text, entry, cpus, self.say)
+        self.bid = Bid(lane, folder, text, entry, cpus, self.say) if share else None
 
     def wait(self):
         """The Start of the job, once it has taken a slot."""

@@ -3,6 +3,7 @@
 
     heavy -- CMD [ARGS...]           a build, a test suite, anything heavy
     heavy --long -- CMD [ARGS...]    a long run, such as a local mutants shard
+    heavy --share -- CMD [ARGS...]   a build with no time limits: it may share a lane
     heavy --alone -- CMD [ARGS...]   a timing: no job shares its lane
     heavy status                     each lane's jobs and how busy its cores are
 
@@ -20,8 +21,13 @@ Commit checks join the queue on their own, through agent-commit-gate, and so doe
 wt-ship's --check.
 
 A lane holds one more job when its holder leaves cores idle. The first waiter in line
-that fits starts beside the holder at nice 10, so the holder keeps about 90% of any
-core both want. It fits when 4 GiB of memory are free and either:
+that asks to (--share) and fits starts beside the holder at nice 10, so the holder
+keeps about 90% of any core both want, and the sharer can run several times slower
+than alone. So share only work with no wall-clock limits, such as a build: many test
+suites have them, from the runner (pytest-timeout, nextest's slow-timeout) or in the
+tests themselves (a wait with a deadline), and fail on a busy core for no fault of the
+code. Commit checks never share. A waiter fits when 4 GiB of memory are free and
+either:
   - heavy has seen both commands exit 0 before, and the waiter's usual cores plus the
     holder's (its usual or its last 10 seconds, whichever is more) come to at most
     three quarters of the holder's cores; or
@@ -133,8 +139,10 @@ def stop(proc):
             continue
 
 
-def run(command, long, alone):
-    with heavyqueue.turn(long=long, command=shlex.join(command), alone=alone) as job:
+def run(command, long, alone, share):
+    with heavyqueue.turn(
+        long=long, command=shlex.join(command), alone=alone, share=share
+    ) as job:
         job.pin()  # CMD inherits this process's cores
         terminal = sys.stdin.isatty()
         try:
@@ -172,10 +180,17 @@ def main(argv=None):
     parser.add_argument(
         "--long", action="store_true", help="a long run: a quarter of the cores"
     )
-    parser.add_argument(
+    beside = parser.add_mutually_exclusive_group()
+    beside.add_argument(
         "--alone",
         action="store_true",
         help="never share a lane, as for a timing: no job runs beside this one",
+    )
+    beside.add_argument(
+        "--share",
+        action="store_true",
+        help="may start beside a lane's holder, at nice 10, for work without time"
+        " limits",
     )
     parser.add_argument(
         "command", nargs=argparse.REMAINDER, help="status, or -- CMD [ARGS...]"
@@ -189,7 +204,7 @@ def main(argv=None):
     for sig in STOPS:
         signal.signal(sig, on_signal)
     try:
-        return run(args.command[1:], args.long, args.alone)
+        return run(args.command[1:], args.long, args.alone, args.share)
     except Stopped as stopped:
         return 128 + stopped.signum
     except heavyqueue.QueueError as error:

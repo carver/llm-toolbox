@@ -675,7 +675,9 @@ def test_a_waiter_whose_history_fits_shares_the_lane_at_nice_10(
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    s = background("--", *sharer[0], HEAVY_SHARE_SECONDS="600")  # history alone
+    s = background(
+        "--share", "--", *sharer[0], HEAVY_SHARE_SECONDS="600"
+    )  # history alone
     wait_until(sharer[1].exists, "the waiter to share the lane")
     shown = heavy(env, "status").stdout
     holder[2].touch()
@@ -705,7 +707,7 @@ def test_a_waiter_whose_history_doesnt_fit_waits_for_the_holder(
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    w = background("--", *waiter[0], HEAVY_SHARE_SECONDS="600", stderr=log)
+    w = background("--share", "--", *waiter[0], HEAVY_SHARE_SECONDS="600", stderr=log)
     wait_until(has_text(log, "don't fit"), "the waiter to say it doesn't fit")
     assert not waiter[1].exists()
     holder[2].touch()
@@ -727,7 +729,7 @@ def test_a_waiter_with_no_history_shares_once_the_holder_has_idled(
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    s = background("--", *sharer[0])
+    s = background("--share", "--", *sharer[0])
     wait_until(sharer[1].exists, "the waiter to share the lane")
     holder[2].touch()
     sharer[2].touch()
@@ -749,7 +751,7 @@ def test_a_busy_holder_keeps_a_waiter_with_no_history_waiting(box, background, s
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    w = background("--", *waiter[0], stderr=log)
+    w = background("--share", "--", *waiter[0], stderr=log)
     wait_until(has_text(log, "under 30%"), "the waiter to say what it waits for")
     assert not waiter[1].exists()
     holder[2].touch()
@@ -771,9 +773,9 @@ def test_only_one_job_shares_a_lane_the_first_in_line(box, background, sharing):
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    one = background("--", *first[0])
+    one = background("--share", "--", *first[0])
     wait_until(lambda: len(entries(tmp_path)) == 1, "the first waiter to queue")
-    two = background("--", *second[0], stderr=log)
+    two = background("--share", "--", *second[0], stderr=log)
     wait_until(first[1].exists, "the first waiter to share")
     wait_until(has_text(log, "already shares"), "the second to see the place taken")
     assert not second[1].exists()
@@ -797,9 +799,9 @@ def test_a_light_waiter_shares_ahead_of_a_heavy_one(box, background, sharing):
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    b = background("--", *big[0], **history_only)
+    b = background("--share", "--", *big[0], **history_only)
     wait_until(lambda: len(entries(tmp_path)) == 1, "the heavy waiter to queue")
-    li = background("--", *light[0], **history_only)
+    li = background("--share", "--", *light[0], **history_only)
     wait_until(light[1].exists, "the light waiter to share")
     assert not big[1].exists()
     holder[2].touch()
@@ -824,7 +826,7 @@ def test_with_too_little_free_memory_nothing_shares(box, background, memory):
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    w = background("--", *waiter[0], stderr=log)
+    w = background("--share", "--", *waiter[0], stderr=log)
     wait_until(has_text(log, "free memory"), "the waiter to say memory is short")
     assert not waiter[1].exists()
     holder[2].touch()
@@ -842,7 +844,7 @@ def test_nothing_shares_beside_an_alone_holder(box, background, sharing):
 
     h = background("--alone", "--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    w = background("--", *waiter[0], stderr=log)
+    w = background("--share", "--", *waiter[0], stderr=log)
     wait_until(has_text(log, "--alone"), "the waiter to say the holder runs alone")
     assert not waiter[1].exists()
     holder[2].touch()
@@ -862,7 +864,7 @@ def test_an_alone_job_never_shares(box, background, sharing):
     wait_until(holder[1].exists, "the holder to start")
     a = background("--alone", "--", *alone[0])
     wait_until(lambda: len(entries(tmp_path)) == 1, "the alone job to queue")
-    o = background("--", *other[0])
+    o = background("--share", "--", *other[0])
     wait_until(other[1].exists, "the job behind it to share")  # the window passed
     assert not alone[1].exists()
     holder[2].touch()
@@ -884,7 +886,7 @@ def test_an_alone_head_waits_for_the_sharer_to_end(box, background, sharing):
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    s = background("--", *sharer[0])
+    s = background("--share", "--", *sharer[0])
     wait_until(sharer[1].exists, "the waiter to share")
     a = background("--alone", "--", *alone[0], stderr=log)
     wait_until(lambda: len(entries(tmp_path)) == 1, "the alone job to queue")
@@ -948,7 +950,7 @@ def test_a_long_job_waits_for_the_cores_a_normal_sharer_holds(box, background, s
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    s = background("--", *sharer[0])
+    s = background("--share", "--", *sharer[0])
     wait_until(sharer[1].exists, "the waiter to share, on every core")
     holder[2].touch()
     finish(h)
@@ -1093,13 +1095,15 @@ def test_a_sharers_run_is_remembered_too(box, background, sharing):
     holder, sharer = job_report(tmp_path, "holder"), job_report(tmp_path, "sharer")
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    s = background("--", *sharer[0], HEAVY_CORES_USED="1.5")
+    s = background("--share", "--", *sharer[0], HEAVY_CORES_USED="1.5")
     wait_until(sharer[1].exists, "the waiter to share")
     sharer[2].touch()
     finish(s)
     sharer[2].unlink()
 
-    w = background("--", *sharer[0], session="s-again", HEAVY_SHARE_SECONDS="600")
+    w = background(
+        "--share", "--", *sharer[0], session="s-again", HEAVY_SHARE_SECONDS="600"
+    )
     wait_until(lambda: entries(tmp_path), "the same command to queue again")
     shown = heavy(env, "status").stdout
     holder[2].touch()
@@ -1182,11 +1186,11 @@ def test_the_waiter_ahead_shares_first_when_both_fit_at_once(box, background, sh
     def round_of(n):
         """A sharer, then two waiters behind it; which of them shares once it ends."""
         report = {job: tmp_path / f"{job}{n}.report" for job in ("first", "second")}
-        sharer = background("--", *command, JOB=f"sharer{n}", **history_only)
+        sharer = background("--share", "--", *command, JOB=f"sharer{n}", **history_only)
         wait_until((tmp_path / f"sharer{n}.report").exists, "a job to share")
-        first = background("--", *command, JOB=f"first{n}", **history_only)
+        first = background("--share", "--", *command, JOB=f"first{n}", **history_only)
         wait_until(lambda: len(entries(tmp_path)) == 1, "the first waiter to queue")
-        second = background("--", *command, JOB=f"second{n}", **history_only)
+        second = background("--share", "--", *command, JOB=f"second{n}", **history_only)
         wait_until(lambda: len(entries(tmp_path)) == 2, "the second waiter to queue")
         (tmp_path / f"sharer{n}.release").touch()
         wait_until(
@@ -1221,9 +1225,9 @@ def test_a_waiter_watches_the_holder_anew_once_the_sharer_ends(
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    s = background("--", *sharer[0])
+    s = background("--share", "--", *sharer[0])
     wait_until(sharer[1].exists, "a job to share")
-    w = background("--", *waiter[0], HEAVY_SHARE_SECONDS="1.5", stderr=log)
+    w = background("--share", "--", *waiter[0], HEAVY_SHARE_SECONDS="1.5", stderr=log)
     wait_until(has_text(log, "already shares"), "the waiter to see the place taken")
     # Long enough for the waiter to gather a whole window while the sharer runs; the
     # samples it took then mustn't count once the sharer ends.
@@ -1248,7 +1252,7 @@ def test_a_heavy_inside_a_sharer_runs_at_once(box, background, sharing):
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    s = background("--", str(SCRIPT), "--", "touch", str(inner))
+    s = background("--share", "--", str(SCRIPT), "--", "touch", str(inner))
     wait_until(inner.exists, "the heavy inside the sharer to run")
     holder[2].touch()
     for proc in (h, s):
@@ -1264,7 +1268,7 @@ def test_a_holder_with_no_history_lets_nobody_in_by_history(box, background, sha
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    w = background("--", *waiter[0], HEAVY_SHARE_SECONDS="600", stderr=log)
+    w = background("--share", "--", *waiter[0], HEAVY_SHARE_SECONDS="600", stderr=log)
     wait_until(
         has_text(log, "no passing run of the holder's command"),
         "the waiter to say the holder has no history",
@@ -1288,7 +1292,7 @@ def test_free_memory_near_the_floor_says_so_once(box, background, sharing):
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    w = background("--", *waiter[0], stderr=log)
+    w = background("--share", "--", *waiter[0], stderr=log)
     wait_until(has_text(log, "free memory"), "the waiter to say memory is short")
     for _ in range(20):  # just under the floor, then just over, a poll or so each
         for gib in (3.9, 4.1):
@@ -1319,7 +1323,7 @@ def test_a_holder_whose_command_has_many_lines_can_still_be_shared(
 
     h = background("--", *holder)
     wait_until(started.exists, "the holder to start")
-    w = background("--", *waiter[0])
+    w = background("--share", "--", *waiter[0])
     wait_until(waiter[1].exists, "the waiter to share")
     release.touch()
     waiter[2].touch()
@@ -1398,7 +1402,7 @@ def test_a_sharers_slot_says_when_it_started_sharing(box, background, sharing):
     wait_until(holder[1].exists, "the holder to start")
     # The holder must idle for 1.5 s first, so the sharer starts a second after it
     # joined, at least.
-    s = background("--", *sharer[0], HEAVY_SHARE_SECONDS="1.5")
+    s = background("--share", "--", *sharer[0], HEAVY_SHARE_SECONDS="1.5")
     wait_until(lambda: entries(tmp_path), "the sharer to queue")
     s_joined = joined(entries(tmp_path)[0])
     wait_until(sharer[1].exists, "the waiter to share")
@@ -1461,7 +1465,9 @@ def test_a_sharer_the_oom_killer_hit_hears_why_it_went_first(box, background, sh
 
     h = background("--", *holder[0])
     wait_until(holder[1].exists, "the holder to start")
-    s = background("--", *failing(vmstat, "exit 1"), HEAVY_VMSTAT=str(vmstat))
+    s = background(
+        "--share", "--", *failing(vmstat, "exit 1"), HEAVY_VMSTAT=str(vmstat)
+    )
     status, _, err = finish(s)
     holder[2].touch()
     finish(h)
@@ -1479,12 +1485,12 @@ def test_a_stopped_waiter_ahead_holds_up_sharing_only_a_while(box, background, s
     history_only = {"HEAVY_SHARE_SECONDS": "600"}
     holder = background("--", *command, JOB="holder")
     wait_until((tmp_path / "holder.report").exists, "the holder to start")
-    sharer = background("--", *command, JOB="sharer", **history_only)
+    sharer = background("--share", "--", *command, JOB="sharer", **history_only)
     wait_until((tmp_path / "sharer.report").exists, "a job to share")
-    stopped = background("--", *command, JOB="stopped", **history_only)
+    stopped = background("--share", "--", *command, JOB="stopped", **history_only)
     wait_until(lambda: len(entries(tmp_path)) == 1, "a waiter to queue")
     stopped.send_signal(signal.SIGSTOP)  # it fits, but can't take the place
-    behind = background("--", *command, JOB="behind", **history_only)
+    behind = background("--share", "--", *command, JOB="behind", **history_only)
     wait_until(lambda: len(entries(tmp_path)) == 2, "a waiter behind it to queue")
 
     (tmp_path / "sharer.release").touch()
@@ -1499,3 +1505,35 @@ def test_a_stopped_waiter_ahead_holds_up_sharing_only_a_while(box, background, s
         assert status == 0, err
 
     assert waited >= 4, waited  # it stepped aside for the stopped one a while
+
+
+def test_a_job_shares_only_when_it_asks_to(box, background, sharing):
+    tmp_path, _, _ = box
+    holder = job_report(tmp_path, "holder")
+    plain, asking = job_report(tmp_path, "plain"), job_report(tmp_path, "asking")
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    p = background("--", *plain[0])
+    wait_until(lambda: len(entries(tmp_path)) == 1, "the plain job to queue")
+    a = background("--share", "--", *asking[0])
+    wait_until(asking[1].exists, "the job that asks to share to share")  # window past
+    assert not plain[1].exists()
+    holder[2].touch()
+    asking[2].touch()
+    wait_until(plain[1].exists, "the plain job to start once the holder ends")
+    plain[2].touch()
+    for proc in (h, p, a):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    assert report(plain[1])["nice"] == BASE_NICE
+
+
+def test_share_and_alone_dont_go_together(box):
+    _, _, env = box
+
+    done = heavy(env, "--share", "--alone", "--", "true")
+
+    assert done.returncode == 2
+    assert "not allowed with" in done.stderr, done.stderr

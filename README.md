@@ -237,14 +237,16 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   slow checks, such as the whole test suite. Git runs the hook after `commit
   -a` or `commit PATHS` updates the index, so the check sees what is
   committed. The trees that passed go on a record in the repo's common git
-  dir, which every worktree shares, keyed by the tree and the check's bytes.
-  When HEAD's own tree is on it, as in an amend that changes only the message,
-  the check is skipped. Otherwise the check gets `$CHECK_BASE`, the nearest of
-  HEAD's last 100 first-parent commits whose tree passed it, and may run only
-  what the changes since need: `git diff --cached --name-only "$CHECK_BASE"`
-  lists them at commit time and on a `wt-ship` or `build-state finish` recheck.
-  A check that ignores it runs in full, as does any with no base found. An
-  agent without llm-toolbox, such as a teammate's, runs the check every time.
+  dir, which every worktree shares, keyed by the tree and the check's bytes; a
+  pass with unstaged changes to tracked files isn't recorded. When the tree
+  being checked is HEAD's own and on the record, as in an amend that changes
+  only the message, the check is skipped. Otherwise the check gets
+  `$CHECK_BASE`, the nearest of HEAD's last 100 first-parent commits whose tree
+  passed it, and may run only what the changes since need: `git diff --cached
+  --name-only "$CHECK_BASE"` lists them at commit time and on a `wt-ship` or
+  `build-state finish` recheck. A check that ignores it runs in full, as does
+  any with no base found; `agent-quick-check` gets the same base. An agent
+  without llm-toolbox, such as a teammate's, runs the check every time.
   The check's output shows only when
   it fails, ending with `COMMIT REFUSED`; a pass prints one line. A small
   fixup!, squash! or amend! commit (found from the running `git commit`'s

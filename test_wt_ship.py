@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import path_without
+
 SCRIPT = Path(__file__).resolve().parent / "bin" / "wt-ship"
 
 
@@ -193,12 +195,6 @@ def test_the_default_check_is_the_repos_agent_pre_commit(setup):
 GATE = SCRIPT.parent / "agent-commit-gate"
 
 
-def without_the_gate_on_path():
-    """PATH without any agent-commit-gate, so a tool that finds it there can't."""
-    dirs = os.environ["PATH"].split(os.pathsep)
-    return {"PATH": os.pathsep.join(d for d in dirs if not Path(d, GATE.name).exists())}
-
-
 def test_the_recheck_gets_the_main_tip_it_rebased_onto_as_check_base(setup):
     _, main, wt, _ = setup
     seen = main.parent / "bases"
@@ -213,7 +209,7 @@ def test_the_recheck_gets_the_main_tip_it_rebased_onto_as_check_base(setup):
     tip = main_head(main)
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", env=without_the_gate_on_path())
+    done = ship(wt, "--local", env={"PATH": path_without(GATE.name)})
 
     assert done.returncode == 0, done.stderr
     assert seen.read_text().split() == ["none", tip]

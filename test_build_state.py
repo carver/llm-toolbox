@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import path_without
+
 SCRIPT = Path(__file__).resolve().parent / "bin" / "build-state"
 
 
@@ -805,10 +807,8 @@ def test_finish_gives_each_commit_it_checks_the_one_before_as_check_base(repo):
     work = commit(repo, "a.py", "Work")
     commit(repo, "b.py", "More")
     commit(repo, "a.py", "fix work", f"--fixup={work}")
-    dirs = os.environ["PATH"].split(os.pathsep)
-    path = os.pathsep.join(d for d in dirs if not Path(d, gate.name).exists())
 
-    done = build_state(repo, "finish", env={"PATH": path})
+    done = build_state(repo, "finish", env={"PATH": path_without(gate.name)})
 
     assert done.returncode == 0, done.stderr
     folded_work = git(repo, "rev-parse", "HEAD~1").strip()

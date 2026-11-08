@@ -72,7 +72,7 @@ import shlex
 import subprocess
 import sys
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -497,28 +497,45 @@ def check_base(passed, fingerprint):
     )
     for line in (log or "").splitlines():
         # Only `<commit> <tree>`, whatever else a config adds to git log's output.
-        if len(words := line.split()) == 2 and f"{words[1]} {fingerprint}" in passed:
+        if (
+            len(words := line.split()) == 2
+            and pass_key(words[1], fingerprint) in passed
+        ):
             return words[0]
     return None
 
 
+def pass_key(tree, fingerprint):
+    """A pass's line on the record: the tree, and the check's fingerprint."""
+    return f"{tree} {fingerprint}"
+
+
+@contextmanager
+def record_lock(record):
+    """Hold the lock beside the record; OSError when another process holds it past
+    RECORD_LOCK_SECONDS. It never blocks outright: the record lives on a shared mount,
+    where a holder stuck in I/O would stall every commit's pass behind it."""
+    deadline = time.monotonic() + RECORD_LOCK_SECONDS
+    with open(record.with_name(f"{record.name}.lock"), "a") as lock:
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise OSError("another commit holds its lock") from None
+                time.sleep(0.05)
+        yield
+
+
 def remember(record, key):
     """Add key to the record, newest last, keeping the last RECORD_SIZE: rewritten
-    whole and renamed into place, under a lock beside it so passes in two worktrees
-    keep both. A lock held past RECORD_LOCK_SECONDS, or a failed write, leaves the pass
-    unrecorded, which costs a fuller run later, and says so."""
-    deadline = time.monotonic() + RECORD_LOCK_SECONDS
+    whole and renamed into place, under the record's lock, so passes in two worktrees
+    keep both. A lock held too long, or a failed write, leaves the pass unrecorded,
+    which costs a fuller run later, and says so."""
     part = record.with_name(f"{record.name}.{os.getpid()}")
     try:
-        with open(record.with_name(f"{record.name}.lock"), "a") as lock:
-            while True:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise OSError("another commit holds its lock") from None
-                    time.sleep(0.05)
+        with record_lock(record):
             kept = [line for line in recorded(record) if line != key]
             kept = [*kept[-(RECORD_SIZE - 1) :], key]
             part.write_text("".join(f"{line}\n" for line in kept))
@@ -558,7 +575,7 @@ def run_check(path):
         )
         return 0
     tree = git_out("write-tree")
-    key = f"{tree} {fingerprint}" if tree else None
+    key = pass_key(tree, fingerprint) if tree else None
     if key in passed and tree == git_out("rev-parse", "-q", "--verify", "HEAD^{tree}"):
         print(
             f"{HOOK_NAME}: skipped, tree {tree[:12]} already passed it", file=sys.stderr
@@ -584,7 +601,8 @@ def main(argv=None):
     parser.add_argument(
         "--run",
         metavar="HOOK",
-        help="run the agent check HOOK with CHECK_BASE, unless HEAD's tree passed it",
+        help="run the agent check HOOK with CHECK_BASE, unless the tree checked is "
+        "HEAD's and passed it",
     )
     args = parser.parse_args(argv)
     if args.run:

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import without_repo_vars
+from conftest import path_without, without_repo_vars
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "agent-commit-gate"
 loader = importlib.machinery.SourceFileLoader("agent_commit_gate", str(SCRIPT))
@@ -124,12 +124,9 @@ def install(*repos):
 def commit(repo, *args, agent=True, gate_on_path=True, env=None):
     env = without_repo_vars(os.environ) | (env or {})
     # The hook line calls agent-commit-gate from PATH: this checkout's, not the installed one.
-    dirs = [
-        d for d in env["PATH"].split(os.pathsep) if not Path(d, SCRIPT.name).exists()
-    ]
+    env["PATH"] = path_without(SCRIPT.name, env["PATH"])
     if gate_on_path:
-        dirs.insert(0, str(SCRIPT.parent))
-    env["PATH"] = os.pathsep.join(dirs)
+        env["PATH"] = os.pathsep.join([str(SCRIPT.parent), env["PATH"]])
     if agent:
         env["AI_AGENT"] = "test-agent"
     return git(repo, "commit", "-q", "-m", "x", *args, env=env, check=False)
@@ -778,7 +775,8 @@ def test_a_tree_that_passed_in_another_worktree_skips_the_check_there(installed)
 
     assert run.returncode == 0, run.stderr
     assert "already passed" in run.stderr
-    assert ran(installed) == ["agent", "fast"]
+    other_git_dir = git(other, "rev-parse", "--absolute-git-dir").stdout.strip()
+    assert Path(other_git_dir, "ran").read_text().split() == ["fast"]
 
 
 def test_any_recorded_tree_of_heads_skips_the_check_not_only_the_last(installed):

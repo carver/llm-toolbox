@@ -1,0 +1,94 @@
+# Why: Add a single-file sub-shape published as an Artifact, with a hash-keyed switcher, for pages the app doesn't have yet.
+--- a/UI.md
++++ b/UI.md
+@@ -11,7 +11,7 @@
+ - "Try a different layout for the settings screen."
+ - Any time the user would otherwise spend a day picking between three vague mockups in their head.
+ 
+-## Two sub-shapes: strongly prefer sub-shape A
++## Sub-shapes: strongly prefer sub-shape A
+ 
+ A UI prototype is much easier to judge when it's **butting up against the rest of the app**: real header, real sidebar, real data, real density. A throwaway route on its own is a vacuum: every variant looks fine in isolation. Default to sub-shape A whenever there's a plausible existing page to host the variants. Only reach for sub-shape B if the prototype genuinely has no nearby home.
+ 
+@@ -29,7 +29,11 @@
+ 
+ Before committing to sub-shape B, sanity-check: is there really no existing page this could be embedded in? An empty route hides design problems that a populated one would expose.
+ 
+-In both sub-shapes the floating bottom bar is identical.
++### Sub-shape C: one HTML file, published as an Artifact
++
++Use this when the app has no page to host the variants yet, as when the prototype decides what those pages will look like. Use it too when the user will review away from the dev server, such as on a phone. Build one HTML file with each variant as a `<section class="variant" id="KEY" hidden>`, and paste in [switcher.html](switcher.html), which is the bottom bar for this sub-shape. It keys the variant on `location.hash`, because an Artifact link passes only a plain `#name`, never a query string. Fill the variants with the project's real content: its docs' example records, its fixtures, its wording. Publish the file as an Artifact and give the user a link per variant (`<url>#KEY`). Variants added later in the conversation go on the end of the list, so the numbers the user already uses keep naming the same variant.
++
++In every sub-shape the floating bottom bar works the same way.
+ 
+ ## Process
+ 
+@@ -101,6 +105,7 @@
+ 
+ - **Sub-shape A**: fold the winner into the existing page; drop the losing variants and the switcher from main.
+ - **Sub-shape B**: promote the winning variant to a real route; drop the throwaway route and the switcher from main.
++- **Sub-shape C**: rebuild the winner in the app's own templates and styles; the file goes to the throwaway branch, and the issue links the Artifact too.
+ 
+ The full set of variants is the primary source, so it lands on the throwaway branch, not the bin, since variant components and the switcher left in the main branch rot fast and confuse the next reader.
+ 
+--- a/switcher.html
++++ b/switcher.html
+@@ -0,0 +1,58 @@
++<!-- Variant switcher for a single-file prototype, such as one published as an Artifact.
++     Each variant is a <section class="variant" id="KEY" hidden> on the page. The bar shows
++     one variant at a time, keyed on location.hash, since an Artifact link passes only a
++     plain #name. ←/→ cycle, except while a form field has focus. <html data-variant="KEY">
++     follows the current variant, so a variant can paint the page background with
++     html[data-variant="KEY"] body { background: ... }. Edit VARIANTS; keep the rest. -->
++<style>
++.proto-bar { position: fixed; left: 50%; transform: translateX(-50%); z-index: 2147483647;
++  bottom: calc(12px + env(safe-area-inset-bottom, 0px));
++  display: flex; align-items: center; gap: .5rem; width: min(36rem, calc(100vw - 24px));
++  background: #ffffff; color: #111111; border-radius: 14px; padding: .5rem;
++  box-shadow: 0 6px 28px rgb(0 0 0 / .35); font: 13px/1.35 system-ui, sans-serif; }
++.proto-bar button { flex: none; width: 2.4rem; height: 2.4rem; border: 0; border-radius: 10px;
++  background: #ececec; color: #111111; font-size: 1.1rem; cursor: pointer; }
++.proto-bar button:hover { background: #dcdcdc; }
++.proto-bar div { flex: 1; min-width: 0; text-align: center; }
++.proto-bar small { display: block; color: #5a5a5a; font-size: 12px; }
++</style>
++<nav class="proto-bar" aria-label="Prototype variants">
++  <button type="button" data-step="-1" aria-label="Previous variant">←</button>
++  <div aria-live="polite"><b></b> <span></span><small></small></div>
++  <button type="button" data-step="1" aria-label="Next variant">→</button>
++</nav>
++<script>
++(() => {
++  // One entry per <section class="variant" id="KEY">. Add new variants at the end, so the
++  // numbers the user has already used keep naming the same variant.
++  const VARIANTS = [
++    { key: "sidebar", name: "Sidebar", note: "One line on what this variant tries." },
++    { key: "tabs", name: "Tabs", note: "One line on what this variant tries." },
++  ];
++  const bar = document.querySelector(".proto-bar");
++  const index = () => Math.max(0, VARIANTS.findIndex(v => v.key === location.hash.slice(1)));
++  function show() {
++    const i = index(), v = VARIANTS[i];
++    for (const o of VARIANTS) document.getElementById(o.key).hidden = o.key !== v.key;
++    document.documentElement.dataset.variant = v.key;
++    bar.querySelector("b").textContent = v.name;
++    bar.querySelector("span").textContent = `${i + 1}/${VARIANTS.length}`;
++    bar.querySelector("small").textContent = v.note;
++  }
++  function go(step) {
++    location.hash = VARIANTS[(index() + step + VARIANTS.length) % VARIANTS.length].key;
++    scrollTo(0, 0);
++  }
++  bar.addEventListener("click", e => {
++    const button = e.target.closest("[data-step]");
++    if (button) go(Number(button.dataset.step));
++  });
++  addEventListener("keydown", e => {
++    if (e.target.closest?.("input, textarea, select, [contenteditable]")) return;
++    if (e.key === "ArrowLeft") go(-1);
++    else if (e.key === "ArrowRight") go(1);
++  });
++  addEventListener("hashchange", show);
++  show();
++})();
++</script>

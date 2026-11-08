@@ -203,6 +203,54 @@ def test_eval_prints_its_value_as_json_where_it_runs(tmp_path):
     assert run.stderr == ""
 
 
+def png_size(path):
+    """(width, height) from a PNG's header."""
+    header = Path(path).read_bytes()[16:24]
+    return int.from_bytes(header[:4], "big"), int.from_bytes(header[4:], "big")
+
+
+@pytest.mark.skipif(
+    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
+)
+def test_a_shot_taller_than_1500px_is_also_saved_in_pieces(tmp_path):
+    """The fewest pieces of at most 1400px, of equal height but for the last. Pieces an earlier run
+    left in the folder go."""
+    page = tmp_path / "p.html"
+    page.write_text(
+        "<!doctype html><style>body { margin: 0 } div { background: teal }</style>"
+        '<div id="tall" style="height: 1501px"></div><div id="edge" style="height: 1500px"></div>'
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    for stale in ("edge.part1.png", "final.part4.png"):
+        (out / stale).write_bytes(b"")
+    run = cli(
+        "--out",
+        out,
+        "--size",
+        "200x300",
+        "--do",
+        "shot tall #tall",
+        "--do",
+        "shot edge #edge",
+        page,
+    )
+    assert run.returncode == 0, run.stderr
+    names = ["tall", "tall.part1", "tall.part2", "edge", "final"]
+    names += [f"final.part{n}" for n in (1, 2, 3)]
+    assert run.stdout.splitlines() == [str(out / f"{name}.png") for name in names]
+    assert sorted(p.name for p in out.iterdir()) == sorted(f"{n}.png" for n in names)
+    sizes = {name: png_size(out / f"{name}.png") for name in names}
+    assert sizes["tall"] == (200, 1501)
+    assert [sizes[f"tall.part{n}"] for n in (1, 2)] == [(200, 751), (200, 750)]
+    assert sizes["final"] == (200, 3001)
+    assert [sizes[f"final.part{n}"] for n in (1, 2, 3)] == [
+        (200, 1001),
+        (200, 1001),
+        (200, 999),
+    ]
+
+
 def test_repeated_errors_collapse_to_one_line_with_a_count():
     assert web_shot.collapse(["a", "b", "a", "a"]) == ["a (x3)", "b"]
 
@@ -249,7 +297,7 @@ def test_prints_text_and_links_after_loading_an_endless_page(tmp_path):
     assert "About -> " not in run.stdout
     assert "item 30" in run.stdout
     assert run.stderr.strip().splitlines() == ["console error: same noise (x5)"]
-    assert lines[-1].endswith("final.png")
+    assert lines[lines.index("item 30") + 1].endswith("/final.png")
 
 
 def test_cookies_are_sent_with_the_page(tmp_path):

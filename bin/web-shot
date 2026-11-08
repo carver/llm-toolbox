@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
-# dependencies = ["playwright==1.64.1"]
+# dependencies = ["pillow==12.3.0", "playwright==1.64.1"]
 # ///
 """Open a web page in headless Chromium, drive it, take screenshots and report its JavaScript errors.
 
@@ -18,8 +18,11 @@ Actions (--do, repeatable, run in order once the page has loaded):
   links [REGEX]          print "text -> url" for each link whose text or url matches REGEX
   scroll-all             scroll to the bottom until the page stops growing (endless feeds)
 
-A final full-page screenshot, OUT/final.png, is always taken. Text, links and
-eval values go to stdout as their actions run, then the paths of the screenshots.
+A final full-page screenshot, OUT/final.png, is always taken. A shot taller than
+1500px is also saved as pieces at most 1400px tall, OUT/NAME.part1.png and on
+(replacing an earlier run's), which an image reader shows without scaling them
+down. Text, links and eval values go to stdout as their actions run, then the
+paths of the screenshots, each followed by its pieces.
 The page's uncaught errors and console errors go to stderr, repeats collapsed
 to one line with a count, and make the exit status 3 once the screenshots are
 saved.
@@ -37,7 +40,11 @@ Examples:
 """
 
 import argparse
+import glob
+import io
 import json
+import math
+import re
 import sys
 import tempfile
 import time
@@ -66,6 +73,10 @@ SCROLL_DONE_MS = 2000
 SCROLL_MAX_ROUNDS = 400
 # Requests that stay open as long as the page does
 UNENDING = {"eventsource", "websocket", "media"}
+# A shot taller than this is also saved in pieces at most PIECE_HEIGHT tall, which a reader shows
+# without scaling them down: a 1280x6353 shot showed at 403x2000.
+SPLIT_ABOVE = 1500
+PIECE_HEIGHT = 1400
 LINKS_JS = """pattern => [...document.querySelectorAll('a[href]')]
   .map(a => [a.innerText.trim().replace(/\\s+/g, ' '), a.href])
   .filter(([text, href]) => !pattern || new RegExp(pattern, 'i').test(text + ' ' + href))"""
@@ -183,6 +194,29 @@ def eval_json(tab, script):
     return json.dumps(value.json_value(), ensure_ascii=False, default=str)
 
 
+def save_pieces(path, png):
+    """Saves PNG, the shot saved at PATH, as pieces beside it when it is tall, and returns their paths:
+    NAME.part1.png and on, the fewest of at most PIECE_HEIGHT, of equal height but for the last. The
+    pieces of an earlier, taller shot by that name go first."""
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None  # our own screenshot, not a decompression bomb
+    for old in path.parent.glob(f"{glob.escape(path.stem)}.part*.png"):
+        if re.fullmatch(r"\.part\d+", old.stem[len(path.stem) :]):
+            old.unlink()
+    image = Image.open(io.BytesIO(png))
+    width, height = image.size
+    if height <= SPLIT_ABOVE:
+        return []
+    step = math.ceil(height / math.ceil(height / PIECE_HEIGHT))
+    pieces = []
+    for number, top in enumerate(range(0, height, step), 1):
+        piece = path.with_name(f"{path.stem}.part{number}.png")
+        image.crop((0, top, width, min(top + step, height))).save(piece)
+        pieces.append(piece)
+    return pieces
+
+
 def page_url(page):
     path = Path(page)
     return path.resolve().as_uri() if "://" not in page and path.exists() else page
@@ -255,10 +289,10 @@ def run(page, actions, out, size, cookies):
             else:
                 path = out / f"{action.args[0]}.png"
                 if len(action.args) == 2:
-                    tab.locator(action.args[1]).first.screenshot(path=str(path))
+                    png = tab.locator(action.args[1]).first.screenshot(path=str(path))
                 else:
-                    tab.screenshot(path=str(path), full_page=True)
-                shots.append(path)
+                    png = tab.screenshot(path=str(path), full_page=True)
+                shots += [path, *save_pieces(path, png)]
         browser.close()
     return shots, errors
 

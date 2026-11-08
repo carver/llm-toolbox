@@ -344,11 +344,36 @@ def visible_text(tab, selector):
 
 def eval_json(tab, script):
     """SCRIPT's value in the page as one line of JSON, or "undefined". Playwright awaits a promise and
-    calls a function, as evaluate does; a value JSON can't hold, such as a Date, prints as text."""
+    calls a function, as evaluate does. A script that navigates, as location.reload() does, takes its
+    value with the page it leaves, so it prints undefined."""
+    from playwright.sync_api import Error
+
     value = tab.evaluate_handle(script)
-    if value.evaluate("v => v === undefined"):
+    try:
+        if value.evaluate("v => v === undefined"):
+            return "undefined"
+        value = value.json_value()
+    except Error:  # the page navigated after the script ran
         return "undefined"
-    return json.dumps(value.json_value(), ensure_ascii=False, default=str)
+    return json.dumps(jsonable(value), ensure_ascii=False, allow_nan=False)
+
+
+def jsonable(value, inside=()):
+    """VALUE, as Playwright gives it, in what JSON can hold: a reference back to an enclosing object
+    becomes "[Circular]", a number JSON lacks its JavaScript name, and anything else, such as a Date,
+    its text."""
+    if isinstance(value, (dict, list)):
+        if any(value is outer for outer in inside):
+            return "[Circular]"
+        inside = (*inside, value)
+        if isinstance(value, dict):
+            return {str(key): jsonable(item, inside) for key, item in value.items()}
+        return [jsonable(item, inside) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return "NaN" if math.isnan(value) else "Infinity" if value > 0 else "-Infinity"
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
 
 
 def save_pieces(path, png):

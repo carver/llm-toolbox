@@ -172,7 +172,8 @@ def cli(*args):
     not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
 )
 def test_eval_prints_its_value_as_json_where_it_runs(tmp_path):
-    """A doctype after a comment still counts, so this page loads as it is."""
+    """A doctype after a comment still counts, so this page loads as it is. A value JSON can't hold
+    still prints as JSON, and a script that navigates leaves no value."""
     page = tmp_path / "p.html"
     page.write_text(
         "<!-- a mockup -->\n<!DOCTYPE html><meta charset=utf-8><title>Tëst</title><p id=t>hello</p>",
@@ -191,6 +192,12 @@ def test_eval_prints_its_value_as_json_where_it_runs(tmp_path):
         "eval console.log('ignored')",
         "--do",
         "eval Promise.resolve(2)",
+        "--do",
+        "eval (() => { const a = {n: NaN, low: -Infinity}; a.self = a; return a })()",
+        "--do",
+        "eval location.reload()",
+        "--do",
+        "text #t",
         page,
     )
     assert run.returncode == 0, run.stderr
@@ -200,6 +207,9 @@ def test_eval_prints_its_value_as_json_where_it_runs(tmp_path):
         '[1, {"a": null}, "CSS1Compat"]',
         "undefined",
         "2",
+        '{"n": "NaN", "low": "-Infinity", "self": "[Circular]"}',
+        "undefined",
+        "hello",
         str(tmp_path / "out" / "final.png"),
     ]
     assert run.stderr == ""

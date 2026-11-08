@@ -5,6 +5,13 @@
     conflicts FILE N SIDE       resolve hunk N of FILE
     conflicts FILE all SIDE     resolve every hunk of FILE the same way
 
+Triples repeat, to resolve several files in one call:
+`conflicts a.py all ours b.md 1 theirs b.md 2 both`. Hunk numbers are the listing's,
+from before the call, so one file's hunks can each take a side in the same call. The
+call resolves every triple or none: an argument out of place is a usage error, and a
+hunk that isn't there or a file it can't read changes no file. N, all and the SIDE
+words are never file names; a file so named goes as ./all.
+
 SIDE is ours (the side after <<<<<<<), theirs (the side before >>>>>>>), both (ours,
 then theirs) or base (the ||||||| side, in a diff3 or zdiff3 hunk). Each side's marker
 label is printed with it: in a rebase, ours (HEAD) is the branch being rebased onto
@@ -13,15 +20,25 @@ and theirs is the commit being replayed.
 apply-edits can't resolve a hunk, since its own blocks use the ======= line. A
 separator line counts as a marker only inside a hunk, so a reStructuredText underline
 is content. A hunk that never closes, lacks its ======= line or opens inside another
-makes conflicts refuse the file and change nothing. Line endings are kept. It never
-stages a file: once a file has no hunk left it says so, and `git add FILE` is yours.
+makes conflicts refuse the file and change nothing. Line endings, and bytes that
+aren't UTF-8, are kept. It never stages a file: once a file has no hunk left it says
+so, and `git add FILE` is yours.
+
+Exit status: 0 listed or resolved; 1 a hunk that isn't there, a malformed or
+unreadable file (nothing changed); 2 a usage error (nothing changed).
 """
 
 import argparse
+import os
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+USAGE = """
+  conflicts [-h] FILE...
+  conflicts [-h] FILE N|all SIDE [FILE N|all SIDE ...]"""
 SIDES = ("ours", "theirs", "both", "base")
 MARK = 7  # git's default conflict-marker-size
 
@@ -38,7 +55,15 @@ class Hunk:
     theirs: list[str] = field(default_factory=list)
 
 
-class Malformed(Exception):
+class Refused(Exception):
+    """A file this call can't resolve as asked; nothing is written."""
+
+
+class Malformed(Refused):
+    """Markers that don't make a hunk."""
+
+
+class Usage(Exception):
     pass
 
 
@@ -106,8 +131,36 @@ def side_lines(hunk: Hunk, side: str) -> list[str]:
 
 
 def read_lines(path: Path) -> list[str]:
-    with open(path, newline="") as file:
+    """The file's lines with their endings; a byte that isn't UTF-8 survives a write."""
+    with open(path, newline="", encoding="utf-8", errors="surrogateescape") as file:
         return file.read().splitlines(keepends=True)
+
+
+def replace_all(texts: list[tuple[str, str]]) -> None:
+    """Write each (path, text) beside its file, then move each into place, so a write
+    that fails leaves every file as it was. An OSError names the path given."""
+    written = []
+    try:
+        for path, text in texts:
+            real = Path(os.path.realpath(path))
+            try:
+                handle, temp = tempfile.mkstemp(
+                    dir=real.parent, prefix=f".{real.name}."
+                )
+                written.append((temp, real))
+                with open(
+                    handle, "w", newline="", encoding="utf-8", errors="surrogateescape"
+                ) as file:
+                    file.write(text)
+                shutil.copymode(real, temp)
+            except OSError as error:
+                raise OSError(error.errno, error.strerror, path) from error
+    except BaseException:
+        for temp, _ in written:
+            os.unlink(temp)
+        raise
+    for temp, real in written:
+        os.replace(temp, real)
 
 
 def show(path: str, parts: list[Hunk | str]) -> None:
@@ -127,32 +180,99 @@ def show(path: str, parts: list[Hunk | str]) -> None:
                 print(f"    | {line.rstrip(chr(13) + chr(10))}")
 
 
-def resolve(path: Path, which: str, side: str) -> int:
-    parts = parse(read_lines(path))
+def is_keyword(word: str) -> bool:
+    """A word that picks a hunk or a side, so never a FILE (`./all` is one)."""
+    return word == "all" or is_number(word) or word in SIDES
+
+
+def is_number(word: str) -> bool:
+    return word.isascii() and word.isdigit()
+
+
+def choices(args: list[str]) -> list[tuple[str, list[tuple[str, str]]]] | None:
+    """Each FILE with its (N|all, SIDE) picks, in the order given, or None when every
+    argument is a file to list. A file named twice, by any path, is one entry."""
+    if not any(map(is_keyword, args)):
+        return None
+    files: dict[str, tuple[str, list[tuple[str, str]]]] = {}
+    for at in range(0, len(args), 3):
+        path, *rest = args[at : at + 3]
+        if is_keyword(path):
+            raise Usage(
+                f"expected a FILE, not {path!r} (a file so named goes as ./{path})"
+            )
+        if not rest:
+            raise Usage(f"expected N|all SIDE after {path}")
+        which = rest[0]
+        if which != "all" and not is_number(which):
+            raise Usage(f"expected N or all after {path}, not {which!r}")
+        side = rest[1] if len(rest) > 1 else None
+        if side not in SIDES:
+            raise Usage(
+                f"expected a SIDE ({', '.join(SIDES)}) after {path} {which}"
+                + (f", not {side!r}" if side else "")
+            )
+        _, picks = files.setdefault(os.path.realpath(path), (path, []))
+        if picks and "all" in (which, *(earlier for earlier, _ in picks)):
+            raise Usage(f"{path}: all picks every hunk, so it takes no other pick")
+        if which != "all" and int(which) in {int(earlier) for earlier, _ in picks}:
+            raise Usage(f"{path}: hunk {int(which)} is picked twice")
+        picks.append((which, side))
+    return list(files.values())
+
+
+def resolved(path: str, picks: list[tuple[str, str]]) -> tuple[str, str]:
+    """The text of `path` with `picks` applied to its hunks as listed, and the line that
+    says so."""
+    parts = parse(read_lines(Path(path)))
     found = hunks(parts)
-    if which == "all":
-        chosen = set(map(id, found))
+    if picks[0][0] == "all":
+        sides = dict.fromkeys(range(len(found)), picks[0][1])
     else:
-        number = int(which)
-        if not 1 <= number <= len(found):
-            print(f"{path}: no hunk {number}; it has {len(found)}", file=sys.stderr)
-            return 1
-        chosen = {id(found[number - 1])}
-    out = []
+        sides = {}
+        for which, side in picks:
+            number = int(which)
+            if not 1 <= number <= len(found):
+                raise Refused(f"no hunk {number}, as it has {len(found)}")
+            sides[number - 1] = side
+    out, index = [], 0
     for part in parts:
         if isinstance(part, str):
             out.append(part)
-        elif id(part) in chosen:
-            out.extend(side_lines(part, side))
-        else:
-            out.extend(render(part))
-    with open(path, "w", newline="") as file:
-        file.write("".join(out))
-    left = len(found) - len(chosen)
-    if left:
-        print(f"{path}: resolved ({side}); {left} hunk{'s' if left > 1 else ''} left")
-    else:
-        print(f"{path}: resolved ({side}); no conflicts left, so `git add {path}`")
+            continue
+        out.extend(side_lines(part, sides[index]) if index in sides else render(part))
+        index += 1
+    said = picks[0][1] if len(picks) == 1 else ", ".join(map(" ".join, picks))
+    left = len(found) - len(sides)
+    after = f"{plural(left, 'hunk')} left" if left else "no conflicts left"
+    if not left:
+        after += f", so `git add {path}`"
+    return "".join(out), f"{path}: resolved ({said}); {after}"
+
+
+def plural(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def resolve(files: list[tuple[str, list[tuple[str, str]]]]) -> int:
+    """Apply every file's picks, or none: any failure writes nothing."""
+    done = []
+    for path, picks in files:
+        try:
+            done.append((path, *resolved(path, picks)))
+        except Refused as error:
+            print(f"{path}: {error}; changed nothing", file=sys.stderr)
+            return 1
+        except OSError as error:
+            print(f"{path}: {error.strerror}; changed nothing", file=sys.stderr)
+            return 1
+    try:
+        replace_all([(path, text) for path, text, _ in done])
+    except OSError as error:
+        print(f"{error.filename}: {error.strerror}; changed nothing", file=sys.stderr)
+        return 1
+    for _, _, said in done:
+        print(said)
     return 0
 
 
@@ -174,29 +294,38 @@ def render(hunk: Hunk) -> list[str]:
     return lines
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("args", nargs="+", metavar="FILE [N|all SIDE]")
-    args = parser.parse_args(argv).args
-    if len(args) == 3 and (args[1] == "all" or args[1].isdigit()):
-        path, which, side = args
-        if side not in SIDES:
-            parser.error(f"SIDE is one of {', '.join(SIDES)}, not {side!r}")
-        try:
-            return resolve(Path(path), which, side)
-        except Malformed as error:
-            print(f"{path}: {error}; changed nothing", file=sys.stderr)
-            return 1
+def list_files(paths: list[str]) -> int:
     code = 0
-    for path in args:
+    for path in paths:
         try:
             show(path, parse(read_lines(Path(path))))
-        except Malformed as error:
+        except Refused as error:
             print(f"{path}: {error}", file=sys.stderr)
             code = 1
+        except OSError as error:
+            print(f"{path}: {error.strerror}", file=sys.stderr)
+            code = 1
     return code
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        usage=USAGE,
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("args", nargs="*", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv).args
+    sys.stdout.reconfigure(errors="replace")  # a listed line that isn't UTF-8
+    if not args:
+        parser.error("name a FILE")
+    try:
+        files = choices(args)
+    except Usage as error:
+        parser.error(str(error))
+    if files is None:
+        return list_files(args)
+    return resolve(files)
 
 
 if __name__ == "__main__":

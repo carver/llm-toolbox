@@ -154,11 +154,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   that a test which passed on its first run guards what it's meant to.
 - **conflicts**: `conflicts FILE` lists a file's conflict hunks, numbered, with
   each side and its marker label; `conflicts FILE N SIDE` (or `all SIDE`)
-  resolves them as `ours`, `theirs`, `both` or `base`. apply-edits can't hold
-  the `=======` line, so without it agents deleted marker lines by number. It
-  refuses a hunk that never closes, lacks its separator or nests, treats a
-  separator outside a hunk as content (a reStructuredText underline), and
-  never stages the file.
+  resolves them as `ours`, `theirs`, `both` or `base`, and the triples repeat,
+  for several files or several hunks of one, numbered as listed. apply-edits
+  can't hold the `=======` line, so without it agents deleted marker lines by
+  number. A call resolves every triple or none: arguments out of place are a
+  usage error, so a word such as `all` is never opened as a file. It refuses a
+  hunk that never closes, lacks its separator or nests, treats a separator
+  outside a hunk as content (a reStructuredText underline), and never stages
+  the file.
 - **wt-ship**: ships a worktree's commits. In a repo that pushes, it rebases
   onto the remote branch (the main tree's, by default), refuses leftover
   conflict markers, runs the repo's `agent-pre-commit` through

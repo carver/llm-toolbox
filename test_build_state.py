@@ -315,6 +315,88 @@ def test_a_fixup_that_conflicts_leaves_the_branch_as_it_was(repo):
     assert git(repo, "status", "--porcelain") == ""
 
 
+def test_a_conflicting_fold_names_the_later_commit_that_changed_the_fixs_files(repo):
+    build_state(repo, "start")
+    first = commit(repo, "a.py", "First")
+    second = commit(repo, "a.py", "Second")
+    commit(repo, "b.py", "Elsewhere")
+    fix = commit(repo, "a.py", "fix first", f"--fixup={first}")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    assert f"{fix[:12]} fixup! First conflicts in a.py" in done.stderr
+    assert f"{second[:12]} Second" in done.stderr
+    assert f"echo 'fixup! {second[:12]}' | build-state reword {fix[:12]}" in done.stderr
+    assert "Elsewhere" not in done.stderr  # it changes no file in the conflict
+    assert "hint:" not in done.stderr  # git's, which say to continue an aborted rebase
+
+
+def commit_files(repo, message, *paths, flags=()):
+    """A commit that adds a line to each of `paths`."""
+    for path in paths:
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        with open(repo / path, "a") as file:
+            file.write(f"{message}\n")
+    git(repo, "add", *paths)
+    git(repo, "commit", "-q", "-m", message, *flags)
+    return git(repo, "rev-parse", "HEAD").strip()
+
+
+def test_the_command_a_conflicting_fold_prints_lets_it_fold_from_a_subfolder(repo):
+    # diff.relative would print the conflicting files relative to sub/.
+    git(repo, "config", "diff.relative", "true")
+    base = git(repo, "rev-parse", "HEAD").strip()
+    build_state(repo, "start")
+    first = commit_files(repo, "First", "a.py", "sub/b.py")
+    commit_files(repo, "Second", "a.py")
+    third = commit_files(repo, "Third", "sub/b.py")
+    fix = commit_files(repo, "fix", "a.py", "sub/b.py", flags=[f"--fixup={first}"])
+    commit_files(repo, "Later", "a.py")
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    sub = repo / "sub"
+    path = {"PATH": f"{SCRIPT.parent}:{os.environ['PATH']}"}
+
+    def run(command):
+        return subprocess.run(
+            command,
+            shell=True,
+            cwd=sub,
+            env=os.environ | path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    failed = run("build-state finish")
+    commands = [
+        line.strip() for line in failed.stderr.splitlines() if "| build-state" in line
+    ]
+
+    # Third is the last commit before the fix to change its files, so the fix
+    # applies on top of it.
+    assert commands == [f"echo 'fixup! {third[:12]}' | build-state reword {fix[:12]}"]
+    reworded = run(commands[0])
+    done = run("build-state finish")
+    assert reworded.returncode == 0, reworded.stderr
+    assert done.returncode == 0, done.stderr
+    assert subjects(repo, base) == ["First", "Second", "Third", "Later"]
+    assert git(repo, "rev-parse", "HEAD^{tree}") == tree
+
+
+def test_a_conflicting_squash_is_told_to_keep_its_message(repo):
+    build_state(repo, "start")
+    first = commit(repo, "a.py", "First")
+    second = commit(repo, "a.py", "Second")
+    commit(repo, "a.py", "more words", f"--squash={first}")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    assert f"`squash! {second[:12]}`" in done.stderr
+    assert "echo" not in done.stderr  # it would replace the squash's own words
+
+
 def test_show_prints_the_recorded_bases(repo):
     build_state(repo, "start")
     base = git(repo, "rev-parse", "HEAD").strip()

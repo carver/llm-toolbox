@@ -291,7 +291,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   stash and other worktrees' branches, and the config with its values hashed),
   `refactor` the refactor base. `finish` refuses leftover conflict markers,
   folds `fixup!` commits into the commits they fix, leaving every other commit
-  separate and the tree as it was, and runs the repo's `agent-pre-commit` on
+  separate and the tree as it was (a fix that conflicts gets the later commit
+  it was made on top of and the `reword` command that points it there), and
+  runs the repo's `agent-pre-commit` on
   each commit the fold rewrote, checked out in turn, so a fix folded into a
   commit before the code it needs fails naming that commit; HEAD ends back on
   its branch either way. Then it lists the commits since the

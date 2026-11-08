@@ -32,7 +32,10 @@ into the commit it names, with an autosquash rebase onto the base. Every other c
 stays as it is, in order, so logically separate commits stay separate. It refuses
 uncommitted changes and leftover conflict markers since the base. On a conflict it aborts
 the rebase, and when the folded tree differs from the tree before, it resets to that;
-either way the branch is as it was.
+either way the branch is as it was. A fix conflicts when a commit after the one it
+names changed the same lines, so finish then names the last commit before the fix to
+change its conflicting files, which the fix was made on top of, and how to point the
+fix at it with reword.
 
 Small fix commits get only the repo's agent-quick-check when they're made, if that, and
 a fold puts each fix into an earlier commit, so after a fold finish
@@ -79,6 +82,8 @@ from pathlib import Path
 TEST_FILE = re.compile(
     r"(^|/)(tests?|spec)/|(^|/)test_[^/]*$|_test\.[^/]+$|\.(test|spec)\.[^/]+$"
 )
+# The subjects of commits that finish folds into the commits they name.
+FIXES = ("fixup! ", "squash! ", "amend! ")
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -326,12 +331,71 @@ def fold_fixups(base: str) -> bool:
     )
     if rebase.returncode == 0:
         return True
+    hint = conflict_hint(base)
     git("rebase", "--abort", check=False)
     fail(
-        rebase.stdout + rebase.stderr,
+        # git's hints say to resolve the conflict and continue, but the rebase is over.
+        *(
+            line
+            for line in (rebase.stdout + rebase.stderr).splitlines()
+            if not line.startswith("hint: ")
+        ),
         "Folding the fixups failed; the branch is as it was.",
+        *hint,
     )
     return False
+
+
+def conflict_hint(base: str) -> list[str]:
+    """For a fold stopped at a fix that conflicts: the later commit it was made on top
+    of, and how to point the fix at that commit. Empty when it stopped elsewhere or the
+    commit the fix names is the last before it to change those files."""
+    stopped = git("rev-parse", "--verify", "--quiet", "REBASE_HEAD", check=False)
+    unmerged = git("diff", "--no-relative", "--name-only", "-z", "--diff-filter=U")
+    files = [name for name in unmerged.stdout.split("\0") if name]
+    if stopped.returncode != 0 or not files:
+        return []
+    fix = stopped.stdout.strip()
+    subject = git("log", "-1", "--format=%s", fix).stdout.strip()
+    kind = next((kind for kind in FIXES if subject.startswith(kind)), None)
+    if kind is None:
+        return []
+    named = subject
+    while named.startswith(FIXES):
+        named = named.partition(" ")[2]
+    log = git(
+        *("log", "--format=%H %s", f"{base}..{fix}~1", "--"),
+        *(f":(top,literal){file}" for file in files),
+    ).stdout
+    # The newest commit before the fix to change its files, other fixes aside: the fix
+    # was made on top of it, so it applies there.
+    later = next(
+        (
+            line
+            for line in log.splitlines()
+            if not line.partition(" ")[2].startswith(FIXES)
+        ),
+        "",
+    )
+    sha, _, later_subject = later.partition(" ")
+    if not sha or later_subject == named or sha.startswith(named):
+        return []
+    point = (
+        f"  echo 'fixup! {sha[:12]}' | build-state reword {fix[:12]}"
+        if kind == "fixup! "
+        else f"  `build-state reword {fix[:12]}` with the subject `{kind}{sha[:12]}`,"
+        " and the rest of its message as it is"
+    )
+    return [
+        (
+            f"{fix[:12]} {subject} conflicts in {', '.join(files)}, which {sha[:12]}"
+            f" {later_subject}"
+        ),
+        "changed after the commit the fix names. Point the fix at that commit and run",
+        "finish again:",
+        point,
+        f"Or keep it as a commit of its own: reword it without `{kind.strip()}`.",
+    ]
 
 
 @contextlib.contextmanager
@@ -453,13 +517,12 @@ def finish(args: argparse.Namespace) -> int:
             *(f"  {marker}" for marker in markers),
         )
     before = head()
-    fixes = ("fixup! ", "squash! ", "amend! ")
     before_fold = set(git("rev-list", f"{base}..HEAD").stdout.split())
     # The trees the check passed when their commits were made; small fix commits skip it.
     passed = {
         tree_of(sha)
         for sha in before_fold
-        if not git("log", "-1", "--format=%s", sha).stdout.startswith(fixes)
+        if not git("log", "-1", "--format=%s", sha).stdout.startswith(FIXES)
     }
     if not fold_fixups(base):
         return 1
@@ -474,7 +537,7 @@ def finish(args: argparse.Namespace) -> int:
         )
     print(git("log", "--oneline", "--reverse", f"{base}..HEAD").stdout, end="")
     subjects = git("log", "--format=%s", f"{base}..HEAD").stdout.splitlines()
-    if unfolded := [subject for subject in subjects if subject.startswith(fixes)]:
+    if unfolded := [subject for subject in subjects if subject.startswith(FIXES)]:
         return fail(
             "These fix commits before the base, so they weren't folded:",
             *(f"  {subject}" for subject in unfolded),

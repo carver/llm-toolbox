@@ -5,7 +5,9 @@ Every test is kept away from the repository pytest was started in: `git rebase
 test's throwaway repo, or the production code under test, would inherit them and
 write to the real repository instead. `shell_and_child` starts a wrapper shell and
 its job, for the process tools' tests, and `started_child` finds a process's child
-by an argument it was started with.
+by an argument it was started with. `wait_or_warn` polls a condition and, on a busy
+machine only, warns instead of failing when it times out; it is meant for tests of
+heavy's queue alone.
 
 The commit hook runs the suite in a copy of the index outside any git checkout, so a test
 that needs a repository makes its own rather than reading this one's."""
@@ -16,6 +18,7 @@ import signal
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import pytest
@@ -106,6 +109,29 @@ def private_heavy_queue(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("HEAVY_POLL", "0.01")
     for name in ("HEAVY_SLOT", "HEAVY_CORES_USED", "RUSTC_WRAPPER"):
         monkeypatch.delenv(name, raising=False)
+
+
+def wait_or_warn(condition, what, seconds=20):
+    """Poll `condition` until it holds, and return True. When `seconds` pass first,
+    fail saying `what` didn't happen; but on a busy machine, its load average above its
+    core count, which can stall a subprocess past any deadline, warn instead and
+    return False, for the test to end there. It is meant only for tests of heavy's
+    queue, since waiting on the machine is what heavy does; any other test's timeout
+    should fail."""
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() >= deadline:
+            message = f"{what} within {seconds} s"
+            load, cores = os.getloadavg()[0], os.cpu_count()
+            if load <= cores:
+                pytest.fail(message)
+            warnings.warn(
+                f"{message}, on a busy machine (load {load:.1f}, {cores} cores), so"
+                " the test ends without judging the rest"
+            )
+            return False
+        time.sleep(0.05)
+    return True
 
 
 def started_child(parent: int, arg: str) -> int:

@@ -10,12 +10,11 @@ import signal
 import socket
 import subprocess
 import time
-import warnings
 from pathlib import Path
 
 import pytest
 
-from conftest import path_without, without_repo_vars
+from conftest import path_without, wait_or_warn, without_repo_vars
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "agent-commit-gate"
 loader = importlib.machinery.SourceFileLoader("agent_commit_gate", str(SCRIPT))
@@ -869,27 +868,6 @@ def committing(tmp_path_factory):
         if proc.poll() is None:
             os.killpg(proc.pid, signal.SIGKILL)
         proc.wait(timeout=10)
-
-
-def wait_or_warn(condition, what, seconds=20):
-    """Poll `condition` until it holds, and return True. When `seconds` pass first,
-    fail saying `what` didn't happen; but on a busy machine, its load average above its
-    core count, which can stall a subprocess past any deadline, warn instead and
-    return False, for the test to end there."""
-    deadline = time.monotonic() + seconds
-    while not condition():
-        if time.monotonic() >= deadline:
-            message = f"{what} within {seconds} s"
-            load, cores = os.getloadavg()[0], os.cpu_count()
-            if load <= cores:
-                pytest.fail(message)
-            warnings.warn(
-                f"{message}, on a busy machine (load {load:.1f}, {cores} cores), so"
-                " the test ends without judging the rest"
-            )
-            return False
-        time.sleep(0.05)
-    return True
 
 
 def in_queue(lane):

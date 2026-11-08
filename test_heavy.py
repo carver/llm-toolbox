@@ -13,7 +13,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1357,6 +1357,21 @@ def test_history_keeps_what_another_heavy_wrote_into_it(box):
     assert [cores for cores, _ in entry["runs"]] == [1, 2], data
 
 
+def joined(entry):
+    """When the waiter whose queue entry this is joined the queue."""
+    return datetime.fromisoformat(fifo.Holder.parse(entry.read_text()).since)
+
+
+def a_second_after(moment):
+    """A condition: the clock has passed moment by a whole second, so what starts
+    now carries a later time than moment does, at the seconds slots keep."""
+    return lambda: datetime.now().astimezone() >= moment + timedelta(seconds=1)
+
+
+def started_at(slot):
+    return datetime.fromisoformat(fifo.Holder.parse(slot.read_text()).since)
+
+
 def test_a_slot_says_when_its_job_started_not_when_it_joined(box, background):
     tmp_path, _, _ = box
     first, second = blocker(tmp_path, "a"), blocker(tmp_path, "b")
@@ -1364,16 +1379,36 @@ def test_a_slot_says_when_its_job_started_not_when_it_joined(box, background):
     wait_until(first[1].exists, "a to start")
     b = background("--", *second[0])
     wait_until(lambda: entries(tmp_path), "b to queue")
-    time.sleep(1.1)  # so b joins and starts in different seconds
-    freed = datetime.now().astimezone().replace(microsecond=0)
+    b_joined = joined(entries(tmp_path)[0])
+    wait_until(a_second_after(b_joined), "a second to pass")
     first[2].touch()
     wait_until(second[1].exists, "b to start")
-    slot = (lane(tmp_path) / "slot").read_text()
+    b_started = started_at(lane(tmp_path) / "slot")
     second[2].touch()
     for proc in (a, b):
         finish(proc)
 
-    assert datetime.fromisoformat(fifo.Holder.parse(slot).since) >= freed, slot
+    assert b_started > b_joined, (b_joined, b_started)
+
+
+def test_a_sharers_slot_says_when_it_started_sharing(box, background, sharing):
+    tmp_path, _, _ = box
+    holder, sharer = job_report(tmp_path, "holder"), job_report(tmp_path, "sharer")
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    # The holder must idle for 1.5 s first, so the sharer starts a second after it
+    # joined, at least.
+    s = background("--", *sharer[0], HEAVY_SHARE_SECONDS="1.5")
+    wait_until(lambda: entries(tmp_path), "the sharer to queue")
+    s_joined = joined(entries(tmp_path)[0])
+    wait_until(sharer[1].exists, "the waiter to share")
+    s_started = started_at(lane(tmp_path) / "share")
+    holder[2].touch()
+    sharer[2].touch()
+    for proc in (h, s):
+        finish(proc)
+
+    assert s_started > s_joined, (s_joined, s_started)
 
 
 def failing(vmstat, ending, oom=True):

@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
-# dependencies = ["playwright"]
+# dependencies = ["playwright==1.64.1"]
 # ///
 """Open a web page in headless Chromium, drive it, take screenshots and report its JavaScript errors.
 
@@ -51,7 +51,7 @@ ARITY = {
     "links": (0, 1),
     "scroll-all": (0, 0),
 }  # (min, max) arguments
-INSTALL = "uv run --with playwright playwright install chromium"
+INSTALL = "uv run --with playwright==1.64.1 playwright install chromium"
 # After a scroll, no request in flight this long means the page has loaded what it asked for; a page
 # that never stops polling is measured after the cap anyway.
 SCROLL_QUIET_MS = 300

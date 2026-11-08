@@ -80,10 +80,10 @@ class Hunk:
 
 
 @dataclass(frozen=True)
-class Known:
-    """What git says of a file: the marker length its conflicts are written with, and
-    the hunks its merge inputs already held (each as its lines without endings),
-    which are content, such as a test fixture's."""
+class Markers:
+    """How to read a file's markers, from what git says of it: the length its
+    conflicts are written with, and the hunks its merge inputs already held (each as
+    its lines without endings), which are content, such as a test fixture's."""
 
     size: int = MARK
     content: frozenset[tuple[str, ...]] = frozenset()
@@ -115,13 +115,14 @@ def unmarked(lines: list[str]) -> tuple[str, ...]:
     return tuple(line.rstrip("\r\n") for line in lines)
 
 
-PLAIN = Known()  # a file git says nothing of: 7-character markers, no fixtures
+# A file git says nothing of: 7-character markers, and no fixtures.
+DEFAULT_MARKERS = Markers()
 
 
-def parse(lines: list[str], known: Known = PLAIN) -> list[Hunk | str]:
-    """The file as plain lines and hunks, in order. A hunk `known` holds as content
+def parse(lines: list[str], markers: Markers = DEFAULT_MARKERS) -> list[Hunk | str]:
+    """The file as plain lines and hunks, in order. A hunk `markers` holds as content
     stays plain lines."""
-    size = known.size
+    size = markers.size
     parts: list[Hunk | str] = []
     hunk, section = None, None
     for number, line in enumerate(lines, start=1):
@@ -152,7 +153,7 @@ def parse(lines: list[str], known: Known = PLAIN) -> list[Hunk | str]:
                 )
             hunk.end, hunk.theirs_label = number, closing
             raw = lines[hunk.start - 1 : number]
-            if unmarked(raw) in known.content:
+            if unmarked(raw) in markers.content:
                 parts.extend(raw)
             else:
                 parts.append(hunk)
@@ -169,14 +170,16 @@ def parse(lines: list[str], known: Known = PLAIN) -> list[Hunk | str]:
 
 
 REGULAR = ("100644", "100755")  # index modes of a file git merges as text
+Stages = dict[int, tuple[str, str]]  # a path's index entries: stage -> (mode, blob)
+Pick = tuple[int | None, str]  # a hunk's number (None for all) and the SIDE it takes
 
 
 @dataclass
 class Facts:
-    """One path as the index has it: its entries by stage, as (mode, blob)."""
+    """One path as the index has it."""
 
-    stages: dict[int, tuple[str, str]]
-    known: Known
+    stages: Stages
+    markers: Markers
     merge: str  # its merge attribute
     binary: bool  # a NUL byte early in some stage's blob, as git judges it
 
@@ -206,14 +209,14 @@ def toplevel() -> Path | None:
 
 def index_stages(
     top: Path, flag: str, paths: list[str] | None = None, env=None
-) -> dict:
+) -> dict[str, Stages]:
     """Each path's entries by stage, as `git ls-files FLAG` lists them: -u the
     unmerged ones, --resolve-undo those of paths staged by hand during this stop,
     --stage every one."""
     if paths == []:
         return {}
     args = ["--literal-pathspecs", "ls-files", "-z", flag, "--", *(paths or [])]
-    found: dict[str, dict[int, tuple[str, str]]] = {}
+    found: dict[str, Stages] = {}
     for record in run_git(args, top, env=env).split(b"\0"):
         if record:
             info, _, path = record.partition(b"\t")
@@ -246,20 +249,20 @@ def marker_size(value: str | None) -> int:
     return MARK
 
 
-def held(data: list[bytes], size: int) -> frozenset[tuple[str, ...]]:
+def hunks_held(data: list[bytes], size: int) -> frozenset[tuple[str, ...]]:
     """The hunks these blobs hold, each as its lines without endings."""
     found = set()
     for blob in data:
         lines = text_lines(blob)
         try:
-            parts = parse(lines, Known(size))
+            parts = parse(lines, Markers(size))
         except Malformed:
             continue
         found.update(unmarked(lines[h.start - 1 : h.end]) for h in hunks(parts))
     return frozenset(found)
 
 
-def gather(top: Path, entries: dict[str, dict[int, tuple[str, str]]]) -> dict:
+def gather(top: Path, entries: dict[str, Stages]) -> dict[str, Facts]:
     """Facts for each path (relative to `top`) of `entries`, which are its index
     stages, empty for a path not in conflict."""
     if not entries:
@@ -282,15 +285,15 @@ def gather(top: Path, entries: dict[str, dict[int, tuple[str, str]]]) -> dict:
         inputs = [data[sha] for _, sha in stages.values() if sha in data]
         facts[path] = Facts(
             stages,
-            Known(size, held(inputs, size)),
+            Markers(size, hunks_held(inputs, size)),
             attrs.get(path, {}).get("merge", "unspecified"),
             any(b"\0" in blob[:8000] for blob in inputs),
         )
     return facts
 
 
-def known_files(paths: list[str]) -> dict[str, Known]:
-    """Known for each path as given that lies in this repository."""
+def markers_of(paths: list[str]) -> dict[str, Markers]:
+    """Markers for each path as given that lies in this repository."""
     top = toplevel()
     if top is None:
         return {}
@@ -302,11 +305,11 @@ def known_files(paths: list[str]) -> dict[str, Known]:
     if not inside:
         return {}
     named = sorted(set(inside.values()))
-    entries: dict[str, dict[int, tuple[str, str]]] = {path: {} for path in named}
+    entries: dict[str, Stages] = {path: {} for path in named}
     entries.update(index_stages(top, "--resolve-undo", named))
     entries.update(index_stages(top, "-u", named))
     facts = gather(top, entries)
-    return {path: facts[relative].known for path, relative in inside.items()}
+    return {path: facts[relative].markers for path, relative in inside.items()}
 
 
 def hunks(parts: list[Hunk | str]) -> list[Hunk]:
@@ -336,10 +339,10 @@ def text_lines(blob: bytes) -> list[str]:
     return blob.decode("utf-8", "surrogateescape").splitlines(keepends=True)
 
 
-def load(path: Path, known: Known) -> list[Hunk | str]:
+def load(path: Path, markers: Markers) -> list[Hunk | str]:
     """The file's parts; Refused when it's malformed or can't be read."""
     try:
-        return parse(read_lines(path), known)
+        return parse(read_lines(path), markers)
     except OSError as error:
         raise Refused(error.strerror) from error
 
@@ -397,12 +400,12 @@ def is_number(word: str) -> bool:
     return word.isascii() and word.isdigit()
 
 
-def choices(args: list[str]) -> list[tuple[str, list[tuple[str, str]]]] | None:
-    """Each FILE with its (N|all, SIDE) picks, in the order given, or None when every
-    argument is a file to list. A file named twice, by any path, is one entry."""
+def choices(args: list[str]) -> list[tuple[str, list[Pick]]] | None:
+    """Each FILE with its picks, in the order given, or None when every argument is a
+    file to list. A file named twice, by any path, is one entry."""
     if not any(map(is_keyword, args)):
         return None
-    files: dict[str, tuple[str, list[tuple[str, str]]]] = {}
+    files: dict[str, tuple[str, list[Pick]]] = {}
     for at in range(0, len(args), 3):
         path, *rest = args[at : at + 3]
         if is_keyword(path):
@@ -420,26 +423,26 @@ def choices(args: list[str]) -> list[tuple[str, list[tuple[str, str]]]] | None:
                 f"expected a SIDE ({', '.join(SIDES)}) after {path} {which}"
                 + (f", not {side!r}" if side else "")
             )
+        number = None if which == "all" else int(which)
         _, picks = files.setdefault(os.path.realpath(path), (path, []))
-        if picks and "all" in (which, *(earlier for earlier, _ in picks)):
+        if picks and None in (number, *(earlier for earlier, _ in picks)):
             raise Usage(f"{path}: all picks every hunk, so it takes no other pick")
-        if which != "all" and int(which) in {int(earlier) for earlier, _ in picks}:
-            raise Usage(f"{path}: hunk {int(which)} is picked twice")
-        picks.append((which, side))
+        if number in {earlier for earlier, _ in picks}:
+            raise Usage(f"{path}: hunk {number} is picked twice")
+        picks.append((number, side))
     return list(files.values())
 
 
-def resolved(path: str, picks: list[tuple[str, str]], known: Known) -> tuple[str, str]:
+def with_picks(path: str, picks: list[Pick], markers: Markers) -> tuple[str, str]:
     """The text of `path` with `picks` applied to its hunks as listed, and the line that
     says so."""
-    parts = parse(read_lines(Path(path)), known)
+    parts = load(Path(path), markers)
     found = hunks(parts)
-    if picks[0][0] == "all":
+    if picks[0][0] is None:
         sides = dict.fromkeys(range(len(found)), picks[0][1])
     else:
         sides = {}
-        for which, side in picks:
-            number = int(which)
+        for number, side in picks:
             if not 1 <= number <= len(found):
                 raise Refused(f"no hunk {number}, as it has {len(found)}")
             sides[number - 1] = side
@@ -450,7 +453,11 @@ def resolved(path: str, picks: list[tuple[str, str]], known: Known) -> tuple[str
             continue
         out.extend(side_lines(part, sides[index]) if index in sides else render(part))
         index += 1
-    said = picks[0][1] if len(picks) == 1 else ", ".join(map(" ".join, picks))
+    said = (
+        picks[0][1]
+        if len(picks) == 1
+        else ", ".join(f"{number} {side}" for number, side in picks)
+    )
     left = len(found) - len(sides)
     after = f"{plural(left, 'hunk')} left" if left else "no conflicts left"
     if not left:
@@ -462,17 +469,15 @@ def plural(count: int, noun: str) -> str:
     return f"{count} {noun}{'' if count == 1 else 's'}"
 
 
-def resolve(files: list[tuple[str, list[tuple[str, str]]]]) -> int:
+def resolve(files: list[tuple[str, list[Pick]]]) -> int:
     """Apply every file's picks, or none: any failure writes nothing."""
-    done, known = [], known_files([path for path, _ in files])
+    done, found = [], markers_of([path for path, _ in files])
     for path, picks in files:
         try:
-            done.append((path, *resolved(path, picks, known.get(path, PLAIN))))
+            markers = found.get(path, DEFAULT_MARKERS)
+            done.append((path, *with_picks(path, picks, markers)))
         except Refused as error:
             print(f"{path}: {error}; changed nothing", file=sys.stderr)
-            return 1
-        except OSError as error:
-            print(f"{path}: {error.strerror}; changed nothing", file=sys.stderr)
             return 1
     try:
         replace_all([(path, text) for path, text, _ in done])
@@ -504,15 +509,12 @@ def render(hunk: Hunk) -> list[str]:
 
 
 def list_files(paths: list[str]) -> int:
-    code, known = 0, known_files(paths)
+    code, found = 0, markers_of(paths)
     for path in paths:
         try:
-            show(path, parse(read_lines(Path(path)), known.get(path, PLAIN)))
+            show(path, load(Path(path), found.get(path, DEFAULT_MARKERS)))
         except Refused as error:
             print(f"{path}: {error}", file=sys.stderr)
-            code = 1
-        except OSError as error:
-            print(f"{path}: {error.strerror}", file=sys.stderr)
             code = 1
     return code
 
@@ -562,7 +564,7 @@ def operation(top: Path) -> str | None:
     return None
 
 
-def shown(top: Path, path: str) -> str:
+def path_here(top: Path, path: str) -> str:
     """`path` (relative to `top`) as `conflicts` takes it from here."""
     relative = os.path.relpath(top / path)
     return f"./{relative}" if is_keyword(relative) or relative[0] == "-" else relative
@@ -586,7 +588,7 @@ def unmarked_why(facts: Facts, file: Path) -> str | None:
 
 def unmarked_note(top: Path, path: str, facts: Facts) -> str | None:
     """For an unmerged file git wrote no markers into, the line that says so."""
-    name, why = shown(top, path), unmarked_why(facts, top / path)
+    name, why = path_here(top, path), unmarked_why(facts, top / path)
     if why is None:
         return None
     return (
@@ -647,9 +649,9 @@ def proceed() -> int:
         return status
     left = []
     for path in sorted(facts):
-        name, where = shown(top, path), "" if path in unmerged else ", as staged"
+        name, where = path_here(top, path), "" if path in unmerged else ", as staged"
         try:
-            count = len(hunks(parse(staged.get(path, []), facts[path].known)))
+            count = len(hunks(parse(staged.get(path, []), facts[path].markers)))
         except Malformed as error:
             left.append(f"{name}: {error}{where}")
             continue
@@ -691,9 +693,9 @@ def proceed() -> int:
                 print(note)
                 continue
             try:
-                show(shown(top, path), load(top / path, facts[path].known))
+                show(path_here(top, path), load(top / path, facts[path].markers))
             except Refused as error:
-                print(f"{shown(top, path)}: {error}")
+                print(f"{path_here(top, path)}: {error}")
         sys.stdout.flush()
         print(
             f"conflicts: the {command} stopped at the next conflict; resolve it,"

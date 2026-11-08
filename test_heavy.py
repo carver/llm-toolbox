@@ -803,8 +803,11 @@ def test_a_light_waiter_shares_ahead_of_a_heavy_one(box, background, sharing):
     wait_until(holder[1].exists, "the holder to start")
     b = background("--share", "--", *big[0], **history_only)
     wait_until(lambda: len(entries(tmp_path)) == 1, "the heavy waiter to queue")
+    joined = time.monotonic()
     li = background("--share", "--", *light[0], **history_only)
     wait_until(light[1].exists, "the light waiter to share")
+    # At once: it doesn't step aside for a waiter ahead that doesn't fit.
+    assert time.monotonic() - joined < 4
     assert not big[1].exists()
     holder[2].touch()
     wait_until(big[1].exists, "the heavy waiter to take the holder's place")
@@ -1539,3 +1542,107 @@ def test_share_and_alone_dont_go_together(box):
 
     assert done.returncode == 2
     assert "not allowed with" in done.stderr, done.stderr
+
+
+def learned_same_job(tmp_path, env):
+    """same_job's command, with a history of 1 core."""
+    command = same_job(tmp_path)
+    (tmp_path / "learn.release").touch()
+    learned = heavy(env, "--", *command, JOB="learn", HEAVY_CORES_USED="1")
+    assert learned.returncode == 0, learned.stderr
+    return command
+
+
+def test_a_waiter_that_never_shares_holds_up_no_sharer(box, background, sharing):
+    tmp_path, _, env = box
+    command = learned_same_job(tmp_path, env)
+    history_only = {"HEAVY_SHARE_SECONDS": "600"}
+    holder = background("--", *command, JOB="holder")
+    wait_until((tmp_path / "holder.report").exists, "the holder to start")
+    plain = background("--", *command, JOB="plain", **history_only)
+    wait_until(lambda: len(entries(tmp_path)) == 1, "a plain waiter to queue")
+    joined = time.monotonic()
+    sharer = background("--share", "--", *command, JOB="sharer", **history_only)
+    wait_until((tmp_path / "sharer.report").exists, "the waiter behind to share")
+    waited = time.monotonic() - joined
+    for name in ("holder", "plain", "sharer"):
+        (tmp_path / f"{name}.release").touch()
+    for proc in (holder, plain, sharer):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    assert waited < 4, waited  # no stepping aside for one that can't share
+
+
+def test_behind_a_stopped_waiter_the_next_in_line_still_goes_first(
+    box, background, sharing
+):
+    tmp_path, _, env = box
+    command = learned_same_job(tmp_path, env)
+    history_only = {"HEAVY_SHARE_SECONDS": "600"}
+    holder = background("--", *command, JOB="holder")
+    wait_until((tmp_path / "holder.report").exists, "the holder to start")
+    sharer = background("--share", "--", *command, JOB="sharer", **history_only)
+    wait_until((tmp_path / "sharer.report").exists, "a job to share")
+    stopped = background("--share", "--", *command, JOB="stopped", **history_only)
+    wait_until(lambda: len(entries(tmp_path)) == 1, "a waiter to queue")
+    stopped.send_signal(signal.SIGSTOP)
+    second = background("--share", "--", *command, JOB="second", **history_only)
+    wait_until(lambda: len(entries(tmp_path)) == 2, "a second waiter to queue")
+    third = background("--share", "--", *command, JOB="third", **history_only)
+    wait_until(lambda: len(entries(tmp_path)) == 3, "a third waiter to queue")
+
+    (tmp_path / "sharer.release").touch()
+    reports = [tmp_path / f"{name}.report" for name in ("second", "third")]
+    wait_until(lambda: any(r.exists() for r in reports), "a waiter behind to share")
+    went = "second" if reports[0].exists() else "third"
+    stopped.send_signal(signal.SIGCONT)
+    for name in ("holder", "stopped", "second", "third"):
+        (tmp_path / f"{name}.release").touch()
+    for proc in (holder, sharer, stopped, second, third):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    assert went == "second"
+
+
+def test_a_waiter_whose_fit_flickers_still_passes_a_stopped_one(
+    box, background, sharing
+):
+    tmp_path, busy, env = box
+    command = learned_same_job(tmp_path, env)
+    history_only = {"HEAVY_SHARE_SECONDS": "600"}
+    holder = background("--", *command, JOB="holder")
+    wait_until((tmp_path / "holder.report").exists, "the holder to start")
+    sharer = background("--share", "--", *command, JOB="sharer", **history_only)
+    wait_until((tmp_path / "sharer.report").exists, "a job to share")
+    stopped = background("--share", "--", *command, JOB="stopped", **history_only)
+    wait_until(lambda: len(entries(tmp_path)) == 1, "a waiter to queue")
+    stopped.send_signal(signal.SIGSTOP)
+    # A one-sample window, so the waiter fits at a quiet sample and not at a busy one.
+    behind = background(
+        "--share",
+        "--",
+        *command,
+        JOB="behind",
+        HEAVY_QUIET_SECONDS="0.05",
+        **history_only,
+    )
+    wait_until(lambda: len(entries(tmp_path)) == 2, "a waiter behind it to queue")
+
+    (tmp_path / "sharer.release").touch()
+    report = tmp_path / "behind.report"
+    deadline = time.monotonic() + 15
+    while not report.exists() and time.monotonic() < deadline:
+        for share in ("0.0", "0.95"):
+            set_busy(busy, share)
+            time.sleep(0.06)
+    set_busy(busy, "0.0")
+    shared = report.exists()
+    stopped.send_signal(signal.SIGCONT)
+    for name in ("holder", "stopped", "behind"):
+        (tmp_path / f"{name}.release").touch()
+    for proc in (holder, sharer, stopped, behind):
+        finish(proc)
+
+    assert shared, "the waiter behind never passed the stopped one"

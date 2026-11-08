@@ -1172,3 +1172,21 @@ def test_a_check_that_fails_as_the_oom_killer_acts_says_to_run_it_again(
 
     assert run.returncode != 0
     assert "out-of-memory killer" in run.stderr, run.stderr
+
+
+def test_a_check_never_shares_a_lane(installed, held_lane, committing, monkeypatch):
+    # Room to share, and a holder that idles: a job that asked to would start.
+    meminfo = Path(os.environ["HEAVY_DIR"]).parent / "roomy"
+    meminfo.write_text("MemAvailable: 16777216 kB\n")
+    monkeypatch.setenv("HEAVY_MEMINFO", str(meminfo))
+    monkeypatch.setenv("HEAVY_SHARE_SECONDS", "0.05")
+    commit_run = committing(installed)
+    waiting = queues_or_warns(commit_run, held_lane.lane)
+    time.sleep(1)  # many share windows, in which a check that shares would start
+
+    assert ran(installed) == [], commit_run.err()  # it still waits its turn
+    if not waiting:
+        return
+    held_lane.kill()
+    if finishes_or_warns(commit_run):
+        assert commit_run.returncode == 0, commit_run.err()

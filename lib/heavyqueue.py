@@ -15,11 +15,11 @@ when the share slot is free, the holder doesn't run `--alone`, 4 GiB of memory a
 free, and either both jobs' history
 says the waiter's usual cores fit in 75% of the holder's cores beside the holder's
 load, or the holder's cores have averaged under 30% busy for HEAVY_SHARE_SECONDS. The
-first waiter in line that may share does: a waiter that may steps aside for one ahead
-of it that fits too, by its own samples and their history, for up to SHARE_PATIENCE
-seconds, so the order holds however late each one's polls come. A sharer runs on the
-holder's cores, at
-nice 10 and first in line for the OOM killer, with CARGO_BUILD_JOBS capped at the
+first waiter in line that may share does: a waiter that may steps aside for each one
+ahead of it that asked to share and fits too, by its own samples and their history,
+for SHARE_PATIENCE seconds times its place among them, so the order holds however late
+each one's polls come. A sharer runs on the holder's cores, at nice 10 and first in
+line for the OOM killer, with CARGO_BUILD_JOBS capped at the
 cores the holder leaves.
 
 Each lane is a lib/fifo.py queue in HEAVY_DIR/<lane>/, its holder's slot the file
@@ -62,9 +62,10 @@ SHARE_MEMORY = 4 * 2**30  # bytes of MemAvailable a sharer needs
 # More, for a waiter that last found too little: memory that hovers at the floor
 # doesn't flip its reason, and its waiting line, at every poll.
 SHARE_MEMORY_AGAIN = SHARE_MEMORY + 2**29
-# Seconds, and polls, at least, that a waiter steps aside for one ahead of it that fits
-# too: long enough for a starved one to take its place, short enough that one stopped
-# (or running an older heavy, which never shares) holds up sharing only that long.
+# Seconds, and polls, at least, that a waiter steps aside for the first sharing waiter
+# ahead of it that fits too (twice that for the second, and so on): long enough for a
+# starved one to take its place, short enough that a stopped one holds up sharing only
+# that long.
 SHARE_PATIENCE = 5.0
 SHARE_PATIENCE_POLLS = 5
 PR_HINT = (
@@ -352,6 +353,8 @@ def turn(long=False, command="", hint=True, alone=False, share=False):
     about = f"cwd={os.getcwd()}\ncmd={one_line}\nkey={known_as}\n"
     if alone:
         about += "alone=1\n"
+    if share:
+        about += "share=1\n"
     try:
         entry = fifo.join(folder, me, about)
     except OSError as error:
@@ -428,7 +431,9 @@ class Bid:
         windows = (knob("HEAVY_QUIET_SECONDS", 10), knob("HEAVY_SHARE_SECONDS", 90))
         self.watch = Watch(max(1, *(round(w / poll) for w in windows)))
         self.short_of_memory = False  # whether it last found too little free memory
-        self.fit_since = {}  # waiters ahead that fit too: since when, by entry name
+        # Sharing waiters ahead that fit too: since when, by entry name, for this
+        # watch's holder and sharer.
+        self.fit_since, self.fit_subject = {}, None
 
     def poll(self, seen):
         """Watch the holder in seen for a poll and, when this waiter may share its
@@ -438,11 +443,14 @@ class Bid:
         holder_cpus = holder_cpus or lane_cores(self.lane, self.cpus)
         subject = (first_line(seen.held), first_line(seen.shared or ""))
         self.watch.add(subject, busy_now(holder_cpus))
+        if subject != self.fit_subject:
+            self.fit_since, self.fit_subject = {}, subject
         history = heavyhistory.History(base())
         verdict = self.refusal(seen) or self.fit(seen, holder_cpus, self.key, history)
         if verdict.load is None:
+            # The waiters ahead keep their clocks: one whose own fit comes and goes
+            # still passes a stopped waiter ahead in time.
             self.say("share", verdict.key, verdict.line)
-            self.fit_since = {}
             return None
         # Read the line again: it may have changed while this waiter sampled.
         ahead = fifo.ahead(self.folder, self.entry)
@@ -508,22 +516,26 @@ class Bid:
         return Verdict(None, "watch", f"heavy: {later}.")
 
     def first_in_line(self, seen, holder_cpus, ahead, history):
-        """Whether no waiter ahead of this one fits beside the holder too, as this
-        waiter's samples and their history see it, or each that does has fit for
-        SHARE_PATIENCE without taking the place. Whether one ahead fits doesn't
-        depend on when its own polls come, so a starved one keeps its turn."""
+        """Whether no waiter ahead of this one that asked to share fits beside the
+        holder too, as this waiter's samples and their history see it, or each that
+        does has fit, without taking the place, for SHARE_PATIENCE times its place
+        among them: so the second of them can't pass the first while both wait out
+        a stopped one. Whether one ahead fits doesn't depend on when its own polls
+        come, so a starved one keeps its turn."""
         now = time.monotonic()
         patience = max(SHARE_PATIENCE, SHARE_PATIENCE_POLLS * knob("HEAVY_POLL", 1))
-        fitting = {}
-        for path, text in ahead:
-            about = fields(text)
-            if about.get("alone"):
-                continue
+        sharing = [(path.name, fields(text)) for path, text in ahead]
+        sharing = [(name, about) for name, about in sharing if about.get("share")]
+        names = {name for name, _ in sharing}
+        self.fit_since = {n: s for n, s in self.fit_since.items() if n in names}
+        place, waiting = 0, False
+        for name, about in sharing:  # every clock starts now, not only the first's
             if self.fit(seen, holder_cpus, about.get("key"), history).load is None:
                 continue
-            fitting[path.name] = self.fit_since.get(path.name, now)
-        self.fit_since = fitting
-        return all(now - since >= patience for since in fitting.values())
+            place += 1
+            since = self.fit_since.setdefault(name, now)
+            waiting = waiting or now - since < patience * place
+        return not waiting
 
     def take(self, held, holder_cpus, load):
         """Take the share slot beside the holder whose slot text is held, under the

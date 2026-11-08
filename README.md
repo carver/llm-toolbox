@@ -283,7 +283,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `$HEAVY_SHARE_SECONDS` (90), with 4 GiB of memory free either way. A sharer
   can run several times slower than alone, so `--share` suits work without
   wall-clock limits, such as a build; many test suites have them, from the
-  runner or in the tests, and commit checks never share. A command's usual
+  runner (pytest-timeout, nextest's slow-timeout) or in the tests, and commit
+  checks never share. A command's usual
   cores come from its last runs that exited 0, shared by every worktree of its
   repo. Nothing shares beside a `heavy --alone` job, for timings. Stopped, it
   stops CMD's process group,

@@ -250,3 +250,102 @@ def test_bytes_that_are_not_utf8_are_listed_and_survive(tmp_path):
     assert shown.returncode == 0 and "caf" in shown.stdout, shown.stderr
     assert done.returncode == 0, done.stderr
     assert file.read_bytes() == b"top\ncaf\xe9\nmiddle\nours two\nbottom\n"
+
+
+@pytest.mark.parametrize("marker", [">>>>>>> abc", "||||||| base"])
+def test_a_closing_or_base_marker_outside_a_hunk_is_malformed(tmp_path, marker):
+    file = tmp_path / "a.txt"
+    file.write_text(f"{TWO_HUNKS}{marker}\n")
+
+    shown = conflicts(tmp_path, "a.txt")
+    done = conflicts(tmp_path, "a.txt", "all", "ours")
+
+    assert shown.returncode == 1 and "line 16" in shown.stderr
+    assert done.returncode == 1 and "changed nothing" in done.stderr
+    assert file.read_text() == f"{TWO_HUNKS}{marker}\n"
+
+
+@pytest.mark.parametrize(
+    "base, theirs",
+    [
+        ("", "a.txt conflict-marker-size=32\n"),  # the merge brings it in
+        ("a.txt conflict-marker-size=32\n", ""),  # the merge takes it out
+    ],
+)
+def test_markers_are_as_long_as_the_attributes_git_merged_with(tmp_path, base, theirs):
+    new_repo(tmp_path)
+    commit(tmp_path, "base", {".gitattributes": base, "a.txt": "a\n"})
+    git(tmp_path, "checkout", "-q", "-b", "other")
+    commit(tmp_path, "theirs", {".gitattributes": theirs, "a.txt": "a theirs\n"})
+    git(tmp_path, "checkout", "-q", "main")
+    commit(tmp_path, "ours", {"a.txt": "a ours\n"})
+    subprocess.run(
+        ["git", "merge", "other"], cwd=tmp_path, capture_output=True, check=False
+    )
+
+    shown = conflicts(tmp_path, "a.txt")
+
+    assert "hunk 1" in shown.stdout, shown
+
+
+def git(cwd, *args):
+    return subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=True
+    ).stdout
+
+
+def commit(repo, message, files):
+    for name, text in files.items():
+        (repo / name).write_text(text)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", message)
+
+
+def new_repo(path):
+    git(path, "init", "-q", "-b", "main")
+    git(path, "config", "user.name", "t")
+    git(path, "config", "user.email", "t@example.com")
+    return path
+
+
+# Markers a file holds on purpose, as the tests of a conflict tool do.
+FIXTURE = "<<<<<<< fixture\nkept\n=======\nkept too\n>>>>>>> fixture\n"
+
+
+def merge_conflict(repo, attributes=""):
+    """A merge stopped at a conflict in a.txt, whose text also holds FIXTURE."""
+    new_repo(repo)
+    commit(repo, "base", {".gitattributes": attributes, "a.txt": f"{FIXTURE}line\n"})
+    git(repo, "checkout", "-q", "-b", "other")
+    commit(repo, "theirs", {"a.txt": f"{FIXTURE}theirs\n"})
+    git(repo, "checkout", "-q", "main")
+    commit(repo, "ours", {"a.txt": f"{FIXTURE}ours\n"})
+    merge = subprocess.run(
+        ["git", "merge", "-q", "other"], cwd=repo, capture_output=True, check=False
+    )
+    assert merge.returncode == 1, merge
+    return repo / "a.txt"
+
+
+@pytest.mark.parametrize(
+    "attributes",
+    [
+        "",  # git's markers are 7 long, as FIXTURE's are
+        "a.txt conflict-marker-size=10\n",
+        "a.txt conflict-marker-size\n",  # no number: 7
+        "a.txt conflict-marker-size=12abc\n",  # not a number: 7
+        "a.txt conflict-marker-size=+12\n",  # a sign: 12
+        "a.txt conflict-marker-size=99999999999\n",  # past an int: 7
+    ],
+)
+def test_only_the_markers_git_wrote_make_hunks(tmp_path, attributes):
+    file = merge_conflict(tmp_path, attributes)
+
+    shown = conflicts(tmp_path, "a.txt")
+    done = conflicts(tmp_path, "a.txt", "1", "theirs")
+
+    assert shown.returncode == 0, shown.stderr
+    assert "hunk 1" in shown.stdout and "hunk 2" not in shown.stdout
+    assert "fixture" not in shown.stdout
+    assert done.returncode == 0, done.stderr
+    assert file.read_text() == f"{FIXTURE}theirs\n"

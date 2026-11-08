@@ -19,10 +19,13 @@ and theirs is the commit being replayed.
 
 apply-edits can't resolve a hunk, since its own blocks use the ======= line. A
 separator line counts as a marker only inside a hunk, so a reStructuredText underline
-is content. A hunk that never closes, lacks its ======= line or opens inside another
-makes conflicts refuse the file and change nothing. Line endings, and bytes that
-aren't UTF-8, are kept. It never stages a file: once a file has no hunk left it says
-so, and `git add FILE` is yours.
+is content. In a file git has in conflict, a hunk that one of the merge's inputs
+already held word for word, such as a test fixture's, is content too, and markers are
+as long as the file's conflict-marker-size attribute makes git write them (7 when
+unset). A hunk that never closes, lacks its separator or opens inside another, or a
+closing or base marker outside any hunk, makes conflicts refuse the file and change
+nothing. Line endings, and bytes that aren't UTF-8, are kept. It never stages a
+file: once a file has no hunk left it says so, and `git add FILE` is yours.
 
 Exit status: 0 listed or resolved; 1 a hunk that isn't there, a malformed or
 unreadable file (nothing changed); 2 a usage error (nothing changed).
@@ -30,7 +33,9 @@ unreadable file (nothing changed); 2 a usage error (nothing changed).
 
 import argparse
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -49,10 +54,21 @@ class Hunk:
     end: int  # line number of >>>>>>>
     ours_label: str
     theirs_label: str
+    size: int = MARK  # the marker length it was written with
     ours: list[str] = field(default_factory=list)
     base: list[str] | None = None
     base_label: str = ""
     theirs: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Known:
+    """What git says of a file: the marker length its conflicts are written with, and
+    the hunks its merge inputs already held (each as its lines without endings),
+    which are content, such as a test fixture's."""
+
+    size: int = MARK
+    content: frozenset[tuple[str, ...]] = frozenset()
 
 
 class Refused(Exception):
@@ -67,23 +83,39 @@ class Usage(Exception):
     pass
 
 
-def marker(line: str, char: str) -> str | None:
+def marker(line: str, char: str, size: int = MARK) -> str | None:
     """The label after a marker made of `char`, or None when the line isn't one."""
     body = line.rstrip("\r\n")
-    if body[:MARK] != char * MARK or body[MARK : MARK + 1] not in ("", " "):
+    if len(body) < size or body[:size] != char * size:
         return None
-    return body[MARK + 1 :]
+    if body[size : size + 1] not in ("", " "):
+        return None
+    return body[size + 1 :]
 
 
-def parse(lines: list[str]) -> list[Hunk | str]:
-    """The file as plain lines and hunks, in order."""
+def unmarked(lines: list[str]) -> tuple[str, ...]:
+    return tuple(line.rstrip("\r\n") for line in lines)
+
+
+PLAIN = Known()  # a file git says nothing of: 7-character markers, no fixtures
+
+
+def parse(lines: list[str], known: Known = PLAIN) -> list[Hunk | str]:
+    """The file as plain lines and hunks, in order. A hunk `known` holds as content
+    stays plain lines."""
+    size = known.size
     parts: list[Hunk | str] = []
     hunk, section = None, None
     for number, line in enumerate(lines, start=1):
-        opening = marker(line, "<")
+        opening = marker(line, "<", size)
         if hunk is None:
             if opening is not None:
-                hunk, section = Hunk(number, 0, opening, ""), "ours"
+                hunk, section = Hunk(number, 0, opening, "", size), "ours"
+            elif (
+                marker(line, ">", size) is not None
+                or marker(line, "|", size) is not None
+            ):
+                raise Malformed(f"line {number}: a {line[:size]} outside any hunk")
             else:
                 parts.append(line)
             continue
@@ -91,17 +123,21 @@ def parse(lines: list[str]) -> list[Hunk | str]:
             raise Malformed(
                 f"line {number}: a hunk opens inside the one from line {hunk.start}"
             )
-        if section == "ours" and (base := marker(line, "|")) is not None:
+        if section == "ours" and (base := marker(line, "|", size)) is not None:
             hunk.base, hunk.base_label, section = [], base, "base"
-        elif section in ("ours", "base") and marker(line, "=") is not None:
+        elif section in ("ours", "base") and marker(line, "=", size) is not None:
             section = "theirs"
-        elif (closing := marker(line, ">")) is not None:
+        elif (closing := marker(line, ">", size)) is not None:
             if section != "theirs":
                 raise Malformed(
-                    f"line {number}: the hunk from line {hunk.start} has no ======="
+                    f"line {number}: the hunk from line {hunk.start} has no {'=' * size}"
                 )
             hunk.end, hunk.theirs_label = number, closing
-            parts.append(hunk)
+            raw = lines[hunk.start - 1 : number]
+            if unmarked(raw) in known.content:
+                parts.extend(raw)
+            else:
+                parts.append(hunk)
             hunk = None
         elif section == "ours":
             hunk.ours.append(line)
@@ -112,6 +148,137 @@ def parse(lines: list[str]) -> list[Hunk | str]:
     if hunk is not None:
         raise Malformed(f"the hunk from line {hunk.start} never closes")
     return parts
+
+
+REGULAR = ("100644", "100755")  # index modes of a file git merges as text
+
+
+@dataclass
+class Facts:
+    """One path as the index has it: its entries by stage, as (mode, blob)."""
+
+    stages: dict[int, tuple[str, str]]
+    known: Known
+    merge: str  # its merge attribute
+    binary: bool  # a NUL byte early in some stage's blob, as git judges it
+
+
+def run_git(args: list[str], cwd: Path | None, stdin: bytes | None = None) -> bytes:
+    """git's output, or b"" when git fails or isn't there."""
+    try:
+        done = subprocess.run(
+            ["git", *args], cwd=cwd, input=stdin, capture_output=True, check=False
+        )
+    except OSError:
+        return b""
+    return done.stdout if done.returncode == 0 else b""
+
+
+def toplevel() -> Path | None:
+    out = run_git(["rev-parse", "--show-toplevel"], None).rstrip(b"\n")
+    return Path(os.fsdecode(out)) if out else None
+
+
+def index_stages(top: Path, flag: str, paths: list[str] | None = None) -> dict:
+    """Each path's entries by stage, as `git ls-files FLAG` lists them: -u the
+    unmerged ones, --resolve-undo those of paths staged by hand during this stop."""
+    if paths == []:
+        return {}
+    args = ["--literal-pathspecs", "ls-files", "-z", flag]
+    found: dict[str, dict[int, tuple[str, str]]] = {}
+    for record in run_git([*args, "--", *(paths or [])], top).split(b"\0"):
+        if record:
+            info, _, path = record.partition(b"\t")
+            mode, sha, stage = info.decode().split()
+            found.setdefault(os.fsdecode(path), {})[int(stage)] = (mode, sha)
+    return found
+
+
+def blobs(top: Path, shas: set[str]) -> dict[str, bytes]:
+    if not shas:
+        return {}
+    out = run_git(
+        ["cat-file", "--batch"], top, "".join(f"{s}\n" for s in shas).encode()
+    )
+    found, at = {}, 0
+    while (eol := out.find(b"\n", at)) != -1:
+        sha, kind, *size = out[at:eol].decode().split()
+        at = eol + 1
+        if kind != "missing":
+            found[sha] = out[at : at + int(size[0])]
+            at += int(size[0]) + 1
+    return found
+
+
+def marker_size(value: str | None) -> int:
+    """conflict-marker-size as git reads it: a whole number, signed or not, above 0
+    and within a C int, else the default."""
+    if value and re.fullmatch(r"[+-]?[0-9]+", value) and 0 < int(value) < 2**31:
+        return int(value)
+    return MARK
+
+
+def held(data: list[bytes], size: int) -> frozenset[tuple[str, ...]]:
+    """The hunks these blobs hold, each as its lines without endings."""
+    found = set()
+    for blob in data:
+        lines = blob.decode("utf-8", "surrogateescape").splitlines(keepends=True)
+        try:
+            parts = parse(lines, Known(size))
+        except Malformed:
+            continue
+        found.update(unmarked(lines[h.start - 1 : h.end]) for h in hunks(parts))
+    return frozenset(found)
+
+
+def gather(top: Path, entries: dict[str, dict[int, tuple[str, str]]]) -> dict:
+    """Facts for each path (relative to `top`) of `entries`, which are its index
+    stages, empty for a path not in conflict."""
+    if not entries:
+        return {}
+    # As the merge read them: HEAD's, not those the merge brought into the worktree.
+    attributes = ["check-attr", "-z", "conflict-marker-size", "merge", "--", *entries]
+    out = run_git([attributes[0], "--source=HEAD", *attributes[1:]], top)
+    out = out or run_git(attributes, top)  # no HEAD yet
+    fields = [os.fsdecode(f) for f in out.split(b"\0")]
+    attrs: dict[str, dict[str, str]] = {}
+    for at in range(0, len(fields) - 2, 3):
+        attrs.setdefault(fields[at], {})[fields[at + 1]] = fields[at + 2]
+    shas = {
+        sha for s in entries.values() for mode, sha in s.values() if mode in REGULAR
+    }
+    data = blobs(top, shas)
+    facts = {}
+    for path, stages in entries.items():
+        size = marker_size(attrs.get(path, {}).get("conflict-marker-size"))
+        inputs = [data[sha] for _, sha in stages.values() if sha in data]
+        facts[path] = Facts(
+            stages,
+            Known(size, held(inputs, size)),
+            attrs.get(path, {}).get("merge", "unspecified"),
+            any(b"\0" in blob[:8000] for blob in inputs),
+        )
+    return facts
+
+
+def known_files(paths: list[str]) -> dict[str, Known]:
+    """Known for each path as given that lies in this repository."""
+    top = toplevel()
+    if top is None:
+        return {}
+    inside = {}
+    for path in paths:
+        relative = os.path.relpath(os.path.realpath(path), os.path.realpath(top))
+        if relative != os.pardir and not relative.startswith(os.pardir + os.sep):
+            inside[path] = relative
+    if not inside:
+        return {}
+    named = sorted(set(inside.values()))
+    entries: dict[str, dict[int, tuple[str, str]]] = {path: {} for path in named}
+    entries.update(index_stages(top, "--resolve-undo", named))
+    entries.update(index_stages(top, "-u", named))
+    facts = gather(top, entries)
+    return {path: facts[relative].known for path, relative in inside.items()}
 
 
 def hunks(parts: list[Hunk | str]) -> list[Hunk]:
@@ -221,10 +388,10 @@ def choices(args: list[str]) -> list[tuple[str, list[tuple[str, str]]]] | None:
     return list(files.values())
 
 
-def resolved(path: str, picks: list[tuple[str, str]]) -> tuple[str, str]:
+def resolved(path: str, picks: list[tuple[str, str]], known: Known) -> tuple[str, str]:
     """The text of `path` with `picks` applied to its hunks as listed, and the line that
     says so."""
-    parts = parse(read_lines(Path(path)))
+    parts = parse(read_lines(Path(path)), known)
     found = hunks(parts)
     if picks[0][0] == "all":
         sides = dict.fromkeys(range(len(found)), picks[0][1])
@@ -256,10 +423,10 @@ def plural(count: int, noun: str) -> str:
 
 def resolve(files: list[tuple[str, list[tuple[str, str]]]]) -> int:
     """Apply every file's picks, or none: any failure writes nothing."""
-    done = []
+    done, known = [], known_files([path for path, _ in files])
     for path, picks in files:
         try:
-            done.append((path, *resolved(path, picks)))
+            done.append((path, *resolved(path, picks, known.get(path, PLAIN))))
         except Refused as error:
             print(f"{path}: {error}; changed nothing", file=sys.stderr)
             return 1
@@ -283,22 +450,23 @@ def render(hunk: Hunk) -> list[str]:
         if any(line.endswith("\r\n") for line in hunk.ours + hunk.theirs)
         else "\n"
     )
-    lines = [f"{'<' * MARK} {hunk.ours_label}".rstrip() + eol, *hunk.ours]
+    size = hunk.size
+    lines = [f"{'<' * size} {hunk.ours_label}".rstrip() + eol, *hunk.ours]
     if hunk.base is not None:
-        lines += [f"{'|' * MARK} {hunk.base_label}".rstrip() + eol, *hunk.base]
+        lines += [f"{'|' * size} {hunk.base_label}".rstrip() + eol, *hunk.base]
     lines += [
-        "=" * MARK + eol,
+        "=" * size + eol,
         *hunk.theirs,
-        f"{'>' * MARK} {hunk.theirs_label}".rstrip() + eol,
+        f"{'>' * size} {hunk.theirs_label}".rstrip() + eol,
     ]
     return lines
 
 
 def list_files(paths: list[str]) -> int:
-    code = 0
+    code, known = 0, known_files(paths)
     for path in paths:
         try:
-            show(path, parse(read_lines(Path(path))))
+            show(path, parse(read_lines(Path(path)), known.get(path, PLAIN)))
         except Refused as error:
             print(f"{path}: {error}", file=sys.stderr)
             code = 1

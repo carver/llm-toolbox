@@ -159,9 +159,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   can't hold the `=======` line, so without it agents deleted marker lines by
   number. A call resolves every triple or none: arguments out of place are a
   usage error, so a word such as `all` is never opened as a file. It refuses a
-  hunk that never closes, lacks its separator or nests, treats a separator
-  outside a hunk as content (a reStructuredText underline), and never stages
-  the file.
+  hunk that never closes, lacks its separator or nests, and a closing or base
+  marker outside a hunk; treats a separator outside a hunk as content (a
+  reStructuredText underline), as it does a hunk the merge's inputs already
+  held (a test fixture's); reads the marker length from `conflict-marker-size`;
+  and never stages the file.
 - **wt-ship**: ships a worktree's commits. In a repo that pushes, it rebases
   onto the remote branch (the main tree's, by default), refuses leftover
   conflict markers, runs the repo's `agent-pre-commit` through

@@ -18,6 +18,11 @@ spec = importlib.util.spec_from_loader("web_shot", loader)
 web_shot = importlib.util.module_from_spec(spec)
 loader.exec_module(web_shot)
 
+# The tests that drive a real Chromium skip on a machine with none in Playwright's cache
+needs_chromium = pytest.mark.skipif(
+    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
+)
+
 
 class Request:
     def __init__(self, resource_type="fetch"):
@@ -125,9 +130,7 @@ def test_a_local_path_becomes_a_file_url(tmp_path):
     assert web_shot.page_url("https://example.com/a") == "https://example.com/a"
 
 
-@pytest.mark.skipif(
-    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
-)
+@needs_chromium
 def test_clicks_shoots_and_reports_page_errors(tmp_path):
     page = tmp_path / "p.html"
     page.write_text(
@@ -170,9 +173,7 @@ def cli(*args):
     )
 
 
-@pytest.mark.skipif(
-    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
-)
+@needs_chromium
 def test_eval_prints_its_value_as_json_where_it_runs(tmp_path):
     """A doctype after a comment still counts, so this page loads as it is. A value JSON can't hold
     still prints as JSON, and a script that navigates leaves no value."""
@@ -223,9 +224,7 @@ def png_size(path):
     return int.from_bytes(header[:4], "big"), int.from_bytes(header[4:], "big")
 
 
-@pytest.mark.skipif(
-    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
-)
+@needs_chromium
 def test_a_shot_taller_than_1500px_is_also_saved_in_pieces(tmp_path):
     """The fewest pieces of at most 1400px, of equal height but for the last. Pieces an earlier run
     left in the folder go."""
@@ -265,9 +264,7 @@ def test_a_shot_taller_than_1500px_is_also_saved_in_pieces(tmp_path):
     ]
 
 
-@pytest.mark.skipif(
-    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
-)
+@needs_chromium
 def test_a_file_without_a_doctype_loads_inside_a_standard_skeleton(tmp_path):
     """As an Artifact file, which its publisher wraps. Its relative URLs and #links still work, and no
     file is written beside it. Given as a file:// URL with a fragment and an unescaped space, it still
@@ -375,9 +372,7 @@ function closed() {  // a culprit the walk can't see
 </script>"""
 
 
-@pytest.mark.skipif(
-    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
-)
+@needs_chromium
 def test_says_what_makes_the_page_scroll_sideways_at_load_and_at_each_shot(tmp_path):
     """Only what widens the page counts: not a table in a box that scrolls, a banner fixed to the
     viewport, a box held in by a clipping or containing box, or what a shadow root slots into a box
@@ -440,9 +435,7 @@ def test_says_what_makes_the_page_scroll_sideways_at_load_and_at_each_shot(tmp_p
     ]
 
 
-@pytest.mark.skipif(
-    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
-)
+@needs_chromium
 def test_an_action_that_fails_keeps_what_came_before(tmp_path):
     page = tmp_path / "p.html"
     page.write_text(
@@ -471,9 +464,7 @@ def test_an_action_that_fails_keeps_what_came_before(tmp_path):
     assert lines[2].endswith("Error: stop")
 
 
-@pytest.mark.skipif(
-    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
-)
+@needs_chromium
 def test_a_page_that_does_not_load_says_so_in_one_line(tmp_path):
     with socket.socket() as closed:  # bound but not listening: connections are refused
         closed.bind(("127.0.0.1", 0))
@@ -485,9 +476,7 @@ def test_a_page_that_does_not_load_says_so_in_one_line(tmp_path):
     assert len(run.stderr.splitlines()) == 1, run.stderr
 
 
-@pytest.mark.skipif(
-    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
-)
+@needs_chromium
 def test_a_page_that_breaks_the_sideways_check_still_gets_its_shots(tmp_path):
     page = tmp_path / "p.html"
     page.write_text(
@@ -552,9 +541,7 @@ def test_repeated_errors_collapse_to_one_line_with_a_count():
     assert web_shot.collapse(["a", "b", "a", "a"]) == ["a (x3)", "b"]
 
 
-@pytest.mark.skipif(
-    not web_shot.cached_chromium(), reason="no Chromium in Playwright's cache"
-)
+@needs_chromium
 def test_prints_text_and_links_after_loading_an_endless_page(tmp_path):
     page = tmp_path / "p.html"
     page.write_text(
@@ -597,6 +584,7 @@ def test_prints_text_and_links_after_loading_an_endless_page(tmp_path):
     assert lines[lines.index("item 30") + 1].endswith("/final.png")
 
 
+@needs_chromium
 def test_cookies_are_sent_with_the_page(tmp_path):
     """For apps that keep who you are in a cookie, so web-shot can skip their login page."""
 

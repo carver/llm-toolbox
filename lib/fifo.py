@@ -120,6 +120,13 @@ def join(folder, holder, details=""):
     return entry
 
 
+def rewrite(entry, text):
+    """Replace the text of this process's entry, whole, keeping its place in line."""
+    part = entry.parent / f".{entry.name}.part"
+    part.write_text(text)
+    part.rename(entry)
+
+
 def ahead(folder, entry):
     """The live waiters that joined before entry (all of them, when entry is None),
     oldest first, as (entry path, its text); ended ones are removed."""

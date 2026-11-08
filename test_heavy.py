@@ -1,8 +1,13 @@
 """heavy runs a CPU-heavy command once it's its turn in its lane and its cores are
-quiet. The tests run it as a process with its queue in tmp_path, a file standing in
-for how busy the cores are (HEAVY_BUSY), and short waits."""
+quiet, and lets a second job share a lane, niced, when there's room. The tests run it
+as a process with its queue in tmp_path, files standing in for how busy the cores are
+(HEAVY_BUSY) and for free memory (HEAVY_MEMINFO, too little to share unless a test
+asks for the `sharing` fixture), and short waits."""
 
+import json
+import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -27,21 +32,41 @@ def set_busy(busy, share):
     part.replace(busy)
 
 
+def meminfo(path, gib):
+    """Put `gib` GiB of MemAvailable in the meminfo file, whole, as set_busy does."""
+    part = path.with_name(f"{path.name}.part")
+    part.write_text(f"MemTotal: 16777216 kB\nMemAvailable: {int(gib * 2**20)} kB\n")
+    part.replace(path)
+
+
 @pytest.fixture
 def box(tmp_path):
-    """The queue folder, the busy file (quiet to start) and an env to run heavy in."""
+    """The queue folder, the busy file (quiet to start) and an env to run heavy in,
+    with too little free memory for a job to share a lane."""
     busy = tmp_path / "busy"
     set_busy(busy, "0.0")
+    meminfo(tmp_path / "meminfo", 1)
     env = os.environ | {
         "HEAVY_DIR": str(tmp_path / "heavy"),
         "HEAVY_BUSY": str(busy),
+        "HEAVY_MEMINFO": str(tmp_path / "meminfo"),
         "HEAVY_QUIET_SECONDS": "0.2",
         "HEAVY_POLL": "0.05",
+        "HEAVY_SHARE_SECONDS": "600",
         "HEAVY_STALL_SECONDS": "600",
         "CLAUDE_CODE_SESSION_ID": "s-test",
     }
-    env.pop("HEAVY_SLOT", None)
+    for name in ("HEAVY_SLOT", "HEAVY_CORES_USED"):
+        env.pop(name, None)
     return tmp_path, busy, env
+
+
+@pytest.fixture
+def sharing(box):
+    """Room to share: 16 GiB free, and a holder idle for 0.3 s lets a waiter in."""
+    tmp_path, _, env = box
+    meminfo(tmp_path / "meminfo", 16)
+    env["HEAVY_SHARE_SECONDS"] = "0.3"
 
 
 @pytest.fixture
@@ -50,7 +75,7 @@ def background(box):
     procs = []
     _, _, env = box
 
-    def start(*args, session="s-test", stderr=None, **extra):
+    def start(*args, session="s-test", stderr=None, cwd=None, **extra):
         """stderr: a file to write heavy's stderr to, to read while it runs."""
         proc = subprocess.Popen(
             [str(SCRIPT), *args],
@@ -58,6 +83,7 @@ def background(box):
             stdout=subprocess.PIPE,
             stderr=stderr.open("w") if stderr else subprocess.PIPE,
             text=True,
+            cwd=cwd,
         )
         procs.append(proc)
         return proc
@@ -75,7 +101,7 @@ def background(box):
                     pipe.close()
 
 
-def heavy(env, *args, **extra):
+def heavy(env, *args, cwd=None, **extra):
     return subprocess.run(
         [str(SCRIPT), *args],
         env=env | extra,
@@ -83,6 +109,7 @@ def heavy(env, *args, **extra):
         text=True,
         timeout=60,
         check=False,
+        cwd=cwd,
     )
 
 
@@ -581,3 +608,743 @@ def test_status_shows_how_long_jobs_ran_and_waited_and_the_holders_cores(
     text = shown.stdout
     assert "running for 0m" in text and "waiting for 0m" in text, text
     assert f"on cores {cpus[0]}-{cpus[-1]}" in text, text
+
+
+def job_report(tmp_path, name):
+    """A command that writes its nice, oom_score_adj, CARGO_BUILD_JOBS and cores to a
+    file, then runs until its release file appears."""
+    out, release = tmp_path / f"{name}.report", tmp_path / f"{name}.release"
+    script = tmp_path / f"{name}.py"
+    script.write_text(
+        "import json, os, pathlib, time\n"
+        "report = {\n"
+        "    'nice': os.nice(0),\n"
+        "    'oom': int(pathlib.Path('/proc/self/oom_score_adj').read_text()),\n"
+        "    'jobs': os.environ.get('CARGO_BUILD_JOBS'),\n"
+        "    'cores': sorted(os.sched_getaffinity(0)),\n"
+        "}\n"
+        f"pathlib.Path({str(out)!r}).write_text(json.dumps(report))\n"
+        f"while not pathlib.Path({str(release)!r}).exists():\n"
+        "    time.sleep(0.05)\n"
+    )
+    return [sys.executable, str(script)], out, release
+
+
+def report(out):
+    return json.loads(out.read_text())
+
+
+def learn(env, job, cores, cwd=None):
+    """Run a job_report job once, released, so its history says it kept `cores` busy."""
+    command, out, release = job
+    release.touch()
+    done = heavy(env, "--", *command, HEAVY_CORES_USED=str(cores), cwd=cwd)
+    assert done.returncode == 0, done.stderr
+    release.unlink()
+    out.unlink()
+
+
+def has_text(path, text):
+    return lambda: path.exists() and text in path.read_text()
+
+
+def usual_cores(status_text, needle):
+    """The usual cores `heavy status` shows on the line naming needle, or None."""
+    line = next(ln for ln in status_text.splitlines() if needle in ln)
+    found = re.search(r"usually ([\d.]+) cores", line)
+    return float(found.group(1)) if found else None
+
+
+CPUS = sorted(os.sched_getaffinity(0))
+BASE_NICE = os.nice(0)
+
+
+def test_a_waiter_whose_history_fits_shares_the_lane_at_nice_10(
+    box, background, sharing
+):
+    tmp_path, _, env = box
+    holder, sharer = job_report(tmp_path, "holder"), job_report(tmp_path, "sharer")
+    learn(env, holder, 1)
+    learn(env, sharer, 1)
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    s = background("--", *sharer[0], HEAVY_SHARE_SECONDS="600")  # history alone
+    wait_until(sharer[1].exists, "the waiter to share the lane")
+    shown = heavy(env, "status").stdout
+    holder[2].touch()
+    sharer[2].touch()
+    for proc in (h, s):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    held, shared = report(holder[1]), report(sharer[1])
+    assert held["nice"] == BASE_NICE and held["jobs"] == str(len(CPUS))
+    assert shared["nice"] == max(BASE_NICE, 10)
+    assert shared["oom"] == 1000
+    assert shared["cores"] == CPUS
+    # 75% of the cores, less the holder's usual core (its cores are idle).
+    assert shared["jobs"] == str(max(1, math.floor(0.75 * len(CPUS) - 1)))
+    assert "sharing at nice 10" in shown, shown
+
+
+def test_a_waiter_whose_history_doesnt_fit_waits_for_the_holder(
+    box, background, sharing
+):
+    tmp_path, _, env = box
+    holder, waiter = job_report(tmp_path, "holder"), job_report(tmp_path, "waiter")
+    learn(env, holder, 1)
+    learn(env, waiter, 0.9 * len(CPUS))
+    log = tmp_path / "waiter.err"
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    w = background("--", *waiter[0], HEAVY_SHARE_SECONDS="600", stderr=log)
+    wait_until(has_text(log, "don't fit"), "the waiter to say it doesn't fit")
+    assert not waiter[1].exists()
+    holder[2].touch()
+    wait_until(waiter[1].exists, "the waiter to start once the holder ends")
+    waiter[2].touch()
+    for proc in (h, w):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    assert report(waiter[1])["nice"] == BASE_NICE  # it ran as the holder
+
+
+def test_a_waiter_with_no_history_shares_once_the_holder_has_idled(
+    box, background, sharing
+):
+    tmp_path, busy, _ = box
+    set_busy(busy, "0.1")
+    holder, sharer = job_report(tmp_path, "holder"), job_report(tmp_path, "sharer")
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    s = background("--", *sharer[0])
+    wait_until(sharer[1].exists, "the waiter to share the lane")
+    holder[2].touch()
+    sharer[2].touch()
+    for proc in (h, s):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    shared = report(sharer[1])
+    assert shared["nice"] == max(BASE_NICE, 10)
+    # 75% of the cores, less the holder's load: 10% of them.
+    assert shared["jobs"] == str(max(1, math.floor(0.75 * len(CPUS) - 0.1 * len(CPUS))))
+
+
+def test_a_busy_holder_keeps_a_waiter_with_no_history_waiting(box, background, sharing):
+    tmp_path, busy, _ = box
+    set_busy(busy, "0.4")
+    holder, waiter = job_report(tmp_path, "holder"), job_report(tmp_path, "waiter")
+    log = tmp_path / "waiter.err"
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    w = background("--", *waiter[0], stderr=log)
+    wait_until(has_text(log, "under 30%"), "the waiter to say what it waits for")
+    assert not waiter[1].exists()
+    holder[2].touch()
+    finish(h)
+    set_busy(busy, "0.1")
+    wait_until(waiter[1].exists, "the waiter to start once the holder ends")
+    waiter[2].touch()
+    status, _, err = finish(w)
+
+    assert status == 0, err
+    assert report(waiter[1])["nice"] == BASE_NICE
+
+
+def test_only_one_job_shares_a_lane_the_first_in_line(box, background, sharing):
+    tmp_path, _, _ = box
+    holder = job_report(tmp_path, "holder")
+    first, second = job_report(tmp_path, "first"), job_report(tmp_path, "second")
+    log = tmp_path / "second.err"
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    one = background("--", *first[0])
+    wait_until(lambda: len(entries(tmp_path)) == 1, "the first waiter to queue")
+    two = background("--", *second[0], stderr=log)
+    wait_until(first[1].exists, "the first waiter to share")
+    wait_until(has_text(log, "already shares"), "the second to see the place taken")
+    assert not second[1].exists()
+    first[2].touch()
+    wait_until(second[1].exists, "the second to share once the first ends")
+    holder[2].touch()
+    second[2].touch()
+    for proc in (h, one, two):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+
+def test_a_light_waiter_shares_ahead_of_a_heavy_one(box, background, sharing):
+    tmp_path, _, env = box
+    holder = job_report(tmp_path, "holder")
+    big, light = job_report(tmp_path, "big"), job_report(tmp_path, "light")
+    learn(env, holder, 1)
+    learn(env, big, 0.9 * len(CPUS))
+    learn(env, light, 1)
+    history_only = {"HEAVY_SHARE_SECONDS": "600"}
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    b = background("--", *big[0], **history_only)
+    wait_until(lambda: len(entries(tmp_path)) == 1, "the heavy waiter to queue")
+    li = background("--", *light[0], **history_only)
+    wait_until(light[1].exists, "the light waiter to share")
+    assert not big[1].exists()
+    holder[2].touch()
+    wait_until(big[1].exists, "the heavy waiter to take the holder's place")
+    big[2].touch()
+    light[2].touch()
+    for proc in (h, b, li):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    assert report(big[1])["nice"] == BASE_NICE
+
+
+@pytest.mark.parametrize("memory", ["short", "unreadable"])
+def test_with_too_little_free_memory_nothing_shares(box, background, memory):
+    tmp_path, _, env = box
+    env["HEAVY_SHARE_SECONDS"] = "0.3"  # the holder idles, but memory is short
+    if memory == "unreadable":
+        env["HEAVY_MEMINFO"] = str(tmp_path / "no-such-meminfo")
+    holder, waiter = job_report(tmp_path, "holder"), job_report(tmp_path, "waiter")
+    log = tmp_path / "waiter.err"
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    w = background("--", *waiter[0], stderr=log)
+    wait_until(has_text(log, "free memory"), "the waiter to say memory is short")
+    assert not waiter[1].exists()
+    holder[2].touch()
+    wait_until(waiter[1].exists, "the waiter to start once the holder ends")
+    waiter[2].touch()
+    for proc in (h, w):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+
+def test_nothing_shares_beside_an_alone_holder(box, background, sharing):
+    tmp_path, _, _ = box
+    holder, waiter = job_report(tmp_path, "holder"), job_report(tmp_path, "waiter")
+    log = tmp_path / "waiter.err"
+
+    h = background("--alone", "--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    w = background("--", *waiter[0], stderr=log)
+    wait_until(has_text(log, "--alone"), "the waiter to say the holder runs alone")
+    assert not waiter[1].exists()
+    holder[2].touch()
+    wait_until(waiter[1].exists, "the waiter to start once the holder ends")
+    waiter[2].touch()
+    for proc in (h, w):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+
+def test_an_alone_job_never_shares(box, background, sharing):
+    tmp_path, _, _ = box
+    holder = job_report(tmp_path, "holder")
+    alone, other = job_report(tmp_path, "alone"), job_report(tmp_path, "other")
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    a = background("--alone", "--", *alone[0])
+    wait_until(lambda: len(entries(tmp_path)) == 1, "the alone job to queue")
+    o = background("--", *other[0])
+    wait_until(other[1].exists, "the job behind it to share")  # the window passed
+    assert not alone[1].exists()
+    holder[2].touch()
+    other[2].touch()
+    wait_until(alone[1].exists, "the alone job to start once both end")
+    alone[2].touch()
+    for proc in (h, a, o):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    assert report(alone[1])["nice"] == BASE_NICE
+
+
+def test_an_alone_head_waits_for_the_sharer_to_end(box, background, sharing):
+    tmp_path, _, _ = box
+    holder, sharer = job_report(tmp_path, "holder"), job_report(tmp_path, "sharer")
+    alone = job_report(tmp_path, "alone")
+    log = tmp_path / "alone.err"
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    s = background("--", *sharer[0])
+    wait_until(sharer[1].exists, "the waiter to share")
+    a = background("--alone", "--", *alone[0], stderr=log)
+    wait_until(lambda: len(entries(tmp_path)) == 1, "the alone job to queue")
+    holder[2].touch()
+    wait_until(has_text(log, "shares no cores"), "the alone job to wait for the sharer")
+    assert not alone[1].exists()
+    sharer[2].touch()
+    wait_until(alone[1].exists, "the alone job to start once the sharer ends")
+    alone[2].touch()
+    for proc in (h, s, a):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+
+def test_alone_inside_a_job_says_it_does_nothing(box):
+    _, _, env = box
+
+    done = heavy(env, "--", str(SCRIPT), "--alone", "--", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert "--alone does nothing" in done.stderr
+
+
+def test_while_a_long_job_waits_the_next_normal_job_leaves_it_its_quarter(
+    box, background
+):
+    tmp_path, _, _ = box
+    if len(CPUS) < 4:
+        pytest.skip("needs at least 4 CPUs to split")
+    quarter = CPUS[len(CPUS) - len(CPUS) // 4 :]
+    first, second = affinity_of(tmp_path, "first"), affinity_of(tmp_path, "second")
+    long_cmd, long_out, long_release = affinity_of(tmp_path, "long")
+
+    one = background("--", *first[0])
+    wait_until(first[1].exists, "the first normal job to start, on every core")
+    # The long job is slow to see quiet cores, so the second normal job goes first.
+    long_job = background("--long", "--", *long_cmd, HEAVY_QUIET_SECONDS="2")
+    wait_until(lambda: entries(tmp_path, "long"), "the long job to queue")
+    two = background("--", *second[0])
+    wait_until(lambda: entries(tmp_path), "the second normal job to queue")
+    first[2].touch()
+    wait_until(second[1].exists, "the second normal job to start")
+    wait_until(long_out.exists, "the long job to start beside it")
+    second[2].touch()
+    long_release.touch()
+    for proc in (one, long_job, two):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    assert set(second[1].read_text().split()).isdisjoint(map(str, quarter))
+    assert long_out.read_text().split() == [str(c) for c in quarter]
+
+
+def test_a_long_job_waits_for_the_cores_a_normal_sharer_holds(box, background, sharing):
+    tmp_path, _, _ = box
+    if len(CPUS) < 4:
+        pytest.skip("needs at least 4 CPUs to split")
+    holder, sharer = job_report(tmp_path, "holder"), job_report(tmp_path, "sharer")
+    long_cmd, long_out, long_release = affinity_of(tmp_path, "long")
+    log = tmp_path / "long.err"
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    s = background("--", *sharer[0])
+    wait_until(sharer[1].exists, "the waiter to share, on every core")
+    holder[2].touch()
+    finish(h)
+    long_job = background("--long", "--", *long_cmd, stderr=log)
+    wait_until(has_text(log, "a normal job"), "the long job to wait for its cores")
+    assert not long_out.exists()
+    sharer[2].touch()
+    wait_until(long_out.exists, "the long job to start once the sharer ends")
+    long_release.touch()
+    for proc in (s, long_job):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+
+def test_status_shows_the_usual_cores_of_a_command_that_exited_0(box, background):
+    tmp_path, _, env = box
+    holder, waiter = job_report(tmp_path, "holder"), job_report(tmp_path, "waiter")
+    learn(env, waiter, 2.5)
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    w = background("--", *waiter[0], session="s-waiter")
+    wait_until(lambda: entries(tmp_path), "the waiter to queue")
+    shown = heavy(env, "status").stdout
+    holder[2].touch()
+    waiter[2].touch()
+    for proc in (h, w):
+        finish(proc)
+
+    assert usual_cores(shown, "s-waiter") == 2.5, shown
+    assert usual_cores(shown, "running for") is None, shown  # no history yet
+
+
+def test_a_run_that_fails_leaves_no_history(box, background):
+    tmp_path, _, env = box
+    command, started, release = blocker(tmp_path, "a")
+    passing = job_report(tmp_path, "passing")
+    learn(env, passing, 2.5)
+    flag = tmp_path / "pass"
+    failing = ["sh", "-c", f'test -e "{flag}"']
+    done = heavy(env, "--", *failing, HEAVY_CORES_USED="2.5")
+    assert done.returncode == 1
+
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+    p = background("--", *passing[0], session="s-passing")
+    wait_until(lambda: len(entries(tmp_path)) == 1, "the passing one to queue")
+    f = background("--", *failing, session="s-failing")
+    wait_until(lambda: len(entries(tmp_path)) == 2, "the failing one to queue")
+    shown = heavy(env, "status").stdout
+    flag.touch()
+    passing[2].touch()
+    release.touch()
+    for proc in (a, p, f):
+        finish(proc)
+
+    assert usual_cores(shown, "s-passing") == 2.5, shown
+    assert usual_cores(shown, "s-failing") is None, shown
+
+
+def test_history_comes_from_the_commands_own_cpu_time(box, background):
+    tmp_path, _, env = box
+    burn = [
+        sys.executable,
+        "-c",
+        "import time; end = time.time() + 0.5; any(iter(lambda: time.time() > end, 1))",
+    ]
+    rest = ["sleep", "0.5"]
+    for command in (burn, rest):
+        done = heavy(env, "--", *command)
+        assert done.returncode == 0, done.stderr
+
+    holder, started, release = blocker(tmp_path, "a")
+    a = background("--", *holder)
+    wait_until(started.exists, "a to start")
+    b = background("--", *burn, session="s-burn")
+    wait_until(lambda: len(entries(tmp_path)) == 1, "the burner to queue")
+    r = background("--", *rest, session="s-rest")
+    wait_until(lambda: len(entries(tmp_path)) == 2, "the sleeper to queue")
+    shown = heavy(env, "status").stdout
+    release.touch()
+    for proc in (a, b, r):
+        finish(proc)
+
+    assert usual_cores(shown, "s-burn") >= 0.3, shown
+    assert usual_cores(shown, "s-rest") <= 0.1, shown
+
+
+def test_every_worktree_of_a_repo_shares_its_history(box, background):
+    tmp_path, _, env = box
+    repo, tree = tmp_path / "repo", tmp_path / "tree"
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        [*git, "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "x"], check=True
+    )
+    subprocess.run(
+        [*git, "-C", str(repo), "worktree", "add", "-q", "--detach", str(tree)],
+        check=True,
+    )
+    learn(env, job_report(tmp_path, "job"), 2.5, cwd=repo)
+
+    command, started, release = blocker(tmp_path, "a")
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+    w = background("--", *job_report(tmp_path, "job")[0], session="s-tree", cwd=tree)
+    wait_until(lambda: entries(tmp_path), "the waiter to queue")
+    shown = heavy(env, "status").stdout
+    release.touch()
+    (tmp_path / "job.release").touch()
+    for proc in (a, w):
+        finish(proc)
+
+    assert usual_cores(shown, "s-tree") == 2.5, shown
+
+
+@pytest.mark.parametrize("text", ["{not json", '{"version": 1, "commands": []}', "[]"])
+def test_a_history_file_that_cant_be_read_counts_as_none(box, background, text):
+    tmp_path, _, env = box
+    (tmp_path / "heavy").mkdir()
+    (tmp_path / "heavy" / "history.json").write_text(text)
+    waiter = job_report(tmp_path, "waiter")
+    learn(env, waiter, 2.5)  # the run passes, and is remembered in a file made anew
+
+    command, started, release = blocker(tmp_path, "a")
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+    w = background("--", *waiter[0], session="s-waiter")
+    wait_until(lambda: entries(tmp_path), "the waiter to queue")
+    shown = heavy(env, "status")
+    release.touch()
+    waiter[2].touch()
+    for proc in (a, w):
+        finish(proc)
+
+    assert shown.returncode == 0, shown.stderr
+    assert usual_cores(shown.stdout, "s-waiter") == 2.5, shown.stdout
+
+
+def test_a_sharers_run_is_remembered_too(box, background, sharing):
+    tmp_path, _, env = box
+    holder, sharer = job_report(tmp_path, "holder"), job_report(tmp_path, "sharer")
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    s = background("--", *sharer[0], HEAVY_CORES_USED="1.5")
+    wait_until(sharer[1].exists, "the waiter to share")
+    sharer[2].touch()
+    finish(s)
+    sharer[2].unlink()
+
+    w = background("--", *sharer[0], session="s-again", HEAVY_SHARE_SECONDS="600")
+    wait_until(lambda: entries(tmp_path), "the same command to queue again")
+    shown = heavy(env, "status").stdout
+    holder[2].touch()
+    sharer[2].touch()
+    for proc in (h, w):
+        finish(proc)
+
+    assert usual_cores(shown, "s-again") == 1.5, shown
+
+
+def fake_sccache(tmp_path):
+    """An env whose RUSTC_WRAPPER is an sccache that logs each start-server call's
+    SCCACHE_IDLE_TIMEOUT and nice."""
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    log = tmp_path / "sccache.log"
+    (folder / "sccache").write_text(
+        "#!/bin/sh\n"
+        f'echo "$1 timeout=${{SCCACHE_IDLE_TIMEOUT-unset}} nice=$(nice)" >> "{log}"\n'
+    )
+    (folder / "sccache").chmod(0o755)
+    return log, {"RUSTC_WRAPPER": "sccache", "PATH": f"{folder}:{os.environ['PATH']}"}
+
+
+def test_heavy_starts_sccache_so_it_never_idles_out(box):
+    tmp_path, _, env = box
+    log, extra = fake_sccache(tmp_path)
+
+    done = heavy(env, "--", str(SCRIPT), "--", "true", **extra)  # a heavy inside a job
+
+    assert done.returncode == 0, done.stderr
+    starts = log.read_text().splitlines() if log.exists() else []
+    # Once, by the outer heavy; none at all when the suite itself runs niced.
+    assert starts == (["--start-server timeout=0 nice=0"] if BASE_NICE == 0 else [])
+
+
+def test_a_niced_heavy_leaves_sccache_alone(box):
+    tmp_path, _, env = box
+    log, extra = fake_sccache(tmp_path)
+
+    done = subprocess.run(
+        ["nice", "-n", "5", str(SCRIPT), "--", "true"],
+        env=env | extra,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert not log.exists()
+
+
+def same_job(tmp_path):
+    """One command for many jobs: each writes its report to JOB.report and runs until
+    JOB.release appears, JOB from its environment, so all share one history."""
+    script = tmp_path / "same.py"
+    script.write_text(
+        "import os, pathlib, time\n"
+        f"folder = pathlib.Path({str(tmp_path)!r})\n"
+        "name = os.environ['JOB']\n"
+        "(folder / f'{name}.report').write_text(str(os.nice(0)))\n"
+        "while not (folder / f'{name}.release').exists():\n"
+        "    time.sleep(0.05)\n"
+    )
+    return [sys.executable, str(script)]
+
+
+def test_the_waiter_ahead_shares_first_when_both_fit_at_once(box, background, sharing):
+    tmp_path, _, env = box
+    command = same_job(tmp_path)
+    (tmp_path / "learn.release").touch()
+    learned = heavy(env, "--", *command, JOB="learn", HEAVY_CORES_USED="1")
+    assert learned.returncode == 0, learned.stderr
+    history_only = {"HEAVY_SHARE_SECONDS": "600"}
+    holder = background("--", *command, JOB="holder")
+    wait_until((tmp_path / "holder.report").exists, "the holder to start")
+
+    def round_of(n):
+        """A sharer, then two waiters behind it; which of them shares once it ends."""
+        report = {job: tmp_path / f"{job}{n}.report" for job in ("first", "second")}
+        sharer = background("--", *command, JOB=f"sharer{n}", **history_only)
+        wait_until((tmp_path / f"sharer{n}.report").exists, "a job to share")
+        first = background("--", *command, JOB=f"first{n}", **history_only)
+        wait_until(lambda: len(entries(tmp_path)) == 1, "the first waiter to queue")
+        second = background("--", *command, JOB=f"second{n}", **history_only)
+        wait_until(lambda: len(entries(tmp_path)) == 2, "the second waiter to queue")
+        (tmp_path / f"sharer{n}.release").touch()
+        wait_until(
+            lambda: report["first"].exists() or report["second"].exists(),
+            "a waiter to share",
+        )
+        went = "first" if report["first"].exists() else "second"
+        for job in ("first", "second"):
+            (tmp_path / f"{job}{n}.release").touch()
+        for proc in (sharer, first, second):
+            status, _, err = finish(proc)
+            assert status == 0, err
+        return went
+
+    # Both waiters watch the lane anew when the sharer ends, so both fit at the same
+    # moment, in whatever phase their polls are in; the one ahead must go first.
+    went = [round_of(n) for n in range(6)]
+    (tmp_path / "holder.release").touch()
+    finish(holder)
+
+    assert went == ["first"] * 6, went
+
+
+def test_a_waiter_watches_the_holder_anew_once_the_sharer_ends(
+    box, background, sharing
+):
+    tmp_path, busy, _ = box
+    set_busy(busy, "0.1")
+    holder, sharer = job_report(tmp_path, "holder"), job_report(tmp_path, "sharer")
+    waiter = job_report(tmp_path, "waiter")
+    log = tmp_path / "waiter.err"
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    s = background("--", *sharer[0])
+    wait_until(sharer[1].exists, "a job to share")
+    w = background("--", *waiter[0], HEAVY_SHARE_SECONDS="1.5", stderr=log)
+    wait_until(has_text(log, "already shares"), "the waiter to see the place taken")
+    # Long enough for the waiter to gather a whole window while the sharer runs; the
+    # samples it took then mustn't count once the sharer ends.
+    time.sleep(1.6)
+    sharer[2].touch()
+    ended = time.monotonic()
+    wait_until(waiter[1].exists, "the waiter to share")
+    waited = time.monotonic() - ended
+    holder[2].touch()
+    waiter[2].touch()
+    for proc in (h, s, w):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    assert waited >= 1.2, waited
+
+
+def test_a_heavy_inside_a_sharer_runs_at_once(box, background, sharing):
+    tmp_path, _, _ = box
+    holder = job_report(tmp_path, "holder")
+    inner = tmp_path / "inner"
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    s = background("--", str(SCRIPT), "--", "touch", str(inner))
+    wait_until(inner.exists, "the heavy inside the sharer to run")
+    holder[2].touch()
+    for proc in (h, s):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+
+def test_a_holder_with_no_history_lets_nobody_in_by_history(box, background, sharing):
+    tmp_path, _, env = box
+    holder, waiter = job_report(tmp_path, "holder"), job_report(tmp_path, "waiter")
+    learn(env, waiter, 1)  # it would fit beside a holder of 1 core
+    log = tmp_path / "waiter.err"
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    w = background("--", *waiter[0], HEAVY_SHARE_SECONDS="600", stderr=log)
+    wait_until(
+        has_text(log, "no passing run of the holder's command"),
+        "the waiter to say the holder has no history",
+    )
+    # Some polls with a full history window, in which a waiter that took the
+    # holder's load for 0 cores would share.
+    time.sleep(0.5)
+    assert not waiter[1].exists()
+    holder[2].touch()
+    waiter[2].touch()
+    for proc in (h, w):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+
+def test_free_memory_near_the_floor_says_so_once(box, background, sharing):
+    tmp_path, _, _ = box
+    holder, waiter = job_report(tmp_path, "holder"), job_report(tmp_path, "waiter")
+    log = tmp_path / "waiter.err"
+    meminfo(tmp_path / "meminfo", 1)
+
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    w = background("--", *waiter[0], stderr=log)
+    wait_until(has_text(log, "free memory"), "the waiter to say memory is short")
+    for _ in range(20):  # just under the floor, then just over, a poll or so each
+        for gib in (3.9, 4.1):
+            meminfo(tmp_path / "meminfo", gib)
+            time.sleep(0.03)
+    meminfo(tmp_path / "meminfo", 16)
+    wait_until(waiter[1].exists, "the waiter to share once memory is plenty")
+    holder[2].touch()
+    waiter[2].touch()
+    for proc in (h, w):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    assert log.read_text().count("free memory") == 1, log.read_text()
+
+
+def test_a_holder_whose_command_has_many_lines_can_still_be_shared(
+    box, background, sharing
+):
+    tmp_path, _, _ = box
+    started, release = tmp_path / "started", tmp_path / "release"
+    holder = [
+        "sh",
+        "-c",
+        f'touch "{started}"; while [ ! -e "{release}" ]; do sleep 0.05; done\nalone=1',
+    ]
+    waiter = job_report(tmp_path, "waiter")
+
+    h = background("--", *holder)
+    wait_until(started.exists, "the holder to start")
+    w = background("--", *waiter[0])
+    wait_until(waiter[1].exists, "the waiter to share")
+    release.touch()
+    waiter[2].touch()
+    for proc in (h, w):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+
+def test_a_job_that_removes_the_queue_still_exits_with_its_status(box):
+    _, _, env = box
+
+    # A run that exits 0 is remembered, in the queue's folder that is now gone.
+    done = heavy(env, "--", "sh", "-c", 'rm -rf "$HEAVY_DIR"')
+
+    assert done.returncode == 0, done.stderr
+    assert "Traceback" not in done.stderr, done.stderr
+
+
+def test_history_keeps_what_another_heavy_wrote_into_it(box):
+    tmp_path, _, env = box
+    job = job_report(tmp_path, "job")
+    learn(env, job, 1)
+    path = tmp_path / "heavy" / "history.json"
+    data = json.loads(path.read_text())
+    data["elsewhere"] = "kept"
+    (entry,) = data["commands"].values()
+    entry["note"] = "kept"
+    path.write_text(json.dumps(data))
+
+    learn(env, job, 2)
+
+    data = json.loads(path.read_text())
+    (entry,) = data["commands"].values()
+    assert data["elsewhere"] == "kept" and entry["note"] == "kept", data
+    assert [cores for cores, _ in entry["runs"]] == [1, 2], data

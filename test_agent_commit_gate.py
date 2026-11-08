@@ -965,3 +965,18 @@ def test_a_heavy_inside_an_agent_check_runs_at_once(installed, committing):
 
     assert commit_run.returncode == 0, commit_run.err()
     assert ran(installed) == ["agent", "fast"]
+
+
+def test_only_a_check_that_passes_goes_into_heavys_history(installed):
+    history = Path(os.environ["HEAVY_DIR"]) / "history.json"
+    passed = commit(installed)
+    assert passed.returncode == 0, passed.stderr
+    assert history.exists()
+    after_pass = history.read_text()
+
+    (installed / "a").write_text("bad\n")
+    git(installed, "add", "a")
+    refused = commit(installed)
+
+    assert refused.returncode != 0
+    assert history.read_text() == after_pass

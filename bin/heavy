@@ -1,21 +1,39 @@
 #!/usr/bin/env python3
 """Run a CPU-heavy command when it's its turn and its cores are quiet.
 
-    heavy -- CMD [ARGS...]          a build, a test suite, anything heavy
-    heavy --long -- CMD [ARGS...]   a long run, such as a local mutants shard
-    heavy status                    each lane's holder, waiters and how busy it is
+    heavy -- CMD [ARGS...]           a build, a test suite, anything heavy
+    heavy --long -- CMD [ARGS...]    a long run, such as a local mutants shard
+    heavy --alone -- CMD [ARGS...]   a timing: no job shares its lane
+    heavy status                     each lane's jobs and how busy its cores are
 
-Every session on this VM shares two lanes, each running one job at a time, first come
-first served. A long job runs on the last quarter of the cores; while one runs, a
-normal job gets the rest, and otherwise all of them, so a commit's checks never wait
-behind a long run. (With fewer than 4 cores, a long job takes the normal lane.) The
-head of a lane starts once its cores have stayed under half busy at every one-second
-sample for 10 seconds, however long that takes: work outside the queue holds it up,
-and `heavy status` shows how busy the cores are. A job that arrives to a free lane,
-nobody waiting, starts at the first quiet sample. CMD then runs in the foreground,
-pinned to those cores (CARGO_BUILD_JOBS set to match), with this call's environment,
-folder, terminal and output, and heavy exits with its status. Commit checks join the
-queue on their own, through agent-commit-gate, and so does wt-ship's --check.
+Every session on this VM shares two lanes, each running one job at a time at full
+priority, first come first served. A long job runs on the last quarter of the cores;
+while one runs or waits, a normal job gets the rest, and otherwise all of them, so a
+commit's checks never wait behind a long run. (With fewer than 4 cores, a long job
+takes the normal lane.) The head of a lane starts once its cores have stayed under
+half busy at every one-second sample for 10 seconds, however long that takes: work
+outside the queue holds it up, and `heavy status` shows how busy the cores are. A job
+that arrives to a free lane, nobody waiting, starts at the first quiet sample. CMD then
+runs in the foreground, pinned to those cores (CARGO_BUILD_JOBS set to match), with
+this call's environment, folder, terminal and output, and heavy exits with its status.
+Commit checks join the queue on their own, through agent-commit-gate, and so does
+wt-ship's --check.
+
+A lane holds one more job when its holder leaves cores idle. The first waiter in line
+that fits starts beside the holder at nice 10, so the holder keeps about 90% of any
+core both want. It fits when 4 GiB of memory are free and either:
+  - heavy has seen both commands exit 0 before, and the waiter's usual cores plus the
+    holder's (its usual or its last 10 seconds, whichever is more) come to at most
+    three quarters of the holder's cores; or
+  - the holder's cores have averaged under 30% busy for 90 seconds.
+The sharer runs on the holder's cores, first in line for the OOM killer, with
+CARGO_BUILD_JOBS at the cores the holder leaves of that three quarters. It stays
+niced to the end, since only root can undo a nice. A job run with --alone never
+shares, and no job shares beside it: time things with it.
+
+A command's usual cores come from its last 5 runs that exited 0: the most CPU time
+any of them used per second of its run, counting CMD and the processes it waited for.
+Every worktree of a repo shares one history, in HEAVY_DIR/history.json.
 
 While it waits, heavy prints a line on stderr when what it waits on changes. When it
 joins a lane that already holds two jobs, or has headed its lane for
@@ -32,9 +50,12 @@ Environment:
   HEAVY_DIR            the queue's folder (default /tmp/heavy)
   HEAVY_QUIET_SECONDS  how long the cores must stay quiet (default 10)
   HEAVY_POLL           seconds per sample (default 1)
+  HEAVY_SHARE_SECONDS  how long a holder must idle before anyone shares (default 90)
   HEAVY_STALL_SECONDS  how long a head waits before suggesting a PR (default 600)
   HEAVY_GRACE          seconds CMD gets to stop before SIGKILL (default 5)
   HEAVY_BUSY           a file whose number stands in for how busy the cores are (tests)
+  HEAVY_MEMINFO        a file that stands in for /proc/meminfo (tests)
+  HEAVY_CORES_USED     a number that stands in for the cores a run used (tests)
   HEAVY_SLOT           set for CMD, to the slot it holds
 
 Exit status: CMD's own; 2 a usage error; 125 heavy couldn't use its queue; 126 CMD
@@ -107,8 +128,8 @@ def stop(proc):
             continue
 
 
-def run(command, long):
-    with heavyqueue.turn(long=long, command=shlex.join(command)) as job:
+def run(command, long, alone):
+    with heavyqueue.turn(long=long, command=shlex.join(command), alone=alone) as job:
         job.pin()  # CMD inherits this process's cores
         terminal = sys.stdin.isatty()
         try:
@@ -135,6 +156,7 @@ def run(command, long):
         finally:
             if terminal:
                 hand_terminal(os.getpgrp())
+        job.exited(code)
         return 128 - code if code < 0 else code
 
 
@@ -144,6 +166,11 @@ def main(argv=None):
     )
     parser.add_argument(
         "--long", action="store_true", help="a long run: a quarter of the cores"
+    )
+    parser.add_argument(
+        "--alone",
+        action="store_true",
+        help="never share a lane, as for a timing: no job runs beside this one",
     )
     parser.add_argument(
         "command", nargs=argparse.REMAINDER, help="status, or -- CMD [ARGS...]"
@@ -157,7 +184,7 @@ def main(argv=None):
     for sig in STOPS:
         signal.signal(sig, on_signal)
     try:
-        return run(args.command[1:], args.long)
+        return run(args.command[1:], args.long, args.alone)
     except Stopped as stopped:
         return 128 + stopped.signum
     except heavyqueue.QueueError as error:

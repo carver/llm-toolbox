@@ -263,21 +263,29 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   print as they come.
 - **heavy**: `heavy -- CMD` runs a CPU-heavy command once it's its turn and its
   cores are quiet. Every session on the VM shares two lanes, each running one
-  job at a time, first come first served: `heavy --long` jobs on the last
-  quarter of the cores, normal ones on the rest while a long job runs and on
-  all of them otherwise (with fewer than 4 cores, long jobs share the normal
-  lane). A lane's head starts once its cores stay under half busy for
-  `$HEAVY_QUIET_SECONDS` (10), sampled every `$HEAVY_POLL` seconds, or at the
-  first quiet sample when it arrived to a free lane; then CMD runs in the
-  foreground with the terminal, pinned to those cores (`CARGO_BUILD_JOBS` to
-  match), and heavy exits with its status. Stopped, it stops CMD's process
-  group, with SIGKILL after `$HEAVY_GRACE` seconds. `heavy status` shows each
-  lane's holder, waiters and how busy its cores are. A third job in a lane, or
-  a head stalled for `$HEAVY_STALL_SECONDS` (600), gets a hint to push a topic
-  branch and open a PR for CI's results instead. A heavy inside a job
-  (`$HEAVY_SLOT`) runs at once, and wt-ship's `--check` queues too. The queue
-  lives in `$HEAVY_DIR` (`/tmp/heavy`); `$HEAVY_BUSY` names a file that stands
-  in for how busy the cores are, for the tests.
+  job at a time at full priority, first come first served: `heavy --long` jobs
+  on the last quarter of the cores, normal ones on the rest while a long job
+  runs or waits and on all of them otherwise (with fewer than 4 cores, long
+  jobs share the normal lane). A lane's head starts once its cores stay under
+  half busy for `$HEAVY_QUIET_SECONDS` (10), sampled every `$HEAVY_POLL`
+  seconds, or at the first quiet sample when it arrived to a free lane; then
+  CMD runs in the foreground with the terminal, pinned to those cores
+  (`CARGO_BUILD_JOBS` to match), and heavy exits with its status. One more job
+  can share a lane at nice 10: the first waiter whose usual cores fit beside
+  the holder's in three quarters of the cores, or any waiter once the holder's
+  cores have averaged under 30% busy for `$HEAVY_SHARE_SECONDS` (90), with 4
+  GiB of memory free either way. A command's usual cores come from its last
+  runs that exited 0, shared by every worktree of its repo. `heavy --alone`,
+  for timings, never shares a lane. Stopped, it stops CMD's process group,
+  with SIGKILL after `$HEAVY_GRACE` seconds. `heavy status` shows each lane's
+  holder, sharer, waiters, their usual cores and how busy the lane's cores
+  are. A third job in a lane, or a head stalled for `$HEAVY_STALL_SECONDS`
+  (600), gets a hint to push a topic branch and open a PR for CI's results
+  instead. A heavy inside a job (`$HEAVY_SLOT`) runs at once, and wt-ship's
+  `--check` queues too. The queue and its history live in `$HEAVY_DIR`
+  (`/tmp/heavy`). For the tests, `$HEAVY_BUSY` names a file that stands in for
+  how busy the cores are, `$HEAVY_MEMINFO` one for `/proc/meminfo`, and
+  `$HEAVY_CORES_USED` a run's measured cores.
 - **issue-todo**: a GitHub issue's task-list items across its body and every
   comment (`issue-todo show N`), which `gh issue view` splits between two
   commands, and ticking one where it lives (`issue-todo tick N MATCH --note

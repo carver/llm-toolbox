@@ -435,7 +435,7 @@ def run_quiet(path, name, base, queue=True):
     the greps hid failed commits. With queue, it runs once it's its turn in heavy's
     queue, whose waiting lines print as they come."""
     with ExitStack() as stack:
-        env = dict(os.environ)
+        env, job = dict(os.environ), None
         try:
             if queue:
                 job = stack.enter_context(heavyqueue.turn(command=name, hint=False))
@@ -458,6 +458,8 @@ def run_quiet(path, name, base, queue=True):
             check=False,
             env=env,
         )
+        if job is not None:
+            job.exited(run.returncode)  # a passing check goes into heavy's history
     code = run.returncode
     if code == 0:
         given = f", given CHECK_BASE {base[:12]}" if base else ""

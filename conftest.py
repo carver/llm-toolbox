@@ -91,15 +91,20 @@ def no_inherited_repo():
 def private_heavy_queue(tmp_path_factory, monkeypatch):
     """Each test gets a heavy queue of its own whose cores are always quiet, so a test
     that commits through agent-commit-gate neither joins the VM's real queue (behind
-    real builds) nor waits on another test's. HEAVY_SLOT goes too: the suite may be
-    running inside a commit check that holds the real slot."""
+    real builds) nor waits on another test's. Its free memory is too little for a job
+    to share a lane, so a check waits its turn. HEAVY_SLOT goes too: the suite may be
+    running inside a commit check that holds the real slot; and RUSTC_WRAPPER, so a
+    test's heavy doesn't start the VM's sccache server."""
     folder = tmp_path_factory.mktemp("heavy")
     (folder / "busy").write_text("0\n")
+    (folder / "meminfo").write_text("MemAvailable: 1048576 kB\n")
     monkeypatch.setenv("HEAVY_DIR", str(folder / "queue"))
     monkeypatch.setenv("HEAVY_BUSY", str(folder / "busy"))
+    monkeypatch.setenv("HEAVY_MEMINFO", str(folder / "meminfo"))
     monkeypatch.setenv("HEAVY_QUIET_SECONDS", "0")
     monkeypatch.setenv("HEAVY_POLL", "0.01")
-    monkeypatch.delenv("HEAVY_SLOT", raising=False)
+    for name in ("HEAVY_SLOT", "HEAVY_CORES_USED", "RUSTC_WRAPPER"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def started_child(parent: int, arg: str) -> int:

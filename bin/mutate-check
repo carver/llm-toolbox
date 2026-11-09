@@ -9,14 +9,17 @@
   >>>>>>> REPLACE
   EDITS
 
-  mutate-check [--timeout SECONDS] -- CMD...
+  mutate-check [--timeout SECONDS] [--edits FILE] -- CMD...
 
 Pick a heredoc delimiter that isn't a line of the blocks: a line EOF in the text ends
 <<'EOF' early, and the shell runs the rest as commands.
 
 Stdin holds apply-edits blocks (`apply-edits -h` shows the format), which apply-edits
-applies all or nothing. Then the command runs, and every file the blocks name is put
-back byte for byte, also when mutate-check is stopped by Ctrl-C, SIGTERM or SIGHUP.
+applies all or nothing; --edits FILE reads them from FILE instead, and stdin isn't
+read. Use --edits under bgrun or heavy: bgrun gives its job no stdin, so `bgrun ... --
+heavy -- mutate-check -- CMD < blocks` runs with no blocks. Then the command runs, and
+every file the blocks name is put back byte for byte, also when mutate-check is
+stopped by Ctrl-C, SIGTERM or SIGHUP.
 
 A failure counts as a catch only when tests ran. A mutation that stops the build (a Rust
 `error: could not compile` or `error[E...]`, as unused code under `-D warnings` does),
@@ -40,7 +43,8 @@ Stopped, or past --timeout, it stops the command's process group: SIGTERM, then
 SIGKILL after $MUTATE_CHECK_GRACE seconds (default 5; the tests shorten it).
 
 Exit status: 0 the command failed, so the mutation was caught; 1 it passed, so the
-tests miss it; 2 usage error or blocks that didn't apply (the command didn't run);
+tests miss it; 2 usage error, an --edits FILE that can't be read, or blocks that didn't
+apply (the command didn't run);
 3 inconclusive: the build failed, no tests ran, or the command hung; 128+N stopped by
 signal N.
 """
@@ -267,25 +271,44 @@ def mutated_run(edits: str, command: list[str], timeout: float) -> tuple[int, st
         raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
 
 
-def main() -> int:
-    args = sys.argv[1:]
-    if args[:1] in (["-h"], ["--help"]):
-        print(__doc__)
-        return 0
-    timeout = DEFAULT_TIMEOUT
-    if args[:1] == ["--timeout"]:
-        try:
-            timeout = float(args[1])
-        except (IndexError, ValueError):
-            timeout = 0.0
-        if not (math.isfinite(timeout) and timeout > 0):
-            print("mutate-check: --timeout takes a number of seconds", file=sys.stderr)
-            return USAGE
+def parse_args(args: list[str]) -> tuple[float, Path | None, list[str]]:
+    """(the timeout, the --edits file or None for stdin, the command), from the
+    options before `--`, in any order. Raises UsageError."""
+    timeout, edits_file = DEFAULT_TIMEOUT, None
+    while args[:1] in (["--timeout"], ["--edits"]):
+        if len(args) < 2:
+            raise UsageError(f"mutate-check: {args[0]} takes a value")
+        if args[0] == "--edits":
+            edits_file = Path(args[1])
+        else:
+            try:
+                timeout = float(args[1])
+            except ValueError:
+                timeout = 0.0
+            if not (math.isfinite(timeout) and timeout > 0):
+                raise UsageError("mutate-check: --timeout takes a number of seconds")
         args = args[2:]
     if args[:1] != ["--"] or len(args) < 2:
-        print(f"mutate-check: give the command after --\n{__doc__}", file=sys.stderr)
+        raise UsageError(f"mutate-check: give the command after --\n{__doc__}")
+    return timeout, edits_file, args[1:]
+
+
+def main() -> int:
+    if sys.argv[1:2] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    try:
+        timeout, edits_file, command = parse_args(sys.argv[1:])
+        edits = edits_file.read_text() if edits_file else sys.stdin.read()
+    except UsageError as e:
+        print(e, file=sys.stderr)
         return USAGE
-    edits = sys.stdin.read()
+    except OSError as e:
+        print(f"mutate-check: can't read {edits_file}: {e.strerror}", file=sys.stderr)
+        return USAGE
+    except UnicodeDecodeError:
+        print(f"mutate-check: {edits_file or 'stdin'} isn't UTF-8", file=sys.stderr)
+        return USAGE
     try:
         files = FORMAT.parse(edits)
     except FORMAT.UsageError as e:
@@ -296,7 +319,7 @@ def main() -> int:
         signal.signal(signum, stop)
     status: int | None = None
     try:
-        code, output = mutated_run(edits, args[1:], timeout)
+        code, output = mutated_run(edits, command, timeout)
     except UsageError as e:
         print(e, file=sys.stderr)
         status = USAGE
@@ -322,10 +345,10 @@ def main() -> int:
     lines = output.splitlines()
     # A Rust build that failed, or a cargo test run, with no line saying a test ran
     no_rust_test = not tests_ran(lines) and (
-        runs_cargo_tests(args[1:]) or rust_build_failed(lines)
+        runs_cargo_tests(command) or rust_build_failed(lines)
     )
     errors = rust_errors(lines) if no_rust_test else []
-    if no_rust_test or (runs_pytest(args[1:]) and code in PYTEST_NOTHING_RAN):
+    if no_rust_test or (runs_pytest(command) and code in PYTEST_NOTHING_RAN):
         print(
             f"mutate-check: inconclusive: the command exited {code} before any test"
             " judged the mutation"

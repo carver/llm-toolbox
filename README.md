@@ -162,8 +162,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   pre-commit hook lints the staged ones that name pipefail. It parses with
   tree-sitter-bash, through `uv run --script`.
 - **mutate-check**: `mutate-check -- CMD` breaks code briefly with apply-edits
-  blocks from stdin, runs CMD (a test run), and puts every file back, also when
-  stopped. It exits 0 when CMD failed (the tests catch the break) and 1 when it
+  blocks from stdin (or from `--edits FILE`, for a run under bgrun, which
+  gives its job no stdin), runs CMD (a test run), and puts every file back, also
+  when stopped. It exits 0 when CMD failed (the tests catch the break) and 1 when it
   passed, printing one line and at most 3 of pytest's `E ` lines. It exits 3,
   inconclusive, when no test judged the break: the build failed (a Rust compile
   error, such as unused code under `-D warnings`), pytest collected nothing, a

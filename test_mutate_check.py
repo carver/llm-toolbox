@@ -41,14 +41,16 @@ PYTEST = [
 
 def check(
     cwd: Path,
-    edits: str,
+    edits: str | None,
     *cmd: str,
     options: tuple[str, ...] = (),
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Run mutate-check with `edits` on stdin, or with none (None), as bgrun runs it."""
     return subprocess.run(
         [str(SCRIPT), *options, "--", *cmd],
         input=edits,
+        stdin=subprocess.DEVNULL if edits is None else None,
         cwd=cwd,
         text=True,
         capture_output=True,
@@ -527,3 +529,55 @@ def test_a_rust_test_that_fails_or_crashes_is_caught(
 
     assert result.returncode == 0, result.stdout
     assert f"caught: the command exited {status}" in result.stdout
+
+
+def test_edits_from_a_file_break_the_code_with_stdin_closed(repo: Path) -> None:
+    blocks = repo.parent / "break.edits"
+    blocks.write_text(BREAK)
+
+    result = check(repo, None, *PYTEST, options=("--edits", str(blocks)))
+
+    assert result.returncode == 0, result.stderr
+    assert "E       assert 5 == 4" in result.stdout
+    assert (repo / "calc.py").read_text() == CODE
+
+
+@pytest.mark.parametrize("edits_first", [True, False])
+def test_edits_and_timeout_go_in_either_order(repo: Path, edits_first: bool) -> None:
+    blocks = repo.parent / "break.edits"
+    blocks.write_text(BREAK)
+    edits, timeout = ("--edits", str(blocks)), ("--timeout", "60")
+
+    options = edits + timeout if edits_first else timeout + edits
+    result = check(repo, None, *PYTEST, options=options)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_an_edits_file_that_cant_be_read_runs_nothing(repo: Path) -> None:
+    missing = repo.parent / "missing.edits"
+
+    result = check(repo, None, "touch", "ran", options=("--edits", str(missing)))
+
+    assert result.returncode == 2
+    assert "missing.edits" in result.stderr
+    assert not (repo / "ran").exists()
+
+
+def test_an_edits_file_that_isnt_utf8_is_a_usage_error(repo: Path) -> None:
+    blocks = repo.parent / "latin1.edits"
+    blocks.write_bytes(BREAK.encode() + b"caf\xe9\n")
+
+    result = check(repo, None, "touch", "ran", options=("--edits", str(blocks)))
+
+    assert result.returncode == 2
+    assert "latin1.edits" in result.stderr and "UTF-8" in result.stderr
+    assert not (repo / "ran").exists()
+
+
+def test_help_says_to_use_edits_under_bgrun(repo: Path) -> None:
+    result = subprocess.run(
+        [str(SCRIPT), "-h"], cwd=repo, text=True, capture_output=True, check=False
+    )
+
+    assert "--edits FILE" in result.stdout and "bgrun" in result.stdout

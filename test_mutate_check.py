@@ -338,3 +338,192 @@ def test_an_endless_timeout_is_a_usage_error(repo: Path) -> None:
     result = check(repo, BREAK, "true", options=("--timeout", "inf"))
 
     assert result.returncode == 2, result.stdout + result.stderr
+
+
+# nextest's and cargo's own output, captured from cargo-nextest 0.9.151 and cargo 1.98
+# on a throwaway crate, for a fake `cargo` first on PATH to print.
+NEXTEST_BAD_FILTER = (
+    "  error: invalid string\n"
+    "   ╭────\n"
+    " 1 │ test(=)\n"
+    "   ·       ▲\n"
+    "   ·       ╰── invalid string\n"
+    "   ╰────\n"
+    "\n"
+    "error: failed to parse filterset\n"
+)
+NEXTEST_NO_TESTS = (
+    "────────────\n"
+    " Nextest run ID cf63cce1-fe12-49d1-a301-b99182380a84 with nextest profile: default\n"
+    "    Starting 0 tests across 1 binary (2 tests skipped)\n"
+    "────────────\n"
+    "     Summary [   0.003s] 0 tests run: 0 passed, 2 skipped\n"
+    "error: no tests to run\n"
+    "(hint: use `--no-tests` to customize)\n"
+)
+NEXTEST_CRASHED = (
+    "────────────\n"
+    " Nextest run ID e8e8fc38-d12e-48ac-aa12-6599576fd817 with nextest profile: default\n"
+    "    Starting 2 tests across 1 binary\n"
+    "        PASS [   0.031s] (1/2) calc tests::doubles\n"
+    "     SIGABRT [   0.036s] (2/2) calc tests::deep\n"
+    "  stdout ───\n"
+    "\n"
+    "    running 1 test\n"
+    "  stderr ───\n"
+    "\n"
+    "    thread 'tests::deep' (3993502) has overflowed its stack\n"
+    "    fatal runtime error: stack overflow, aborting\n"
+    "\n"
+    "    (test aborted with signal 6: SIGABRT)\n"
+    "\n"
+    "  Cancelling due to test failure\n"
+    "────────────\n"
+    "     Summary [   0.043s] 2 tests run: 1 passed, 1 failed, 0 skipped\n"
+    "     SIGABRT [   0.036s] (2/2) calc tests::deep\n"
+    "error: test run failed\n"
+)
+# The same Summary as nextest colours it under CARGO_TERM_COLOR=always.
+NEXTEST_CRASHED_IN_COLOUR = NEXTEST_CRASHED.replace(
+    "     Summary [   0.043s] 2 tests run",
+    "     \x1b[31;1mSummary\x1b[0m [   0.043s] \x1b[1m2\x1b[0m tests run",
+)
+# libtest refusing an option it doesn't know, from `cargo test -q -- --bogus`: cargo's
+# line that a test binary failed follows, though no test ran.
+LIBTEST_BAD_OPTION = (
+    "error: Unrecognized option: 'bogus'\nerror: test failed, to rerun pass `--lib`\n"
+)
+# libtest prints no `test result:` line for a binary that dies under a test.
+LIBTEST_CRASHED = (
+    "\n"
+    "running 2 tests\n"
+    ".\n"
+    "thread 'tests::deep' (3993413) has overflowed its stack\n"
+    "fatal runtime error: stack overflow, aborting\n"
+    "error: test failed, to rerun pass `--lib`\n"
+    "\n"
+    "Caused by:\n"
+    "  process didn't exit successfully: `target/debug/deps/calc-8bfc7c3af6e6b5c2"
+    " --quiet` (signal: 6, SIGABRT: process abort signal)\n"
+)
+
+
+@pytest.fixture
+def cargo(repo: Path) -> dict[str, str]:
+    """An environment whose `cargo` prints cargo.out and exits with cargo.status."""
+    fake = repo / "fakebin"
+    fake.mkdir()
+    (fake / "cargo").write_text(
+        '#!/bin/sh\ncat cargo.out\nexit "$(cat cargo.status)"\n'
+    )
+    (fake / "cargo").chmod(0o755)
+    return os.environ | {"PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
+
+
+def cargo_prints(repo: Path, output: str, status: int) -> None:
+    (repo / "cargo.out").write_text(output)
+    (repo / "cargo.status").write_text(str(status))
+
+
+NEXTEST = ("cargo", "nextest", "run", "--cargo-quiet")
+
+
+@pytest.mark.parametrize(
+    ("command", "output", "status", "shown"),
+    [
+        (
+            (*NEXTEST, "-E", "test(=)"),
+            NEXTEST_BAD_FILTER,
+            94,
+            "error: failed to parse filterset",
+        ),
+        (
+            (*NEXTEST, "-E", "test(=nomatch)"),
+            NEXTEST_NO_TESTS,
+            4,
+            "error: no tests to run",
+        ),
+        (
+            ("cargo", "test", "-q", "--", "--bogus"),
+            LIBTEST_BAD_OPTION,
+            101,
+            "error: Unrecognized option: 'bogus'",
+        ),
+    ],
+    ids=["nextest bad filter", "nextest no tests", "libtest bad option"],
+)
+def test_a_rust_test_run_that_ran_no_test_is_inconclusive_not_caught(
+    repo: Path,
+    cargo: dict[str, str],
+    command: tuple[str, ...],
+    output: str,
+    status: int,
+    shown: str,
+) -> None:
+    cargo_prints(repo, output, status)
+
+    result = check(repo, BREAK, *command, env=cargo)
+
+    assert result.returncode == 3, result.stdout
+    assert f"inconclusive: the command exited {status}" in result.stdout
+    assert "judged the mutation" in result.stdout
+    assert f"  {shown}" in result.stdout.splitlines()
+    assert len(result.stdout.splitlines()) <= 4, result.stdout
+    assert (repo / "calc.py").read_text() == CODE
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["cargo", "test", "-q"],
+        ["cargo", "+nightly", "t"],
+        ["cargo", "-q", "test"],
+        ["fakebin/cargo", "test"],
+        ["sh", "-c", "cd . && cargo nextest run --cargo-quiet"],
+    ],
+)
+def test_each_way_of_writing_a_rust_test_run_is_read_as_one(
+    repo: Path, cargo: dict[str, str], command: list[str]
+) -> None:
+    cargo_prints(repo, "error: unexpected argument '--tset' found\n", 1)
+
+    result = check(repo, BREAK, *command, env=cargo)
+
+    assert result.returncode == 3, result.stdout
+
+
+@pytest.mark.parametrize(
+    "command", [["cargo", "run", "--bin", "test"], ["cargo", "tree"]]
+)
+def test_a_cargo_command_that_isnt_a_test_run_is_still_caught(
+    repo: Path, cargo: dict[str, str], command: list[str]
+) -> None:
+    cargo_prints(repo, "error: the check found a mismatch\n", 1)
+
+    result = check(repo, BREAK, *command, env=cargo)
+
+    assert result.returncode == 0, result.stdout
+
+
+@pytest.mark.parametrize(
+    ("command", "output", "status"),
+    [
+        (NEXTEST, NEXTEST_CRASHED, 100),
+        (NEXTEST, NEXTEST_CRASHED_IN_COLOUR, 100),
+        (("cargo", "test", "-q"), LIBTEST_CRASHED, 101),
+    ],
+    ids=["nextest", "nextest in colour", "libtest"],
+)
+def test_a_rust_test_that_fails_or_crashes_is_caught(
+    repo: Path,
+    cargo: dict[str, str],
+    command: tuple[str, ...],
+    output: str,
+    status: int,
+) -> None:
+    cargo_prints(repo, output, status)
+
+    result = check(repo, BREAK, *command, env=cargo)
+
+    assert result.returncode == 0, result.stdout
+    assert f"caught: the command exited {status}" in result.stdout

@@ -20,9 +20,18 @@ back byte for byte, also when mutate-check is stopped by Ctrl-C, SIGTERM or SIGH
 
 A failure counts as a catch only when tests ran. A mutation that stops the build (a Rust
 `error: could not compile` or `error[E...]`, as unused code under `-D warnings` does),
-or pytest exiting 2, 4 or 5 (collection errors, usage, no tests), is inconclusive: no
-test judged it. So is a command that runs past --timeout (default 600 seconds), which
-is stopped: a hang isn't a catch.
+pytest exiting 2, 4 or 5 (collection errors, usage, no tests), or a `cargo test` or
+`cargo nextest` run that fails with no line saying a test ran, is inconclusive: no test
+judged it. So is a command that runs past --timeout (default 600 seconds), which is
+stopped: a hang isn't a catch.
+
+The cargo case covers nextest refusing a filter (exit 94) or finding no test to run
+(exit 4). A test ran when the output, colour codes aside, has libtest's `test result:`,
+nextest's `Summary [...]` with a count of tests run other than 0, or cargo's `error:
+test failed, to rerun pass ...` (also `doctest`, `bench`), which it prints for a test
+binary that crashed or has no libtest harness. The command is a cargo test run when it
+holds `cargo`, then any `+toolchain` or `-flag` words, then `test`, `t` or `nextest`,
+also inside `sh -c '...'` or after a wrapper such as `heavy --`.
 
 Prints one line, with up to 3 of the command's pytest `E ` lines or Rust `error` lines
 when it failed, or its last line of output when there are none; never the whole output.
@@ -142,7 +151,8 @@ def run(command: list[str], timeout: float) -> tuple[int, str]:
     except subprocess.TimeoutExpired as e:
         stop_child(child, grace)
         raise TimedOut from e
-    return child.returncode, output.decode(errors="replace")
+    # Without colour codes, which CARGO_TERM_COLOR=always or --color puts mid-line
+    return child.returncode, COLOUR.sub("", output.decode(errors="replace"))
 
 
 def stop_child(child: subprocess.Popen[bytes], grace: float) -> None:
@@ -178,19 +188,31 @@ UNUSED_HINT = (
     "  hint: the mutation left code unused, which -D warnings refuses; keep it used,"
     " such as with `let _ = &name;`, or mutate a condition instead of removing a call"
 )
-# A cargo or nextest summary line: tests ran, so a failure is theirs.
-TESTS_RAN = re.compile(r"^test result: |^\s*Summary \[")
+# A line that says tests ran, so a failure is theirs: libtest's summary, or its line
+# before the tests, which is all a binary that crashed under a test prints; nextest's
+# Summary when it counts a test run (it prints `0 tests run` before exiting 4 for no
+# tests). Not cargo's `error: test failed`, which follows libtest refusing an option.
+TESTS_RAN = re.compile(
+    r"^test result: |^running \d+ tests?$|^\s*Summary \[[^\]]*\]\s*[1-9]"
+)
+COLOUR = re.compile(r"\x1b\[[0-9;]*m")
+# `cargo`, then any `+toolchain` or `-flag` words, then a subcommand that runs tests,
+# anywhere in the command, so also inside `sh -c '...'` or after `heavy --`.
+CARGO_TEST_RUN = re.compile(r"(?<![\w-])cargo(\s+[-+]\S*)*\s+(test|t|nextest)(?![\w-])")
 
 
-def build_errors(output: str) -> list[str]:
-    """Rust's compile errors, when the build failed before any test ran."""
-    lines = output.splitlines()
-    if any(TESTS_RAN.search(line) for line in lines):
-        return []
-    if not any(RUST_BUILD_FAILED.match(line) for line in lines):
-        return []
-    # Each error and the `-->` line that places it, causes first, then cargo's lines
-    # that only say the build failed, so the cap on lines shown keeps the cause.
+def tests_ran(lines: list[str]) -> bool:
+    return any(TESTS_RAN.search(line) for line in lines)
+
+
+def rust_build_failed(lines: list[str]) -> bool:
+    return any(RUST_BUILD_FAILED.match(line) for line in lines)
+
+
+def rust_errors(lines: list[str]) -> list[str]:
+    """Rust's error lines: each error and the `-->` line that places it, causes first,
+    then cargo's lines that only say the build failed, so the cap on lines shown keeps
+    the cause."""
     causes, failed = [], []
     for index, line in enumerate(lines):
         if not RUST_ERROR.match(line):
@@ -207,6 +229,10 @@ def build_errors(output: str) -> list[str]:
 
 def runs_pytest(command: list[str]) -> bool:
     return any(Path(arg).name == "pytest" or arg.endswith("pytest") for arg in command)
+
+
+def runs_cargo_tests(command: list[str]) -> bool:
+    return CARGO_TEST_RUN.search(" ".join(command)) is not None
 
 
 def summary(output: str) -> list[str]:
@@ -293,8 +319,13 @@ def main() -> int:
     if code == 0:
         print("mutate-check: not caught: the command passed with the mutation")
         return MISSED
-    errors = build_errors(output)
-    if errors or (runs_pytest(args[1:]) and code in PYTEST_NOTHING_RAN):
+    lines = output.splitlines()
+    # A Rust build that failed, or a cargo test run, with no line saying a test ran
+    no_rust_test = not tests_ran(lines) and (
+        runs_cargo_tests(args[1:]) or rust_build_failed(lines)
+    )
+    errors = rust_errors(lines) if no_rust_test else []
+    if no_rust_test or (runs_pytest(args[1:]) and code in PYTEST_NOTHING_RAN):
         print(
             f"mutate-check: inconclusive: the command exited {code} before any test"
             " judged the mutation"

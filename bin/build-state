@@ -59,11 +59,15 @@ keys (never config values: a remote URL can hold a token), exits 1 and keeps the
 before folding anything. Some changes, which can't change what a fold makes, it only
 reports, in one line saying to tell the user, and goes on: core.hooksPath (the hooks a
 fold runs can't change its trees, which finish checks after, and hook files were never
-in the fingerprint), a branch's settings, for any branch but the build's own, and a
-remote-tracking ref (refs/remotes/) made, moved or deleted, other than the build's
-target or upstream, such as a topic branch pushed to get CI's results and deleted
-after, which neither a fold nor a landing reads. Another session's install.py set
-core.hooksPath during a build. A
+in the fingerprint), a branch's settings, for any branch but the build's own, the
+build's own branch's remote and merge, each when it wasn't set at start, as `git push
+-u origin BRANCH` for CI's results sets them, and a remote-tracking ref (refs/remotes/)
+made, moved or deleted, other than the build's target or upstream, such as a topic
+branch pushed to get CI's results and deleted after, which neither a fold nor a
+landing reads. Finish reads the upstream the branch had at start, not one it got
+since. The build's own branch's other settings, and those two when they were set at
+start, still stop it: they decide where a bare git push or pull goes. Another
+session's install.py set core.hooksPath during a build. A
 remote-tracking ref is named when it pointed at a commit the fold may rewrite, at
 start or now, or is a symbolic ref repointed; the rest, as a fetch in any worktree
 moves them, are counted. A fix commit left unfolded (its target is older than the
@@ -165,22 +169,32 @@ def target_branches(base: str) -> list[str]:
     )
 
 
-def rewritten_base(targets: set[str]) -> tuple[str, str] | None:
+def rewritten_base(targets: set[str], upstream: str | None) -> tuple[str, str] | None:
     """When another session rewrote the branch a build lands on (a rebase, an amended
     tip) and HEAD was rebased onto the new one, the recorded base is in neither, and a
     fold from it would replay the branch's own commits. This is that branch and where
     HEAD meets it now: a landing branch, or, for a build on a named branch, which has
-    none, the branch's upstream. None if HEAD meets none of them."""
-    upstream = git(
-        "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False
-    ).stdout.strip()
+    none, the branch's `upstream` at start (a full ref name), not one it got since,
+    such as a `git push -u` of the work for CI, which finish only reports. None if HEAD
+    meets none of them."""
     for branch, ref in [
         *((name, f"refs/heads/{name}") for name in sorted(targets)),
-        *([(upstream, upstream)] if upstream else []),
+        *([(short_ref(upstream), upstream)] if upstream else []),
     ]:
         if meet := meets(ref):
             return branch, meet
     return None
+
+
+def short_ref(ref: str) -> str:
+    """origin/main for refs/remotes/origin/main, main for refs/heads/main."""
+    return ref.removeprefix("refs/heads/").removeprefix("refs/remotes/")
+
+
+def start_upstream(state: dict) -> str | None:
+    """The work branch's upstream at start, which work_refs() records after the branch;
+    None on a detached HEAD or a branch that had none."""
+    return next(iter(state["work_refs"][1:]), None)
 
 
 def meets(ref: str) -> str:
@@ -260,16 +274,22 @@ def on_work_commit(name: str, before: str | None, work: set[str]) -> bool:
     return any(peeled(ref) in work for ref in (name, before) if ref)
 
 
-def only_reported(key: str, work: list[str]) -> bool:
+def only_reported(key: str, work: list[str], new: bool) -> bool:
     """Whether finish only reports a change to config `key`, rather than stopping:
     core.hooksPath, the owner's call (hooks run in a fold, but its trees are checked
-    after, and hook files were never in the fingerprint), and a branch's settings for
-    any branch but the build's own, whose upstream finish reads."""
+    after, and hook files were never in the fingerprint); a branch's settings for any
+    branch but the build's own; and the build's own branch's remote and merge when
+    they're `new` since start, as a `git push -u` of the work for CI sets them (finish
+    reads the upstream recorded at start). The build's own branch's other changes
+    stop it: its remote, pushRemote and merge decide where a bare git push or pull
+    goes."""
     if key == "core.hookspath":
         return True
     if key.startswith("branch.") and key.count(".") >= 2:  # branch.NAME.KEY
-        branch = key.removeprefix("branch.").rpartition(".")[0]
-        return f"refs/heads/{branch}" not in work
+        branch, _, setting = key.removeprefix("branch.").rpartition(".")
+        if f"refs/heads/{branch}" not in work:
+            return True
+        return new and setting in ("remote", "merge")
     return False
 
 
@@ -323,7 +343,7 @@ def changed_since_start(
     for change in changes(before, now):
         kind, _, name = change.partition(" ")
         if kind == "config":
-            if only_reported(name, state["work_refs"]):
+            if only_reported(name, state["work_refs"], name not in before["config"]):
                 changed.config.append(name)
             else:
                 changed.stops.append(change)
@@ -527,7 +547,11 @@ def finish(args: argparse.Namespace) -> int:
         return fail("There are uncommitted changes: commit or stash them first.")
     targets = set(state.get("targets", []))
     others = set(state.get("others", [])) | other_worktree_branches()
-    found = None if ancestor(base, "HEAD") else rewritten_base(targets)
+    found = (
+        None
+        if ancestor(base, "HEAD")
+        else rewritten_base(targets, start_upstream(state))
+    )
     # The commits the fold may rewrite, from where it will start.
     work = set(git("rev-list", f"{found[1] if found else base}..HEAD").stdout.split())
     changed = changed_since_start(state, work, targets, others)

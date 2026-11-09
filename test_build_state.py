@@ -1318,13 +1318,79 @@ def test_a_setting_of_every_branch_still_stops_finish(repo, worktree):
     assert "branch.autosetupmerge" in done.stderr
 
 
-def test_the_work_branchs_own_settings_still_stop_finish(repo):
+def test_the_work_branchs_upstream_changed_since_start_still_stops_finish(repo):
     git(repo, "checkout", "-q", "-b", "work")
+    git(repo, "config", "branch.work.merge", "refs/heads/main")
     build_state(repo, "start")
     commit(repo, "a.py", "Work")
-    git(repo, "config", "branch.work.merge", "refs/heads/main")
+    git(repo, "config", "branch.work.merge", "refs/heads/other")
 
     done = build_state(repo, "finish")
 
     assert done.returncode == 1
     assert "branch.work.merge" in done.stderr
+
+
+def test_another_setting_of_the_work_branch_made_since_start_still_stops_finish(repo):
+    git(repo, "checkout", "-q", "-b", "work")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    git(repo, "config", "branch.work.pushRemote", "elsewhere")  # where `git push` goes
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    assert "branch.work.pushremote" in done.stderr
+
+
+@pytest.fixture
+def origin(repo, tmp_path_factory):
+    """A bare repo the work branch can be pushed to, as the remote origin."""
+    path = tmp_path_factory.mktemp("origin") / "origin.git"
+    git(repo, "init", "-q", "--bare", str(path))
+    git(repo, "remote", "add", "origin", str(path))
+    return path
+
+
+def push_u(repo, branch):
+    """`git push -u origin BRANCH`, setting the branch's remote and merge alone: a
+    global branch.autoSetupRebase would add its rebase."""
+    git(
+        repo, "-c", "branch.autoSetupRebase=never", "push", "-q", "-u", "origin", branch
+    )
+
+
+def test_a_push_u_of_the_work_for_ci_is_reported_not_a_stop(repo, origin):
+    git(repo, "checkout", "-q", "-b", "work")
+    base = git(repo, "rev-parse", "HEAD").strip()
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    push_u(repo, "work")  # the workspace's PR flow
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    line = reported(done)
+    assert "branch.work.remote" in line and "branch.work.merge" in line
+    assert "refs/remotes/origin/work" in line
+    assert subjects(repo, base) == ["Work"]
+
+
+def test_an_upstream_the_work_branch_got_since_start_isnt_read_for_its_base(
+    repo, origin
+):
+    git(repo, "checkout", "-q", "-b", "work")
+    before = commit(repo, "b.py", "Before the build")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    push_u(repo, "work")
+    # The base leaves HEAD's history. origin/work, the CI push, wasn't rewritten.
+    git(repo, "rebase", "-q", "--onto", "main", before)
+
+    done = build_state(repo, "finish")
+
+    # As without the push: no upstream at start, so nothing to fold onto.
+    assert done.returncode == 1
+    assert "meets no branch" in done.stderr, done.stderr
+    assert "rewritten" not in done.stdout

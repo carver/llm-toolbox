@@ -260,6 +260,15 @@ worktree, so main was neither behind nor ahead of it and wasn't the target. Now:
   dozens; the report names a ref only when it pointed at a commit the fold may
   rewrite, at start or now (the CI push of the build's own work), or is a symbolic
   ref repointed, and counts the rest.
+- On a build on a named branch, that branch's own `branch.NAME.remote` and `.merge`
+  are reported too, each when it wasn't set at start: the owner's call (2026-11-09),
+  as `git push -u origin NAME`, the workspace's PR flow, sets them. So that a change
+  finish only reports changes no fold, `rewritten_base` reads the upstream the branch
+  had at start (`work_refs`), not `@{upstream}` now, which after such a push names the
+  CI push of the work itself. While the branch's keys are as at start, the two name
+  the same ref. Its other keys, and those two when they were set at start, still stop
+  finish: `.remote`, `.pushRemote` and `.merge` decide where a bare `git push` or
+  `git pull` goes, the reason `remote.*` stops (below).
 - The rest of the config still stops finish. `remote.*` can't change a fold either, but
   a test leaking into the real repo can point `remote.origin.url` at a temporary repo,
   which is the damage the fingerprint is for, and wt-ship would push there next.
@@ -269,10 +278,19 @@ post-rewrite), and a prepare-commit-msg hook can change a folded commit's messag
 hook files were never in the fingerprint, so a hook added under the old path ran
 unguarded too.
 
-Left to the owner (a review of the plan found them): a build on a named branch still
-stops on a CI push made with `git push -u`, which sets the work branch's own
-`branch.*.remote` and `.merge`; and a push over another session's remote branch is
-only reported, or not at all when another worktree has that branch checked out.
+Left to the owner (reviews of the plans found them): a push over another session's
+remote branch is only reported, or not at all when another worktree has that branch
+checked out. A path or URL passes as a push: git takes `branch.NAME.remote=/tmp/x`
+with no `remote.*` entry, so a leaked test that sets it and `.merge` is only reported,
+and the next bare `git push` goes there; reporting the two keys only when
+`@{upstream}` now names a remote-tracking ref made since start would close it. A
+branch that tracked something at start (`git checkout -b work origin/main`) still
+stops on `push -u`, which changes its `.merge`; so does one under a global
+`branch.autoSetupRebase`, for which `push -u` also writes `.rebase`. And a later build
+on the branch starts with its own CI push, `origin/NAME`, as its upstream: when its
+base leaves HEAD's history (a rebase onto a fetched main, then a force-push),
+`rewritten_base` folds from that push and fails on the fixes before it; skipping such
+an upstream would lose a collaborator's real rewrite of a shared branch.
 
 ### wt-ship refuses a message naming an unlanded commit by its ID (2026-11-09)
 

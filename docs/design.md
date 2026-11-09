@@ -211,6 +211,18 @@ file, so every bash a check started had them back (a review of the plan found it
 The other way, a variable the persistent file's secrets block would honour, needs a
 change in sandbox-setup.
 
+The secrets file also exports EBAY_CERT_ID, eBay's client secret, whose name no part
+marks. So the gate also leaves out every name that the file `$AGENT_SECRETS_FILE`
+names exports; sandbox-setup's secrets block sets the variable to that file. The
+owner's terms (2026-11-09): llm-toolbox names no sandbox path, a missing or
+unreadable file is no error, and names are read, never values. The gate reads the
+file's `export` commands with `lib/shellparse.py` rather than sourcing it in a bash
+and listing what it exported: that would run the owner's file at every check, with
+whatever command substitutions it holds, and pass every value through another
+process. The variable is named for the environment it describes, not after the gate,
+so another tool may read it. It isn't the marker above: the secrets block still
+sources the file wherever it runs, so BASH_ENV stays stripped.
+
 ### build-state finish stops only for what a fold, or the repo's safety, depends on (2026-11-09)
 
 The fingerprint came from an anki-cards retro (757b220): a subagent's `rebase --exec`

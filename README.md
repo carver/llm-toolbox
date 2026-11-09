@@ -312,7 +312,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   without llm-toolbox, such as a teammate's, runs the check every time.
   No check the gate runs gets a variable whose name marks a secret (a
   `_`-separated part that is KEY, TOKEN, SECRET, PASSWORD or PASS, in any
-  case, as in GH_TOKEN), nor BASH_ENV, through which bash would source them
+  case, as in GH_TOKEN), nor any name the file `$AGENT_SECRETS_FILE` names
+  exports (its `export` commands, read without running it; nothing more when
+  it's unset or unreadable), nor BASH_ENV, through which bash would source them
   back, since a test's failure message once printed a secret's value;
   `heavy -- CMD` keeps them for a job that needs one.
   The check's output shows only when

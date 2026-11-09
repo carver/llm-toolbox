@@ -1698,34 +1698,34 @@ def names_received(repo):
     return set((repo / ".git" / "names").read_text().split())
 
 
-def full_check(repo):
+def full_check(repo, env=PLANTED):
     hook(repo, "agent-pre-commit", NOTE_NAMES)
-    return commit(repo, env=PLANTED)
+    return commit(repo, env=env)
 
 
-def commit_check_at_a_commit(repo):
+def commit_check_at_a_commit(repo, env=PLANTED):
     install_commit_check(repo, NOTE_NAMES)
-    return commit(repo, env=PLANTED)
+    return commit(repo, env=env)
 
 
-def quick_check_of_a_small_fix(repo):
+def quick_check_of_a_small_fix(repo, env=PLANTED):
     quick_check(repo, NOTE_NAMES)
     assert commit(repo).returncode == 0
     edit(repo, "still good\n")
-    return commit(repo, "--fixup=HEAD", env=PLANTED)
+    return commit(repo, "--fixup=HEAD", env=env)
 
 
-def check_outside_the_queue(repo):
+def check_outside_the_queue(repo, env=PLANTED):
     light_check(repo, NOTE_NAMES)
-    return commit(repo, env=PLANTED)
+    return commit(repo, env=env)
 
 
-def wt_ships_recheck(repo):
+def wt_ships_recheck(repo, env=PLANTED):
     light_check(repo, NOTE_NAMES)
-    return run_no_queue(repo, env=PLANTED)
+    return run_no_queue(repo, env=env)
 
 
-@pytest.mark.parametrize(
+EVERY_CHECK = pytest.mark.parametrize(
     "run_check",
     [
         full_check,
@@ -1735,6 +1735,9 @@ def wt_ships_recheck(repo):
         wt_ships_recheck,
     ],
 )
+
+
+@EVERY_CHECK
 def test_no_check_gets_a_variable_whose_name_marks_a_secret(installed, run_check):
     done = run_check(installed)
 
@@ -1754,3 +1757,86 @@ def test_a_bash_the_check_starts_doesnt_source_the_secrets_back(installed, tmp_p
 
     assert done.returncode == 0, done.stderr
     assert "FAKE_SOURCED_TOKEN" not in names_received(installed)
+
+
+# A secrets file as bash reads it, its values fake, exporting names no part marks.
+SECRETS_FILE_TEXT = """\
+# export FAKE_COMMENTED=fake
+export FAKE_CERT_ID="fake value"
+export FAKE_APP_ID=fake; export FAKE_USER
+export FAKE_A FAKE_B=fake
+export -p FAKE_FLAGGED=fake
+export FAKE_ADDED+=fake
+export \\
+  FAKE_CONTINUED=fake
+export FAKE_QUOTED='FAKE_IN_A_VALUE=fake'
+"""
+EXPORTED = (
+    *("FAKE_CERT_ID", "FAKE_APP_ID", "FAKE_USER", "FAKE_A", "FAKE_B"),
+    *("FAKE_FLAGGED", "FAKE_ADDED", "FAKE_CONTINUED", "FAKE_QUOTED"),
+)
+NOT_EXPORTED = ("FAKE_COMMENTED", "FAKE_IN_A_VALUE")
+
+
+def secrets_file_env(tmp_path):
+    path = tmp_path / "secrets.sh"
+    path.write_text(SECRETS_FILE_TEXT)
+    return dict.fromkeys(EXPORTED + NOT_EXPORTED, "fake") | {
+        "AGENT_SECRETS_FILE": str(path)
+    }
+
+
+@EVERY_CHECK
+def test_no_check_gets_a_name_the_secrets_file_exports(installed, run_check, tmp_path):
+    done = run_check(installed, env=secrets_file_env(tmp_path))
+
+    assert done.returncode == 0, done.stderr
+    received = names_received(installed)
+    assert not received & set(EXPORTED)
+    assert set(NOT_EXPORTED) <= received
+    assert "AGENT_SECRETS_FILE" in received  # a path, which the check may keep
+
+
+def no_file(path):
+    pass
+
+
+def a_directory(path):
+    path.mkdir()
+
+
+def unreadable(path):
+    path.write_text(SECRETS_FILE_TEXT)
+    path.chmod(0)
+
+
+def a_pipe(path):
+    os.mkfifo(path)  # a read would wait for a writer that never comes
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("make", [no_file, a_directory, unreadable, a_pipe])
+def test_a_secrets_file_it_cant_read_strips_nothing_more(installed, tmp_path, make):
+    make(tmp_path / "secrets.sh")
+    hook(installed, "agent-pre-commit", NOTE_NAMES)
+
+    done = commit(
+        installed,
+        env={
+            "FAKE_CERT_ID": "fake",
+            "AGENT_SECRETS_FILE": str(tmp_path / "secrets.sh"),
+        },
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert "FAKE_CERT_ID" in names_received(installed)
+    assert "Traceback" not in done.stderr
+
+
+def test_an_empty_secrets_file_variable_strips_nothing_more(installed):
+    hook(installed, "agent-pre-commit", NOTE_NAMES)
+
+    done = commit(installed, env={"FAKE_CERT_ID": "fake", "AGENT_SECRETS_FILE": ""})
+
+    assert done.returncode == 0, done.stderr
+    assert "FAKE_CERT_ID" in names_received(installed)

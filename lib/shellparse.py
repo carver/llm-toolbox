@@ -15,7 +15,8 @@ options it reads with split_options(). Then SHELLS names the shells: shell_scrip
 finds the script one runs with -c, reads_stdin() says whether it reads its script
 from stdin, and set_pipefail() whether set's or a shell's options turn pipefail on.
 commit_args() finds the arguments of a `git commit`, bgrun_command() reads
-bgrun's, and is_help() spots an option that asks for help.
+bgrun's, and is_help() spots an option that asks for help. exports() lists the names
+a script's `export` commands name.
 """
 
 import re
@@ -29,7 +30,8 @@ OPERATORS = ";&|()<>\n`"
 WORD_BREAK = " \t\n;&|()<>"
 # A heredoc's opener, not a here-string's `<<<`; the delimiter is a name, maybe quoted.
 HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
-ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ASSIGNMENT = re.compile(rf"^{VARIABLE_NAME.pattern}=")
 # Words of a quote left open, for a command shlex can't parse.
 FALLBACK = re.compile(r"[;&|()<>\n`]+|[^\s;&|()<>`]+")
 SHELLS = {"sh", "bash", "dash", "ksh", "zsh"}
@@ -353,6 +355,22 @@ def command_of(words: list[str]) -> tuple[list[str], set[str]]:
         else:
             break
     return words, assigned
+
+
+def exports(script: str) -> set[str]:
+    """The names the `export` commands in ``script`` name: each word after `export` but
+    its options, up to its `=` or `+=`, as in `export A B=1 C+=2`. A word that isn't a
+    name there, as one written through an expansion, gives none: each substitution is
+    a marker, so `export $(...)` doesn't read as the name `_`."""
+    names = set()
+    for command in commands(prepare(script, first_mark=0)[0]):
+        words, _ = command_of(command.words)
+        if words[:1] == ["export"]:
+            for word in words[1:]:
+                name = word.partition("=")[0].removesuffix("+")
+                if VARIABLE_NAME.fullmatch(name):
+                    names.add(name)
+    return names
 
 
 def split_options(args: list[str], values: set[str]) -> tuple[list[str], list[str]]:

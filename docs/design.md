@@ -338,11 +338,47 @@ leaves out: a Read's offset (now shown), an output spilled to a file, a command
 cut mid-pipeline.
 
 The default model is sonnet: fewer candidates for the agent to verify (62 and 82
-against haiku's 114), a third of its false rate, and more real findings. Every
-run reads about 200k input tokens, whatever the model, so sonnet costs its higher
-price per token; the owner's rule above accepts that. A run takes a few minutes.
-Two sonnet runs each found a finding the other missed, so one run is not
-exhaustive.
+against haiku's 114), a third of its false rate, and more real findings. A run's
+input tokens are the same whatever the model, so sonnet costs its higher price
+per token; the owner's rule above accepts that. A run takes a few minutes. Two
+sonnet runs each found a finding the other missed, so one run is not exhaustive.
+
+/upskill's agent still reads `--errors` itself and accounts for every failure:
+the scan adds to that read, it doesn't replace it. Of the baseline, item 7 (a
+test failure) came from the errors, and no run of the scan with cut text found
+it.
+
+### session-scan reads whole messages and output tails (2026-11-09)
+
+The digest cut each assistant message to 400 characters and printed no
+successful output, so a wrong assumption deep in a long report, or an output
+the agent misread, was out of the reader's sight. In a8a346b2, 82 of 361
+messages ran past 400 characters (154k characters more, whole), and successful
+outputs held 4.2M characters, too many to read. session-scan now digests with
+`--whole-text` and `--tails` (each output's last three lines, at most 300
+characters). Measured with sonnet on a8a346b2, scored like the runs above:
+
+| digest | chunks | input tokens | candidates | real | false | distinct real findings | baseline found |
+|---|---|---|---|---|---|---|---|
+| text cut, no tails | 12 | 201k | 82 | 28 | 3 (4%) | 12 | 1-5 |
+| whole text | 16 | 271k | 87 | 35 | 2 (2%) | 15 | 1-6 |
+| whole text and tails | 25 | 407k | 128 | 44 | 7 (5%) | 17 | 1-7 |
+
+Each step lost none of the findings before it. Whole text found a reviewer's
+admission, at the end of a 6k-character report, that its unqueued test runs
+skewed another agent's benchmarks, and an environment variable that BASH_ENV
+exports again after a test unsets it. Tails found the one baseline item no
+earlier run had, the timing-test margin, in a FAILED summary line, and a
+`waitone` timeout past the Bash call's limit. 11 real candidates rest on whole
+text and 9 on tails. The cost: twice the input tokens, more trivial candidates
+(77 against 51), and three false ones from reading a tail as the whole result,
+such as a mutant caught by mutate-check taken for a failing test; the reader's
+prompt now names that case.
+
+That run took tails as they came; on its digest, 115 of 1994 tails held only
+Claude Code's notices ("Shell cwd was reset to …"), and those of Read, Write,
+Edit and Agent results carried a file's last lines or a confirmation. Tails now
+leave both out, and a line that doesn't fit whole keeps its end.
 
 ### Rejected: Agent-tool subagents or a Workflow for the fan-out (2026-11-09)
 

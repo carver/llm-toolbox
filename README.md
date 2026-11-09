@@ -579,7 +579,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   and counted; a failed chunk is retried once after `SESSION_SCAN_BACKOFF`
   seconds (default 30), and `--chunks N,M` rereads chunks of an earlier run in
   DIR, such as a failed one or those a stopped run never read. Exit 3 when a
-  chunk failed twice.
+  chunk failed twice. Then verifiers (`--verify-model`, default opus, no
+  tools) check the candidates in batches of 15 against their digest lines, and
+  one merge call groups the real ones into findings, so /upskill's agent reads
+  the findings and the dismissed list instead of checking every candidate.
+  `--verify-only` verifies what an earlier run left unverified (exit 4 when any
+  is), `--candidates-only` skips verifying. Also lists each line where an agent
+  set something aside ("left for later", "out of scope", "TODO").
 
 - **yt-transcript**: prints a YouTube video's captions, or the ones around
   the URL's timestamp (90 seconds before, 60 after, by default), each line

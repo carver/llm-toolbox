@@ -521,8 +521,10 @@ missed one among them. A premise the user corrected sits in the user's turns,
 which /upskill's agent reads itself. The scan found 5 real findings the old pitch
 lacked.
 
-The scored runs and the held-out check are kept outside the repo, in
-cache/session-scan/ of this workspace.
+The scored runs, the held-out check and the script that compares a verifier's
+verdicts with the scored ones are kept outside the repo, in
+/home/carver/code/claudedev/keep/session-scan/; its README.md says what each
+part is and how to check a change to the verifier against them.
 
 ## claude-fresh
 

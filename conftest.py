@@ -5,9 +5,9 @@ Every test is kept away from the repository pytest was started in: `git rebase
 test's throwaway repo, or the production code under test, would inherit them and
 write to the real repository instead. `shell_and_child` starts a wrapper shell and
 its job, for the process tools' tests, and `started_child` finds a process's child
-by an argument it was started with. `wait_or_warn` polls a condition and, on a busy
-machine only, warns instead of failing when it times out; it is meant for tests of
-heavy's queue alone.
+by an argument it was started with. `wait_until` polls a condition and fails when it
+times out. `wait_or_warn` polls one too but, on a busy machine only, warns instead of
+failing; it is meant for tests of heavy's queue alone.
 
 The commit hook runs the suite in a copy of the index outside any git checkout, so a test
 that needs a repository makes its own rather than reading this one's."""
@@ -132,6 +132,18 @@ def wait_or_warn(condition, what, seconds=20):
             return False
         time.sleep(0.05)
     return True
+
+
+def wait_until(condition, what, seconds=60):
+    """Poll `condition` until it holds; fail saying `what` didn't happen when `seconds`
+    pass first, however busy the machine. For a test that waits on anything but heavy's
+    queue, such as a check run outside it; the deadline covers slow process start-up
+    under load."""
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() >= deadline:
+            pytest.fail(f"{what} within {seconds} s")
+        time.sleep(0.05)
 
 
 def started_child(parent: int, arg: str) -> int:

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import path_without, wait_or_warn, without_repo_vars
+from conftest import path_without, wait_or_warn, wait_until, without_repo_vars
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "agent-commit-gate"
 loader = importlib.machinery.SourceFileLoader("agent_commit_gate", str(SCRIPT))
@@ -1048,6 +1048,16 @@ def group_ended(pgid):
     return True
 
 
+def finishes(commit_run):
+    """Wait, as finishes_or_warns does, for a commit whose check runs outside heavy's
+    queue and its hook to end, failing past the deadline: nothing it does waits on the
+    machine."""
+    wait_until(
+        lambda: commit_run.poll() is not None and group_ended(commit_run.pid),
+        "the commit never finished",
+    )
+
+
 def finishes_or_warns(commit_run):
     """Wait for the commit and its hook, which share its process group. A Ctrl-C ends
     git at once, while the hook may still be printing its refusal to the shared stderr
@@ -1177,8 +1187,7 @@ def test_a_check_that_needs_no_queue_passes_while_the_lane_is_held(
 ):
     light_check(installed)
     commit_run = committing(installed)
-    if not finishes_or_warns(commit_run):
-        return
+    finishes(commit_run)
     err = commit_run.err()
 
     assert commit_run.returncode == 0, err
@@ -1237,15 +1246,16 @@ def test_a_pass_outside_the_queue_is_recorded(installed):
     assert ran(installed) == ["fast", "light-75", "fast"]
 
 
-def test_stopping_a_check_outside_the_queue_refuses_in_one_line(installed, committing):
+def test_stopping_a_check_outside_the_queue_refuses_in_one_line(
+    installed, held_lane, committing
+):
+    # With the lane held, a check wrongly queued never starts.
     light_check(installed, 'touch "$(git rev-parse --git-dir)/started"\nsleep 30')
     commit_run = committing(installed)
     started = installed / ".git" / "started"
-    if not wait_or_warn(started.exists, "the check never started"):
-        return
+    wait_until(started.exists, "the check never started")
     os.killpg(commit_run.pid, signal.SIGINT)  # Ctrl-C reaches the whole group
-    if not finishes_or_warns(commit_run):
-        return
+    finishes(commit_run)
     err = commit_run.err()
 
     assert commit_run.returncode != 0

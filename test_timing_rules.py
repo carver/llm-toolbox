@@ -165,7 +165,7 @@ def test_every_long_fixed_sleep_says_why():
     found = located(long_sleeps)
     assert not found, (
         f"fixed sleeps of {SHORTEST:g} s or more at {', '.join(found)}. Poll the"
-        " condition with a deadline instead, as wait_until in test_heavy.py does: a"
+        " condition with a deadline instead, as conftest's wait_until does: a"
         " fixed sleep costs its whole length on every run, and under load it can end"
         " before what it waits for. When the sleep is the scenario itself, a window in"
         " which something must not happen, say so in a `# fixed sleep: <why>` comment"

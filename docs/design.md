@@ -171,3 +171,84 @@ test (2026-11-08).
 
 Nothing used it. It came with wt-ship's first version, for a repo that had no
 `agent-pre-commit` then and has one now.
+
+## session-digest, session-scan and /upskill
+
+### /upskill reads every agent's whole timeline, through session-scan (2026-11-09)
+
+The owner's rule: a retrospective that misses an opportunity costs more than the
+tokens it would take to find it. Before, /upskill read `session-digest --errors`
+(the summary, the user's turns and what failed) and the full digest only to drill
+into one agent, since the full digest of session a8a346b2, a main session and 22
+subagents in filedrawer, ran to 540k characters. That read found the seven baseline
+findings below; waste in calls that succeeded left no error to find.
+
+Now step 1 reads `--errors` itself and runs `session-scan`, which cuts the full
+digest into chunks of about 60k characters (12 for a8a346b2), has a model read
+each at once through `claude-fresh` for /upskill's six categories, and prints
+candidates with the digest lines they cite. The retrospective's agent verifies
+each one. Measured on a8a346b2, each run's candidates scored by an agent that
+checked every one against the digest and the raw log:
+
+| run | candidates | real | false | distinct real findings | baseline found |
+|---|---|---|---|---|---|
+| haiku | 114 | 36 | 14 (12%) | 10 | 2, 4, 5, 6 (1 weakly) |
+| sonnet | 62 | 25 | 3 (5%) | 12 | 2, 3, 4, 5, 6 |
+| sonnet, with the user's turns and the longer list of non-findings | 82 | 28 | 3 (4%) | 12 | 1, 2, 3, 4, 5 |
+
+Baseline (the errors-first retrospective): 1 the main session's length; 2
+filedrawer's hooks ran the main tree's scripts; 3 stale text after behaviour
+changes; 4 leaked test processes; 5 benchmarks holding heavy's queue; 6
+session-digest's size; 7 a timing-test margin set too tight.
+
+Every run found what errors-first missed: 214 foreground `waitone` polls, 165 of
+them in two builder subagents, each resending 150 to 300k tokens of context; subagent
+cache rebuilds; reviewers' mutation runs queued behind other sessions' commit
+checks; full checks run before a rebase that then conflicted; `find /` and a
+`grep -r` over the mount; a docs-only commit that ran the full suite because
+`docs/` was missing from the hook's map. Most candidates that aren't real are
+true but normal work (a subagent reading its brief, a hook refusal followed by a
+correct retry), cheap to dismiss. The false ones mostly misread what the digest
+leaves out: a Read's offset (now shown), an output spilled to a file, a command
+cut mid-pipeline.
+
+The default model is sonnet: fewer candidates for the agent to verify (62 and 82
+against haiku's 114), a third of its false rate, and more real findings. Every
+run reads about 200k input tokens, whatever the model, so sonnet costs its higher
+price per token; the owner's rule above accepts that. A run takes a few minutes.
+Two sonnet runs each found a finding the other missed, so one run is not
+exhaustive.
+
+### Rejected: Agent-tool subagents or a Workflow for the fan-out (2026-11-09)
+
+A script gives the same chunking, prompt and output shape every run, and a cost
+that can be measured; subagents' reports arrive as prose in the main context, and
+a Workflow needs the owner's opt-in each time. The readers get no tools: a
+chunk's text is all they need, and claude-fresh runs them locked down, which suits
+logs that hold tool output and pasted text.
+
+### session-digest times slow calls and marks cache rebuilds (2026-11-09)
+
+A call of a minute or more shows its time; from 40 minutes it is marked LONG (the
+owner: "it's common and okay for a tool call to last a long time. Calls over 40
+minutes are definitely worth highlighting though, since that starts to risk
+losing the prompt cache"). Calls sent in one batch run one after another, so each
+is timed from the result before it: timed from its own start, the third of three
+3-minute waits read 9 minutes, and such stacks filled the whole longest-calls
+list. A call that started in the background isn't timed, since its result can be
+logged when the agent next wakes (one in a8a346b2 read 1h48m). AskUserQuestion
+and ExitPlanMode are tagged user, never LONG.
+
+A tool call's time doesn't show the cache loss itself, which happens between
+requests. The digest marks every request after an agent's first that wrote 100k
+tokens or more to the cache and read fewer: on a8a346b2, 21 rebuilds and about
+6M tokens, four in the main session (an hour's cache) after 68 to 167 idle
+minutes, and 17 in subagents (a five-minute cache), most after a few `waitone`
+calls of about three minutes in a row. A request that wrote that much but read
+more, such as after a big tool output, kept its cache and isn't one.
+
+### Rejected: a rebuild only after 40 idle minutes (2026-11-09)
+
+The first rule. It caught all four of the main session's rebuilds, but only one
+of the 17 in subagents, whose cache lasts five minutes; the 16 it missed held
+about 3.2M tokens.

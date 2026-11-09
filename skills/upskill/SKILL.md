@@ -12,7 +12,12 @@ Also look for important conventions in the repositories that might be ill-formed
 
 ## 1. Mine the history
 
-Walk the whole transcript, first turn to last. Your context holds only a subagent's final report, so start from `session-digest --errors`: what every agent and tool cost, the user's turns, and each agent's failed calls, hooks and background tasks. To drill into one agent, such as its retries or what it tried before a failure, write the full digest (no flag; `--timelines` adds workflow agents) to your scratchpad and read that agent's section, from its `== <agent>` line. Collect every instance of:
+Walk the whole session, every agent, first turn to last. Your context holds only a subagent's final report, so read the session two ways, with the same session argument:
+
+- Start `bgrun --wait -o <scratchpad>/scan.log -- session-scan --out <scratchpad>/scan` as a background call; it takes a few minutes. A cheaper model reads every chunk of the full digest, subagents included, and the log gets its **candidates**: findings, each citing the lines of `scan/digest.txt` that show it. Then come the calls repeated across agents, and each chunk's candidate count. Read the whole log.
+- Meanwhile, read `session-digest --errors`: what every agent and tool cost, the longest calls, the cache rebuilds, the user's turns, and each agent's failed calls, hooks and background tasks.
+
+Verify each candidate: read `scan/digest.txt` at its lines, and the raw log when the claim rests on what the digest leaves out, such as an output's content. The reader over-reports, and gets details wrong in claims that are otherwise true. One habit seen in several agents, or in several candidates, is one finding with its count. To drill into one agent, such as its retries or what it tried before a failure, read its section of `scan/digest.txt`, from its `== <agent>` line. Collect every instance of:
 
 - **Mistakes**: wrong assumptions, retracted answers, reverted edits, user corrections.
 - **Waste**: dead ends, oversized reads or outputs, searches that took several tries to land.
@@ -21,7 +26,9 @@ Walk the whole transcript, first turn to last. Your context holds only a subagen
 - **Hungry tools**: a CLI, MCP server or script of ours whose output costs more tokens than the agent used. `session-digest`'s biggest outputs are the place to start.
 - **Skipped checks**: grep the raw session logs (`session-digest` names them) for `--no-verify` and `git commit -n`. `agent-commit-gate` allows them in a repo without an agent check, scratch repos included. For each, see whether the repo's hooks would have caught something and whether that commit reached a shared branch (a push, or a merge into main). Skipping the hooks in a throwaway test repo is fine. Skipping them on code that then landed on main is a finding, even when nothing broke.
 
-Done when every failed tool call and hook error, in the main session and in each subagent, and every user correction is accounted for, either as a finding or dismissed with a reason.
+`session-scan`'s reader prompt lists these categories too: a change to one goes in the other.
+
+Done when every failed tool call and hook error, in the main session and in each subagent, every user correction, every line of `scan/candidates.jsonl` and every repeated call the scan lists is accounted for: a finding, or dismissed with a reason that cites the digest lines you checked. A chunk the scan reports FAILED or UNREAD is read again with `session-scan --out <scratchpad>/scan --chunks N`.
 
 ## 2. Match each finding to a fix
 
@@ -47,7 +54,7 @@ Look for candidates for improvement in these categories.
 - **Coding standards**: should the **reviewer agent** be given a new rule to enforce? Should an existing rule be removed or clarified? Classify the violation first: a **mechanical** one (a fixed syntactic pattern, a banned API, an import shape, a file-location rule) gets a deterministic check, full stop: a custom rule in the repo's own linter, a new pre-commit hook, or a new CI job, whichever the repo's language and existing guardrail make cheapest. Default to building the check over writing the rule. Reserve `CODING_STANDARDS.md` (or `~/.agents/skills/coding/standards.md` for a rule that holds across repos) for genuine **judgement calls** (cross-file consistency, "matches the surrounding style," anything no guardrail could ever substitute for). _Use when_ the reviewer agent failed to catch a mistake.
 - **Global AGENTS.md**: are there any steering instructions that should be moved to coding standards (or automated checks) instead? _Use when_ the AGENTS.md file is particularly large - in the repo OR the user's global scope.
 - **No-ops**: look for instructions in steering files that don't modify the agent's behavior. _Use when_ the steering files are large and unwieldy.
-- **Information access**: look for opportunities to increase the agent's access to information. Teeing dev server logs, readonly access to third-party services. _Use when_ a crucial piece of information was not available to the agent.
+- **Information access**: look for opportunities to increase the agent's access to information. Teeing dev server logs, readonly access to third-party services. _Use when_ the agent lacked a piece of information it needed.
 
 
 ## 4. Pitch

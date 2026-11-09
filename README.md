@@ -499,10 +499,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   base and the test files changed since the refactor base, and fails naming
   any ref or config key that moved (a tag only when it points at a commit the
   fold may rewrite); `core.hooksPath`, another branch's settings, the work
-  branch's remote and merge, each when it wasn't set at start (a `git push -u`
-  for CI), and a remote-tracking ref other than the target's or the upstream (a
-  topic pushed for CI, or what a fetch moved, counted unless it holds a work
-  commit) it only reports, and goes on. In a detached worktree, the
+  branch's remote and merge, each when it wasn't set at start and the upstream
+  is a remote-tracking ref of its remote made since start (a `git push -u` for
+  CI; a path, a URL or a local branch still stops, saying why), and a
+  remote-tracking ref other than the target's or the upstream (a topic pushed
+  for CI, or what a fetch moved, counted unless it holds a work commit) it only
+  reports, and goes on. In a detached worktree, the
   branch it lands on (the main tree's, when HEAD shares history with it) may
   move: finish then names it, and says to rebase onto it while HEAD lacks one
   of its commits. `review-prompt

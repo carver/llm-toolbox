@@ -1352,12 +1352,11 @@ def origin(repo, tmp_path_factory):
     return path
 
 
-def push_u(repo, branch):
-    """`git push -u origin BRANCH`, setting the branch's remote and merge alone: a
-    global branch.autoSetupRebase would add its rebase."""
-    git(
-        repo, "-c", "branch.autoSetupRebase=never", "push", "-q", "-u", "origin", branch
-    )
+def push_u(repo, branch, to="origin"):
+    """`git push -u origin BRANCH`, or to another remote or a path, setting the
+    branch's remote and merge alone: a global branch.autoSetupRebase would add its
+    rebase."""
+    git(repo, "-c", "branch.autoSetupRebase=never", "push", "-q", "-u", to, branch)
 
 
 def test_a_push_u_of_the_work_for_ci_is_reported_not_a_stop(repo, origin):
@@ -1394,3 +1393,88 @@ def test_an_upstream_the_work_branch_got_since_start_isnt_read_for_its_base(
     assert done.returncode == 1
     assert "meets no branch" in done.stderr, done.stderr
     assert "rewritten" not in done.stdout
+
+
+def assert_the_upstream_keys_stop(done, why):
+    """finish stopped, naming the work branch's remote and merge, each with `why`."""
+    assert done.returncode == 1, done.stdout
+    for key in ("branch.work.remote", "branch.work.merge"):
+        line = next((ln for ln in done.stderr.splitlines() if key in ln), "")
+        assert why in line, done.stderr
+
+
+def test_a_push_u_to_a_path_still_stops_finish(repo, tmp_path_factory):
+    path = tmp_path_factory.mktemp("elsewhere") / "elsewhere.git"
+    git(repo, "init", "-q", "--bare", str(path))
+    git(repo, "checkout", "-q", "-b", "work")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    # As a test leaking into the repo might: the next bare `git push` goes there.
+    push_u(repo, "work", to=str(path))
+
+    done = build_state(repo, "finish")
+
+    assert_the_upstream_keys_stop(
+        done, "its upstream maps to no remote-tracking ref, as with a path or URL"
+    )
+    assert str(path) not in done.stdout + done.stderr  # a config value
+
+
+def test_a_push_u_whose_remote_branch_was_deleted_since_still_stops_finish(
+    repo, origin
+):
+    git(repo, "checkout", "-q", "-b", "work")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    push_u(repo, "work")
+    git(repo, "push", "-q", "origin", "--delete", "work")  # the PR closed
+
+    done = build_state(repo, "finish")
+
+    assert_the_upstream_keys_stop(
+        done, "its upstream, refs/remotes/origin/work, doesn't exist"
+    )
+
+
+def test_a_local_upstream_set_since_start_still_stops_finish(repo):
+    git(repo, "checkout", "-q", "-b", "work")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    git(repo, "branch", "-q", "--set-upstream-to=main")  # remote ".", no push
+
+    done = build_state(repo, "finish")
+
+    assert_the_upstream_keys_stop(
+        done, "its upstream, refs/heads/main, isn't a remote-tracking ref of its remote"
+    )
+
+
+def test_a_push_u_tracked_under_another_remotes_name_still_stops_finish(repo, origin):
+    git(repo, "remote", "add", "fork", str(origin))
+    git(repo, "config", "remote.fork.fetch", "+refs/heads/*:refs/remotes/origin/*")
+    git(repo, "checkout", "-q", "-b", "work")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    push_u(repo, "work", to="fork")
+
+    done = build_state(repo, "finish")
+
+    assert_the_upstream_keys_stop(
+        done,
+        "its upstream, refs/remotes/origin/work, isn't a remote-tracking ref of its"
+        " remote",
+    )
+
+
+def test_a_push_u_over_a_remote_branch_there_at_start_still_stops_finish(repo, origin):
+    git(repo, "checkout", "-q", "-b", "work")
+    git(repo, "push", "-q", "origin", "work")  # before the build, without -u
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    push_u(repo, "work")
+
+    done = build_state(repo, "finish")
+
+    assert_the_upstream_keys_stop(
+        done, "its upstream, refs/remotes/origin/work, was there at start"
+    )

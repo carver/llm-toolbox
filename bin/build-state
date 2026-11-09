@@ -60,13 +60,19 @@ before folding anything. Some changes, which can't change what a fold makes, it 
 reports, in one line saying to tell the user, and goes on: core.hooksPath (the hooks a
 fold runs can't change its trees, which finish checks after, and hook files were never
 in the fingerprint), a branch's settings, for any branch but the build's own, the
-build's own branch's remote and merge, each when it wasn't set at start, as `git push
--u origin BRANCH` for CI's results sets them, and a remote-tracking ref (refs/remotes/)
-made, moved or deleted, other than the build's target or upstream, such as a topic
-branch pushed to get CI's results and deleted after, which neither a fold nor a
-landing reads. Finish reads the upstream the branch had at start, not one it got
-since. The build's own branch's other settings, and those two when they were set at
-start, still stop it: they decide where a bare git push or pull goes. Another
+build's own branch's remote and merge, each when it wasn't set at start, while the
+branch's upstream is a remote-tracking ref of its remote made since start, as `git
+push -u origin BRANCH` for CI's results leaves them, and a remote-tracking ref
+(refs/remotes/) made, moved or deleted, other than the build's target or upstream,
+such as a topic branch pushed to get CI's results and deleted after, which neither a
+fold nor a landing reads. Finish reads the upstream the branch had at start, not one
+it got since. The build's own branch's other settings, and those two when they were
+set at start, still stop it: they decide where a bare git push or pull goes. So do
+those two when new while the upstream is anything else, and the stop line says why:
+the upstream maps to no remote-tracking ref, as with a path or URL for its remote (a
+leaked test's `git push -u /tmp/x BRANCH`); it isn't a remote-tracking ref of its
+remote (a local branch, or a refspec into another remote's refs); it doesn't exist
+(the remote branch deleted since the push); or it was there at start. Another
 session's install.py set core.hooksPath during a build. A
 remote-tracking ref is named when it pointed at a commit the fold may rewrite, at
 start or now, or is a symbolic ref repointed; the rest, as a fetch in any worktree
@@ -274,23 +280,60 @@ def on_work_commit(name: str, before: str | None, work: set[str]) -> bool:
     return any(peeled(ref) in work for ref in (name, before) if ref)
 
 
-def only_reported(key: str, work: list[str], new: bool) -> bool:
-    """Whether finish only reports a change to config `key`, rather than stopping:
-    core.hooksPath, the owner's call (hooks run in a fold, but its trees are checked
-    after, and hook files were never in the fingerprint); a branch's settings for any
-    branch but the build's own; and the build's own branch's remote and merge when
-    they're `new` since start, as a `git push -u` of the work for CI sets them (finish
-    reads the upstream recorded at start). The build's own branch's other changes
-    stop it: its remote, pushRemote and merge decide where a bare git push or pull
-    goes."""
+def config_stop(
+    key: str, work: list[str], before: dict[str, dict[str, str]]
+) -> str | None:
+    """The line naming a change to config `key` that stops finish; None when finish
+    only reports it: core.hooksPath, the owner's call (hooks run in a fold, but its
+    trees are checked after, and hook files were never in the fingerprint); a branch's
+    settings for any branch but the build's own; and the build's own branch's remote
+    and merge, each when it wasn't set at start (`before`, the start's fingerprint),
+    while the branch's upstream is what a `git push -u` of the work for CI leaves
+    (why_not_a_push). finish reads the upstream recorded at start. The build's own
+    branch's other changes stop it: its remote, pushRemote and merge decide where a
+    bare git push or pull goes."""
+    stop = f"config {key}"
     if key == "core.hookspath":
-        return True
+        return None
     if key.startswith("branch.") and key.count(".") >= 2:  # branch.NAME.KEY
         branch, _, setting = key.removeprefix("branch.").rpartition(".")
         if f"refs/heads/{branch}" not in work:
-            return True
-        return new and setting in ("remote", "merge")
-    return False
+            return None
+        if key in before["config"] or setting not in ("remote", "merge"):
+            return stop
+        if why := why_not_a_push(branch, before["refs"]):
+            return f"{stop}: set since start, but not as a git push -u leaves it: {why}"
+        return None
+    return stop
+
+
+def why_not_a_push(branch: str, refs_at_start: dict[str, str]) -> str | None:
+    """Why `branch`'s upstream isn't what a `git push -u` to a configured remote
+    leaves, a remote-tracking ref of the branch's remote (refs/remotes/REMOTE/...)
+    that exists and wasn't there at start; None when it is. git maps an upstream to a
+    remote-tracking ref only through a configured remote's fetch refspec, so a path or
+    URL as the remote, as a leaked test may set, maps to none, and a bare git push
+    would go there."""
+    # The ref the upstream maps to, whether or not it exists; empty when none.
+    upstream = git(
+        "for-each-ref", "--format=%(upstream)", f"refs/heads/{branch}"
+    ).stdout.strip()
+    if not upstream:
+        return (
+            "its upstream maps to no remote-tracking ref, as with a path or URL for its"
+            " remote"
+        )
+    remote = git("config", f"branch.{branch}.remote", check=False).stdout.strip()
+    if not upstream.startswith(f"refs/remotes/{remote}/"):
+        return f"its upstream, {upstream}, isn't a remote-tracking ref of its remote"
+    if git("rev-parse", "-q", "--verify", upstream, check=False).returncode != 0:
+        return (
+            f"its upstream, {upstream}, doesn't exist, as when the remote branch was"
+            " deleted since the push"
+        )
+    if upstream in refs_at_start:
+        return f"its upstream, {upstream}, was there at start, so no push since made it"
+    return None
 
 
 def changes(
@@ -308,9 +351,9 @@ def changes(
 @dataclass
 class Changed:
     """What changed since start, sorted by what finish does with it: each change that
-    stops it ("kind name"), the targets that moved, and what it only reports: config
-    keys and remote-tracking refs by name, and a count of the remote-tracking refs off
-    the work."""
+    stops it ("kind name", and why for some), the targets that moved, and what it only
+    reports: config keys and remote-tracking refs by name, and a count of the
+    remote-tracking refs off the work."""
 
     stops: list[str] = field(default_factory=list)
     targets: set[str] = field(default_factory=set)
@@ -343,10 +386,10 @@ def changed_since_start(
     for change in changes(before, now):
         kind, _, name = change.partition(" ")
         if kind == "config":
-            if only_reported(name, state["work_refs"], name not in before["config"]):
-                changed.config.append(name)
+            if stop := config_stop(name, state["work_refs"], before):
+                changed.stops.append(stop)
             else:
-                changed.stops.append(change)
+                changed.config.append(name)
             continue
         was = before["refs"].get(name)
         if name.startswith("refs/tags/") and not on_work_commit(name, was, work):

@@ -269,6 +269,15 @@ worktree, so main was neither behind nor ahead of it and wasn't the target. Now:
   the same ref. Its other keys, and those two when they were set at start, still stop
   finish: `.remote`, `.pushRemote` and `.merge` decide where a bare `git push` or
   `git pull` goes, the reason `remote.*` stops (below).
+  The two are reported only while the branch's upstream is what such a push leaves:
+  the ref it maps to (`git for-each-ref --format='%(upstream)'`) is a remote-tracking
+  ref of the branch's remote, `refs/remotes/REMOTE/...`, that exists and wasn't there
+  at start (the owner's call, 2026-11-09, closing a hole the plan's review found). git
+  takes `branch.NAME.remote=/tmp/x` with no `remote.*` entry, as `git push -u /tmp/x
+  NAME` in a leaked test sets it, and maps no remote-tracking ref for it, so such a
+  pair stops; so does a local upstream (`.remote=.`), a remote whose fetch refspec
+  writes another remote's namespace, and a remote branch deleted since the push. The
+  stop line says which.
 - The rest of the config still stops finish. `remote.*` can't change a fold either, but
   a test leaking into the real repo can point `remote.origin.url` at a temporary repo,
   which is the damage the fingerprint is for, and wt-ship would push there next.
@@ -280,17 +289,18 @@ unguarded too.
 
 Left to the owner (reviews of the plans found them): a push over another session's
 remote branch is only reported, or not at all when another worktree has that branch
-checked out. A path or URL passes as a push: git takes `branch.NAME.remote=/tmp/x`
-with no `remote.*` entry, so a leaked test that sets it and `.merge` is only reported,
-and the next bare `git push` goes there; reporting the two keys only when
-`@{upstream}` now names a remote-tracking ref made since start would close it. A
-branch that tracked something at start (`git checkout -b work origin/main`) still
-stops on `push -u`, which changes its `.merge`; so does one under a global
-`branch.autoSetupRebase`, for which `push -u` also writes `.rebase`. And a later build
-on the branch starts with its own CI push, `origin/NAME`, as its upstream: when its
-base leaves HEAD's history (a rebase onto a fetched main, then a force-push),
-`rewritten_base` folds from that push and fails on the fixes before it; skipping such
-an upstream would lose a collaborator's real rewrite of a shared branch.
+checked out. A `push -u` whose remote branch is deleted again before finish (`git
+push origin --delete NAME`, `gh pr close --delete-branch`) stops, since the ref its
+upstream maps to no longer exists; letting that pass when the ref wasn't there at
+start would still stop a path, URL or local upstream. So does one over a remote
+branch there at start, pushed before the build without `-u`. A branch that tracked
+something at start (`git checkout -b work origin/main`) still stops on `push -u`,
+which changes its `.merge`; so does one under a global `branch.autoSetupRebase`, for
+which `push -u` also writes `.rebase`. And a later build on the branch starts with its
+own CI push, `origin/NAME`, as its upstream: when its base leaves HEAD's history (a
+rebase onto a fetched main, then a force-push), `rewritten_base` folds from that push
+and fails on the fixes before it; skipping such an upstream would lose a
+collaborator's real rewrite of a shared branch.
 
 ### wt-ship refuses a message naming an unlanded commit by its ID (2026-11-09)
 

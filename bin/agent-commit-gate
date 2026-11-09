@@ -12,7 +12,9 @@ files it only modifies in place, none binary and none a test, runs the optional
 beside it instead, the repo's fast static checks, or nothing when the repo has
 none: wt-ship runs the full check on each commit it lands that has no pass on the
 record below. Any other fix commit runs the full check, or the commit check where
-the repo keeps one.
+the repo keeps one. The gate knows a fix commit by --fixup or --squash, or by its
+subject, given with -m or in the file -F names; not with `-F -`, since git reads
+stdin only after the hook has run.
 
 The commit check: a repo that keeps an executable `agent-commit-check` beside
 `agent-pre-commit` runs it at each commit that isn't a small fix, in the full
@@ -368,10 +370,35 @@ def is_small_fix():
     return lines <= SMALL_FIX_LINES
 
 
+# How much of a message file the gate reads for its subject: the first line is all it
+# needs, and the cut may split a character, so bytes that aren't UTF-8 are replaced.
+MESSAGE_HEAD_BYTES = 4096
+
+
+def file_subject(path):
+    """The subject of the message file `-F path` names: its first non-blank line, as
+    git's cleanup leaves it. None for `-`, stdin, which git reads only after the hook
+    has run; for anything but a regular file, such as the pipe `-F <(...)` names,
+    which a read would leave empty for git; and for a file that can't be read. git
+    reads a relative path from where it started, which it passes hooks as GIT_PREFIX,
+    relative to the top level the hook runs in."""
+    if path == "-":
+        return None
+    message = Path(os.environ.get("GIT_PREFIX", "")) / path
+    try:
+        if not message.is_file():
+            return None
+        with message.open("rb") as file:
+            head = file.read(MESSAGE_HEAD_BYTES).decode(errors="replace")
+    except OSError:
+        return None
+    return next((line for line in head.splitlines() if line.strip()), "")
+
+
 def is_fix_commit(args):
     """Whether a `git commit` with these arguments makes a fixup!, squash! or amend!
     commit, which build-state finish folds and wt-ship checks."""
-    words, subject = iter(args), None
+    words, subject, message_file = iter(args), None, None
     for word in words:
         if word == "--":
             break
@@ -381,6 +408,12 @@ def is_fix_commit(args):
             message = next(words, "")
         elif word.startswith("--message="):
             message = word.removeprefix("--message=")
+        elif word == "--file":
+            message_file = next(words, "")
+            continue
+        elif word.startswith("--file="):
+            message_file = word.removeprefix("--file=")
+            continue
         elif word.startswith("--"):
             if word in COMMIT_LONG_VALUE:
                 next(words, None)
@@ -396,12 +429,16 @@ def is_fix_commit(args):
                     )
                     if letter == "m":
                         message = value
+                    elif letter == "F":
+                        message_file = value
                     break
             if message is None:
                 continue
         else:
             continue
         subject = message if subject is None else subject  # the first -m is the subject
+    if subject is None and message_file is not None:
+        subject = file_subject(message_file)  # git refuses -m with -F
     return subject is not None and subject.startswith(FIX_SUBJECT)
 
 

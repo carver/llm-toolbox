@@ -9,6 +9,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -688,15 +689,39 @@ def test_an_empty_fix_commit_is_small(installed):
     assert checks_for_fix(installed, nothing, nothing, "--allow-empty") == QUICK
 
 
-def test_a_fixup_subject_given_with_m_skips_the_agent_check(installed):
-    assert commit(installed).returncode == 0
-    (installed / "a").write_text("bad\n")
-    git(installed, "add", "a")
+def staged_for_a_fix(repo):
+    """After one passing commit, stage a change the agent check refuses, so only a
+    commit that skips that check passes. Returns an agent's environment, with this
+    checkout's gate on PATH."""
+    assert commit(repo).returncode == 0
+    (repo / "a").write_text("bad\n")
+    git(repo, "add", "a")
     env = without_repo_vars(os.environ)
     env["PATH"] = os.pathsep.join([str(SCRIPT.parent), env["PATH"]])
     env["AI_AGENT"] = "test-agent"
+    return env
+
+
+def test_a_fixup_subject_given_with_m_skips_the_agent_check(installed):
+    env = staged_for_a_fix(installed)
 
     run = git(installed, "commit", "-q", "-m", "fixup! x", env=env, check=False)
+
+    assert run.returncode == 0, run.stderr
+    assert ran(installed) == ["fast", "agent", "fast"]
+
+
+def test_a_fixup_subject_in_a_message_file_given_from_a_subfolder_skips_the_agent_check(
+    installed,
+):
+    """git reads a relative -F path from where it started, which hooks get as
+    GIT_PREFIX, while the hook itself runs at the top level."""
+    env = staged_for_a_fix(installed)
+    (installed / "sub").mkdir()
+    (installed / "sub" / "msg.txt").write_text("fixup! x\n\nWhy.\n")
+    (installed / "msg.txt").write_text("x\n")  # what a path from the top would find
+
+    run = git(installed / "sub", "commit", "-q", "-F", "msg.txt", env=env, check=False)
 
     assert run.returncode == 0, run.stderr
     assert ran(installed) == ["fast", "agent", "fast"]
@@ -756,6 +781,59 @@ def test_fix_commit_forms(args):
 )
 def test_ordinary_commits_are_not_fix_commits(args):
     assert not gate.is_fix_commit(args)
+
+
+@pytest.mark.parametrize(
+    "form",
+    [["-F", "{}"], ["-F{}"], ["-qF", "{}"], ["--file", "{}"], ["--file={}"]],
+)
+def test_a_fixup_subject_in_a_message_file_makes_a_fix_commit(tmp_path, form):
+    path = tmp_path / "msg.txt"
+    path.write_text("\nfixup! x\n\nWhy.\n")  # git's cleanup drops the blank line
+
+    assert gate.is_fix_commit([word.format(path) for word in form])
+
+
+def test_a_message_file_with_fixup_only_in_a_later_paragraph_is_not_a_fix(tmp_path):
+    path = tmp_path / "msg.txt"
+    path.write_text("x\n\nfixup! later paragraph\n")
+
+    assert not gate.is_fix_commit(["-F", str(path)])
+
+
+def test_a_message_file_the_gate_cant_read_is_not_a_fix(tmp_path):
+    assert not gate.is_fix_commit(["-F", str(tmp_path / "missing.txt")])
+
+
+def test_a_message_in_a_pipe_is_left_for_git(tmp_path):
+    """`-F <(printf ...)` or a named pipe: the gate must neither read it, which would
+    leave git no message, nor wait on it."""
+    pipe = tmp_path / "msg"
+    os.mkfifo(pipe)
+    held = os.open(pipe, os.O_RDWR | os.O_NONBLOCK)  # a writer, so no open blocks
+    found = []
+    try:
+        os.write(held, b"fixup! x\n")
+        call = threading.Thread(
+            target=lambda: found.append(gate.is_fix_commit(["-F", str(pipe)])),
+            daemon=True,
+        )
+        call.start()
+        call.join(5)
+
+        assert not call.is_alive(), "the gate waited on the pipe"
+        assert found == [False]
+        assert os.read(held, 100) == b"fixup! x\n"
+    finally:
+        os.close(held)  # the last writer: a read still waiting gets its end
+
+
+def test_a_message_on_stdin_is_not_a_fix(tmp_path, monkeypatch):
+    """git reads stdin only after the hook has run; `-` is never a file's name here."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "-").write_text("fixup! x\n")
+
+    assert not gate.is_fix_commit(["-F", "-"])
 
 
 def test_a_cd_carries_across_segments(monkeypatch, capsys, tmp_path):

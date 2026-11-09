@@ -291,6 +291,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   recheck. A check that ignores it runs in full, as does
   any with no base found; `agent-quick-check` gets the same base. An agent
   without llm-toolbox, such as a teammate's, runs the check every time.
+  No check the gate runs gets a variable whose name marks a secret (a
+  `_`-separated part that is KEY, TOKEN, SECRET, PASSWORD or PASS, in any
+  case, as in GH_TOKEN), nor BASH_ENV, through which bash would source them
+  back, since a test's failure message once printed a secret's value;
+  `heavy -- CMD` keeps them for a job that needs one.
   The check's output shows only when
   it fails, ending with `COMMIT REFUSED`; a pass prints one line. A small
   fixup!, squash! or amend! commit (found from the running `git commit`'s

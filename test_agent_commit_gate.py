@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -1636,7 +1637,9 @@ def test_a_rechecks_base_counts_only_full_passes(installed):
 # --no-queue: wt-ship's first round of a landing's checks, outside heavy's queue.
 
 
-def run_no_queue(repo):
+def run_no_queue(repo, env=None):
+    """Run the agent check through the gate with --no-queue, as wt-ship's first round
+    does, with `env` added to the environment."""
     return subprocess.run(
         [
             str(SCRIPT),
@@ -1645,7 +1648,7 @@ def run_no_queue(repo):
             "--no-queue",
         ],
         cwd=repo,
-        env=without_repo_vars(os.environ) | {"AGENT_PRE_COMMIT": "1"},
+        env=without_repo_vars(os.environ) | {"AGENT_PRE_COMMIT": "1"} | (env or {}),
         capture_output=True,
         text=True,
         check=False,
@@ -1675,3 +1678,79 @@ def test_no_queue_runs_a_check_that_needs_no_queue(installed):
 
     assert done.returncode == 0, done.stderr
     assert ran(installed) == ["light-75"]
+
+
+# Variables whose names mark a secret, and some that only look alike. Their values are
+# fake, and the checks below write down names only: a test's failure prints names.
+SECRET_NAMED = (
+    *("FAKE_API_KEY", "GH_TOKEN", "SHOP_CLIENT_SECRET", "MAIL_PASSWORD"),
+    *("SMTP_PASS", "github_token"),
+)
+LOOKALIKES = ("MONKEY", "SSH_AUTH_SOCK", "KEYRING_DIR", "BYPASS_CACHE", "TOKENS_SEEN")
+PLANTED = dict.fromkeys(SECRET_NAMED + LOOKALIKES, "fake")
+NOTE_NAMES = (
+    "awk 'BEGIN { for (name in ENVIRON) print name }'"
+    ' > "$(git rev-parse --git-dir)/names"'
+)
+
+
+def names_received(repo):
+    return set((repo / ".git" / "names").read_text().split())
+
+
+def full_check(repo):
+    hook(repo, "agent-pre-commit", NOTE_NAMES)
+    return commit(repo, env=PLANTED)
+
+
+def commit_check_at_a_commit(repo):
+    install_commit_check(repo, NOTE_NAMES)
+    return commit(repo, env=PLANTED)
+
+
+def quick_check_of_a_small_fix(repo):
+    quick_check(repo, NOTE_NAMES)
+    assert commit(repo).returncode == 0
+    edit(repo, "still good\n")
+    return commit(repo, "--fixup=HEAD", env=PLANTED)
+
+
+def check_outside_the_queue(repo):
+    light_check(repo, NOTE_NAMES)
+    return commit(repo, env=PLANTED)
+
+
+def wt_ships_recheck(repo):
+    light_check(repo, NOTE_NAMES)
+    return run_no_queue(repo, env=PLANTED)
+
+
+@pytest.mark.parametrize(
+    "run_check",
+    [
+        full_check,
+        commit_check_at_a_commit,
+        quick_check_of_a_small_fix,
+        check_outside_the_queue,
+        wt_ships_recheck,
+    ],
+)
+def test_no_check_gets_a_variable_whose_name_marks_a_secret(installed, run_check):
+    done = run_check(installed)
+
+    assert done.returncode == 0, done.stderr
+    received = names_received(installed)
+    assert not received & set(SECRET_NAMED)
+    assert set(LOOKALIKES) <= received
+
+
+def test_a_bash_the_check_starts_doesnt_source_the_secrets_back(installed, tmp_path):
+    # As /etc/sandbox-persistent.sh, which BASH_ENV names, sources the secrets file.
+    startup = tmp_path / "persistent.sh"
+    startup.write_text("export FAKE_SOURCED_TOKEN=fake\n")
+    hook(installed, "agent-pre-commit", f"bash -c {shlex.quote(NOTE_NAMES)}")
+
+    done = commit(installed, env={"BASH_ENV": str(startup)})
+
+    assert done.returncode == 0, done.stderr
+    assert "FAKE_SOURCED_TOKEN" not in names_received(installed)

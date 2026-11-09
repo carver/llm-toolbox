@@ -167,6 +167,22 @@ filedrawer opted in with clippy (its pre-commit hook has no Rust lint); llm-tool
 and sandbox-setup, whose pre-commit hooks run ruff, with a commit check that runs no
 test (2026-11-08).
 
+### Checks run without secret-named variables (2026-11-09)
+
+agent-commit-gate leaves out of every check's environment each variable with a
+`_`-separated part of its name, in any case, that is KEY, TOKEN, SECRET, PASSWORD or
+PASS: the commit check, the full check and the quick check, at a commit or in
+wt-ship's recheck, in every repo. `/etc/sandbox-secrets.sh` exports 11 such variables
+into every shell, and a filedrawer test's failure message printed the environment a
+subprocess received, so a secret's value reached the session's output. The owner
+chose "Checks only": a `heavy -- CMD` job keeps the environment, so one that needs a
+secret, such as filedrawer's `ops/smoke-staging eval`, still runs.
+
+BASH_ENV goes too: it names `/etc/sandbox-persistent.sh`, which sources the secrets
+file, so every bash a check started had them back (a review of the plan found it).
+The other way, a variable the persistent file's secrets block would honour, needs a
+change in sandbox-setup.
+
 ### Rejected: `wt-ship --check CMD` (removed in 9927dd7)
 
 Nothing used it. It came with wt-ship's first version, for a repo that had no

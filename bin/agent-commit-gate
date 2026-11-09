@@ -54,6 +54,18 @@ worktree's git dir names the run, and `--run` refuses a commit in that worktree,
 would be lost when the tip comes back. The checks wt-ship starts carry its PID in
 CHECKING_EARLIER_COMMITS_PID, and run (`wt-ship -h`).
 
+No check `--run` runs gets a variable whose name marks a secret: one of the name's
+`_`-separated parts, in any case, is KEY, TOKEN, SECRET, PASSWORD or PASS, as in
+FILEDRAWER_STAGING_KEY or GH_TOKEN (MONKEY and SSH_AUTH_SOCK stay). Nor does it get
+BASH_ENV, the file every non-interactive bash sources first: in the sandbox it sources
+the secrets file, which would give them back to each bash the check starts; what else
+it sets is in the environment already. That holds for each check, at a commit or in
+wt-ship's recheck, in every repo. A test's failure message once printed the
+environment a subprocess received, and a secret's value reached an agent's output. A
+job that needs a secret runs as `heavy -- CMD`, which keeps the environment. This
+catches a mistake, not a check set on a secret: one can still read the secrets file,
+or the environment of the process that ran it in /proc.
+
 `--run` records each tree that passes in agent-pre-commit-passed, in the repo's
 common git dir, which every worktree shares: the last 1,000, each with the SHA-1
 of agent-pre-commit's bytes, so an edited check reuses no pass of its old self.
@@ -184,6 +196,8 @@ OLD_LINES = (
         f'{{ echo "COMMIT REFUSED: {HOOK_NAME} failed" >&2; exit 1; }}; fi; exit; fi'
     ),
 )
+# The parts of a variable's name that mark it a secret, which no check gets.
+SECRET_PARTS = frozenset({"KEY", "TOKEN", "SECRET", "PASSWORD", "PASS"})
 # How many of HEAD's first-parent commits, HEAD included, --run looks through for one
 # whose tree passed the check: the check's CHECK_BASE.
 BASE_SEARCH = 100
@@ -569,11 +583,18 @@ def install(repo):
     return None
 
 
+def secret_named(name):
+    """Whether a variable's name marks it a secret: one of its `_`-separated parts, in
+    any case, is in SECRET_PARTS."""
+    return not SECRET_PARTS.isdisjoint(name.upper().split("_"))
+
+
 def check_env(env, base):
-    """`env` for a check: CHECK_BASE set to `base` (None: unset), and CHECK_QUEUE_EXIT
-    and AT_COMMIT left out, so nothing the check starts takes itself for a commit's."""
-    gone = ("CHECK_BASE", QUEUE_EXIT_NAME, AT_COMMIT)
-    env = {k: v for k, v in env.items() if k not in gone}
+    """`env` for a check: CHECK_BASE set to `base` (None: unset), every secret-named
+    variable and BASH_ENV left out, and CHECK_QUEUE_EXIT and AT_COMMIT left out, so
+    nothing the check starts takes itself for a commit's."""
+    gone = ("CHECK_BASE", QUEUE_EXIT_NAME, AT_COMMIT, "BASH_ENV")
+    env = {k: v for k, v in env.items() if k not in gone and not secret_named(k)}
     if base:
         env["CHECK_BASE"] = base
     return env

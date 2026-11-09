@@ -40,6 +40,17 @@ taskset.
   rest page cache, disk reads stayed at 46 to 188 blocks a second, iowait under 1%,
   and steal under 4%.
 
+The host, as the owner reported it the same day: a laptop with an Intel Core i7-1260P,
+a hybrid chip of 4 performance cores with two threads each and 8 efficiency cores with
+one, 16 threads in all, which are the VM's 16 vCPUs, on one power budget of 28 W base
+and 64 W at most. So the vCPUs are 4 fast cores' 8 threads and 8 cores at about half
+their speed, and with more than a few threads busy the power limit lowers every
+core's clock. That fits each number above: no gain from 8 vCPUs to 16, the same
+throughput side by side as one after the other, and three times the CPU seconds for
+the same work while the other vCPUs were busy. The machine is bound by its power
+budget, not its core count, so only less work, or more machine (a bigger host, or
+GitHub's CI), makes checks faster.
+
 So heavy's "% busy", which counts vCPUs, overstates the room left: a lane that looks
 half busy may be using most of what the host gives this VM. The levers for faster
 landings are fewer full checks per landing and cheaper ones, not more at once.

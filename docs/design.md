@@ -292,19 +292,37 @@ commit here is ignored.
   rebased again: a lost push race, or the branch moving under the claim, rebases it.
 - It runs after every rebase, so with --local before the wait for the main tree.
 - The line `git cherry-pick -x` adds, `(cherry picked from commit ID)`, whose source
-  is meant to stay off the branch, doesn't count: the owner's call (2026-11-09),
-  "exempt IDs on that line only". The line must be whole, as git writes it; the same
-  ID anywhere else in the message still counts.
+  is meant to stay off the branch, doesn't count when a ref that lasts holds that
+  source: the owner's calls (2026-11-09), "exempt IDs on that line only", then "only
+  when some ref (branch, tag, remote-tracking ref) holds the commit", since a pick from
+  an unlanded worktree, or a hand-written line in git's form, let through an ID a
+  rebase would change. The line must be whole, as git writes it; the same ID anywhere
+  else in the message still counts.
+- The refs that don't last, for this: a branch a linked worktree has checked out (the
+  recommendation the owner took) and its twin on a remote, such as a `push -u` for
+  CI: that is a session's work, which its landing rebases. The main tree's branch
+  counts, as build-state's `other_worktree_branches` leaves it in: landings
+  fast-forward it. A commit of this landing's own never counts as held, whatever ref
+  holds it, since its rebase rewrites it: one HEAD holds, or one with the patch (`git
+  patch-id --stable`) of another commit of the landing, as the copy from before a
+  rebase has, which a detached worktree's push for CI or a backup tag keeps (a code
+  review found the copy passing). When no ref at all holds a pick's source, as for a
+  pick from another repo's `FETCH_HEAD`, the refusal says how to give it one (a tag,
+  or a fetch into refs/remotes/) if it should last.
+- This guards against mistakes, as the rest does: a ref made on purpose (`git tag t
+  ID`) passes any ID. Wider citations of a held commit stay refused, as the owner
+  said not to widen it: "Backport of 1a2b3c4" above the -x line, and `git merge
+  --squash`'s default message, which lists each squashed commit as `commit ID`.
 
 Left to the owner (a review of the plan found them): worktrees share one object store,
 so another session's unlanded commit or a PR topic commit resolves here and is refused
 though its ID will last; and `build-state reword` refuses a commit a remote-tracking
-branch holds, as after a push for CI. The cherry-pick line's ID is exempt whatever it
-names, so a pick from an unlanded worktree, whose source a rebase rewrites, lands with
-an ID that won't last; exempting the ID only when a ref holds it would close that.
-Honest messages that name a held source elsewhere are still refused: "Backport of
-1a2b3c4" above the -x line, and `git merge --squash`'s default message, which lists
-each squashed commit as `commit ID`.
+branch holds, as after a push for CI. A remote-tracking ref holding a pick's source
+exempts it, though a topic pushed for CI from another session's detached worktree is
+one, and that landing rebases the commit; and a stale one, a branch deleted on the
+remote but kept here until `fetch --prune`, exempts an ID the remote has lost. A
+named-branch worktree mid-rebase shows as detached, so its branch isn't left out
+while its landing rewrites it.
 
 ### Rejected: `wt-ship --check CMD` (removed in 9927dd7)
 

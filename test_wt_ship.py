@@ -2073,6 +2073,96 @@ def test_the_picked_id_on_another_line_or_one_unlike_gits_still_counts(setup, me
 
     assert done.returncode == 1
     assert source[:7] in done.stderr and "build-state reword" in done.stderr
+    assert "git tag" not in done.stderr  # a side branch holds the picked commit
+
+
+def made_and_dropped(wt):
+    """A commit made in `wt` and reset away, so that no ref holds it; its ID."""
+    source = commit(wt, "side.py", "s = 1\n", "Fix on the side")
+    git(wt, "reset", "-q", "--hard", "HEAD~1")
+    return source
+
+
+def test_a_pick_whose_source_no_ref_holds_is_refused(setup):
+    _, _, wt, _ = setup
+    source = made_and_dropped(wt)
+    git(wt, "cherry-pick", "-x", source)
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1
+    assert source[:7] in done.stderr and "build-state reword" in done.stderr
+    # The other way out, for a source that should last.
+    assert "(cherry picked from commit ID)" in done.stderr and "git tag" in done.stderr
+
+
+@pytest.mark.parametrize("holder", ["branch", "its-remote-twin", "origin-HEAD-to-it"])
+def test_a_pick_whose_source_only_a_checked_out_branch_holds_is_refused(
+    setup, tmp_path, holder
+):
+    _, main, wt, _ = setup
+    source = made_and_dropped(wt)
+    # Another session works on branch theirs, and its landing rebases it.
+    start = source if holder == "branch" else "main"
+    git(main, "worktree", "add", "-q", "-b", "theirs", str(tmp_path / "theirs"), start)
+    if holder != "branch":
+        git(main, "update-ref", "refs/remotes/origin/theirs", source)  # pushed for CI
+    if holder == "origin-HEAD-to-it":
+        git(
+            main,
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/theirs",
+        )
+    git(wt, "cherry-pick", "-x", source)
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1
+    assert source[:7] in done.stderr
+    assert "git tag" not in done.stderr  # a tag would keep an old copy, not this one
+
+
+@pytest.mark.parametrize("ref", ["refs/tags/fix-v1", "refs/remotes/origin/release"])
+def test_a_pick_whose_source_a_tag_or_a_remote_branch_holds_lands(setup, ref):
+    _, main, wt, _ = setup
+    source = made_and_dropped(wt)
+    git(wt, "update-ref", ref, source)
+    git(wt, "cherry-pick", "-x", source)
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == git(wt, "rev-parse", "HEAD")
+
+
+def test_a_pick_line_naming_a_commit_of_the_landing_counts_though_a_ref_holds_it(
+    setup,
+):
+    _, _, wt, _ = setup
+    first = commit(wt, "a.py", "x = 1\n", "Add a")
+    git(wt, "tag", "backup")
+    commit(wt, "b.py", "y = 1\n", f"Add b\n\n(cherry picked from commit {first})")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1
+    assert first[:7] in done.stderr
+    assert "git tag" not in done.stderr  # only a reword helps
+
+
+def test_a_pick_line_naming_the_landings_commit_before_its_rebase_counts(setup):
+    _, main, wt, _ = setup
+    first = commit(wt, "a.py", "x = 1\n", "Add a")
+    commit(wt, "b.py", "y = 1\n", f"Add b\n\n(cherry picked from commit {first})")
+    git(wt, "update-ref", "refs/remotes/origin/ci-topic", "HEAD")  # pushed for CI
+    commit(main, "m.py", "m = 1\n", "Another session's landing")
+
+    # The rebase onto main copies `first`; the CI ref keeps the old one.
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1
+    assert first[:7] in done.stderr
 
 
 BUILD_STATE = SCRIPT.parent / "build-state"

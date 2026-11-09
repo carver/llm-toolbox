@@ -22,10 +22,18 @@ In order, it:
    earlier commit of the same landing, whose ID a rebase changes: a word of 7 to 64
    lowercase hex digits that `git rev-parse --verify WORD^{commit}` resolves to a
    commit the branch doesn't hold, whether from before a rebase or after it. A hex
-   word that resolves to no commit here, such as another repo's commit, is ignored,
-   as is the ID on a whole line `(cherry picked from commit ID)`, which `git
-   cherry-pick -x` adds and whose source is meant to stay off the branch; the same
-   ID on any other line still counts.
+   word that resolves to no commit here, such as another repo's commit, is ignored.
+   So is the ID on a whole line `(cherry picked from commit ID)`, which `git
+   cherry-pick -x` adds and whose source is meant to stay off the branch, when a ref
+   that lasts holds that commit. A branch, a tag or a remote-tracking ref lasts; a
+   branch a linked worktree has checked out doesn't, nor does its twin on a remote
+   (refs/remotes/REMOTE/BRANCH): they are a session's work, which its landing rebases.
+   Nor does any ref count for a commit of this landing's own, which HEAD holds or
+   whose patch another of its commits has, as the copy from before a rebase does. The
+   same ID on any other line still counts, as do wider citations of a held commit
+   ("Backport of ID", the `commit ID` lines of `git merge --squash`). When no ref at
+   all holds a cherry-pick line's source, the refusal says how to give it one (a tag,
+   or a fetch) if it should last.
    It lists each such commit with the IDs it names, newest first, and the fix for
    each, `build-state reword SHA`, to name the commit by its subject instead, run in
    the order listed. This runs after every rebase, so before any check, and with
@@ -333,7 +341,7 @@ FIXUP_PREFIXES = ("fixup! ", "squash! ", "amend! ")
 HEX_ID = "[0-9a-f]{7,64}"
 COMMIT_ID = re.compile(rf"(?<![0-9A-Za-z_]){HEX_ID}(?![0-9A-Za-z_])")
 # The line `git cherry-pick -x` adds, whose source is meant to stay off the branch.
-CHERRY_PICKED = re.compile(rf"^\(cherry picked from commit {HEX_ID}\)$", re.MULTILINE)
+CHERRY_PICKED = re.compile(rf"^\(cherry picked from commit ({HEX_ID})\)$", re.MULTILINE)
 # How many times a push may lose a race to another session's, each followed by a
 # rebase and the check, before wt-ship gives up; the same for a landing whose branch
 # moves during the check.
@@ -368,23 +376,77 @@ def prepare(upstream, mode):
     run_checks(upstream, mode)
 
 
+class Citation(NamedTuple):
+    """A commit since upstream whose message names commits upstream doesn't hold."""
+
+    sha: str
+    words: list[str]  # the IDs, as the message writes them
+    # Whether one of them is a cherry-pick line's source that no ref holds at all,
+    # which a ref would let pass.
+    refless_pick: bool
+
+
 def stale_citations(upstream):
-    """(commit, words) for each commit since upstream, newest first, whose message
-    names, by ID, commits of this repo that upstream doesn't hold: IDs a rebase will
-    change, or has changed already."""
+    """A Citation for each commit since upstream, newest first, whose message names, by
+    ID, commits of this repo that upstream doesn't hold: IDs a rebase will change, or
+    has changed already. An ID on a cherry-pick line counts only when no lasting ref
+    holds its commit (pick_source_holders)."""
     found = []
+    landing = Landing(upstream)
     log = out("log", "-z", "--format=%H%n%B", f"{upstream}..HEAD")
     for entry in filter(None, log.split("\0")):
         sha, _, message = entry.partition("\n")
         words = dict.fromkeys(COMMIT_ID.findall(CHERRY_PICKED.sub("", message)))
-        if unheld := [word for word in words if names_unheld(word, upstream)]:
-            found.append((sha, unheld))
+        unheld = [word for word in words if unheld_commit(word, upstream)]
+        picks = {}  # each cherry-pick line's ID that counts: whether no ref holds it
+        for word in dict.fromkeys(CHERRY_PICKED.findall(message)):
+            if word in words or not (commit := unheld_commit(word, upstream)):
+                continue
+            if landing.holds_a_copy(commit, sha):
+                picks[word] = False
+            elif not any(lasting := pick_source_holders(commit)):
+                picks[word] = not lasting
+        if unheld or picks:
+            found.append(Citation(sha, unheld + list(picks), any(picks.values())))
     return found
 
 
-def names_unheld(word, upstream):
-    """Whether `word` resolves to a commit of this repo that upstream doesn't hold. A
-    partial clone would fetch an ID it lacks from its remote; it may not."""
+class Landing:
+    """The commits since upstream, which this landing's rebase copies."""
+
+    def __init__(self, upstream):
+        self.upstream = upstream
+        self._patch_ids = None
+
+    def holds_a_copy(self, commit, citing):
+        """Whether `commit` is one of the landing's own, which its rebase rewrites:
+        HEAD holds it, or it has the patch of one of them other than `citing`, the
+        commit that names it, as the copy from before a rebase does."""
+        if is_ancestor(commit, "HEAD"):
+            return True
+        if self._patch_ids is None:
+            self._patch_ids = patch_ids(f"{self.upstream}..HEAD")
+        others = {pid for sha, pid in self._patch_ids.items() if sha != citing}
+        return patch_ids("-1", commit).get(commit) in others
+
+
+def patch_ids(*revs):
+    """{commit: patch ID} for the commits `git log REVS` lists, merges and commits with
+    no change left out (they have no patch ID)."""
+    log = out("log", "-p", "--no-color", "--no-ext-diff", "--no-merges", *revs)
+    listed = subprocess.run(
+        ["git", "patch-id", "--stable"],
+        input=log,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return {sha: pid for pid, sha in (line.split() for line in listed.splitlines())}
+
+
+def unheld_commit(word, upstream):
+    """The commit of this repo `word` resolves to when upstream doesn't hold it, else
+    None. A partial clone would fetch an ID it lacks from its remote; it may not."""
     resolved = subprocess.run(
         ["git", "rev-parse", "--verify", "--quiet", f"{word}^{{commit}}"],
         env=os.environ | {"GIT_NO_LAZY_FETCH": "1"},
@@ -392,9 +454,42 @@ def names_unheld(word, upstream):
         text=True,
         check=False,
     )
-    return resolved.returncode == 0 and not is_ancestor(
-        resolved.stdout.strip(), upstream
+    commit = resolved.stdout.strip()
+    if resolved.returncode != 0 or is_ancestor(commit, upstream):
+        return None
+    return commit
+
+
+def pick_source_holders(commit):
+    """For each branch, tag and remote-tracking ref that holds `commit`, whether it
+    lasts: not a branch a linked worktree has checked out, nor that branch's twin on a
+    remote (refs/remotes/REMOTE/BRANCH), which are a session's work that its landing
+    rebases. A symbolic ref (origin/HEAD) is left out: the ref it names is listed."""
+    worked = {branch for _, branch in worktrees()[1:] if branch}
+    listed = out(
+        "for-each-ref",
+        "--contains",
+        commit,
+        "--format=%(refname) %(symref)",
+        "refs/heads",
+        "refs/tags",
+        "refs/remotes",
     )
+    lasting = []
+    for line in listed.splitlines():
+        ref, _, symref = line.partition(" ")
+        if not symref:
+            lasting.append(branch_of(ref) not in worked)
+    return lasting
+
+
+def branch_of(ref):
+    """BRANCH for refs/heads/BRANCH or refs/remotes/REMOTE/BRANCH; None for a tag."""
+    if ref.startswith("refs/heads/"):
+        return ref.removeprefix("refs/heads/")
+    if ref.startswith("refs/remotes/"):
+        return ref.removeprefix("refs/remotes/").partition("/")[2]
+    return None
 
 
 def refuse_stale_citations(upstream, mode):
@@ -409,7 +504,15 @@ def refuse_stale_citations(upstream, mode):
             + "\n".join(
                 f"  {named(sha)}: names {', '.join(words)}; build-state reword"
                 f" {sha[:12]}"
-                for sha, words in found
+                for sha, words, _ in found
+            )
+            + (
+                "\nAn ID on a `(cherry picked from commit ID)` line counts when no"
+                " branch, tag or remote-tracking ref holds that commit: if it should"
+                " last, give it one (`git tag NAME ID`, or a fetch into refs/remotes/)"
+                " instead of rewording."
+                if any(citation.refless_pick for citation in found)
+                else ""
             )
             + f"\nThen run `{RERUN}` again; nothing was {mode.done}."
         )

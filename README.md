@@ -198,7 +198,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   onto the remote branch (the main tree's, by default), refuses leftover
   conflict markers, refuses a commit message that names, by its ID, a commit
   the branch doesn't hold (7 to 64 hex digits that resolve to a commit here,
-  but not on the line `git cherry-pick -x` adds),
+  but not on the line `git cherry-pick -x` adds when a branch no linked
+  worktree has out, a tag or a remote-tracking ref holds the source),
   since a rebase changes an unlanded commit's ID (`build-state reword SHA`
   rewords it), and checks every commit it would push with the repo's
   `agent-pre-commit`, through `agent-commit-gate --run`, which hands each the

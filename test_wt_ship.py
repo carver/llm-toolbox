@@ -119,7 +119,7 @@ def test_it_pushes_the_worktrees_commits_and_prints_a_notice(setup):
     old = remote_main(origin)
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--check", "true")
+    done = ship(wt)
 
     assert done.returncode == 0, done.stderr
     assert remote_main(origin) == new
@@ -135,7 +135,7 @@ def test_it_rebases_onto_another_sessions_push_first(setup):
     git(other, "push", "-q", "origin", "main")
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--check", "true")
+    done = ship(wt)
 
     assert done.returncode == 0, done.stderr
     assert git(origin, "log", "--format=%s", "main").splitlines() == [
@@ -153,7 +153,7 @@ def test_a_rebase_conflict_stops_with_the_rebase_in_progress(setup):
     before = remote_main(origin)
     commit(wt, "README", "ours\n", "Ours")
 
-    done = ship(wt, "--check", "true")
+    done = ship(wt)
 
     assert done.returncode == 1
     assert "conflicts --continue" in done.stderr, done.stderr
@@ -167,18 +167,19 @@ def test_leftover_conflict_markers_are_refused(setup):
     before = remote_main(origin)
     commit(wt, "a.py", "<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> abc\n", "Oops")
 
-    done = ship(wt, "--check", "true")
+    done = ship(wt)
 
     assert done.returncode == 1 and "conflict marker" in done.stderr
     assert remote_main(origin) == before
 
 
 def test_a_failing_check_stops_the_push(setup):
-    origin, _, wt, _ = setup
+    origin, main, wt, _ = setup
     before = remote_main(origin)
+    install_hook(main, "agent-pre-commit", "echo broken; exit 3")
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--check", "echo broken; exit 3")
+    done = ship(wt)
 
     assert done.returncode == 1 and "broken" in done.stdout + done.stderr
     assert remote_main(origin) == before
@@ -201,17 +202,23 @@ def test_the_default_check_is_the_repos_agent_pre_commit(setup):
 GATE = SCRIPT.parent / "agent-commit-gate"
 
 
+def pass_the_check(main, cwd):
+    """Run the repo's agent check through the gate in `cwd`, as a commit's own check
+    or a landing does, so the tree there goes on the record of passes."""
+    hooks = Path(git(main, "rev-parse", "--absolute-git-dir")) / "hooks"
+    run = subprocess.run(
+        [str(GATE), "--run", str(hooks / "agent-pre-commit")], cwd=cwd, check=False
+    )
+    assert run.returncode == 0
+
+
 def test_the_recheck_gets_the_main_tip_it_rebased_onto_as_check_base(setup):
     _, main, wt, _ = setup
     seen = main.parent / "bases"
     install_hook(main, "agent-pre-commit", f'echo "${{CHECK_BASE:-none}}" >> "{seen}"')
-    hooks = Path(git(main, "rev-parse", "--absolute-git-dir")) / "hooks"
     commit(main, "b.py", "y = 2\n", "Add b")
     # The main tree's tip passes the check, as it does when it lands.
-    passed = subprocess.run(
-        [str(GATE), "--run", str(hooks / "agent-pre-commit")], cwd=main, check=False
-    )
-    assert passed.returncode == 0
+    pass_the_check(main, main)
     tip = main_head(main)
     commit(wt, "a.py", "x = 1\n", "Add a")
 
@@ -220,23 +227,6 @@ def test_the_recheck_gets_the_main_tip_it_rebased_onto_as_check_base(setup):
     assert done.returncode == 0, done.stderr
     assert seen.read_text().split() == ["none", tip]
     assert f"given CHECK_BASE {tip[:12]}" in done.stderr
-
-
-def test_a_check_given_with_check_gets_no_check_base(setup):
-    _, main, wt, _ = setup
-    seen = main.parent / "base"
-    commit(wt, "a.py", "x = 1\n", "Add a")
-
-    done = ship(
-        wt,
-        "--local",
-        "--check",
-        f'echo "${{CHECK_BASE:-none}}" > "{seen}"',
-        env={"CHECK_BASE": main_head(main)},
-    )
-
-    assert done.returncode == 0, done.stderr
-    assert seen.read_text().split() == ["none"]
 
 
 def test_a_push_that_loses_one_race_rebases_and_retries(setup):
@@ -253,7 +243,7 @@ def test_a_push_that_loses_one_race_rebases_and_retries(setup):
     )
     (hooks / "pre-push").chmod(0o755)
 
-    done = ship(wt, "--check", "true")
+    done = ship(wt)
 
     assert done.returncode == 0, done.stderr
     assert git(origin, "log", "--format=%s", "main").splitlines() == [
@@ -284,7 +274,7 @@ def test_a_push_that_keeps_losing_races_keeps_rebasing_until_it_lands(setup):
     commit(wt, "a.py", "x = 1\n", "Add a")
     racing_pre_push(main, other, races=3)
 
-    done = ship(wt, "--check", "true")
+    done = ship(wt)
 
     assert done.returncode == 0, done.stderr
     assert git(origin, "log", "--format=%s", "main").splitlines() == [
@@ -301,13 +291,12 @@ def test_a_push_that_never_wins_stops_after_its_tries(setup):
     commit(wt, "a.py", "x = 1\n", "Add a")
     racing_pre_push(main, other, races=1000)
 
-    done = ship(wt, "--check", "true")
+    done = ship(wt)
 
     assert done.returncode == 5
-    assert (
-        "won the race" in done.stderr
-        and "run `wt-ship --check true` again" in done.stderr
-    ), done.stderr
+    assert "won the race" in done.stderr and "run `wt-ship` again" in done.stderr, (
+        done.stderr
+    )
     assert "Add a" not in git(origin, "log", "--format=%s", "main")
 
 
@@ -316,7 +305,7 @@ def test_uncommitted_changes_are_refused(setup):
     commit(wt, "a.py", "x = 1\n", "Add a")
     (wt / "a.py").write_text("changed\n")
 
-    done = ship(wt, "--check", "true")
+    done = ship(wt)
 
     assert done.returncode == 1 and "uncommitted" in done.stderr
 
@@ -324,7 +313,7 @@ def test_uncommitted_changes_are_refused(setup):
 def test_nothing_to_push_says_so(setup):
     _, _, wt, _ = setup
 
-    done = ship(wt, "--check", "true")
+    done = ship(wt)
 
     assert done.returncode == 0 and "nothing to push" in done.stdout
 
@@ -333,7 +322,7 @@ def test_remove_removes_the_worktree_after_the_push(setup):
     origin, main, wt, _ = setup
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--check", "true", "--remove")
+    done = ship(wt, "--remove")
 
     assert done.returncode == 0, done.stderr
     assert remote_main(origin) == new and not wt.exists()
@@ -344,7 +333,7 @@ def test_remove_is_refused_in_the_main_tree(setup):
     _, main, _, _ = setup
     commit(main, "a.py", "x = 1\n", "Add a")
 
-    done = ship(main, "--check", "true", "--remove")
+    done = ship(main, "--remove")
 
     assert done.returncode == 1 and "main tree" in done.stderr
     # From the main tree, the way on is -C, not a cd into the worktree.
@@ -359,7 +348,7 @@ def test_a_push_refused_for_another_reason_isnt_retried(setup):
     (hooks / "pre-push").write_text(f'#!/bin/sh\necho x >> "{count}"\nexit 1\n')
     (hooks / "pre-push").chmod(0o755)
 
-    done = ship(wt, "--check", "true")
+    done = ship(wt)
 
     assert done.returncode == 1
     assert count.read_text().count("x") == 1
@@ -387,7 +376,7 @@ def test_local_fast_forwards_the_main_tree_and_releases_its_claim(setup):
     (main / "notes.txt").write_text("the user's own edit\n")
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     new = git(wt, "rev-parse", "HEAD")
@@ -412,7 +401,7 @@ def test_the_notice_names_directories_with_counts_not_every_file(setup):
     commit(wt, "skills/build/SKILL.md", "s\n", "Skill")
     commit(wt, "README.md", "r\n", "Readme")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     notice = done.stdout.split("Notice for other sessions:")[1]
@@ -424,7 +413,7 @@ def test_local_rebases_onto_what_the_main_tree_got_meanwhile(setup):
     theirs = commit(main, "b.py", "y = 2\n", "Add b")
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     assert git(main, "log", "--format=%s", "main").splitlines() == [
@@ -436,23 +425,26 @@ def test_local_rebases_onto_what_the_main_tree_got_meanwhile(setup):
 
 
 def moving_check(main, moves):
-    """A check that lands another session's commit in the main tree on its first
-    `moves` runs, and counts its runs in a file beside the main tree."""
+    """Install a check that lands another session's commit in the main tree on its
+    first `moves` runs, and counts its runs in a file beside the main tree, which it
+    returns."""
     ran = main.parent / "checks"
-    check = (
+    install_hook(
+        main,
+        "agent-pre-commit",
         f'echo x >> "{ran}"; [ "$(wc -l < "{ran}")" -gt {moves} ] && exit 0; '
         "unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX; "
-        f'cd "{main}" && echo z >> c.py && git add c.py && git commit -qm "Race $(wc -l < "{ran}")"'
+        f'cd "{main}" && echo z >> c.py && git add c.py && git commit -qm "Race $(wc -l < "{ran}")"',
     )
-    return check, ran
+    return ran
 
 
 def test_local_keeps_rebasing_while_the_main_tree_moves(setup):
     _, main, wt, _ = setup
     commit(wt, "a.py", "x = 1\n", "Add a")
-    check, ran = moving_check(main, moves=3)
+    ran = moving_check(main, moves=3)
 
-    done = ship(wt, "--local", "--check", check)
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     assert git(main, "log", "--format=%s", "main").splitlines()[0] == "Add a"
@@ -463,9 +455,9 @@ def test_local_keeps_rebasing_while_the_main_tree_moves(setup):
 def test_local_stops_after_its_tries_and_says_what_moved_the_branch(setup):
     _, main, wt, _ = setup
     commit(wt, "a.py", "x = 1\n", "Add a")
-    check, ran = moving_check(main, moves=1000)
+    ran = moving_check(main, moves=1000)
 
-    done = ship(wt, "--local", "--remove", "--check", check)
+    done = ship(wt, "--local", "--remove")
 
     assert done.returncode == 5, done.stderr
     assert ran.read_text().count("x") == 10
@@ -481,13 +473,15 @@ def test_local_rebases_when_the_main_tree_moves_once_during_the_check(setup):
     commit(wt, "a.py", "x = 1\n", "Add a")
     ran = main.parent / "checks"
     # The first check lands another session's commit in the main tree.
-    check = (
+    install_hook(
+        main,
+        "agent-pre-commit",
         f'echo x >> "{ran}"; [ "$(wc -l < "{ran}")" -gt 1 ] && exit 0; '
         "unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX; "
-        f'cd "{main}" && echo z >> c.py && git add c.py && git commit -qm Race'
+        f'cd "{main}" && echo z >> c.py && git add c.py && git commit -qm Race',
     )
 
-    done = ship(wt, "--local", "--check", check)
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     assert git(main, "log", "--format=%s", "main").splitlines() == [
@@ -505,7 +499,7 @@ def test_local_leaves_a_main_tree_another_session_claimed(setup):
     flag(main).write_text("s-other 2026-11-07T01:02:03+00:00\n")
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", wait="0.3")
+    done = ship(wt, "--local", wait="0.3")
 
     assert done.returncode == 3, done.stderr
     assert "s-other" in done.stderr and "2026-11-07T01:02:03" in done.stderr
@@ -518,7 +512,7 @@ def test_local_keeps_a_claim_this_session_holds(setup):
     flag(main).write_text("s-mine 2026-11-07T01:02:03+00:00\n")
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     assert main_head(main) == new
@@ -531,7 +525,7 @@ def test_local_stops_when_the_main_trees_changes_touch_the_same_files(setup):
     (main / "README").write_text("start\nthe user's edit\n")
     commit(wt, "README", "ours\n", "Ours")
 
-    done = ship(wt, "--local", "--check", "true", "--remove")
+    done = ship(wt, "--local", "--remove")
 
     assert done.returncode == 4, done.stderr
     assert "ask the user" in done.stderr and "README" in done.stderr
@@ -545,7 +539,7 @@ def test_local_remove_removes_the_worktree_once_landed(setup):
     _, main, wt, _ = setup
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", "--remove")
+    done = ship(wt, "--local", "--remove")
 
     assert done.returncode == 0, done.stderr
     assert main_head(main) == new and not wt.exists()
@@ -554,7 +548,7 @@ def test_local_remove_removes_the_worktree_once_landed(setup):
 def test_local_with_nothing_to_land_says_so(setup):
     _, _, wt, _ = setup
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0 and "nothing to land" in done.stdout
 
@@ -567,7 +561,7 @@ def test_local_refuses_another_target(setup, args):
     before = main_head(main)
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", *args)
+    done = ship(wt, "--local", *args)
 
     assert done.returncode == 1 and "--local" in done.stderr
     assert main_head(main) == before
@@ -577,7 +571,7 @@ def test_local_takes_branch_naming_the_main_trees_own(setup):
     _, main, wt, _ = setup
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--branch", "main", "--check", "true")
+    done = ship(wt, "--local", "--branch", "main")
 
     assert done.returncode == 0, done.stderr
     assert main_head(main) == new
@@ -588,7 +582,7 @@ def test_local_refuses_a_detached_main_tree(setup):
     git(main, "checkout", "-q", "--detach")
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 1 and "detached" in done.stderr
 
@@ -605,7 +599,7 @@ def test_local_merges_while_it_holds_the_claim(setup):
     install_hook(main, "post-merge", f'cat "{main}/CLAUDE_WORKING" > "{seen}"')
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     assert seen.read_text().startswith("s-mine ")
@@ -625,7 +619,7 @@ def test_local_keeps_the_worktree_when_the_branch_doesnt_hold_head_after(setup):
     )
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", "--remove")
+    done = ship(wt, "--local", "--remove")
 
     assert done.returncode == 1 and "doesn't hold" in done.stderr
     assert wt.exists() and not flag(main).exists()
@@ -637,7 +631,7 @@ def test_local_lands_when_a_tag_shares_the_branchs_name(setup):
     commit(main, "b.py", "y = 2\n", "Add b")
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     assert git(main, "log", "--format=%s", "refs/heads/main").splitlines() == [
@@ -650,12 +644,15 @@ def test_local_lands_when_a_tag_shares_the_branchs_name(setup):
 def test_local_failing_check_says_nothing_was_landed(setup):
     _, main, wt, _ = setup
     before = main_head(main)
+    install_hook(main, "agent-pre-commit", "exit 3")
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "exit 3")
+    done = ship(wt, "--local")
 
     assert done.returncode == 1
     assert "nothing was landed" in done.stderr and "push" not in done.stderr
+    # It names the commit, and says to run it again.
+    assert "Add a" in done.stderr and "`wt-ship --local` again" in done.stderr
     assert main_head(main) == before
 
 
@@ -665,15 +662,17 @@ def test_local_stopped_during_the_retry_releases_the_claim(setup):
     ran, started = main.parent / "checks", main.parent / "retry-started"
     # The first check lands another commit in the main tree, forcing the retry under
     # the claim; the retry's check waits to be stopped.
-    check = (
+    install_hook(
+        main,
+        "agent-pre-commit",
         f'echo x >> "{ran}"; if [ "$(wc -l < "{ran}")" -gt 1 ]; then'
         f' touch "{started}"; sleep 30; exit 0; fi; '
         "unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX; "
-        f'cd "{main}" && echo z >> c.py && git add c.py && git commit -qm Race'
+        f'cd "{main}" && echo z >> c.py && git add c.py && git commit -qm Race',
     )
     env = os.environ | {"CLAUDE_CODE_SESSION_ID": "s-mine"}
     run = subprocess.Popen(
-        [str(SCRIPT), "--local", "--check", check],
+        [str(SCRIPT), "--local"],
         cwd=wt,
         env=env,
         stdout=subprocess.PIPE,
@@ -694,7 +693,7 @@ def test_local_is_refused_in_the_main_tree(setup):
     _, main, _, _ = setup
     commit(main, "a.py", "x = 1\n", "Add a")
 
-    done = ship(main, "--local", "--check", "true")
+    done = ship(main, "--local")
 
     assert done.returncode == 1 and "linked worktree" in done.stderr
     assert "-C" in done.stderr, done.stderr
@@ -710,7 +709,7 @@ def test_local_replays_only_its_own_commits_when_the_branch_was_rewritten(setup)
     (main / "b.py").write_text("y = 3\n")
     git(main, "commit", "-q", "-a", "--amend", "-m", "Add b")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     assert git(main, "log", "--format=%s", "main").splitlines() == [
@@ -724,13 +723,13 @@ def test_local_replays_only_its_own_commits_when_the_branch_was_rewritten(setup)
 def test_local_names_its_own_landed_commit_the_branch_dropped_and_leaves_it_out(setup):
     _, main, wt, _ = setup
     commit(wt, "a.py", "x = 1\n", "Add a")
-    assert ship(wt, "--local", "--check", "true").returncode == 0
+    assert ship(wt, "--local").returncode == 0
     # The main tree drops it, then gains another commit.
     git(main, "reset", "-q", "--hard", "HEAD~1")
     commit(main, "d.py", "w = 4\n", "Add d")
     commit(wt, "c.py", "z = 3\n", "Add c")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     assert git(main, "log", "--format=%s", "main").splitlines() == [
@@ -745,11 +744,11 @@ def test_local_names_its_own_landed_commit_the_branch_dropped_and_leaves_it_out(
 def test_local_leaves_out_what_the_branch_dropped_even_with_nothing_after(setup):
     _, main, wt, _ = setup
     commit(wt, "a.py", "x = 1\n", "Add a")
-    assert ship(wt, "--local", "--check", "true").returncode == 0
+    assert ship(wt, "--local").returncode == 0
     git(main, "reset", "-q", "--hard", "HEAD~1")
     commit(wt, "c.py", "z = 3\n", "Add c")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     assert git(main, "log", "--format=%s", "main").splitlines() == ["Add c", "start"]
@@ -763,7 +762,7 @@ def test_local_folds_fixups_into_the_commits_they_fix(setup):
         file.write("y = 2\n")
     git(wt, "commit", "-q", "-a", f"--fixup={first}")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     assert git(main, "log", "--format=%s", "main").splitlines() == ["Add a", "start"]
@@ -844,7 +843,7 @@ def test_local_clears_a_flag_whose_process_is_gone_and_lands(setup, holder):
     flag(main).write_text(text)
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", wait="0.3")
+    done = ship(wt, "--local", wait="0.3")
 
     assert done.returncode == 0, done.stderr
     assert main_head(main) == new
@@ -858,7 +857,7 @@ def test_local_waits_while_another_landing_holds_the_flag_then_lands(
     flag(main).write_text(holder_flag(holder()))
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    waiting = background(wt, "--local", "--check", "true")
+    waiting = background(wt, "--local")
     waits_to_land(waiting)
     flag(main).unlink()  # that landing finished
     status, out, err = finish(waiting)
@@ -876,7 +875,7 @@ def test_local_waits_for_a_holder_that_dies_then_lands(setup, holder, background
     flag(main).write_text(holder_flag(alive))
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    waiting = background(wt, "--local", "--check", "true")
+    waiting = background(wt, "--local")
     wait_until(lambda: queue(main), "the waiter to join the queue")
     alive.kill()
     alive.wait()
@@ -895,7 +894,7 @@ def test_local_never_clears_a_flag_from_another_host(setup, holder):
     flag(main).write_text(text)
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", wait="0.3")
+    done = ship(wt, "--local", wait="0.3")
 
     assert done.returncode == 3, done.stderr
     assert flag(main).read_text() == text
@@ -908,7 +907,7 @@ def test_no_wait_stops_at_once_on_a_held_flag(setup, holder):
     commit(wt, "a.py", "x = 1\n", "Add a")
 
     started = time.monotonic()
-    done = ship(wt, "--local", "--no-wait", "--check", "true", wait="30")
+    done = ship(wt, "--local", "--no-wait", wait="30")
 
     assert done.returncode == 3, done.stderr
     assert time.monotonic() - started < 10
@@ -923,9 +922,9 @@ def test_waiters_land_in_the_order_they_came(setup, holder, background):
     first = commit(wt, "a.py", "x = 1\n", "First")
     commit(second_wt, "b.py", "y = 1\n", "Second")
 
-    one = background(wt, "--local", "--check", "true", session="s-one")
+    one = background(wt, "--local", session="s-one")
     wait_until(lambda: len(queue(main)) == 1, "the first waiter to join")
-    two = background(second_wt, "--local", "--check", "true", session="s-two")
+    two = background(second_wt, "--local", session="s-two")
     wait_until(lambda: len(queue(main)) == 2, "the second waiter to join")
     flag(main).unlink()
 
@@ -945,12 +944,12 @@ def test_a_killed_waiter_doesnt_hold_up_the_queue(setup, holder, background):
     commit(wt, "a.py", "x = 1\n", "First")
     new = commit(second_wt, "b.py", "y = 1\n", "Second")
 
-    killed = background(wt, "--local", "--check", "true", session="s-one")
+    killed = background(wt, "--local", session="s-one")
     wait_until(lambda: len(queue(main)) == 1, "the first waiter to join")
     killed.kill()  # no chance to clean up: its entry stays behind
     killed.wait()
     assert queued_sessions(main) == ["s-one"]
-    two = background(second_wt, "--local", "--check", "true", session="s-two")
+    two = background(second_wt, "--local", session="s-two")
     # The second waiter drops the killed one's entry as it joins.
     wait_until(lambda: queued_sessions(main) == ["s-two"], "the dead entry to go")
     flag(main).unlink()
@@ -967,7 +966,7 @@ def test_a_waiter_stopped_while_waiting_leaves_the_queue(setup, holder, backgrou
     flag(main).write_text(text)
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    waiting = background(wt, "--local", "--check", "true")
+    waiting = background(wt, "--local")
     waits_to_land(waiting)
     waiting.send_signal(signal.SIGTERM)
     status, _, _ = finish(waiting)
@@ -1017,7 +1016,7 @@ def test_a_flag_naming_a_reused_pid_is_cleared(setup, holder):
     )
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", wait="0.3")
+    done = ship(wt, "--local", wait="0.3")
 
     assert done.returncode == 0, done.stderr
     assert main_head(main) == new
@@ -1032,7 +1031,7 @@ def test_no_wait_still_clears_a_flag_whose_process_is_gone(setup, holder):
     flag(main).write_text(text)
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--no-wait", "--check", "true")
+    done = ship(wt, "--local", "--no-wait")
 
     assert done.returncode == 0, done.stderr
     assert main_head(main) == new
@@ -1048,7 +1047,7 @@ def test_a_flag_missing_a_field_is_waited_on_not_misread(setup, holder):
     flag(main).write_text(text)
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", wait="0.3")
+    done = ship(wt, "--local", wait="0.3")
 
     assert done.returncode == 3, done.stderr
     assert flag(main).read_text() == text
@@ -1062,7 +1061,7 @@ def test_another_run_of_this_session_holding_the_flag_is_waited_on(setup, holder
     before = main_head(main)
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", wait="0.3")
+    done = ship(wt, "--local", wait="0.3")
 
     assert done.returncode == 3, done.stderr
     assert main_head(main) == before
@@ -1075,7 +1074,7 @@ def test_no_wait_doesnt_jump_the_queue(setup, holder):
     before = main_head(main)
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--no-wait", "--check", "true")
+    done = ship(wt, "--local", "--no-wait")
 
     assert done.returncode == 3, done.stderr
     assert main_head(main) == before
@@ -1087,7 +1086,7 @@ def test_giving_up_behind_a_waiter_names_its_entry(setup, holder):
     entry = queue_entry(main, holder())
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", wait="0.3")
+    done = ship(wt, "--local", wait="0.3")
 
     assert done.returncode == 3, done.stderr
     assert str(entry) in done.stderr and "s-ahead" in done.stderr
@@ -1100,7 +1099,7 @@ def test_a_waiter_stopped_with_ctrl_c_leaves_quietly(setup, holder, background):
     flag(main).write_text(holder_flag(holder()))
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    waiting = background(wt, "--local", "--check", "true")
+    waiting = background(wt, "--local")
     waits_to_land(waiting)
     waiting.send_signal(signal.SIGINT)
     status, _, err = finish(waiting)
@@ -1116,7 +1115,7 @@ def test_a_queue_it_cant_use_fails_in_one_line(setup, holder):
     flag(main).write_text(holder_flag(holder()))
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", wait="0.3")
+    done = ship(wt, "--local", wait="0.3")
 
     assert done.returncode == 1
     assert done.stderr.count("\n") == 1, done.stderr
@@ -1130,7 +1129,7 @@ def test_files_in_the_queue_that_arent_entries_are_ignored(setup):
     (folder / "README").write_text("")
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", wait="0.3")
+    done = ship(wt, "--local", wait="0.3")
 
     assert done.returncode == 0, done.stderr
     assert main_head(main) == new
@@ -1143,7 +1142,7 @@ def test_the_flag_goes_only_while_it_holds_this_runs_text(setup):
     install_hook(main, "post-merge", f"printf '{theirs}' > \"{main}/CLAUDE_WORKING\"")
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true")
+    done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
     assert flag(main).read_text() == theirs
@@ -1154,7 +1153,7 @@ def test_waiting_says_whom_it_waits_on_once_per_change(setup, holder):
     flag(main).write_text(holder_flag(holder()))
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(wt, "--local", "--check", "true", wait="0.5")
+    done = ship(wt, "--local", wait="0.5")
 
     assert done.returncode == 3
     lines = [ln for ln in done.stdout.splitlines() if ln.startswith("Waiting")]
@@ -1170,9 +1169,7 @@ def test_c_lands_and_removes_the_worktree_from_outside_it(setup):
     _, main, wt, _ = setup
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(
-        main, "-C", "../repo-wt-topic", "--local", "--remove", "--check", "true"
-    )
+    done = ship(main, "-C", "../repo-wt-topic", "--local", "--remove")
 
     assert done.returncode == 0, done.stderr
     assert main_head(main) == new
@@ -1183,7 +1180,7 @@ def test_c_pushes_from_outside_the_worktree(setup):
     origin, main, wt, _ = setup
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(main.parent, "-C", str(wt), "--check", "true")
+    done = ship(main.parent, "-C", str(wt))
 
     assert done.returncode == 0, done.stderr
     assert remote_main(origin) == new
@@ -1192,7 +1189,7 @@ def test_c_pushes_from_outside_the_worktree(setup):
 def test_c_naming_no_folder_is_a_usage_error(setup):
     _, main, _, _ = setup
 
-    done = ship(main, "-C", "../nowhere", "--local", "--check", "true")
+    done = ship(main, "-C", "../nowhere", "--local")
 
     assert done.returncode == 2
     assert "../nowhere" in done.stderr
@@ -1202,7 +1199,7 @@ def test_c_naming_no_folder_is_a_usage_error(setup):
 def test_c_naming_a_file_is_a_usage_error(setup):
     _, main, _, _ = setup
 
-    done = ship(main, "-C", "README", "--local", "--check", "true")
+    done = ship(main, "-C", "README", "--local")
 
     assert done.returncode == 2
     assert "README" in done.stderr
@@ -1214,18 +1211,15 @@ def test_a_stop_says_to_run_the_same_command_again(setup):
     flag(main).write_text("s-other 2026-11-07T01:02:03+00:00\n")
     commit(wt, "a.py", "x = 1\n", "Add a")
 
-    done = ship(
-        main, "-C", "../repo-wt-topic", "--local", "--check", "true", wait="0.3"
-    )
+    done = ship(main, "-C", "../repo-wt-topic", "--local", wait="0.3")
 
     assert done.returncode == 3, done.stderr
-    assert "`wt-ship -C ../repo-wt-topic --local --check true` again" in done.stderr
+    assert "`wt-ship -C ../repo-wt-topic --local` again" in done.stderr
 
 
-def test_a_check_given_with_check_waits_its_turn_in_heavys_queue(
-    setup, holder, background
-):
+def test_the_check_waits_its_turn_in_heavys_queue(setup, holder, background):
     _, main, wt, _ = setup
+    install_hook(main, "agent-pre-commit", "exit 0")
     alive = holder()
     lane = Path(os.environ["HEAVY_DIR"]) / "normal"
     lane.mkdir(parents=True)
@@ -1235,7 +1229,7 @@ def test_a_check_given_with_check_waits_its_turn_in_heavys_queue(
     )
     new = commit(wt, "a.py", "x = 1\n", "Add a")
 
-    shipping = background(wt, "--local", "--check", "true")
+    shipping = background(wt, "--local")
     wait_until(
         lambda: any(p.name[:1].isdigit() for p in lane.iterdir()), "the check to queue"
     )
@@ -1246,3 +1240,353 @@ def test_a_check_given_with_check_waits_its_turn_in_heavys_queue(
 
     assert status == 0, err
     assert main_head(main) == new
+
+
+# Every commit it lands is checked, not only HEAD: each earlier commit is checked out in
+# turn in the worktree, oldest first, unless its tree passed the check already.
+
+
+def logging_check(main, body=""):
+    """Install a check that appends the subject of the commit it sees to a file beside
+    the main tree, which it returns, then runs `body`."""
+    log = main.parent / "checked"
+    install_hook(main, "agent-pre-commit", f'git log -1 --format=%s >> "{log}"\n{body}')
+    return log
+
+
+def test_local_checks_each_commit_it_lands_oldest_first(setup):
+    _, main, wt, _ = setup
+    log = logging_check(main)
+    for name in "abc":
+        commit(wt, f"{name}.py", "x = 1\n", f"Add {name}")
+    # Main moves, so the rebase gives each commit a tree no check has seen.
+    commit(main, "m.py", "m = 1\n", "Meanwhile")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert log.read_text().splitlines() == ["Add a", "Add b", "Add c"]
+    assert git(main, "log", "--format=%s", "main").splitlines()[0] == "Add c"
+
+
+def test_a_push_checks_each_commit_it_pushes(setup):
+    origin, main, wt, _ = setup
+    log = logging_check(main)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    commit(wt, "b.py", "y = 2\n", "Add b")
+
+    done = ship(wt)
+
+    assert done.returncode == 0, done.stderr
+    assert log.read_text().splitlines() == ["Add a", "Add b"]
+    assert git(origin, "log", "--format=%s", "main").splitlines()[0] == "Add b"
+
+
+def fails_at(subject):
+    return f'test "$(git log -1 --format=%s)" != "{subject}" || exit 3'
+
+
+def test_a_failing_earlier_commit_stops_the_landing_and_names_it(setup):
+    _, main, wt, _ = setup
+    install_hook(main, "agent-pre-commit", fails_at("Add a"))
+    first = commit(wt, "a.py", "x = 1\n", "Add a")
+    tip = commit(wt, "b.py", "y = 2\n", "Add b")
+    before = main_head(main)
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1, done.stderr
+    assert f"{first[:12]} Add a" in done.stderr, done.stderr
+    assert f"--fixup={first[:12]}" in done.stderr
+    assert "nothing was landed" in done.stderr
+    assert main_head(main) == before
+    # The worktree is back at its tip, with nothing changed.
+    assert git(wt, "rev-parse", "HEAD") == tip
+    assert git(wt, "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize("upstream_passed", [True, False])
+def test_a_failure_says_when_upstreams_tip_has_no_pass_either(setup, upstream_passed):
+    _, main, wt, _ = setup
+    install_hook(main, "agent-pre-commit", fails_at("Add a"))
+    if upstream_passed:
+        pass_the_check(main, main)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    commit(wt, "b.py", "y = 2\n", "Add b")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1, done.stderr
+    assert ("no pass" in done.stderr) is not upstream_passed, done.stderr
+
+
+@pytest.fixture
+def blocking_check():
+    """Install a check that, the first time it sees the commit with a subject, writes
+    its PID to a file `started` beside the main tree and waits for a file `go` there:
+    `blocking_check(main, subject)` returns both paths. Only the first time, so another
+    check of that commit, such as a commit's own, can't wait behind it. Every `go` is
+    touched when the test ends, passed or failed, so no check outlives it."""
+    gos = []
+
+    def install(main, subject):
+        started, go = main.parent / "started", main.parent / "go"
+        once = main.parent / "blocked-once"
+        install_hook(
+            main,
+            "agent-pre-commit",
+            f'if [ "$(git log -1 --format=%s)" = "{subject}" ] &&'
+            f' mkdir "{once}" 2>/dev/null; then echo $$ > "{started}.part";'
+            f' mv "{started}.part" "{started}";'
+            f' while [ ! -e "{go}" ]; do sleep 0.05; done; fi',
+        )
+        gos.append(go)
+        return started, go
+
+    yield install
+    for go in gos:
+        go.touch()
+
+
+@pytest.mark.parametrize("branch", [None, "topic"])
+def test_a_stop_during_an_earlier_commits_check_puts_the_tip_back(
+    setup, background, blocking_check, branch
+):
+    _, main, wt, _ = setup
+    started, go = blocking_check(main, "Add a")
+    if branch:
+        git(wt, "checkout", "-q", "-b", branch)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    tip = commit(wt, "b.py", "y = 2\n", "Add b")
+
+    shipping = background(wt, "--local")
+    wait_until(started.exists, "the earlier commit's check to start")
+    shipping.send_signal(signal.SIGTERM)
+    status, _, _ = finish(shipping)
+    check = int(started.read_text())
+
+    assert status != 0
+    # The stop reached the check too, not only wt-ship.
+    wait_until(lambda: not alive(check), "the stopped check to end")
+    assert git(wt, "rev-parse", "HEAD") == tip
+    assert git(wt, "status", "--porcelain") == ""
+    if branch:
+        assert git(wt, "symbolic-ref", "HEAD") == f"refs/heads/{branch}"
+    go.touch()
+    # Nothing it left stops the next run.
+    done = ship(wt, "--local")
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == tip
+
+
+def gate_commit(repo):
+    """Commit as an agent does, through the gate's line in the pre-commit hook, with
+    this checkout's gate first on PATH. The commit is empty: staging a file would
+    change the index under the check wt-ship is running, which the gate refuses. A
+    commit the gate lets through waits for heavy's lane behind that check, so the
+    timeout fails it rather than hang, and stops the gate with git: they run in a
+    process group of their own."""
+    env = os.environ | {
+        "AI_AGENT": "test-agent",
+        "PATH": os.pathsep.join([str(GATE.parent), os.environ["PATH"]]),
+    }
+    proc = subprocess.Popen(
+        ["git", "commit", "-q", "--allow-empty", "-m", "Meanwhile"],
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+def test_a_commit_while_an_earlier_commit_is_checked_is_refused(
+    setup, background, blocking_check
+):
+    _, main, wt, _ = setup
+    started, go = blocking_check(main, "Add a")
+    installed = subprocess.run(
+        [str(GATE), "--install", str(main)], capture_output=True, check=False
+    )
+    assert installed.returncode == 0, installed.stderr
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    tip = commit(wt, "b.py", "y = 2\n", "Add b")
+
+    shipping = background(wt, "--local")
+    wait_until(started.exists, "the earlier commit's check to start")
+    refused = gate_commit(wt)
+    go.touch()
+    status, _, err = finish(shipping)
+
+    assert refused.returncode != 0
+    assert "COMMIT REFUSED" in refused.stderr and "wt-ship" in refused.stderr
+    assert status == 0, err
+    assert main_head(main) == tip
+
+
+def test_a_run_killed_mid_check_leaves_the_next_one_naming_the_tip(
+    setup, background, blocking_check
+):
+    _, main, wt, _ = setup
+    started, go = blocking_check(main, "Add a")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    tip = commit(wt, "b.py", "y = 2\n", "Add b")
+    before = main_head(main)
+    shipping = background(wt, "--local")
+    wait_until(started.exists, "the earlier commit's check to start")
+    shipping.kill()  # SIGKILL: no chance to put the tip back
+    shipping.wait()
+    go.touch()
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1, done.stderr
+    assert tip[:12] in done.stderr and "git checkout --force" in done.stderr
+    assert main_head(main) == before
+
+
+@pytest.mark.parametrize("where", [".", "sub"])
+def test_a_commit_that_drops_the_check_kept_in_the_tree_fails(setup, where):
+    _, main, wt, _ = setup
+    git(main, "config", "core.hooksPath", ".githooks")
+    (main / ".githooks").mkdir()
+    (main / ".githooks" / "agent-pre-commit").write_text("#!/bin/sh\nexit 0\n")
+    (main / ".githooks" / "agent-pre-commit").chmod(0o755)
+    git(main, "add", ".githooks")
+    git(main, "commit", "-qm", "Add the check")
+    git(wt, "checkout", "-q", "--detach", "main")
+    git(wt, "rm", "-q", ".githooks/agent-pre-commit")
+    git(wt, "commit", "-qm", "Drop the check")
+    (wt / "sub").mkdir()
+    commit(wt, "sub/a.py", "x = 1\n", "Add a")
+    before = main_head(main)
+
+    # Run from a subdirectory too, where git reads paths relative to it.
+    done = ship(wt / where, "--local")
+
+    assert done.returncode == 1, done.stderr
+    assert "Drop the check" in done.stderr, done.stderr
+    assert main_head(main) == before
+
+
+def test_commits_that_passed_are_not_checked_out_again(setup):
+    _, main, wt, _ = setup
+    log = logging_check(main)
+    for name in "ab":
+        commit(wt, f"{name}.py", "x = 1\n", f"Add {name}")
+        pass_the_check(main, wt)  # as the commit's own check does
+    log.unlink()
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert "Checking with" not in done.stdout
+    assert not log.exists()
+
+
+def test_a_second_run_waits_for_one_checking_the_same_worktree(
+    setup, background, blocking_check
+):
+    _, main, wt, _ = setup
+    started, go = blocking_check(main, "Add a")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    tip = commit(wt, "b.py", "y = 2\n", "Add b")
+    shipping = background(wt, "--local")
+    wait_until(started.exists, "the earlier commit's check to start")
+
+    second = ship(wt, "--local")
+    go.touch()
+    status, _, err = finish(shipping)
+
+    assert second.returncode == 1
+    assert "Another wt-ship" in second.stderr, second.stderr
+    assert status == 0, err
+    assert main_head(main) == tip
+
+
+def test_each_commits_check_gets_the_commit_before_as_check_base(setup):
+    _, main, wt, _ = setup
+    bases = main.parent / "bases"
+    install_hook(main, "agent-pre-commit", f'echo "${{CHECK_BASE:-none}}" >> "{bases}"')
+    # The main tree's tip passed the check, as it does when it lands.
+    pass_the_check(main, main)
+    start = main_head(main)
+    first = commit(wt, "a.py", "x = 1\n", "Add a")
+    commit(wt, "b.py", "y = 2\n", "Add b")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert bases.read_text().split() == ["none", start, first]
+
+
+def test_every_check_runs_at_the_top_of_the_worktree(setup):
+    _, main, wt, _ = setup
+    seen = main.parent / "seen"
+    install_hook(
+        main,
+        "agent-pre-commit",
+        f'echo "$(pwd -P) $(git log -1 --format=%s)" >> "{seen}"',
+    )
+    (wt / "sub").mkdir()
+    commit(wt, "sub/a.py", "x = 1\n", "Add a")
+    commit(wt, "sub/b.py", "y = 2\n", "Add b")
+
+    done = ship(wt / "sub", "--local")
+
+    assert done.returncode == 0, done.stderr
+    top = wt.resolve()
+    assert seen.read_text().splitlines() == [f"{top} Add a", f"{top} Add b"]
+
+
+def test_each_check_sees_its_commits_files_whatever_the_last_check_left(setup):
+    _, main, wt, _ = setup
+    seen = main.parent / "seen"
+    # Each check reads the work tree, then leaves it dirty.
+    install_hook(main, "agent-pre-commit", f'cat state >> "{seen}"; echo junk >> state')
+    for name in "abc":
+        (wt / "state").write_text(f"{name}\n")
+        git(wt, "add", "state")
+        git(wt, "commit", "-qm", f"State {name}")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert seen.read_text().splitlines() == ["a", "b", "c"]
+    assert "the work tree holds that commit" in done.stdout
+
+
+def test_an_earlier_commit_without_the_check_kept_in_the_tree_has_none_to_pass(setup):
+    _, main, wt, _ = setup
+    git(main, "config", "core.hooksPath", ".githooks")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    # The branch adds the check, which the main tree's branch doesn't have.
+    (wt / ".githooks").mkdir()
+    (wt / ".githooks" / "agent-pre-commit").write_text("#!/bin/sh\nexit 0\n")
+    (wt / ".githooks" / "agent-pre-commit").chmod(0o755)
+    git(wt, "add", ".githooks")
+    git(wt, "commit", "-qm", "Add the check")
+    tip = git(wt, "rev-parse", "HEAD")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert "nothing to check" in done.stdout
+    assert main_head(main) == git(wt, "rev-parse", "HEAD") == tip
+
+
+def alive(pid):
+    """Whether a process runs under `pid`, a zombie counting as ended."""
+    stat = Path(f"/proc/{pid}/stat")
+    try:
+        return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (FileNotFoundError, IndexError):
+        return False

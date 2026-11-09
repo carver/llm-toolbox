@@ -3,7 +3,6 @@
 the main tree's branch.
 
     wt-ship                       rebase onto origin/<main tree's branch>, check, push
-    wt-ship --check 'make test'   run this check instead of the repo's agent-pre-commit
     wt-ship --remove              then remove this worktree, through the main tree
     wt-ship --remote up --branch dev
     wt-ship --local [--remove]    in a repo that doesn't push: land on the main tree
@@ -12,16 +11,27 @@ the main tree's branch.
 
 In order, it:
 
-1. refuses uncommitted changes to tracked files;
+1. refuses uncommitted changes to tracked files, and a worktree whose earlier commits
+   another run is checking, or where one was killed before it put the tip back (step 4);
 2. fetches the remote, and when HEAD lacks REMOTE/BRANCH or holds fixup! commits,
    rebases onto it, folding them (autosquash). A conflict stops it with the rebase in
    progress: resolve the hunks (`conflicts -h`), finish with `conflicts --continue`,
    then run it again;
 3. refuses leftover conflict markers in what it would push;
-4. runs the check: --check CMD (through sh, without CHECK_BASE), else the repo's
-   agent-pre-commit hook through agent-commit-gate --run, which skips a tree that
-   passed it and hands it CHECK_BASE, usually the main branch's tip (`agent-commit-gate
-   -h`), so the check can run only what the landing changed; else none, and says so;
+4. checks every commit it would push with the repo's agent-pre-commit hook, else none,
+   and says so. First each commit before HEAD whose tree has no pass of the check, as
+   its bytes are now, on agent-commit-gate's record, oldest first, each checked out in
+   turn here, forced; then HEAD. Each runs through agent-commit-gate --run, which skips
+   a tree that passed and hands the check CHECK_BASE, usually the commit before or the
+   main branch's tip (`agent-commit-gate -h`), so it can run only what that commit
+   changed. The first failure stops it, naming the commit to fix with a fixup!, and
+   says when the branch's tip it rebased onto has no pass either. While the work tree
+   holds an earlier commit, a marker in the worktree's git dir names the tip and this
+   run, and agent-commit-gate refuses commits there, which would be lost; the tip comes
+   back and the marker goes however the checks end, unless the run is killed outright,
+   and then the next run names the tip to put back. A repo that keeps the check in its
+   tree (core.hooksPath inside it) fails a commit that drops it while the branch has
+   it;
 5. pushes HEAD to REMOTE/BRANCH. When another session's push wins the race (a
    non-fast-forward rejection), it fetches, rebases, checks and pushes again, up to
    10 tries in all, then stops saying to run it again;
@@ -86,7 +96,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import commitcheck
 import fifo
+from commitcheck import git, out, run_stoppable
 from fifo import Holder
 
 # --local's outcomes the user decides on.
@@ -101,8 +113,7 @@ class Stop(Exception):
         self.status = status
 
 
-HEAVY = Path(__file__).resolve().parent / "heavy"
-GATE = HEAVY.with_name("agent-commit-gate")
+GATE = Path(__file__).resolve().parent / "agent-commit-gate"
 
 # This run's command line, so a stop can say to run the same thing again; main sets it.
 RERUN = "wt-ship"
@@ -124,17 +135,6 @@ class Mode(NamedTuple):
 
 PUSH = Mode("pushed", fork_point=False)
 LAND = Mode("landed", fork_point=True)
-
-
-def git(*args, check=True):
-    run = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
-    if check and run.returncode != 0:
-        raise Stop(f"git {' '.join(args)} failed:\n{run.stdout}{run.stderr}".rstrip())
-    return run
-
-
-def out(*args):
-    return git(*args).stdout.strip()
 
 
 def worktrees():
@@ -206,42 +206,91 @@ def markers(upstream):
         )
 
 
-def run_stoppable(argv, env=None):
-    """Run argv to its end and return its exit status. When this run is stopped
-    meanwhile, argv's whole process group is stopped too, so no check outlives it."""
-    process = subprocess.Popen(argv, env=env, start_new_session=True)
-    try:
-        return process.wait()
-    except BaseException:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait()
-        raise
+CHECK = commitcheck.HOOK_NAME
 
 
-def run_check(command, mode):
-    if command is None:
-        hook = Path(out("rev-parse", "--git-path", "hooks")) / "agent-pre-commit"
-        hook = (
-            hook
-            if hook.is_absolute()
-            else Path(out("rev-parse", "--show-toplevel")) / hook
+def named(sha):
+    return out("log", "-1", "--format=%h %s", "--abbrev=12", sha)
+
+
+def short(ref):
+    """A branch's name as people say it: main, not refs/heads/main."""
+    return ref.removeprefix("refs/heads/")
+
+
+def upstream_note(upstream, hook):
+    """For a failure at the first commit checked: a sentence when upstream's tip has
+    no pass of the check either, so the failure may come from there."""
+    if commitcheck.passed(upstream, hook):
+        return ""
+    return (
+        f" {short(upstream)}'s tip has no pass of the check on record either, so the"
+        " failure may come from there."
+    )
+
+
+def run_checks(upstream, mode):
+    """Check every commit since upstream with the repo's agent check, if it has one:
+    those before HEAD with no pass on record, oldest first, each checked out here in
+    turn, then HEAD; the first failure stops it."""
+    hook = commitcheck.hook_path()
+    if dropped := commitcheck.dropping_check(upstream, hook):
+        raise Stop(
+            f"{named(dropped)} has no {CHECK}, which {short(upstream)} has, so it would"
+            f" land without the check. Put it back in that commit (`git commit"
+            f" --fixup={dropped[:12]}`), then run `{RERUN}` again; nothing was"
+            f" {mode.done}."
         )
-        if not (hook.is_file() and os.access(hook, os.X_OK)):
-            print(
-                "No check: the repo has no agent-pre-commit hook and no --check was given."
+    if not commitcheck.runnable(hook):
+        print(f"No check: the repo has no {CHECK} hook.")
+        return
+    earlier = commitcheck.unchecked(upstream, hook)
+    if earlier:
+        count = f"{len(earlier)} commit{'' if len(earlier) == 1 else 's'}"
+        print(
+            f"Checking with {CHECK} the {count} before HEAD with no pass on record, each"
+            " checked out here in turn: until wt-ship ends, the work tree holds that"
+            " commit, not the tip, so change or commit nothing in it.",
+            flush=True,
+        )
+        if failed := commitcheck.first_failing(hook, earlier, GATE):
+            note = upstream_note(upstream, hook) if failed == earlier[0] else ""
+            raise Stop(
+                f"The repo's {CHECK} fails at {named(failed)}, a commit before HEAD. Fix"
+                f" it with `git commit --fixup={failed[:12]}`, or move the code it needs"
+                f" into it, then run `{RERUN}` again; nothing was {mode.done}, and the"
+                f" branch stays at its tip.{note}"
             )
-            return
-        env = os.environ | {"AGENT_PRE_COMMIT": "1"}
-        code = run_stoppable([str(GATE), "--run", str(hook)], env)
-        name = "agent-pre-commit"
-    else:
-        # Through heavy, so a --check waits its turn with every other heavy job. The
-        # gate's CHECK_BASE is for the repo's own check, so none is passed on.
-        env = {k: v for k, v in os.environ.items() if k != "CHECK_BASE"}
-        code = run_stoppable([str(HEAVY), "--", "sh", "-c", command], env)
-        name = repr(command)
+    env = os.environ | {"AGENT_PRE_COMMIT": "1"}
+    # At the top of the work tree, as git runs a hook, wherever wt-ship started.
+    top = out("rev-parse", "--show-toplevel")
+    code = run_stoppable([str(GATE), "--run", str(hook)], env, cwd=top)
     if code != 0:
-        raise Stop(f"The check {name} failed (exit {code}); nothing was {mode.done}.")
+        note = "" if earlier else upstream_note(upstream, hook)
+        raise Stop(
+            f"The repo's {CHECK} fails at HEAD, {named('HEAD')} (exit {code}). Fix it,"
+            f" commit, then run `{RERUN}` again; nothing was {mode.done}.{note}"
+        )
+
+
+def refuse_a_marked_worktree():
+    """Stop when another run is checking earlier commits here, or one was killed before
+    it put the tip back."""
+    found = commitcheck.marker()
+    if found is None:
+        return
+    if not found.holder.gone():
+        raise Stop(
+            f"Another wt-ship ({found.holder}) is checking earlier commits in this"
+            f" worktree: wait for it to end, then run `{RERUN}` again. If none is"
+            f" running, delete {found.path}."
+        )
+    raise Stop(
+        f"A wt-ship that was checking earlier commits here ({found.holder}) ended before"
+        f" it put the tip, {found.tip[:12]}, back, so the work tree may hold one of them."
+        f" Put the tip back with `{found.restore_command()}`, which discards changes to"
+        f" tracked files, delete {found.path}, then run `{RERUN}` again."
+    )
 
 
 # A push that lost a race: refused as a non-fast-forward, or the branch moved mid-push.
@@ -283,13 +332,13 @@ def not_replayed(upstream):
     return out("log", "--reverse", "--format=%h %s", f"{base}..{point}").splitlines()
 
 
-def prepare(upstream, check, mode):
+def prepare(upstream, mode):
     """Rebase onto upstream when HEAD lacks it, holds fixups to fold, or (--local)
     holds commits the branch dropped; refuse markers; check."""
     skipped = not_replayed(upstream) if mode.fork_point else []
     if skipped:
         print(
-            f"Not replaying these, which {upstream.removeprefix('refs/heads/')} held"
+            f"Not replaying these, which {short(upstream)} held"
             " when this worktree forked from it and holds no more:\n  "
             + "\n  ".join(skipped)
             + "\n",
@@ -298,14 +347,14 @@ def prepare(upstream, check, mode):
     if skipped or has_fixups(upstream) or not is_ancestor(upstream, "HEAD"):
         rebase(upstream, mode)
     markers(upstream)
-    run_check(check, mode)
+    run_checks(upstream, mode)
 
 
-def rebase_and_check(remote, branch, check):
+def rebase_and_check(remote, branch):
     """Fetch, rebase onto the remote branch, refuse markers, check."""
     git("fetch", "-q", remote, branch)
     upstream = f"{remote}/{branch}"
-    prepare(upstream, check, PUSH)
+    prepare(upstream, PUSH)
     return upstream
 
 
@@ -318,6 +367,7 @@ def locate():
 
 
 def ship(args):
+    refuse_a_marked_worktree()
     if git("status", "--porcelain", "--untracked-files=no").stdout:
         raise Stop("There are uncommitted changes: commit or stash them first.")
     if args.local:
@@ -339,7 +389,7 @@ def ship(args):
     if is_ancestor("HEAD", upstream):
         print(f"HEAD is already in {upstream}: nothing to push.")
         return 0
-    rebase_and_check(remote, branch, args.check)
+    rebase_and_check(remote, branch)
     for attempt in range(1, TRIES + 1):
         old = out("rev-parse", upstream)
         pushed = git("push", "-q", remote, f"HEAD:{branch}", check=False)
@@ -358,7 +408,7 @@ def ship(args):
             f" (try {attempt + 1} of {TRIES}):\n{pushed.stderr.strip()}",
             flush=True,
         )
-        rebase_and_check(remote, branch, args.check)
+        rebase_and_check(remote, branch)
     git("fetch", "-q", remote, branch)
     new = out("rev-parse", "HEAD")
     if not is_ancestor(new, upstream):
@@ -575,7 +625,7 @@ def land(args):
     if is_ancestor("HEAD", ref):
         print(f"HEAD is already in {branch}: nothing to land.")
         return 0
-    prepare(ref, args.check, LAND)
+    prepare(ref, LAND)
     with claim(main_path, wait=not args.no_wait):
         # The claim stops other sessions from landing, but the owner, or a tool that
         # doesn't read the flag, may still move the branch: rebase until HEAD holds
@@ -597,7 +647,7 @@ def land(args):
                 f" (try {attempt} of {TRIES}).",
                 flush=True,
             )
-            prepare(ref, args.check, LAND)
+            prepare(ref, LAND)
         old = out("merge-base", ref, "HEAD")
         new = out("rev-parse", "HEAD")
         merge(main_path, new)
@@ -623,11 +673,6 @@ def main(argv=None):
     parser.add_argument(
         "--branch",
         help="the branch to push to (default: the main tree's; --local takes only that)",
-    )
-    parser.add_argument(
-        "--check",
-        metavar="CMD",
-        help="the check to run before pushing or landing",
     )
     parser.add_argument(
         "--remove",
@@ -665,6 +710,9 @@ def main(argv=None):
     except Stop as error:
         print(error, file=sys.stderr)
         return error.status
+    except commitcheck.GitError as error:
+        print(error, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -179,10 +179,16 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   markers.
 - **wt-ship**: ships a worktree's commits. In a repo that pushes, it rebases
   onto the remote branch (the main tree's, by default), refuses leftover
-  conflict markers, runs the repo's `agent-pre-commit` through
-  `agent-commit-gate --run`, which hands it `CHECK_BASE`, usually the main
-  branch's tip (or runs `--check CMD`, without it), pushes with one retry when
-  another push wins the race, and confirms the
+  conflict markers, and checks every commit it would push with the repo's
+  `agent-pre-commit`, through `agent-commit-gate --run`, which hands each the
+  `CHECK_BASE` of the commit before or the main branch's tip: first each
+  commit before HEAD with no pass on record, oldest first, checked out in turn
+  in the worktree, then HEAD. The first failure stops it, naming the commit to
+  fix with a fixup. While the work tree holds an earlier commit, a marker in
+  the worktree's git dir makes `agent-commit-gate` refuse commits there, and a
+  run killed before it put the tip back leaves the next one naming the tip. A
+  repo that keeps the check in its tree fails a commit that drops it. Then it
+  pushes with one retry when another push wins the race, and confirms the
   remote holds HEAD. Then it prints the range, a notice for other sessions and
   whether the main tree is behind; `--remove` removes the worktree, and `-C DIR`
   runs it on the worktree DIR from outside, so the call's shell isn't left in
@@ -321,8 +327,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   holder, sharer, waiters, their usual cores and how busy the lane's cores
   are. A third job in a lane, or a head stalled for `$HEAVY_STALL_SECONDS`
   (600), gets a hint to push a topic branch and open a PR for CI's results
-  instead. A heavy inside a job (`$HEAVY_SLOT`) runs at once, and wt-ship's
-  `--check` queues too. The queue and its history live in `$HEAVY_DIR`
+  instead. A heavy inside a job (`$HEAVY_SLOT`) runs at once. The queue and
+  its history live in `$HEAVY_DIR`
   (`/tmp/heavy`). A Ctrl-Z while heavy holds the queue's lock, a moment at each
   look, stops it once it lets go; a wait of `$FIFO_LOCK_SECONDS` (5) for that lock
   names the process holding it, and how to continue it when it's stopped. For

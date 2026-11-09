@@ -32,7 +32,11 @@ teammate's, runs the check directly instead, every time. A check `--run` runs
 waits its turn in heavy's queue (bin/heavy), so agents' commit checks never run
 at once, and prints heavy's waiting lines; one that needs no build or test can
 skip the queue, as below.
-wt-ship and build-state finish recheck through `--run` too.
+wt-ship and build-state finish recheck through `--run` too. While wt-ship checks a
+worktree's commits before its tip, each checked out there in turn, a marker in the
+worktree's git dir names the run, and `--run` refuses a commit in that worktree, which
+would be lost when the tip comes back. The checks wt-ship starts carry its PID in
+CHECKING_EARLIER_COMMITS_PID, and run (`wt-ship -h`).
 
 `--run` records each tree that passes in agent-pre-commit-passed, in the repo's
 common git dir, which every worktree shares: the last 1,000, each with the SHA-1
@@ -57,9 +61,10 @@ which works at commit time, when the index holds what's staged, and on a
 recheck, when the index matches the commit being checked. Add -z for paths git
 would quote, --no-renames to list both sides of a rename, and run it before
 unsetting git's variables or changing directory: `commit -a` and `commit
-PATHS` stage into an index of their own, which GIT_INDEX_FILE names. After
-wt-ship's rebase the base is usually the main branch's tip, which passed when
-it landed; in build-state finish, the commit before. A check that ignores
+PATHS` stage into an index of their own, which GIT_INDEX_FILE names. On
+wt-ship's recheck the base is usually the commit before, or for the first
+commit it checks, the main branch's tip, which passed when it landed; in
+build-state finish, the commit before. A check that ignores
 CHECK_BASE runs in full, as does any check when no base is found. The pass line
 names the base it was given. agent-quick-check gets CHECK_BASE too: the nearest
 commit that passed agent-pre-commit, whose checks include the quick ones.
@@ -103,6 +108,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import commitcheck
 import heavyqueue
 import passrecord
 
@@ -650,6 +656,15 @@ def run_check(path):
     check gets CHECK_BASE, the nearest first-parent commit whose tree passed it. A
     check that passes but leaves what's staged changed refuses the commit."""
     hook = Path(path)
+    if (busy := commitcheck.blocking_commits()) is not None:
+        print(
+            f"COMMIT REFUSED: wt-ship ({busy.holder}) is checking earlier commits in"
+            " this worktree, which holds one of them until it ends, so a commit now"
+            " would be lost when the tip comes back. Wait for it to end, then commit;"
+            f" if no wt-ship is running there, delete {busy.path}.",
+            file=sys.stderr,
+        )
+        return 1
     if not (hook.is_file() and os.access(hook, os.X_OK)):
         print(f"{path}: no executable agent check", file=sys.stderr)
         print(f"COMMIT REFUSED: no {HOOK_NAME} to run", file=sys.stderr)

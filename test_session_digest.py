@@ -991,3 +991,162 @@ def test_calls_of_one_batch_are_each_timed_from_the_previous_result(
     write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
     times = [line for line in sections(digest(tmp_path))["main"] if "= 2 chars" in line]
     assert times == ["    = 2 chars ~0 tok [3m00s]"] * 3
+
+
+def request(
+    rid: str,
+    minutes: float | None,
+    written: int,
+    read: int = 20_000,
+    life: str = "1h",
+    text: str = "Next.",
+) -> dict:
+    """A reply of request rid at START + minutes (None: no timestamp) that wrote
+    written tokens to a cache of lifetime life and read read tokens from it."""
+    record = assistant(rid, {"type": "text", "text": text})
+    if minutes is None:
+        del record["timestamp"]
+    else:
+        record["timestamp"] = (START + timedelta(minutes=minutes)).isoformat()
+    record["message"]["usage"] |= {
+        "cache_creation_input_tokens": written,
+        "cache_read_input_tokens": read,
+        "cache_creation": {f"ephemeral_{life}_input_tokens": written},
+    }
+    return record
+
+
+def rebuilds(tmp_path: Path, *records: dict) -> list[str]:
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", list(records))
+    out = sections(digest(tmp_path))["main"]
+    return [line for line in out if "CACHE REBUILT" in line]
+
+
+def test_a_cache_rebuild_gets_a_line_before_its_reply(tmp_path: Path) -> None:
+    records = [request("r1", 0, 5000), request("r2", 161, 700_000, text="Back.")]
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    assert sections(digest(tmp_path))["main"][-2:] == [
+        "  CACHE REBUILT after 2h41m idle (1h cache): 700.0k tokens written",
+        "  Back.",
+    ]
+
+
+def test_a_rebuild_after_a_short_gap_counts_with_its_cache_life(tmp_path: Path) -> None:
+    lines = rebuilds(
+        tmp_path, request("r1", 0, 5000), request("r2", 6, 271_615, life="5m")
+    )
+    assert lines == [
+        "  CACHE REBUILT after 6m00s idle (5m cache): 271.6k tokens written"
+    ]
+
+
+def test_a_rebuild_after_a_user_turn_says_so(tmp_path: Path) -> None:
+    lines = rebuilds(
+        tmp_path, request("r1", 0, 5000), user("Carry on"), request("r2", 50, 300_000)
+    )
+    assert lines == [
+        (
+            "  CACHE REBUILT after 50m00s idle (1h cache): 300.0k tokens written,"
+            " after a user turn"
+        )
+    ]
+
+
+def test_a_user_turn_before_an_earlier_request_is_not_in_the_gap(
+    tmp_path: Path,
+) -> None:
+    lines = rebuilds(
+        tmp_path,
+        request("r1", 0, 5000),
+        user("Carry on"),
+        request("r2", 1, 3000),
+        request("r3", 70, 300_000),
+    )
+    assert lines == [
+        "  CACHE REBUILT after 1h09m idle (1h cache): 300.0k tokens written"
+    ]
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        pytest.param(
+            [request("r1", 0, 5000), request("r2", 90, 99_999)], id="small write"
+        ),
+        pytest.param(
+            [request("r1", 0, 5000), request("r2", 90, 150_000, read=300_000)],
+            id="a big output on a warm cache",
+        ),
+        pytest.param([request("r1", 0, 700_000)], id="the agent's first request"),
+    ],
+)
+def test_no_rebuild_line_for_what_is_not_one(tmp_path: Path, records: list) -> None:
+    assert rebuilds(tmp_path, *records) == []
+
+
+def test_a_rebuild_of_exactly_100k_tokens_counts(tmp_path: Path) -> None:
+    assert rebuilds(tmp_path, request("r1", 0, 5000), request("r2", 1, 100_000))
+
+
+def test_a_rebuild_is_counted_once_per_request(tmp_path: Path) -> None:
+    lines = rebuilds(
+        tmp_path,
+        request("r1", 0, 5000),
+        request("r2", 45, 200_000),
+        request("r2", 46, 200_000, text="Same request, second block."),
+    )
+    assert len(lines) == 1
+
+
+def test_a_rebuild_without_timestamps_leaves_out_the_idle_time(tmp_path: Path) -> None:
+    lines = rebuilds(
+        tmp_path, request("r1", None, 5000), request("r2", None, 700_000, life="5m")
+    )
+    assert lines == ["  CACHE REBUILT (5m cache): 700.0k tokens written"]
+
+
+def test_a_reply_without_a_timestamp_keeps_the_idle_clock(tmp_path: Path) -> None:
+    lines = rebuilds(
+        tmp_path,
+        request("r1", 0, 5000),
+        request("r2", None, 3000),
+        request("r3", 90, 700_000),
+    )
+    assert lines == [
+        "  CACHE REBUILT after 1h30m idle (1h cache): 700.0k tokens written"
+    ]
+
+
+def test_summary_lists_every_cache_rebuild(tmp_path: Path) -> None:
+    records = [
+        request("r1", 0, 5000),
+        request("r2", 68, 650_000),
+        user("Hi again"),
+        request("r3", 235, 700_000, life="5m"),
+    ]
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    summary = digest(tmp_path).split("\n== ")[0]
+    block = summary.split("cache rebuilds")[1].strip().split("\n\n")[0]
+    rows = [line.split() for line in block.splitlines()[1:]]  # after the legend
+    assert rows == [
+        ["1h08m", "650.0k", "1h", "main"],
+        ["2h47m", "700.0k", "5m", "main", "after", "a", "user", "turn"],
+    ]
+
+
+def test_summary_has_no_cache_rebuilds_without_one(config: Path) -> None:
+    assert "cache rebuilds" not in digest(config)
+
+
+def test_a_rewrite_that_read_as_much_as_it_wrote_is_no_rebuild(tmp_path: Path) -> None:
+    records = [request("r1", 0, 5000), request("r2", 90, 150_000, read=150_000)]
+    assert rebuilds(tmp_path, *records) == []
+
+
+def test_a_cache_of_both_lifetimes_is_named_by_the_hour(tmp_path: Path) -> None:
+    second = request("r2", 90, 700_000, life="5m")
+    second["message"]["usage"]["cache_creation"]["ephemeral_1h_input_tokens"] = 9
+    lines = rebuilds(tmp_path, request("r1", 0, 5000), second)
+    assert lines == [
+        "  CACHE REBUILT after 1h30m idle (1h cache): 700.0k tokens written"
+    ]

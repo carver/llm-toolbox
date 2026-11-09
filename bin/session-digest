@@ -20,6 +20,12 @@ ExitPlanMode last as long as the user takes to answer: their time reads
 once and isn't timed. Calls sent in one batch run one after another, so a call is
 timed from the result before it. The summary lists the five longest calls of a
 minute or more, and every LONG call beyond them.
+A request after an agent's first that wrote 100k tokens or more to the prompt
+cache, and read fewer from it, rebuilt the cache, which had expired: the main
+agent's lasts an hour, a subagent's five minutes. A CACHE REBUILT line before it
+gives the idle time since the agent's previous request, the cache's lifetime and
+the tokens written, and says when a user turn came in the gap (the user's pause,
+not the agent's). The summary lists every one.
 A background task's notification gets one line, its id, status and summary,
 without the report: a subagent's report shows in that agent's own timeline.
 An image counts about width * height / 750 tokens, from its header (PNG, GIF,
@@ -64,6 +70,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 TEXT_LIMIT = 400
 # --errors prints an error up to ERROR_LIMIT characters whole, and of a longer one its
@@ -85,6 +92,9 @@ LONG = 40 * 60
 BACKGROUND_STARTS = ("Command running in background", "Async agent launched")
 # These last as long as the user takes to answer: their time is tagged user, never LONG.
 USER_WAITS = ("AskUserQuestion", "ExitPlanMode")
+# A request that wrote this many tokens or more to the prompt cache, and read fewer from
+# it, rebuilt the cache: it had expired, or been lost some other way.
+REBUILD_TOKENS = 100_000
 
 
 @dataclass
@@ -108,6 +118,7 @@ class Agent:
     tools: dict[str, ToolStats] = field(default_factory=dict)
     outputs: list[tuple[int, str]] = field(default_factory=list)
     slow_calls: list[tuple[float, str]] = field(default_factory=list)
+    cache_rebuilds: list["CacheRebuild"] = field(default_factory=list)
     # What --errors prints, a block of lines each, as they happened: the user's turns
     # (main's only), each failed call with its failed hooks and its error, each failed
     # hook that ran for no call, and each task notification that didn't complete.
@@ -122,6 +133,49 @@ class Agent:
 
     def short_form_text(self) -> str:
         return "\n".join(line for block in self.short_form for line in block)
+
+
+class CacheRebuild(NamedTuple):
+    idle: float | None  # seconds since the agent's previous request, when known
+    written: int
+    life: str  # the cache's lifetime, 5m or 1h, when the usage names it
+    after_user: bool  # a user turn came since the previous request
+
+    def line(self) -> str:
+        idle = "" if self.idle is None else f" after {clock(self.idle)} idle"
+        life = f" ({self.life} cache)" if self.life else ""
+        user = ", after a user turn" if self.after_user else ""
+        return (
+            f"  CACHE REBUILT{idle}{life}: {human(self.written)} tokens written{user}"
+        )
+
+    def row(self, name: str, width: int) -> str:
+        idle = "?" if self.idle is None else clock(self.idle)
+        user = "after a user turn" if self.after_user else ""
+        written = human(self.written)
+        return (
+            f"{idle:>7}  {written:>7}  {self.life:<3}  {name:<{width}}  {user}".rstrip()
+        )
+
+
+def cache_rebuild(
+    usage: dict, idle: float | None, after_user: bool
+) -> CacheRebuild | None:
+    """The rebuild a request's usage shows, if it rebuilt the cache. A big tool output
+    also writes many tokens, but reads the rest of the context from the cache."""
+    written = usage.get("cache_creation_input_tokens", 0)
+    if written < REBUILD_TOKENS or usage.get("cache_read_input_tokens", 0) >= written:
+        return None
+    created = usage.get("cache_creation") or {}
+    life = next(
+        (
+            life
+            for life in ("1h", "5m")
+            if created.get(f"ephemeral_{life}_input_tokens")
+        ),
+        "",
+    )
+    return CacheRebuild(idle, written, life, after_user)
 
 
 def short(text: str, limit: int) -> str:
@@ -323,6 +377,8 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
     # Calls sent in one batch run one after another, so a call's clock starts no
     # earlier than the result before it.
     last_result: datetime | None = None
+    last_reply: datetime | None = None
+    user_since_reply = False
     requests: set[str] = set()
     hooks_by_call = hook_lines(records)
     failing = failed_calls(records)
@@ -336,6 +392,8 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
         return failures[call_id]
 
     def user_turn(text: str) -> None:
+        nonlocal user_since_reply
+        user_since_reply = True
         line = f"USER {short(text, TEXT_LIMIT * 5)}"
         agent.lines.append(line)
         if agent.name == "main":
@@ -371,6 +429,7 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
             request = record.get("requestId") or message.get("id")
             usage = message.get("usage")
             if usage and request not in requests:
+                first_request = not requests
                 requests.add(request)
                 agent.context_in += (
                     usage.get("input_tokens", 0)
@@ -378,6 +437,16 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
                     + usage.get("cache_read_input_tokens", 0)
                 )
                 agent.output += usage.get("output_tokens", 0)
+                now = timestamp(record)
+                idle = (
+                    (now - last_reply).total_seconds() if now and last_reply else None
+                )
+                rebuild = cache_rebuild(usage, idle, user_since_reply)
+                if rebuild and not first_request:
+                    agent.cache_rebuilds.append(rebuild)
+                    agent.lines.append(rebuild.line())
+            last_reply = timestamp(record) or last_reply
+            user_since_reply = False
             for block in content or []:
                 if block.get("type") == "text":
                     agent.lines.append(f"  {short(block['text'], TEXT_LIMIT)}")
@@ -549,6 +618,12 @@ def summary(agents: list[Agent]) -> list[str]:
                 f"{clock(seconds):>7} {long_mark(seconds):<4}  "
                 f"{name:<{width}} {short(call, 100)}"
             )
+    rebuilds = [
+        rebuild.row(a.name, width) for a in agents for rebuild in a.cache_rebuilds
+    ]
+    if rebuilds:
+        legend = f"idle, then {human(REBUILD_TOKENS)}+ tokens rewritten to the cache"
+        lines += ["", "cache rebuilds", legend, *rebuilds]
     hook_errors = sum((a.hook_errors for a in agents), Counter())
     if hook_errors:
         lines += ["", "hook errors"]

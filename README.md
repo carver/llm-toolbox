@@ -510,6 +510,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   then each subagent's timeline: user turns, the assistant's text, one line per
   tool call with its output's size and, for a call of a minute or more, how
   long it took (`LONG` from 40 minutes, when the prompt cache may expire),
+  a line where a request rebuilt the expired prompt cache, with the idle
+  time before it (also listed in the summary),
   one line per background task notification
   (id, status, summary), and every error in full. A hook that failed or was
   cancelled (by a timeout, say) gets a line with its error's last line, under

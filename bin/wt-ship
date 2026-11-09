@@ -74,9 +74,10 @@ stopped, how to continue it. A flag it can't judge, an old-style one or one from
 another host, it only waits on.
 Should the branch move during the checks anyway, from the owner or a tool that doesn't
 read the flag, it rebases and checks again, up to 10 times, still holding the claim,
-then merges. When the main tree's uncommitted changes
-touch the files the merge changes, it stops, merging nothing: ask the user. The flag
-it made, and its place in the queue, go once the merge is done or has failed, or the
+then merges. When the main tree's uncommitted changes, staged or not, or its untracked
+files, touch the files the landing changes, it stops before any check, merging
+nothing: ask the user. The flag it made, and its place in the queue, go once the merge
+is done or has failed, or the
 run is stopped. It must run in a linked worktree.
 
 Environment:
@@ -603,6 +604,38 @@ def gave_up(path, held, ahead, waited):
     )
 
 
+def refuse_overlap(main_path, ref):
+    """Stop, with SAME_FILES, when the main tree's uncommitted changes touch a file this
+    landing changes, either path of a rename on both sides: what's staged and what
+    isn't, and untracked files git doesn't ignore, which the fast-forward would refuse
+    to overwrite. NUL-separated, so a path git would quote matches as it is."""
+    landing = out("diff", "--name-only", "--no-renames", "-z", ref, "HEAD")
+    # .stdout, not out(): a leading space is the first entry's status letter.
+    status = git(
+        "-C",
+        main_path,
+        "status",
+        "--porcelain",
+        "-z",
+        "--no-renames",
+        "--untracked-files=all",
+    ).stdout
+    # Each entry is two status letters, a space, then the path.
+    touched = {entry[3:] for entry in status.split("\0") if entry}
+    if overlap := sorted((set(landing.split("\0")) - {""}) & touched):
+        raise Stop(
+            same_files("checked or merged", "\n  " + "\n  ".join(overlap)), SAME_FILES
+        )
+
+
+def same_files(spared, said):
+    """The stop for the main tree's uncommitted changes in the way of a landing."""
+    return (
+        "The main tree's uncommitted changes touch files this landing changes, so"
+        f" nothing was {spared}; ask the user:{said}"
+    )
+
+
 def merge(main_path, sha):
     """Fast-forward the main tree to sha."""
     run = git("-C", main_path, "merge", "-q", "--ff-only", sha, check=False)
@@ -610,11 +643,7 @@ def merge(main_path, sha):
         return
     said = f"{run.stdout}{run.stderr}".strip()
     if "would be overwritten" in said:
-        raise Stop(
-            "The main tree's uncommitted changes touch files this landing changes, so"
-            f" nothing was merged; ask the user:\n{said}",
-            SAME_FILES,
-        )
+        raise Stop(same_files("merged", f"\n{said}"), SAME_FILES)
     raise Stop(f"git merge --ff-only failed in the main tree:\n{said}")
 
 
@@ -647,8 +676,11 @@ def land(args):
     # yet, since another landing may move the branch meanwhile.
     rebase_onto(ref, LAND)
     with claim(main_path, wait=not args.no_wait):
+        rebase_onto(ref, LAND)
+        # Before the checks, which everyone waiting for the claim waits through.
+        refuse_overlap(main_path, ref)
         # Other sessions can't land now, so each commit is checked once.
-        prepare(ref, LAND)
+        run_checks(ref, LAND)
         # The owner, or a tool that doesn't read the flag, may still move the
         # branch: rebase until HEAD holds it, checking each time, at most TRIES
         # checks in all.

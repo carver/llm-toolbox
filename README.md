@@ -209,8 +209,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   stops at once), looking every `$WT_SHIP_POLL` seconds, and clears a flag or entry
   whose process on this host has ended. A wait of `$FIFO_LOCK_SECONDS` (5) for
   the queue folder's lock names the process holding it, and how to continue it
-  when it's stopped. It stops on uncommitted changes in the main tree that touch
-  the same files.
+  when it's stopped. It stops before any check on uncommitted changes, or
+  untracked files, in the main tree that touch the same files.
 - **gui-shot**: runs a GUI app on a headless display (Xvfb, or weston for
   Wayland), clicks and types into it, and saves screenshots. For checking a
   desktop app's UI from a sandbox with no screen. `gui-shot -h` lists the

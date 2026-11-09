@@ -521,6 +521,7 @@ def test_local_keeps_a_claim_this_session_holds(setup):
 
 def test_local_stops_when_the_main_trees_changes_touch_the_same_files(setup):
     _, main, wt, _ = setup
+    log = logging_check(main)
     before = main_head(main)
     (main / "README").write_text("start\nthe user's edit\n")
     commit(wt, "README", "ours\n", "Ours")
@@ -529,6 +530,8 @@ def test_local_stops_when_the_main_trees_changes_touch_the_same_files(setup):
 
     assert done.returncode == 4, done.stderr
     assert "ask the user" in done.stderr and "README" in done.stderr
+    # It stops before the checks, so nobody waits through a run that can't land.
+    assert not log.exists()
     assert main_head(main) == before
     assert (main / "README").read_text() == "start\nthe user's edit\n"
     assert not flag(main).exists()
@@ -1788,3 +1791,59 @@ def test_the_oldest_failing_commit_is_named_whichever_round_finds_it(setup):
 
     assert done.returncode == 1
     assert f"{first[:12]} Add a" in done.stderr, done.stderr
+
+
+def test_local_stops_before_its_checks_when_an_untracked_file_is_in_the_way(setup):
+    _, main, wt, _ = setup
+    log = logging_check(main)
+    before = main_head(main)
+    (main / "new.py").write_text("the user's draft\n")  # untracked in the main tree
+    commit(wt, "new.py", "x = 1\n", "Add new")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 4, done.stderr
+    assert "new.py" in done.stderr and "ask the user" in done.stderr
+    assert not log.exists()
+    assert main_head(main) == before
+    assert (main / "new.py").read_text() == "the user's draft\n"
+
+
+def staged_only_edit(main):
+    """A staged edit to README whose work tree is back as HEAD has it."""
+    (main / "README").write_text("start\nstaged\n")
+    git(main, "add", "README")
+    (main / "README").write_text("start\n")
+
+
+def staged_rename_away(main):
+    git(main, "mv", "README", "README.old")
+
+
+@pytest.mark.parametrize("main_change", [staged_only_edit, staged_rename_away])
+def test_local_sees_a_staged_change_to_a_file_it_lands_before_its_checks(
+    setup, main_change
+):
+    _, main, wt, _ = setup
+    log = logging_check(main)
+    main_change(main)
+    commit(wt, "README", "ours\n", "Ours")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 4, done.stderr
+    assert "README" in done.stderr
+    assert not log.exists()
+
+
+def test_local_sees_the_old_path_of_a_file_the_landing_renames(setup):
+    _, main, wt, _ = setup
+    log = logging_check(main)
+    (main / "README").write_text("start\nthe user's edit\n")
+    git(wt, "mv", "README", "README.md")
+    git(wt, "commit", "-qm", "Rename README")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 4, done.stderr
+    assert not log.exists()

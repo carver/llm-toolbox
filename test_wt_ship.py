@@ -654,6 +654,7 @@ def test_local_failing_check_says_nothing_was_landed(setup):
     # It names the commit, and says to run it again.
     assert "Add a" in done.stderr and "`wt-ship --local` again" in done.stderr
     assert main_head(main) == before
+    assert not flag(main).exists()
 
 
 def test_local_stopped_during_the_retry_releases_the_claim(setup):
@@ -1604,3 +1605,75 @@ def test_an_inherited_commit_mark_doesnt_spare_a_landing_the_full_check(setup):
 
     assert done.returncode == 1, done.stderr
     assert main_head(main) == before
+
+
+# --local checks only while it holds the main tree, so each commit is checked once per
+# landing, however long it waited.
+
+
+def test_local_runs_every_check_while_it_holds_the_main_tree(setup):
+    _, main, wt, _ = setup
+    seen = main.parent / "seen"
+    install_hook(
+        main,
+        "agent-pre-commit",
+        # This run's session, s-mine, holds the main tree's flag.
+        f'if grep -q "^s-mine " "{main}/CLAUDE_WORKING" 2>/dev/null; then echo held;'
+        f' else echo free; fi >> "{seen}"',
+    )
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    commit(wt, "b.py", "y = 2\n", "Add b")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert seen.read_text().split() == ["held", "held"]
+
+
+def test_a_landing_that_waited_while_main_moved_checks_each_commit_once(
+    setup, holder, background
+):
+    _, main, wt, _ = setup
+    log = logging_check(main)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    commit(wt, "b.py", "y = 2\n", "Add b")
+    alive = holder()
+    flag(main).write_text(holder_flag(alive))
+    shipping = background(wt, "--local")
+    waits_to_land(shipping)
+    commit(main, "m.py", "m = 1\n", "Meanwhile")  # the holder's landing
+    alive.kill()
+    alive.wait()
+
+    status, _, err = finish(shipping)
+
+    assert status == 0, err
+    assert log.read_text().splitlines() == ["Add a", "Add b"]
+    assert git(main, "log", "--format=%s", "main").splitlines()[:3] == [
+        "Add b",
+        "Add a",
+        "Meanwhile",
+    ]
+
+
+def test_a_waiter_keeps_waiting_while_the_holder_changes(setup, holder, background):
+    _, main, wt, _ = setup
+    first, second = holder(), holder()
+    flag(main).write_text(holder_flag(first))
+    tip = commit(wt, "a.py", "x = 1\n", "Add a")
+    shipping = background(wt, "--local", wait="8")
+    waits_to_land(shipping)
+    # A loaded machine has 7 s of the 8 s wait to see the handover.
+    # fixed sleep: the handover comes a second into the wait
+    time.sleep(1)
+    flag(main).write_text(holder_flag(second))
+    # Only a wait that restarted at the handover lands.
+    # fixed sleep: the second holder keeps the flag past the first wait's deadline
+    time.sleep(8)
+    second.kill()
+    second.wait()
+
+    status, _, err = finish(shipping)
+
+    assert status == 0, err
+    assert main_head(main) == tip

@@ -79,6 +79,16 @@ Each commit with no pass on agent-commit-gate's record, oldest first, each check
 out in turn in the worktree, then HEAD. Before, it checked only HEAD, so after a
 rebase the commits before it reached main checked only on the base they were made on.
 
+### wt-ship --local checks only while it holds the main tree (2026-11-08)
+
+It rebases before it waits, so a conflict shows without holding anyone up, but checks
+nothing until it holds the claim, then checks each commit once. Checking first threw
+the round away whenever another session landed during the wait, which with several
+sessions landing was often. Other landings wait longer for the claim, but they'd wait
+the same for heavy's one lane, and a wait for the claim costs no CPU. The wait limit,
+WT_SHIP_WAIT, starts again when the holder changes, so a queue that moves never times
+out (the owner's choice over a longer fixed limit).
+
 ### build-state finish only folds (1465ae5, 2026-11-08)
 
 wt-ship checks a fold's new trees when it lands them, so finish's own run of the

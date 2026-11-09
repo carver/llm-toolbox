@@ -194,12 +194,16 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   runs it on the worktree DIR from outside, so the call's shell isn't left in
   the folder it removed. In a repo
   that doesn't push, `--local` lands the commits on the main tree's branch
-  instead: it claims the main tree for the merge with the `CLAUDE_WORKING`
-  flag, recording `CLAUDE_CODE_SESSION_ID`, the host and its PID, fast-forwards
-  it, and rebases and checks again, up to 10 times, when another session lands
-  first. While another session holds the flag it waits its turn in a queue in
-  the git dir, for up to `$WT_SHIP_WAIT` seconds (30 minutes; `--no-wait` stops
-  at once), looking every `$WT_SHIP_POLL` seconds, and clears a flag or entry
+  instead: it rebases before it waits, checking nothing, then claims the main
+  tree with the `CLAUDE_WORKING` flag, recording `CLAUDE_CODE_SESSION_ID`, the
+  host and its PID, rebases again if the branch moved meanwhile, checks each
+  commit once under the claim, and fast-forwards the main tree; a failing
+  check releases the claim. Should the branch move under the claim anyway,
+  from the owner or a tool that ignores the flag, it rebases and checks again,
+  up to 10 times. While another session holds the flag it waits its
+  turn in a queue in the git dir, for up to `$WT_SHIP_WAIT` seconds behind one
+  holder (30 minutes, starting again when the holder changes; `--no-wait`
+  stops at once), looking every `$WT_SHIP_POLL` seconds, and clears a flag or entry
   whose process on this host has ended. A wait of `$FIFO_LOCK_SECONDS` (5) for
   the queue folder's lock names the process holding it, and how to continue it
   when it's stopped. It stops on uncommitted changes in the main tree that touch

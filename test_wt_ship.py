@@ -156,7 +156,8 @@ def test_a_rebase_conflict_stops_with_the_rebase_in_progress(setup):
     done = ship(wt, "--check", "true")
 
     assert done.returncode == 1
-    assert "conflicts" in done.stderr and "rebase --continue" in done.stderr
+    assert "conflicts --continue" in done.stderr, done.stderr
+    assert "git rebase --continue" not in done.stderr, done.stderr
     assert remote_main(origin) == before
     assert (Path(git(wt, "rev-parse", "--absolute-git-dir")) / "rebase-merge").exists()
 

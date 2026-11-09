@@ -15,8 +15,8 @@ In order, it:
 1. refuses uncommitted changes to tracked files;
 2. fetches the remote, and when HEAD lacks REMOTE/BRANCH or holds fixup! commits,
    rebases onto it, folding them (autosquash). A conflict stops it with the rebase in
-   progress: resolve the hunks (`conflicts -h`), `git rebase --continue`, then run it
-   again;
+   progress: resolve the hunks (`conflicts -h`), finish with `conflicts --continue`,
+   then run it again;
 3. refuses leftover conflict markers in what it would push;
 4. runs the check: --check CMD (through sh, without CHECK_BASE), else the repo's
    agent-pre-commit hook through agent-commit-gate --run, which skips a tree that
@@ -162,8 +162,20 @@ def is_ancestor(older, newer):
 def rebase(upstream, mode):
     env = os.environ | {"GIT_SEQUENCE_EDITOR": ":", "GIT_EDITOR": ":"}
     fork = ["--fork-point"] if mode.fork_point else []
+    # Without git's own hint to `git add` and `git rebase --continue`, so the one
+    # instruction is the message below, whose `conflicts --continue` checks first.
     run = subprocess.run(
-        ["git", "rebase", "-q", "-i", "--autosquash", *fork, upstream],
+        [
+            "git",
+            "-c",
+            "advice.mergeConflict=false",
+            "rebase",
+            "-q",
+            "-i",
+            "--autosquash",
+            *fork,
+            upstream,
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -173,8 +185,9 @@ def rebase(upstream, mode):
         raise Stop(
             f"{run.stdout}{run.stderr}".rstrip()
             + f"\nThe rebase onto {upstream} hit a conflict and is still in progress."
-            "\nResolve each hunk (`conflicts FILE`, `conflicts -h`), `git add` the file,"
-            f" `git rebase --continue`, then run `{RERUN}` again."
+            "\nResolve each hunk (`conflicts FILE`, `conflicts -h`), then"
+            " `conflicts --continue`, which refuses while any marker is left,"
+            f" then run `{RERUN}` again."
         )
 
 

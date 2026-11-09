@@ -286,3 +286,16 @@ def test_heavy_names_a_stopped_holder_of_its_queues_lock_and_runs_after_it(
     assert status == 0, err.read_text()
     assert len(said) == 1 and said[0].startswith("heavy: "), said
     assert lines(log) == ["holder got", "holder releasing", "heavy ran"]
+
+
+def test_a_front_entry_goes_ahead_of_ordinary_ones_after_earlier_front_ones(tmp_path):
+    folder = tmp_path / "queue"
+    me = fifo.Holder.mine()
+    first = fifo.join(folder, me)
+    fifo.join(folder, me)
+    front = fifo.join(folder, me, front=True)
+    later_front = fifo.join(folder, me, front=True)
+
+    assert fifo.ahead(folder, front) == []
+    assert [path for path, _ in fifo.ahead(folder, later_front)] == [front]
+    assert [path for path, _ in fifo.ahead(folder, first)] == [front, later_front]

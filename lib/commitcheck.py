@@ -19,11 +19,13 @@ module's git() for its own commands too.
 import os
 import signal
 import subprocess
-from contextlib import suppress
+from contextlib import ExitStack, suppress
+from functools import partial
 from pathlib import Path
 from typing import NamedTuple
 
 import fifo
+import heavyqueue
 import passrecord
 from fifo import Holder
 
@@ -122,11 +124,16 @@ def passed(commit, hook):
 
 
 def unchecked(upstream, hook):
-    """The commits in upstream..HEAD before HEAD, oldest first, whose trees have no
+    """The commits in upstream..HEAD, HEAD included, oldest first, whose trees have no
     pass of the agent check at `hook`, as its bytes are now."""
     # rev-list, not log, which a config such as log.showSignature adds lines to.
-    commits = out("rev-list", "--reverse", f"{upstream}..HEAD").split()[:-1]
+    commits = out("rev-list", "--reverse", f"{upstream}..HEAD").split()
     return [sha for sha in commits if not passed(sha, hook)]
+
+
+# The exit status agent-commit-gate --run --no-queue gives a check that needs heavy's
+# queue (agent-commit-gate's QUEUE_EXIT).
+QUEUE_EXIT = 75
 
 
 class Marker(NamedTuple):
@@ -176,14 +183,18 @@ def blocking_commits():
     return found
 
 
-def first_failing(hook, commits, gate):
+def first_failing(hook, commits, gate, front=False):
     """Check out each of `commits` in turn, oldest first, index and work tree, forced,
     since some checks read the work tree, and run the agent check at `hook` through
-    `gate --run`; return the first that fails, or None. A commit without
-    the hook has nothing to check (dropping_check catches one that should have it).
-    The worktree's marker stands for the whole run, and HEAD comes back to where it
-    was, on its branch, however the run ends; the marker goes once it has. The caller
-    made sure no tracked file has changes."""
+    `gate --run`; return the first that fails, or None. Two rounds: each commit first
+    with --no-queue, which runs a check that needs no build or test, such as a
+    docs-only commit's, outside heavy's queue; then those whose check needs the queue
+    all in one heavy job, `front` putting it at the queue's front, so no other job
+    runs between them. The oldest commit that fails is the one returned, whichever
+    round finds it. A commit without the hook has nothing to check (dropping_check
+    catches one that should have it). The worktree's marker stands for the whole run,
+    and HEAD comes back to where it was, on its branch, however the run ends; the
+    marker goes once it has. The caller made sure no tracked file has changes."""
     top = out("rev-parse", "--show-toplevel")
     ref = git("symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
     branch = ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else ""
@@ -196,14 +207,76 @@ def first_failing(hook, commits, gate):
     # The check runs at the top of the work tree, as git runs a hook.
     argv = [str(gate), "--run", str(hook)]
     try:
+        queued = []
+        rest = partial(in_one_job, argv=argv, env=env, top=top, front=front)
         for sha in commits:
-            print(git("log", "-1", "--format=  %h %s", sha).stdout, end="", flush=True)
-            git("checkout", "-q", "--force", "--detach", sha)
+            check_out(sha, say=False)
             if not runnable(hook):
-                print(f"    no {HOOK_NAME} at this commit, so nothing to check")
-            elif run_stoppable(argv, env, cwd=top) != 0:
-                return sha
-        return None
+                print(
+                    f"  {named(sha)}: no {HOOK_NAME} at this commit, so nothing to check"
+                )
+                continue
+            code = run_stoppable([*argv, "--no-queue"], env, cwd=top)
+            if code == QUEUE_EXIT:
+                queued.append(sha)
+            elif code != 0:
+                # An older commit set aside for the queue may fail too: it goes first.
+                return (rest(queued) if queued else None) or sha
+        return rest(queued) if queued else None
     finally:
         git("checkout", "-q", "--force", *([branch] if branch else ["--detach", tip]))
         path.unlink(missing_ok=True)
+
+
+def named(sha):
+    """A commit as messages name it: its SHA's first 12 digits and its subject."""
+    return out("log", "-1", "--format=%h %s", "--abbrev=12", sha)
+
+
+def check_out(sha, say=True):
+    if say:
+        print(f"  {named(sha)}", flush=True)
+    git("checkout", "-q", "--force", "--detach", sha)
+
+
+def in_one_job(commits, argv, env, top, front):
+    """Run the check `argv` on each of `commits`, checked out in turn, inside one heavy
+    job, where each gate run starts at once; the first that fails, or None. A queue
+    that can't be used leaves each check to queue for itself, as the gate does."""
+    print(
+        f"Checking the {len(commits)} that need heavy's queue in one job"
+        f"{' at its front' if front else ''}:",
+        flush=True,
+    )
+    cores = os.sched_getaffinity(0)
+    with ExitStack() as stack:
+        stack.callback(restore_cores, cores)
+        try:
+            turn = heavyqueue.turn(command="wt-ship's checks", hint=False, front=front)
+            job = stack.enter_context(turn)
+        except heavyqueue.QueueError as error:
+            print(f"heavy: can't use its queue ({error}), so each check queues alone.")
+            job = None
+        if job is not None:
+            job.pin()
+            env = env | {
+                key: job.env[key]
+                for key in ("HEAVY_SLOT", "CARGO_BUILD_JOBS")
+                if key in job.env
+            }
+        for sha in commits:
+            check_out(sha)
+            if run_stoppable(argv, env, cwd=top) != 0:
+                if job is not None:
+                    job.exited(1)
+                return sha
+        if job is not None:
+            job.exited(0)  # a passing run goes into heavy's history
+        return None
+
+
+def restore_cores(cores):
+    """Give this process back the cores it had before a job pinned it; a failure only
+    leaves it on fewer, as on_one_core's does in agent-commit-gate."""
+    with suppress(OSError):
+        os.sched_setaffinity(0, cores)

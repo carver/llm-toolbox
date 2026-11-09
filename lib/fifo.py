@@ -231,11 +231,19 @@ def holder_line(folder, holder):
     return line + "."
 
 
-def join(folder, holder, details=""):
+# What a front entry's number is less than its join time by: every front entry sorts
+# ahead of every ordinary one, and front ones keep their order among themselves.
+FRONT = 10**18
+
+
+def join(folder, holder, details="", front=False):
     """Add holder's entry to the queue in folder, with details on the lines after its
-    first, written whole so a reader never sees it half written. Its path."""
+    first, written whole so a reader never sees it half written. Its path. The queue
+    goes in the order of the entries' names, which start with the join time; front
+    puts the entry ahead of every ordinary one, after earlier front ones."""
     folder.mkdir(parents=True, exist_ok=True)
-    entry = folder / f"{time.time_ns():020d}-{os.getpid()}"
+    number = time.time_ns() - (FRONT if front else 0)
+    entry = folder / f"{number:020d}-{os.getpid()}"
     write_whole(entry, holder.line() + details)
     return entry
 

@@ -17,8 +17,10 @@ outside the queue holds it up, and `heavy status` shows how busy the cores are. 
 that arrives to a free lane, nobody waiting, starts at the first quiet sample. CMD then
 runs in the foreground, pinned to those cores (CARGO_BUILD_JOBS set to match), with
 this call's environment, folder, terminal and output, and heavy exits with its status.
-Commit checks join the queue on their own, through agent-commit-gate, and so do
-wt-ship's.
+Commit checks join the queue on their own, through agent-commit-gate. wt-ship takes one
+job for a landing's checks that need the queue, and while it holds a main tree's claim,
+the job joins at the queue's front, ahead of every waiter that didn't (first come first
+served among those that did): it doesn't stop the running job, but goes next.
 
 A lane holds one more job when its holder leaves cores idle. The first waiter in line
 that asks to (--share) and fits starts beside the holder at nice 10, so the holder

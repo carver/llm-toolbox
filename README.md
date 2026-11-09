@@ -181,10 +181,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   onto the remote branch (the main tree's, by default), refuses leftover
   conflict markers, and checks every commit it would push with the repo's
   `agent-pre-commit`, through `agent-commit-gate --run`, which hands each the
-  `CHECK_BASE` of the commit before or the main branch's tip: first each
-  commit before HEAD with no pass on record, oldest first, checked out in turn
-  in the worktree, then HEAD. The first failure stops it, naming the commit to
-  fix with a fixup. While the work tree holds an earlier commit, a marker in
+  `CHECK_BASE` of the commit before or the main branch's tip: each commit with
+  no pass on record, oldest first, checked out in turn in the worktree, first
+  outside `heavy`'s queue (`--no-queue`), so a docs-only commit never waits,
+  then those that need the queue in one `heavy` job, at the queue's front when
+  it lands under the main tree's claim, so no other job comes between them. The
+  first failure stops it, naming the commit to fix with a fixup. While the work
+  tree holds an earlier commit, a marker in
   the worktree's git dir makes `agent-commit-gate` refuse commits there, and a
   run killed before it put the tip back leaves the next one naming the tip. A
   repo that keeps the check in its tree fails a commit that drops it. Then it

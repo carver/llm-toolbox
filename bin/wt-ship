@@ -19,12 +19,16 @@ In order, it:
    then run it again;
 3. refuses leftover conflict markers in what it would push;
 4. checks every commit it would push with the repo's agent-pre-commit hook, else none,
-   and says so. First each commit before HEAD whose tree has no pass of the check, as
-   its bytes are now, on agent-commit-gate's record, oldest first, each checked out in
-   turn here, forced; then HEAD. Each runs through agent-commit-gate --run, which skips
-   a tree that passed and hands the check CHECK_BASE, usually the commit before or the
-   main branch's tip (`agent-commit-gate -h`), so it can run only what that commit
-   changed. The first failure stops it, naming the commit to fix with a fixup!, and
+   and says so: each commit whose tree has no pass of the check, as its bytes are now,
+   on agent-commit-gate's record, HEAD included, oldest first, each checked out in
+   turn here, forced. Each runs through agent-commit-gate --run, which hands the check
+   CHECK_BASE, usually the commit before or the main branch's tip (`agent-commit-gate
+   -h`), so it can run only what that commit changed. Two rounds: first each commit
+   with --no-queue, which runs a check that needs no build or test, such as a
+   docs-only commit's, outside heavy's queue; then the commits whose check needs the
+   queue, all in one heavy job, so no other session's job runs between them, at the
+   queue's front with --local, which checks only under the main tree's claim. The
+   first failure stops it, naming the commit to fix with a fixup!, and
    says when the branch's tip it rebased onto has no pass either. While the work tree
    holds an earlier commit, a marker in the worktree's git dir names the tip and this
    run, and agent-commit-gate refuses commits there, which would be lost; the tip comes
@@ -105,7 +109,7 @@ from typing import NamedTuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import commitcheck
 import fifo
-from commitcheck import git, out, run_stoppable
+from commitcheck import git, named, out
 from fifo import Holder
 
 # --local's outcomes the user decides on.
@@ -216,10 +220,6 @@ def markers(upstream):
 CHECK = commitcheck.HOOK_NAME
 
 
-def named(sha):
-    return out("log", "-1", "--format=%h %s", "--abbrev=12", sha)
-
-
 def short(ref):
     """A branch's name as people say it: main, not refs/heads/main."""
     return ref.removeprefix("refs/heads/")
@@ -238,8 +238,9 @@ def upstream_note(upstream, hook):
 
 def run_checks(upstream, mode):
     """Check every commit since upstream with the repo's agent check, if it has one:
-    those before HEAD with no pass on record, oldest first, each checked out here in
-    turn, then HEAD; the first failure stops it."""
+    each with no pass on record, oldest first, each checked out here in turn, those
+    that need heavy's queue in one job (at its front when landing, which runs under the
+    main tree's claim); the first failure stops it."""
     hook = commitcheck.hook_path()
     if dropped := commitcheck.dropping_check(upstream, hook):
         raise Stop(
@@ -251,32 +252,33 @@ def run_checks(upstream, mode):
     if not commitcheck.runnable(hook):
         print(f"No check: the repo has no {CHECK} hook.")
         return
-    earlier = commitcheck.unchecked(upstream, hook)
-    if earlier:
-        count = f"{len(earlier)} commit{'' if len(earlier) == 1 else 's'}"
-        print(
-            f"Checking with {CHECK} the {count} before HEAD with no pass on record, each"
-            " checked out here in turn: until wt-ship ends, the work tree holds that"
-            " commit, not the tip, so change or commit nothing in it.",
-            flush=True,
-        )
-        if failed := commitcheck.first_failing(hook, earlier, GATE):
-            note = upstream_note(upstream, hook) if failed == earlier[0] else ""
-            raise Stop(
-                f"The repo's {CHECK} fails at {named(failed)}, a commit before HEAD. Fix"
-                f" it with `git commit --fixup={failed[:12]}`, or move the code it needs"
-                f" into it, then run `{RERUN}` again; nothing was {mode.done}, and the"
-                f" branch stays at its tip.{note}"
-            )
-    # At the top of the work tree, as git runs a hook, wherever wt-ship started.
-    top = out("rev-parse", "--show-toplevel")
-    code = run_stoppable([str(GATE), "--run", str(hook)], commitcheck.gate_env(), top)
-    if code != 0:
-        note = "" if earlier else upstream_note(upstream, hook)
+    needed = commitcheck.unchecked(upstream, hook)
+    if not needed:
+        print(f"{CHECK}: every commit since {short(upstream)} passed it already.")
+        return
+    tip = out("rev-parse", "HEAD")
+    count = f"{len(needed)} commit{'' if len(needed) == 1 else 's'}"
+    print(
+        f"Checking with {CHECK} the {count} with no pass on record, each checked out"
+        " here in turn: until wt-ship ends, the work tree holds that commit, not the"
+        " tip, so change or commit nothing in it.",
+        flush=True,
+    )
+    failed = commitcheck.first_failing(hook, needed, GATE, front=mode is LAND)
+    if failed is None:
+        return
+    note = upstream_note(upstream, hook) if failed == needed[0] else ""
+    if failed == tip:
         raise Stop(
-            f"The repo's {CHECK} fails at HEAD, {named('HEAD')} (exit {code}). Fix it,"
-            f" commit, then run `{RERUN}` again; nothing was {mode.done}.{note}"
+            f"The repo's {CHECK} fails at HEAD, {named(failed)}. Fix it, commit, then"
+            f" run `{RERUN}` again; nothing was {mode.done}.{note}"
         )
+    raise Stop(
+        f"The repo's {CHECK} fails at {named(failed)}, a commit before HEAD. Fix it"
+        f" with `git commit --fixup={failed[:12]}`, or move the code it needs into it,"
+        f" then run `{RERUN}` again; nothing was {mode.done}, and the branch stays at"
+        f" its tip.{note}"
+    )
 
 
 def refuse_a_marked_worktree():

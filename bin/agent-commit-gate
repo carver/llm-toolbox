@@ -44,7 +44,9 @@ teammate's, runs the check directly instead, every time. A check `--run` runs
 waits its turn in heavy's queue (bin/heavy), so agents' commit checks never run
 at once, and prints heavy's waiting lines; one that needs no build or test can
 skip the queue, as below.
-wt-ship rechecks through `--run` too. While wt-ship checks a
+wt-ship rechecks through `--run` too, first with `--no-queue`: a check that would wait
+in heavy's queue then doesn't run there, and --run exits 75, recording nothing, for
+wt-ship to run it in one job with the landing's other such checks. While wt-ship checks a
 worktree's commits before its tip, each checked out there in turn, a marker in the
 worktree's git dir names the run, and `--run` refuses a commit in that worktree, which
 would be lost when the tip comes back. The checks wt-ship starts carry its PID in
@@ -305,7 +307,7 @@ COMMIT_CHECK_NAME = "agent-commit-check"
 # A check that names this variable runs first outside heavy's queue, with it set to
 # QUEUE_EXIT, the exit status that asks for the queue (sysexits' EX_TEMPFAIL).
 QUEUE_EXIT_NAME = "CHECK_QUEUE_EXIT"
-QUEUE_EXIT = 75
+QUEUE_EXIT = commitcheck.QUEUE_EXIT
 
 
 def names_queue_exit(content):
@@ -590,11 +592,11 @@ def report(name, base, run, took, outside=False):
     return code
 
 
-def run_outside_first(path, name, base):
+def run_outside_first(path, name, base, queue=True):
     """Run the check as run_quiet does, but first outside heavy's queue, on one core,
     with CHECK_QUEUE_EXIT set. That run's outcome is the check's, unless it exits with
     QUEUE_EXIT: then what it printed shows, as its reason, and it runs again in the
-    queue."""
+    queue, or without queue, returns QUEUE_EXIT for the caller to run it there."""
     env = check_env(os.environ, base) | {
         QUEUE_EXIT_NAME: str(QUEUE_EXIT),
         "CARGO_BUILD_JOBS": "1",
@@ -604,7 +606,7 @@ def run_outside_first(path, name, base):
     if run.returncode != QUEUE_EXIT:
         return report(name, base, run, took, outside=True)
     sys.stderr.write(run.stdout.decode(errors="replace"))
-    return run_quiet(path, name, base)
+    return run_quiet(path, name, base) if queue else QUEUE_EXIT
 
 
 def run_quiet(path, name, base, queue=True):
@@ -710,7 +712,7 @@ def no_unstaged_changes():
     return subprocess.run(["git", "diff", "--quiet"], check=False).returncode == 0
 
 
-def run_check(path):
+def run_check(path, queue=True):
     """Run the agent check at `path`, or at a commit the repo's COMMIT_CHECK_NAME in
     its place (commit_check), unless HEAD's tree is the tree being checked and passed
     already, as when an amend changes only the message or wt-ship rechecks a commit it
@@ -720,7 +722,9 @@ def run_check(path):
     to tracked files, since some checks read the working tree rather than the index.
     The check gets CHECK_BASE, the nearest first-parent commit whose tree passed a
     check that counts. A check that passes but leaves what's staged changed refuses
-    the commit."""
+    the commit. Without queue (--no-queue), a check that would wait in heavy's queue
+    doesn't run there: --run exits with QUEUE_EXIT, recording nothing, for the caller to
+    run it in a job of its own, as wt-ship does with a landing's checks."""
     hook = Path(path)
     if (busy := commitcheck.blocking_commits()) is not None:
         print(
@@ -771,10 +775,17 @@ def run_check(path):
     check = at_commit or full
     base = check_base(counted)
     clean = no_unstaged_changes()
-    run = run_outside_first if names_queue_exit(check.content) else run_quiet
-    code = refuse_if_staged_changed(
-        run(check.path, check.name, base), before, check.name
-    )
+    if heavyqueue.inside_job():
+        # The job holds the lane already, so a run outside the queue would be a
+        # second one: wt-ship's job for a landing's checks.
+        code = run_quiet(check.path, check.name, base)
+    elif names_queue_exit(check.content):
+        code = run_outside_first(check.path, check.name, base, queue=queue)
+    elif queue:
+        code = run_quiet(check.path, check.name, base)
+    else:
+        return QUEUE_EXIT  # it waits in the queue: the caller's to run there
+    code = refuse_if_staged_changed(code, before, check.name)
     # Some checks read the work tree, so it must match the index from start to end.
     if code == 0 and clean and no_unstaged_changes() and tree and check.record:
         passrecord.remember(check.record, check.key(tree), check.name)
@@ -797,10 +808,15 @@ def main(argv=None):
         help="run the agent check HOOK with CHECK_BASE, unless the tree checked is "
         "HEAD's and passed it",
     )
+    parser.add_argument(
+        "--no-queue",
+        action="store_true",
+        help=f"with --run: exit {QUEUE_EXIT} instead of waiting in heavy's queue",
+    )
     args = parser.parse_args(argv)
     if args.run:
         try:
-            return run_check(args.run)
+            return run_check(args.run, queue=not args.no_queue)
         except KeyboardInterrupt:
             print("COMMIT REFUSED: the agent check was stopped.", file=sys.stderr)
             return 130

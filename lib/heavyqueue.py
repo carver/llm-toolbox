@@ -330,12 +330,14 @@ def inside_job():
 
 
 @contextmanager
-def turn(long=False, command="", hint=True, alone=False, share=False):
+def turn(long=False, command="", hint=True, alone=False, share=False, front=False):
     """Wait for this job's turn in its lane and for its cores to go quiet, or, with
     share, for room beside its lane's holder; then hold the slot while the body runs,
     yielding the Job to run with. Inside a job that holds a slot, yield at once.
     hint=False leaves out the PR hint, for a commit check, which has nothing to push
-    yet. alone: no job shares the lane beside this one. A body that calls
+    yet. alone: no job shares the lane beside this one. front: join the lane's queue
+    ahead of every waiter that didn't ask to (fifo.join's front), for wt-ship's checks
+    while it holds the main tree; the running job isn't stopped. A body that calls
     job.exited(0) has its run remembered. Raises QueueError when the queue's folder
     can't be used."""
     if inside_job():
@@ -356,7 +358,7 @@ def turn(long=False, command="", hint=True, alone=False, share=False):
     if share:
         about += "share=1\n"
     try:
-        entry = fifo.join(folder, me, about)
+        entry = fifo.join(folder, me, about, front=front)
     except OSError as error:
         raise QueueError(f"{folder}: {error.strerror}") from None
     started = None

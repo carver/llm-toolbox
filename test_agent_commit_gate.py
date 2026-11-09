@@ -1553,3 +1553,47 @@ def test_a_rechecks_base_counts_only_full_passes(installed):
     assert done.returncode == 0, done.stderr
     # The commit check's pass of HEAD's tree is no base: the full check runs whole.
     assert bases(installed) == ["none"]
+
+
+# --no-queue: wt-ship's first round of a landing's checks, outside heavy's queue.
+
+
+def run_no_queue(repo):
+    return subprocess.run(
+        [
+            str(SCRIPT),
+            "--run",
+            str(repo / ".githooks" / "agent-pre-commit"),
+            "--no-queue",
+        ],
+        cwd=repo,
+        env=without_repo_vars(os.environ) | {"AGENT_PRE_COMMIT": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_no_queue_exits_75_without_running_a_check_that_waits_in_the_queue(installed):
+    done = run_no_queue(installed)  # its agent check doesn't name CHECK_QUEUE_EXIT
+
+    assert done.returncode == 75, done.stderr
+    assert ran(installed) == []
+
+
+def test_no_queue_exits_75_when_the_check_asks_for_the_queue(installed):
+    asking_check(installed)
+
+    done = run_no_queue(installed)
+
+    assert done.returncode == 75, done.stderr
+    assert ran(installed) == ["ask"]
+
+
+def test_no_queue_runs_a_check_that_needs_no_queue(installed):
+    light_check(installed)
+
+    done = run_no_queue(installed)
+
+    assert done.returncode == 0, done.stderr
+    assert ran(installed) == ["light-75"]

@@ -89,6 +89,17 @@ the same for heavy's one lane, and a wait for the claim costs no CPU. The wait l
 WT_SHIP_WAIT, starts again when the holder changes, so a queue that moves never times
 out (the owner's choice over a longer fixed limit).
 
+### A landing's checks run in one heavy job, at the queue's front (2026-11-08)
+
+Under the claim, each check used to wait its own turn in heavy's queue, behind every
+session's commit checks (20 to 43 minutes that day), while every other landing waited
+for the claim; and a job from the queue could take the lane between two of a landing's
+checks. Now each commit's check runs first outside the queue (`--no-queue`), so a
+docs-only landing never waits for the lane, and the checks that need it run together
+in one heavy job that joins the queue ahead of every ordinary waiter (the owner's
+design). The running job isn't stopped. The front goes only to a landing under the
+claim, and works on trust, as the queue does.
+
 ### build-state finish only folds (1465ae5, 2026-11-08)
 
 wt-ship checks a fold's new trees when it lands them, so finish's own run of the

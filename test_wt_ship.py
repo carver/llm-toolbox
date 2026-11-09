@@ -1677,3 +1677,114 @@ def test_a_waiter_keeps_waiting_while_the_holder_changes(setup, holder, backgrou
 
     assert status == 0, err
     assert main_head(main) == tip
+
+
+# A landing's checks that need heavy's queue run in one job at its front, so no other
+# session's job comes between them; checks that need no queue run outside it.
+
+
+def hold_the_lane(holder):
+    """Put a live process in heavy's normal lane slot; return the lane folder."""
+    alive = holder()
+    lane = Path(os.environ["HEAVY_DIR"]) / "normal"
+    lane.mkdir(parents=True, exist_ok=True)
+    (lane / "slot").write_text(
+        f"s-other 2026-11-07T01:02:03+00:00 host={socket.gethostname()}"
+        f" pid={alive.pid} start={start_time(alive.pid)}\ncwd=/x\ncmd=cargo test\n"
+    )
+    return alive, lane
+
+
+def queue_asking_check(main, log, asks=None):
+    """Install a check that asks for heavy's queue, noting `ask` in `asks` each time,
+    and in the queue notes its job's slot in `log`."""
+    asks = asks or main.parent / "asks"
+    install_hook(
+        main,
+        "agent-pre-commit",
+        f'if [ -n "${{CHECK_QUEUE_EXIT:-}}" ]; then echo ask >> "{asks}";'
+        ' exit "$CHECK_QUEUE_EXIT"; fi\n'
+        f'echo "$HEAVY_SLOT" >> "{log}"',
+    )
+
+
+def test_a_landing_whose_checks_need_no_queue_lands_while_the_lane_is_held(
+    setup, holder
+):
+    _, main, wt, _ = setup
+    hold_the_lane(holder)
+    # It names CHECK_QUEUE_EXIT and passes outside the queue, as a docs-only change's.
+    install_hook(main, "agent-pre-commit", ': "${CHECK_QUEUE_EXIT:-}"; exit 0')
+    commit(wt, "a.md", "a\n", "Add a")
+    tip = commit(wt, "b.md", "b\n", "Add b")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == tip
+
+
+def test_a_landings_checks_that_need_the_queue_run_in_one_heavy_job(setup):
+    _, main, wt, _ = setup
+    slots = main.parent / "slots"
+    queue_asking_check(main, slots)
+    for name in "abc":
+        commit(wt, f"{name}.py", "x = 1\n", f"Add {name}")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    seen = slots.read_text().splitlines()
+    assert len(seen) == 3 and len(set(seen)) == 1, seen
+    # Each asked for the queue once: inside the job the gate runs it straight away.
+    assert (main.parent / "asks").read_text().split() == ["ask"] * 3
+
+
+def test_a_landings_job_joins_heavys_queue_ahead_of_ordinary_waiters(
+    setup, holder, background
+):
+    _, main, wt, _ = setup
+    alive, lane = hold_the_lane(holder)
+    waiter = holder()
+    (lane / f"{time.time_ns():020d}-{waiter.pid}").write_text(
+        f"s-waiting 2026-11-07T01:02:04+00:00 host={socket.gethostname()}"
+        f" pid={waiter.pid} start={start_time(waiter.pid)}\ncwd=/y\ncmd=cargo build\n"
+    )
+    queue_asking_check(main, main.parent / "slots")
+    tip = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    shipping = background(wt, "--local")
+
+    def entries():
+        return sorted(p.name for p in lane.iterdir() if p.name[:1].isdigit())
+
+    wait_until(lambda: len(entries()) == 2, "the landing to queue")
+    assert entries()[0].endswith(f"-{shipping.pid}"), entries()
+    alive.kill()
+    alive.wait()
+    status, _, err = finish(shipping)
+    assert status == 0, err
+    assert main_head(main) == tip
+
+
+def test_the_oldest_failing_commit_is_named_whichever_round_finds_it(setup):
+    _, main, wt, _ = setup
+    # a needs the queue and fails in it; b fails outside it, in the first round.
+    install_hook(
+        main,
+        "agent-pre-commit",
+        "subject=$(git log -1 --format=%s)\n"
+        'if [ -n "${CHECK_QUEUE_EXIT:-}" ]; then\n'
+        '  [ "$subject" = "Add a" ] && exit "$CHECK_QUEUE_EXIT"\n'
+        '  [ "$subject" = "Add b" ] && exit 3\n'
+        "  exit 0\n"
+        "fi\n"
+        '[ "$subject" != "Add a" ]',
+    )
+    first = commit(wt, "a.py", "x = 1\n", "Add a")
+    commit(wt, "b.py", "y = 2\n", "Add b")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1
+    assert f"{first[:12]} Add a" in done.stderr, done.stderr

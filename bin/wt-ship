@@ -22,7 +22,10 @@ In order, it:
    earlier commit of the same landing, whose ID a rebase changes: a word of 7 to 64
    lowercase hex digits that `git rev-parse --verify WORD^{commit}` resolves to a
    commit the branch doesn't hold, whether from before a rebase or after it. A hex
-   word that resolves to no commit here, such as another repo's commit, is ignored.
+   word that resolves to no commit here, such as another repo's commit, is ignored,
+   as is the ID on a whole line `(cherry picked from commit ID)`, which `git
+   cherry-pick -x` adds and whose source is meant to stay off the branch; the same
+   ID on any other line still counts.
    It lists each such commit with the IDs it names, newest first, and the fix for
    each, `build-state reword SHA`, to name the commit by its subject instead, run in
    the order listed. This runs after every rebase, so before any check, and with
@@ -327,7 +330,10 @@ REJECTED = (
 FIXUP_PREFIXES = ("fixup! ", "squash! ", "amend! ")
 # A word of a commit message that may be a commit's ID: 7 to 64 hex digits, alone.
 # git abbreviates to 7 by default; shorter words are mostly English (added, decade).
-COMMIT_ID = re.compile(r"(?<![0-9A-Za-z_])[0-9a-f]{7,64}(?![0-9A-Za-z_])")
+HEX_ID = "[0-9a-f]{7,64}"
+COMMIT_ID = re.compile(rf"(?<![0-9A-Za-z_]){HEX_ID}(?![0-9A-Za-z_])")
+# The line `git cherry-pick -x` adds, whose source is meant to stay off the branch.
+CHERRY_PICKED = re.compile(rf"^\(cherry picked from commit {HEX_ID}\)$", re.MULTILINE)
 # How many times a push may lose a race to another session's, each followed by a
 # rebase and the check, before wt-ship gives up; the same for a landing whose branch
 # moves during the check.
@@ -370,7 +376,7 @@ def stale_citations(upstream):
     log = out("log", "-z", "--format=%H%n%B", f"{upstream}..HEAD")
     for entry in filter(None, log.split("\0")):
         sha, _, message = entry.partition("\n")
-        words = dict.fromkeys(COMMIT_ID.findall(message))
+        words = dict.fromkeys(COMMIT_ID.findall(CHERRY_PICKED.sub("", message)))
         if unheld := [word for word in words if names_unheld(word, upstream)]:
             found.append((sha, unheld))
     return found

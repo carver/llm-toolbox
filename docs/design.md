@@ -263,11 +263,20 @@ commit here is ignored.
 - A commit of the same landing is refused too, though its ID would hold if nothing
   rebased again: a lost push race, or the branch moving under the claim, rebases it.
 - It runs after every rebase, so with --local before the wait for the main tree.
+- The line `git cherry-pick -x` adds, `(cherry picked from commit ID)`, whose source
+  is meant to stay off the branch, doesn't count: the owner's call (2026-11-09),
+  "exempt IDs on that line only". The line must be whole, as git writes it; the same
+  ID anywhere else in the message still counts.
 
 Left to the owner (a review of the plan found them): worktrees share one object store,
-so another session's unlanded commit, a PR topic commit or a `cherry-pick -x` source
-resolves here and is refused though its ID will last; and `build-state reword` refuses
-a commit a remote-tracking branch holds, as after a push for CI.
+so another session's unlanded commit or a PR topic commit resolves here and is refused
+though its ID will last; and `build-state reword` refuses a commit a remote-tracking
+branch holds, as after a push for CI. The cherry-pick line's ID is exempt whatever it
+names, so a pick from an unlanded worktree, whose source a rebase rewrites, lands with
+an ID that won't last; exempting the ID only when a ref holds it would close that.
+Honest messages that name a held source elsewhere are still refused: "Backport of
+1a2b3c4" above the -x line, and `git merge --squash`'s default message, which lists
+each squashed commit as `commit ID`.
 
 ### Rejected: `wt-ship --check CMD` (removed in 9927dd7)
 

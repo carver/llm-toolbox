@@ -2013,6 +2013,68 @@ def test_hex_words_that_name_no_unlanded_commit_pass(setup):
     assert done.returncode == 0, done.stderr
 
 
+def picked_from_a_side_branch(wt):
+    """A commit on branch `side`, which the branch it lands on doesn't hold, cherry-picked
+    into `wt` with -x; its ID."""
+    source = commit(wt, "side.py", "s = 1\n", "Fix on the side")
+    git(wt, "branch", "side")
+    git(wt, "reset", "-q", "--hard", "HEAD~1")
+    git(wt, "cherry-pick", "-x", "side")
+    return source
+
+
+def test_the_line_cherry_pick_x_adds_doesnt_count_as_naming_a_commit(setup):
+    _, main, wt, _ = setup
+    source = picked_from_a_side_branch(wt)
+    assert f"(cherry picked from commit {source})" in git(
+        wt, "log", "-1", "--format=%B"
+    )
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert main_head(main) == git(wt, "rev-parse", "HEAD")
+
+
+def test_a_commit_picked_twice_carries_both_lines_and_lands(setup):
+    _, _, wt, _ = setup
+    first = picked_from_a_side_branch(wt)
+    # Picked again from a branch that had picked it: git adds a line for each pick.
+    second = commit(wt, "other.py", "o = 1\n", "Another fix on the side")
+    git(wt, "branch", "side2")
+    git(wt, "reset", "-q", "--hard", "HEAD~1")
+    message = (
+        "Fix on the side\n\n"
+        f"(cherry picked from commit {first})\n(cherry picked from commit {second})"
+    )
+    git(wt, "commit", "-q", "--amend", "-m", message)
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Fix on the side\n\nBackport of {short}.\n\n(cherry picked from commit {id})",
+        "Fix on the side\n\n  (cherry picked from commit {id})",
+        "Fix on the side\n\n(cherry picked from commit {id}) and more",
+    ],
+)
+def test_the_picked_id_on_another_line_or_one_unlike_gits_still_counts(setup, message):
+    _, _, wt, _ = setup
+    source = picked_from_a_side_branch(wt)
+    git(
+        wt, "commit", "-q", "--amend", "-m", message.format(short=source[:7], id=source)
+    )
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1
+    assert source[:7] in done.stderr and "build-state reword" in done.stderr
+
+
 BUILD_STATE = SCRIPT.parent / "build-state"
 
 

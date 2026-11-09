@@ -9,17 +9,17 @@ CMD` as a background call. Background call or not, it refuses heavy around bgrun
 (`heavy -- bgrun ...`), and around git commit and wt-ship, which queue their own
 checks and run bare. install.py registers it in ~/.claude/settings.json.
 
-It reads the command as shell words and looks only at what runs: each simple
-command's command word, past variable settings, redirections, keywords such as
-`if` and `do`, and wrappers such as timeout, nice, env, nohup, sudo and xargs; the
-script of `bash -c`, `eval` and a heredoc fed to a shell; and $(...) and backticks
-outside single quotes. A word that only mentions heavy (`grep heavy`, a commit
-message, a heredoc's body, a comment, a path such as .../heavy-queue-race) passes.
-So do `heavy status` and `heavy -h`, which return at once; `bgrun -o LOG -- heavy
--- CMD` without --wait, which returns once CMD has started; and a heavy with
-HEAVY_DIR or HEAVY_SLOT set in front of it, which uses a queue of its own or runs
-inside a job. A command shlex can't parse, such as one with a quote left open, is
-split without regard to quotes, which errs toward refusing.
+It reads the command as shell words and looks only at what runs: each simple command's
+command word, past variable settings, redirections, keywords such as `if` and `do`, and
+wrappers such as timeout, nice, env, nohup, sudo and xargs; the script of `bash -c`,
+`eval` and a heredoc fed to a shell; $(...) and backticks outside single quotes; and
+<(...) and >(...) outside quotes. A word that only mentions heavy (`grep heavy`, a
+commit message, a heredoc's body, a comment, a path such as .../heavy-queue-race)
+passes. So do `heavy status` and `heavy -h`, which return at once; `bgrun -o LOG --
+heavy -- CMD` without --wait, which returns once CMD has started; and a heavy with
+HEAVY_DIR or HEAVY_SLOT set in front of it, which uses a queue of its own or runs inside
+a job. A command shlex can't parse, such as one with a quote left open, is split without
+regard to quotes, which errs toward refusing.
 
     heavy-gate < hook-input.json    # as Claude Code calls it
 
@@ -35,12 +35,12 @@ from shellparse import (
     SHELLS,
     bgrun_command,
     command_of,
-    is_commit,
+    commands,
+    commit_args,
     is_help,
     prepare,
     reads_stdin,
     shell_script,
-    simple_commands,
 )
 
 RIGHT_FORM = (
@@ -66,13 +66,13 @@ def refusals(command: str, blocks: bool) -> set[str]:
     """The refusals a shell command earns. ``blocks``: the Bash call waits for it."""
     cleaned, substitutions, heredocs = prepare(command)
     found = set()
-    for words in simple_commands(cleaned):
-        found |= judge(words, blocks)
+    for simple in commands(cleaned):
+        found |= judge(simple.words, blocks)
     for substitution in substitutions:
         found |= refusals(substitution, blocks)
     for opener, body in heredocs:
-        opened = simple_commands(prepare(opener)[0])
-        if any(map(reads_stdin, opened)):
+        opened = commands(prepare(opener)[0])
+        if any(reads_stdin(simple.words) for simple in opened):
             found |= refusals(body, blocks)
     return found
 
@@ -101,7 +101,8 @@ def judge(words: list[str], blocks: bool) -> set[str]:
         return set()
     inner, _ = command_of(queued)
     inner_name = Path(inner[0]).name if inner else ""
-    if inner_name == "wt-ship" or inner_name == "git" and is_commit(inner[1:]):
+    commits = inner_name == "git" and commit_args(inner[1:]) is not None
+    if inner_name == "wt-ship" or commits:
         return {RUN_BARE}
     if inner_name == "bgrun":
         return {WRONG_ORDER}

@@ -386,6 +386,18 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `bash -c`, a heredoc fed to a shell and `$(...)`. A word that only mentions
   heavy passes, as do `heavy status`, `heavy -h`, `bgrun` without `--wait`, and
   a heavy with `HEAVY_DIR` or `HEAVY_SLOT` set in front of it.
+- **pipe-status-gate**: a Claude Code hook, which `install.py` registers, that
+  refuses a Bash command piping `git commit`, `wt-ship` or `bgrun --wait` into
+  another command. A pipeline exits with its last command's status, so in
+  `git commit -q -F MSG 2>&1 | tail -2` a commit its hook refused reads as a
+  success: an agent built on a commit that didn't exist that way. A pipe after
+  a compound command around one, as in `( ... ) | tail` or a loop's `done |
+  tail`, counts too. A command passes when pipefail is on for its pipeline,
+  from a `set -o pipefail` earlier in its script and outside any compound
+  command, and so do help as the first argument (`wt-ship -h | head`), `git
+  commit --dry-run`, a pipe into `git commit`, `||`, and a `|` in quotes, a
+  heredoc's body or a comment. It reads the command as heavy-gate does, through
+  `lib/shellparse.py`, nested scripts included.
 - **issue-view-hint**: a Claude Code hook, which `install.py` registers. After a
   `gh issue view` that printed task-list boxes, or any with `--comments`, it
   adds a note for the agent: the body and the comments come out separately, and

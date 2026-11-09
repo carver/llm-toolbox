@@ -221,6 +221,7 @@ def test_hooks_register_once_beside_existing_settings(settings):
         str(install.BIN_DST / "agent-commit-gate"),
         str(install.BIN_DST / "edit-script-gate"),
         str(install.BIN_DST / "heavy-gate"),
+        str(install.BIN_DST / "pipe-status-gate"),
     ]
 
 

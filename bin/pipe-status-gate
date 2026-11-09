@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""A Claude Code PreToolUse hook that refuses a Bash command piping git commit, wt-ship or
+bgrun --wait into another command.
+
+A pipeline exits with its last command's status. In `git commit -q -F MSG 2>&1 | tail -2`
+that's tail's, so a commit its hook refused reads as a success, and the agent builds on
+a commit that doesn't exist. wt-ship's landing can fail unseen the same way, and so can
+whatever `bgrun --wait` runs, since bgrun exits with its command's status. The refusal
+says to drop the pipe, since bgrun --wait prints the log's last lines itself and git
+commit prints a few lines. To filter the output anyway, put `set -o pipefail;` first and
+pipe into tail, not head, whose early exit can fail the command; or redirect to a file
+and read it in the next call. install.py registers it in ~/.claude/settings.json.
+
+A command is piped when `|` or `|&` follows it, or follows a compound command around
+it: ( ... ), { ...; }, if ... fi, case ... esac, or a for, while, until or select
+loop. It passes when pipefail is on for the shell running that pipeline: a `set
+-o pipefail` (or `set -euo pipefail`) earlier in the same script and outside any
+compound command, not undone by a `set +o pipefail`, or a shell started with -o
+pipefail. It finds what runs as heavy-gate does (lib/shellparse.py): past variable
+settings and wrappers such as timeout, env and sudo; in the script of bash -c, eval
+or a heredoc fed to a shell; in $(...), backticks and <(...); and in the command bgrun
+runs. A bash -c, eval or heredoc whose shell is piped counts as piped throughout,
+whatever it sets inside. A new shell starts without pipefail, and a $(...) gets
+the pipefail its script has at its end. Help as the first argument (`wt-ship -h |
+head`) and `git commit --dry-run` pass, as do a pipe into git commit (`echo msg |
+git commit -F -`), `||`, and a `|` in quotes, a heredoc's body or a comment.
+
+It catches a mistake, not an agent set on getting past it: an alias, a variable that
+holds `git`, a function or a script that commits all pass.
+
+    pipe-status-gate < hook-input.json    # as Claude Code calls it
+
+Exit status: 0 allowed, 2 refused (the reason on stderr), 1 input that isn't JSON.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from shellparse import (
+    SHELLS,
+    Command,
+    bgrun_command,
+    command_of,
+    commands,
+    commit_args,
+    is_help,
+    prepare,
+    reads_stdin,
+    shell_options,
+    shell_script,
+)
+
+REFUSAL = (
+    "Refused: {name} is piped into another command, and a pipeline exits with its last "
+    "command's status, so {name} failing reads as success.\n"
+    "Drop the pipe: bgrun --wait prints the log's last lines itself (--tail N), and git "
+    "commit prints a few lines. To filter anyway, put `set -o pipefail;` first and pipe "
+    "into tail, not head (its early exit can fail the command), or redirect to a file "
+    "and read it in the next call."
+)
+
+
+def hidden_failures(
+    command: str, pipefail: bool = False, hidden: bool = False
+) -> list[str]:
+    """The names of the commands in ``command`` whose failure a pipe hides, in the order
+    they come. ``pipefail``: on as the script starts. ``hidden``: the script's own output
+    goes into a pipe that hides its status."""
+    cleaned, substitutions, heredocs = prepare(command)
+    found = []
+    for simple in commands(cleaned):
+        found += judge(simple.words, hides(simple, hidden, pipefail), pipefail)
+        if not simple.grouped:
+            pipefail = pipefail_after(simple.words, pipefail)
+    for substitution in substitutions:
+        found += hidden_failures(substitution, pipefail, hidden)
+    for opener, body in heredocs:
+        for simple in commands(prepare(opener)[0]):
+            if reads_stdin(simple.words):
+                hidden_body = hides(simple, hidden, pipefail)
+                found += hidden_failures(
+                    body, shell_pipefail(simple.words), hidden_body
+                )
+    return found
+
+
+def hides(simple: Command, hidden: bool, pipefail: bool) -> bool:
+    """Whether a pipe hides the status of what a simple command runs: the script around
+    it is hidden, or it is piped while pipefail is off."""
+    return hidden or simple.piped and not pipefail
+
+
+def judge(words: list[str], hidden: bool, pipefail: bool) -> list[str]:
+    """The names of the commands one simple command runs whose failure a pipe hides.
+    ``hidden``: its output goes into a pipe that hides its status; ``pipefail``: on
+    where it runs."""
+    words, _ = command_of(words)
+    if not words:
+        return []
+    name, args = Path(words[0]).name, words[1:]
+    if name in SHELLS:
+        script = shell_script(words)
+        if script is None:
+            return []
+        return hidden_failures(script, shell_pipefail(words), hidden)
+    if name == "eval":
+        return hidden_failures(" ".join(args), pipefail, hidden)
+    if name == "bgrun":
+        parsed = bgrun_command(args)
+        if parsed is None:
+            return []
+        waits, rest = parsed
+        return (["bgrun --wait"] if waits and hidden else []) + judge(
+            rest, False, False
+        )
+    if not hidden:
+        return []
+    if name == "wt-ship":
+        return [] if asks_help(args) else ["wt-ship"]
+    commit = commit_args(args) if name == "git" else None
+    if commit is None or asks_help(commit) or "--dry-run" in commit:
+        return []
+    return ["git commit"]
+
+
+def asks_help(args: list[str]) -> bool:
+    """Whether a command's arguments ask for its help: -h or --help comes first."""
+    return bool(args) and is_help(args[0])
+
+
+def pipefail_after(words: list[str], pipefail: bool) -> bool:
+    """Whether pipefail is on after one simple command, which may be a `set`."""
+    words, _ = command_of(words)
+    return set_pipefail(words[1:], pipefail) if words[:1] == ["set"] else pipefail
+
+
+def shell_pipefail(words: list[str]) -> bool:
+    """Whether a shell command starts its shell with pipefail on (-o pipefail)."""
+    words, _ = command_of(words)
+    return set_pipefail(words[1:], False)
+
+
+def set_pipefail(args: list[str], pipefail: bool) -> bool:
+    """``pipefail`` after set's or a shell's options ``args``: -o pipefail turns it on,
+    as does a cluster such as -euo pipefail, and +o pipefail off."""
+    for option, values in shell_options(args)[0]:
+        if "o" in option and "pipefail" in values:
+            pipefail = option[0] == "-"
+    return pipefail
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if any(arg in ("-h", "--help") for arg in argv):
+        print(__doc__)
+        return 0
+    try:
+        event = json.load(sys.stdin)
+    except json.JSONDecodeError as error:
+        print(
+            f"pipe-status-gate: the hook input isn't JSON ({error}); it reads the "
+            "PreToolUse event Claude Code sends on stdin.",
+            file=sys.stderr,
+        )
+        return 1
+    if event.get("tool_name") != "Bash":
+        return 0
+    found = hidden_failures((event.get("tool_input") or {}).get("command") or "")
+    if found:
+        print(REFUSAL.format(name=found[0]), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

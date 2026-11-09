@@ -47,6 +47,7 @@ WAITS_ON_HEAVY = [
     "echo x | xargs heavy -- make",
     "nohup heavy -- cargo build > build.log 2>&1 &",
     "bash -lc 'heavy -- cargo test'",
+    "bash -euo pipefail -c 'heavy -- cargo test'",
     "eval 'heavy -- cargo test'",
     'out="$(heavy -- cargo test 2>&1)"; echo "$out"',
     "echo $(heavy -- cargo test)",
@@ -114,6 +115,7 @@ def test_heavy_around_bgrun_is_refused_anywhere(command, background):
 RUN_BARE = [
     "heavy -- wt-ship -C ../x --local --remove",
     "heavy -- git -C repo commit -m x",
+    "heavy -- git --config-env x=Y commit -m x",
 ]
 
 
@@ -156,6 +158,7 @@ def test_heavy_around_a_self_queueing_command_is_refused_anywhere(command, backg
         "git commit -m x",
         "wt-ship -C ../x --local --remove",
         "x=$((1<<3))\necho done",
+        "x=\"$(cat <<'EOF'\nit's\nEOF\n)\"; echo 'x;heavy -- make'",
     ],
 )
 def test_a_call_that_does_not_wait_on_heavy_passes(command):

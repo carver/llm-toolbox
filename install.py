@@ -74,6 +74,12 @@ HOOKS = [
         {"timeout": 10},
     ),
     (
+        "PreToolUse",
+        "Bash",
+        "pipe-status-gate",
+        {"timeout": 10},
+    ),
+    (
         "PostToolUse",
         "Bash",
         "issue-view-hint",

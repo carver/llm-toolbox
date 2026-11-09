@@ -1,21 +1,23 @@
 """Read a Bash command's words and what they run, for a hook that judges the command.
 
 prepare() cleans a command for shlex: it drops comments and heredoc bodies, joins
-continued lines, and sets aside each $(...) or backtick substitution and each heredoc's
-body, which a hook judges as scripts of their own. simple_commands() splits what's left
-into the words of each simple command, without the redirections. A command shlex can't
-parse, such as one with a quote left open, is split without regard to quotes.
+continued lines, and sets aside each $(...), backtick or <(...) substitution and each
+heredoc's body, which a hook judges as scripts of their own. commands() splits what's
+left into simple commands: the words of each, without the redirections; whether its
+output goes into a pipe; and whether it sits inside a compound command. A command shlex
+can't parse, such as one with a quote left open, is split without regard to quotes.
 
 command_of() finds the command a simple command runs, past variable settings, keywords
 such as `if` and `do`, and wrappers such as timeout, nice, env, sudo and xargs, whose
 options it reads with split_options(). Then SHELLS names the shells: shell_script()
 finds the script one runs with -c, and reads_stdin() says whether it reads its script
-from stdin. is_commit() says whether git's arguments run `git commit`, bgrun_command()
-reads bgrun's, and is_help() spots an option that asks for help.
+from stdin. commit_args() finds the arguments of a `git commit`, bgrun_command() reads
+bgrun's, and is_help() spots an option that asks for help.
 """
 
 import re
 import shlex
+from dataclasses import dataclass
 from pathlib import Path
 
 # Characters shlex returns as operator tokens: separators and redirections.
@@ -29,6 +31,11 @@ ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 FALLBACK = re.compile(r"[;&|()<>\n`]+|[^\s;&|()<>`]+")
 SHELLS = {"sh", "bash", "dash", "ksh", "zsh"}
 KEYWORDS = {"if", "then", "elif", "else", "do", "while", "until", "!", "{"}
+# The words that open and close a compound command whose output a pipe can take whole.
+OPENERS = {"{", "if", "for", "while", "until", "select", "case"}
+CLOSERS = {"}", "fi", "done", "esac"}
+# A quoted word of these alone, such as '|', which shlex returns unquoted, as an operator.
+OPERATOR_WORD = re.compile(r"[;&|()<>]+")
 # Commands that run the command after them: (their options that take a value, how many
 # arguments come between their options and that command).
 WRAPPERS = {
@@ -51,50 +58,119 @@ WRAPPERS = {
     "xargs": ({"-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s", "--max-args"}, 0),
     "flock": ({"-w", "--timeout", "-E", "--conflict-exit-code"}, 1),
 }
-GIT_VALUES = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
+GIT_VALUES = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
 BGRUN_VALUES = {"-o", "--output", "-C", "--cwd", "--tail"}
 
 
-def simple_commands(cleaned: str) -> list[list[str]]:
-    """The words of each simple command in ``cleaned``, a command prepare() has cleaned."""
+@dataclass
+class Command:
+    """A simple command's words; whether its output goes into a pipe, because `|` or `|&`
+    follows it or a compound command around it; and whether it sits inside a compound
+    command: ( ... ), { ...; }, if ... fi, case ... esac, or a for, while, until or
+    select loop."""
+
+    words: list[str]
+    piped: bool
+    grouped: bool
+
+
+@dataclass
+class _Output:
+    """Whether the output of a simple or compound command goes into a pipe, and whether
+    the compound command is a case, whose patterns end in a `)` that closes nothing."""
+
+    piped: bool = False
+    case: bool = False
+
+
+def commands(cleaned: str) -> list[Command]:
+    """Each simple command in ``cleaned``, a command prepare() has cleaned, in order."""
     lexer = shlex.shlex(cleaned, posix=True, punctuation_chars=OPERATORS)
     lexer.whitespace, lexer.whitespace_split, lexer.commenters = " \t\r", True, ""
     try:
         tokens = list(lexer)
     except ValueError:  # a quote left open
         tokens = FALLBACK.findall(cleaned)
-    commands, words, redirected = [], [], False
+    # Each command's words, with its own output and those of the compound commands
+    # around it; the compound commands open now, innermost last; the output a `|` would
+    # take now; the words of the command being read.
+    found: list[tuple[list[str], list[_Output]]] = []
+    groups: list[_Output] = []
+    pipe_source: _Output | None = None
+    words: list[str] = []
+
+    def end() -> None:
+        nonlocal words, pipe_source
+        if not words:
+            return
+        closed = None
+        for word in words:
+            if word in OPENERS:
+                groups.append(_Output(case=word == "case"))
+            elif word in CLOSERS:
+                closed = groups.pop() if groups else None
+            elif word not in KEYWORDS:
+                break
+        own = _Output()
+        found.append((words, [own, *groups]))
+        pipe_source, words = closed or own, []
+
+    def close() -> None:
+        """A `)`: it ends a subshell, or a case's pattern."""
+        nonlocal pipe_source
+        end()
+        if groups and groups[-1].case:
+            pipe_source = None
+        else:
+            pipe_source = groups.pop() if groups else None
+
+    redirected = False
     for token in tokens:
         if redirected:
             redirected = False
-        elif not is_operator(token):
+            continue
+        if not is_operator(token):
             words.append(token)
-        elif is_redirection(token):
-            if words and words[-1].isdigit():
-                words.pop()  # the file descriptor of 2>FILE
-            redirected = True  # the next word is the redirection's target
-        else:
-            commands.append(words)
-            words = []
-    commands.append(words)
-    return [words for words in commands if words]
+            continue
+        i = 0
+        while i < len(token):  # shlex runs operators together, as in `)|` or `;>`
+            char = token[i]
+            if char in "<>" or token.startswith("&>", i):
+                # The rest of the token redirects, and the next one is its target.
+                if words and words[-1].isdigit():
+                    words.pop()  # the file descriptor of 2>FILE
+                redirected = True
+                break
+            if char == ")":
+                close()
+            else:
+                end()
+                if token.startswith("||", i):
+                    i += 1
+                elif char == "|" and pipe_source:  # the & of a |& only separates
+                    pipe_source.piped = True
+                elif char == "(":
+                    groups.append(_Output())
+                pipe_source = None
+            i += 1
+    end()
+    return [
+        Command(words, any(o.piped for o in outputs), len(outputs) > 1)
+        for words, outputs in found
+    ]
 
 
 def is_operator(token: str) -> bool:
-    return all(c in OPERATORS for c in token)
-
-
-def is_redirection(operator: str) -> bool:
-    """Whether an operator redirects (>, 2>&, <<<), rather than separating commands or
-    starting a process substitution such as <(...)."""
-    return bool(set(operator) & set("<>")) and "(" not in operator
+    return bool(token) and all(c in OPERATORS for c in token)
 
 
 def prepare(text: str) -> tuple[str, list[str], list[tuple[str, str]]]:
     """(``text`` ready for shlex; the bodies of its command substitutions outside single
-    quotes; each heredoc's body, with the line that opened it). Drops comments and
-    heredoc bodies, joins continued lines, turns $'...' into a plain quoted word and each
-    substitution into a placeholder, so the word around it stays one word."""
+    quotes and of its process substitutions outside quotes; each heredoc's body, with the
+    line that opened it). Drops comments and heredoc bodies, joins continued lines, turns
+    $'...' into a plain quoted word and each substitution into a placeholder, so the word
+    around it stays one word. A quoted word of operator characters alone, such as '|',
+    becomes underscores, since shlex drops the quotes and would return it as an operator."""
     out, substitutions, heredocs = [], [], []
     delimiters, line_start, quote, i = [], 0, None, 0
     while i < len(text):
@@ -107,9 +183,10 @@ def prepare(text: str) -> tuple[str, list[str], list[tuple[str, str]]]:
             continue
         elif quote is None and text.startswith("$'", i):
             end = ansi_end(text, i + 2)
-            out.append(
-                "'" + re.sub(r"\\.?", "_", text[i + 2 : end]) + text[end : end + 1]
-            )
+            body = re.sub(r"\\.?", "_", text[i + 2 : end])
+            if OPERATOR_WORD.fullmatch(body):
+                body = "_" * len(body)
+            out.append("'" + body + text[end : end + 1])
             i = end + 1
             continue
         elif quote is None and char == "#" and (i == 0 or text[i - 1] in WORD_BREAK):
@@ -129,11 +206,21 @@ def prepare(text: str) -> tuple[str, list[str], list[tuple[str, str]]]:
             i = heredoc.end()
             continue
         elif quote is None and char in "'\"":
+            end = text.find(char, i + 1)
+            if end != -1 and OPERATOR_WORD.fullmatch(text, i + 1, end):
+                out.append(char + "_" * (end - i - 1) + char)
+                i = end + 1
+                continue
             quote = char
         elif quote == '"' and char == '"':
             quote = None
-        elif text.startswith("$(", i) or char == "`":
-            start = i + (2 if char == "$" else 1)
+        elif (
+            text.startswith("$(", i)
+            or char == "`"
+            or quote is None
+            and text.startswith(("<(", ">("), i)
+        ):
+            start = i + (1 if char == "`" else 2)
             end = substitution_end(text, start, char)
             substitutions.append(text[start:end])
             out.append("_")
@@ -176,9 +263,10 @@ def ansi_end(text: str, start: int) -> int:
 
 
 def substitution_end(text: str, start: int, opener: str) -> int:
-    """Where the $( or backtick substitution whose body starts at ``start`` closes:
-    len(text) if it doesn't."""
-    depth, quote, i = 1, None, start
+    """Where the substitution ($(, <(, >( or a backtick) whose body starts at ``start``
+    closes: len(text) if it doesn't. Heredoc bodies inside it are skipped, so a quote in
+    one, as in a commit message's "Don't", opens nothing."""
+    depth, quote, delimiters, i = 1, None, [], start
     while i < len(text):
         char = text[i]
         if char == "\\" and quote != "'":
@@ -186,6 +274,14 @@ def substitution_end(text: str, start: int, opener: str) -> int:
             continue
         if quote:
             quote = None if char == quote else quote
+        elif char == "\n" and delimiters:
+            i = heredoc_bodies(text, i + 1, delimiters)[1]
+            delimiters = []
+            continue
+        elif heredoc := HEREDOC.match(text, i):
+            delimiters.append(heredoc.group(2))
+            i = heredoc.end()
+            continue
         elif opener == "`":
             if char == "`":
                 return i
@@ -256,19 +352,39 @@ def bgrun_command(args: list[str]) -> tuple[bool, list[str]] | None:
     return any(len(o) > 2 and "--wait".startswith(o) for o in options), rest
 
 
-def is_commit(git_args: list[str]) -> bool:
+def commit_args(git_args: list[str]) -> list[str] | None:
+    """The arguments of the `git commit` that git's arguments run, or None when they
+    run some other git command."""
     _, rest = split_options(git_args, GIT_VALUES)
-    return rest[:1] == ["commit"]
+    return rest[1:] if rest[:1] == ["commit"] else None
+
+
+def shell_options(args: list[str]) -> tuple[list[tuple[str, list[str]]], list[str]]:
+    """(each option in front of ``args``, as set and the shells read them, with the
+    words it takes; the words after them and the `--` that may end them). An option
+    starts with - or +. Each o or O in a cluster of short options takes one word, as in
+    -euo pipefail, and a long option such as --norc takes none."""
+    options, i = [], 0
+    while i < len(args) and len(args[i]) > 1 and args[i][0] in "-+":
+        option = args[i]
+        i += 1
+        if option == "--":
+            break
+        taken = 0 if option.startswith("--") else option.count("o") + option.count("O")
+        options.append((option, args[i : i + taken]))
+        i += taken
+    return options, args[i:]
 
 
 def shell_flags(words: list[str]) -> tuple[str, list[str]] | None:
-    """(the letters of a shell command's short options, the words after its options), or
-    None when the simple command doesn't run a shell."""
+    """(the letters of a shell command's short options that start with -, the words
+    after its options), or None when the simple command doesn't run a shell."""
     words, _ = command_of(words)
     if not words or Path(words[0]).name not in SHELLS:
         return None
-    options, rest = split_options(words[1:], {"-o", "-O"})
-    return "".join(o[1:] for o in options if not o.startswith("--")), rest
+    options, rest = shell_options(words[1:])
+    on = [option for option, _ in options if option[0] == "-" and option[1] != "-"]
+    return "".join(option[1:] for option in on), rest
 
 
 def shell_script(words: list[str]) -> str | None:

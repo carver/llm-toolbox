@@ -262,18 +262,29 @@ def test_open_titles_prints_a_long_title_in_full(fake, capsys):
     assert capsys.readouterr().out == f"#8 {title}\n"
 
 
-def test_open_titles_reads_comments_only_for_issues_that_have_some(fake):
+@pytest.mark.parametrize("form", [[], ["--titles"]], ids=["open", "open --titles"])
+def test_open_reads_comments_only_for_issues_that_have_some(fake, form):
     fake.listing = [
         fake.issue | {"comments": 2},
         {"number": 8, "title": "No comments", "body": "", "comments": 0},
     ]
 
-    assert tool.main(["open", "--titles", "--repo", "other/thing"]) == 0
+    assert tool.main(["open", *form, "--repo", "other/thing"]) == 0
 
     assert [args[-1].split("?")[0] for args in fake.calls] == [
         "repos/other/thing/issues",  # the listing
         "repos/other/thing/issues/7/comments",
     ]
+
+
+@pytest.mark.parametrize("command", ["show", "read"])
+def test_one_issue_with_no_comments_costs_one_call(fake, capsys, command):
+    fake.issue["comments"] = 0
+
+    assert tool.main([command, "7", "--repo", "other/thing"]) == 0
+
+    assert [args[-1] for args in fake.calls] == ["repos/other/thing/issues/7"]
+    assert "The forecast question" in capsys.readouterr().out
 
 
 def test_show_cuts_a_long_item_to_one_line(fake, capsys):

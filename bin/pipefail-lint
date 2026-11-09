@@ -1,0 +1,637 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tree-sitter==0.25.2", "tree-sitter-bash==0.23.3"]
+# ///
+"""Flag pipelines under pipefail whose reader can stop reading early.
+
+    pipefail-lint FILE...
+
+Under pipefail a pipeline fails when any stage fails. When a stage stops reading its
+input before the stage writing into it is done, the writer dies of SIGPIPE (status
+141) and the pipeline fails, though every stage did its job; the race makes it
+intermittent. filedrawer's `gh api ... | grep -qx main` under `set -euo pipefail`
+took the wrong branch in 11 of 400 runs that way. shellcheck has no rule for it.
+
+In each FILE that sets pipefail anywhere (a `set` with `-o pipefail`, alone or in a
+cluster such as `set -euo pipefail`), it flags each pipeline stage after the first
+that can stop reading early:
+
+  grep, egrep, fgrep, rg   with -q/--quiet/--silent, -m N/--max-count,
+                           -l/--files-with-matches or -L/--files-without-match
+                           (rg's -L follows links, and isn't one)
+  head                     with any count but a negative one (-n -1 reads to the end)
+  sed                      whose script holds a q or Q command
+  awk, gawk, mawk, nawk    whose program holds `exit` outside an END block
+  read                     which reads one line
+  cmp                      which stops at the first difference
+
+It finds the reader past variable settings and wrappers such as timeout, env and nice,
+but not past xargs, which reads all its input itself. A stage that is a compound
+command (`while read ...; do ...; done`, `{ ...; }`) isn't judged, nor are readers not
+listed above (dd count=, od -N, xxd -l, perl's exit). Nor is a pipeline whose status
+nothing reads: one followed by `|| true` or `|| :`; one in a process substitution,
+`<(...)`; and one in a `$(...)` that is a command's word (`echo "$(cmd | head -1)"`),
+a declaration's value (`local x=$(...)`, also declare, typeset, export, readonly), or
+an assignment followed by `|| true`. Scripts in a string (`bash -c '...'`) and
+pipefail set by a sourced file aren't seen.
+
+The fix: capture the output first, then read the capture,
+
+    out=$(gh api ... --jq '.[].name')
+    grep -qx main <<<"$out"
+
+so the writer has finished before anything stops reading. To keep a pipeline it flags
+wrongly, put `# pipefail-lint: ignore` on any of its lines, or on the line above it.
+
+A FILE is linted when it's a shell script: a name ending .sh, .bash or .ksh, or a
+first line `#!` naming sh, bash, dash or ksh, directly or through env (zsh's syntax
+differs). Any other file is skipped, so a hook can pass every staged file. It parses
+with tree-sitter-bash; a file with a part it can't parse is still linted, with a line
+on stderr saying a finding there may be missed or on the wrong line.
+
+Output: one line per finding on stdout, `FILE:LINE: `STAGE` can stop reading early`,
+with the line of the stage that stops reading; then the fix, on stderr. Nothing on a
+pass.
+
+Exit status: 0 nothing found, 1 something found, 2 a usage error or a file that can't
+be read (the other files are still checked).
+"""
+
+import re
+import shlex
+import sys
+from collections.abc import Iterator
+from itertools import pairwise
+from pathlib import Path
+from typing import NamedTuple
+
+import tree_sitter
+import tree_sitter_bash
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from shellparse import command_of, set_pipefail
+
+IGNORE = b"pipefail-lint: ignore"
+# The shells whose scripts it reads; tree-sitter-bash isn't a zsh parser.
+SHELLS = {"sh", "bash", "dash", "ksh"}
+# Where a pipeline's status flows on to what holds it: a $(...), the word or string
+# around it, the assignment it's the value of, a redirection around the pipeline.
+# What a $(...) can sit in on its way to an assignment, which takes its status: the
+# word or string around it, an array, the assignments of one statement.
+TO_ASSIGNMENT = {"string", "concatenation", "array", "variable_assignment"}
+ASSIGNMENTS = {"variable_assignment", "variable_assignments"}
+# Groups whose last statement's status is the group's.
+GROUPS = {"compound_statement", "subshell", "redirected_statement"}
+SHELL_SUFFIXES = {".sh", ".bash", ".ksh"}
+PIPES = {"|", "|&"}
+FIX = (
+    "pipefail-lint: under pipefail, a reader that stops early can kill the writer with"
+    ' SIGPIPE. Capture the output first, out=$(cmd), then grep -q ... <<<"$out";'
+    " or end a line flagged wrongly with `# pipefail-lint: ignore` (pipefail-lint -h)."
+)
+PARSER = tree_sitter.Parser(tree_sitter.Language(tree_sitter_bash.language()))
+
+GREPS = {"grep", "egrep", "fgrep", "rg"}
+# Per grep: the short options that stop at a first match, and those that take a value.
+GREP_EARLY = {name: frozenset("qlm" if name == "rg" else "qlLm") for name in GREPS}
+GREP_VALUES = {
+    name: frozenset("efgtTABCmMjErd" if name == "rg" else "efmABCdD") for name in GREPS
+}
+# Long options of grep or rg that take the next word as their value, given without =.
+GREP_LONG_VALUES = {
+    "--regexp",
+    "--file",
+    "--after-context",
+    "--before-context",
+    "--context",
+    "--devices",
+    "--directories",
+    "--label",
+    "--include",
+    "--exclude",
+    "--exclude-dir",
+    "--glob",
+    "--type",
+    "--type-not",
+    "--max-depth",
+    "--replace",
+    "--encoding",
+    "--max-columns",
+    "--threads",
+}
+GREP_EARLY_LONG = {
+    "--quiet",
+    "--silent",
+    "--max-count",
+    "--files-with-matches",
+    "--files-without-match",
+}
+AWKS = {"awk", "gawk", "mawk", "nawk"}
+
+
+def is_shell_script(path: Path, text: bytes) -> bool:
+    """Whether the file is a shell script, by its name or its shebang."""
+    if path.suffix in SHELL_SUFFIXES:
+        return True
+    first = text.split(b"\n", 1)[0].decode(errors="replace")
+    if not first.startswith("#!"):
+        return False
+    words = first[2:].split()
+    if words and Path(words[0]).name == "env":
+        words = [w for w in words[1:] if not w.startswith("-") and "=" not in w]
+    return bool(words) and Path(words[0]).name in SHELLS
+
+
+def parse(text: bytes) -> tree_sitter.Node:
+    """The script's syntax tree. tree-sitter-bash (0.23 to 0.25) misreads the newline
+    after a pipeline of three stages or more when a line with `&&` or `||`, or a
+    heredoc, comes after it: it runs that line into the pipeline's last command. A
+    newline inside a simple command, not after a backslash, can only come from that,
+    so it gets a `;` in front, which ends the command as the newline would, and the
+    text is parsed again; lines stay where they were."""
+    source, mended = text, -1
+    while True:
+        root = PARSER.parse(source).root_node
+        glued = glued_newline(root, source)
+        if glued is None or glued <= mended:
+            return root  # nothing to mend, or a mend that didn't take
+        source, mended = source[:glued] + b";" + source[glued:], glued
+
+
+def glued_newline(root: tree_sitter.Node, source: bytes) -> int | None:
+    """Where the first word of a simple command ends that a newline, not after a
+    backslash, parts from its next word: where its `;` goes. None when there's none."""
+    for node in nodes(root):
+        if node.type not in ("command", "declaration_command"):
+            continue
+        words = [c for c in node.children if c.is_named and c.type != "comment"]
+        for before, after in pairwise(words):
+            gap = source[before.end_byte : after.start_byte]
+            newline = gap.find(b"\n")
+            if newline != -1 and not gap[:newline].rstrip(b" \t").endswith(b"\\"):
+                return before.end_byte
+    return None
+
+
+def nodes(node: tree_sitter.Node) -> Iterator[tree_sitter.Node]:
+    """`node` and every node under it."""
+    yield node
+    for child in node.children:
+        yield from nodes(child)
+
+
+def unquoted(node: tree_sitter.Node) -> str:
+    """A word as the shell passes it on, when shlex can tell; its text otherwise."""
+    text = node.text.decode(errors="replace")
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        return text
+    return parts[0] if len(parts) == 1 else text
+
+
+def words_of(command: tree_sitter.Node) -> list[str]:
+    """A simple command's words, variable settings in front included."""
+    words = []
+    for index, child in enumerate(command.children):
+        field = command.field_name_for_child(index)
+        if child.type == "variable_assignment":
+            words.append(child.text.decode(errors="replace"))
+        elif field in ("name", "argument"):
+            words.append(unquoted(child))
+    return words
+
+
+def sets_pipefail(root: tree_sitter.Node) -> bool:
+    """Whether a `set` (or `shopt -so`) anywhere in the script turns pipefail on."""
+    for node in nodes(root):
+        if node.type != "command":
+            continue
+        words, _ = command_of(words_of(node))
+        if words[:1] == ["set"] and set_pipefail(words[1:], False):
+            return True
+        letters = "".join(word for word in words[1:] if word.startswith("-"))
+        if (
+            words[:1] == ["shopt"]
+            and {"s", "o"} <= set(letters)
+            and "pipefail" in words
+        ):
+            return True
+    return False
+
+
+def readers(pipeline: tree_sitter.Node) -> Iterator[tree_sitter.Node]:
+    """The simple commands of a pipeline that read from a pipe: each stage a `|` or
+    `|&` comes before, unwrapped from its redirections. tree-sitter-bash reads `a | b
+    | c || d` as `a | (b | c || d)`, so a stage that is a list stands for its first
+    command."""
+    piped = False
+    for child in pipeline.children:
+        if child.type in PIPES:
+            piped = True
+            continue
+        if child.type == "comment":
+            continue
+        if piped and child.is_named:
+            while child.type in ("redirected_statement", "list", "pipeline"):
+                child = child.child_by_field_name("body") or child.named_children[0]
+            if child.type == "command":
+                yield child
+        piped = False
+
+
+def status_unread(pipeline: tree_sitter.Node) -> bool:
+    """Whether nothing reads the pipeline's status. Its status goes to the list or
+    group that holds it, as their last part, until a statement reads it, or until
+    `|| true` or `|| :` throws it away. In a $(...), as its last statement, it goes to
+    the assignment the $(...) is the value of; anywhere else (a command's word, a
+    declaration such as `local x=$(...)`, a test, a case or for word, a redirection)
+    nothing reads it, nor in a `<(...)`."""
+    last = pipeline.named_children[-1]
+    if last.type == "list":  # tree-sitter's `a | (b | c || d)`
+        return throws_away(last)
+    node = statement_of(pipeline)
+    if node is None:
+        return True
+    while (holder := node.parent) is not None:
+        if holder.type == "pipeline":  # a list tree-sitter put inside one
+            node = holder
+        elif holder.type == "list":
+            if node != holder.children[-1]:
+                return throws_away(holder)
+            node = holder
+        elif holder.type in GROUPS and node == last_statement(holder):
+            node = holder
+        else:
+            return holder.type == "process_substitution"
+    return False
+
+
+def throws_away(holder: tree_sitter.Node) -> bool:
+    """Whether a list throws its left side's status away: `|| true` or `|| :`. Any
+    other list reads it, to choose whether its right side runs."""
+    operator, right = holder.children[1], holder.children[-1]
+    return (
+        operator.type == "||"
+        and right.type == "command"
+        and words_of(right) in (["true"], [":"])
+    )
+
+
+def statement_of(pipeline: tree_sitter.Node) -> tree_sitter.Node | None:
+    """The statement whose status is the pipeline's: the pipeline itself, or for one
+    that ends a $(...), the assignment statement the $(...) is the value of. None when
+    the $(...)'s status goes nowhere."""
+    node = pipeline
+    while node.parent is not None and node.parent.type == "command_substitution":
+        if node != last_statement(node.parent):
+            return None
+        node = node.parent
+        while node.parent is not None and node.parent.type in TO_ASSIGNMENT:
+            node = node.parent
+        if node.type not in ASSIGNMENTS:
+            return None
+        if node.parent is not None and node.parent.type == "variable_assignments":
+            node = node.parent
+        if node.parent is not None and node.parent.type in (
+            "command",
+            "declaration_command",
+        ):
+            return None
+    return node
+
+
+def last_statement(group: tree_sitter.Node) -> tree_sitter.Node | None:
+    """The last statement of a group, a $(...) or a redirection's body."""
+    if (body := group.child_by_field_name("body")) is not None:
+        return body
+    parts = [c for c in group.named_children if c.type != "comment"]
+    return parts[-1] if parts else None
+
+
+def stops_early(words: list[str]) -> bool:
+    """Whether the command these words run can stop reading its input early."""
+    found, _ = command_of(words)
+    if found[:1] == ["builtin"]:
+        found = found[1:]
+    if not found:
+        return False
+    if any(Path(word).name == "xargs" for word in words[: len(words) - len(found)]):
+        return False  # xargs reads all its input; the command it runs reads none
+    name, args = Path(found[0]).name, found[1:]
+    if name in GREPS:
+        return grep_stops(name, args)
+    if name == "head":
+        return not any(count.startswith("-") for count in head_counts(args))
+    if name == "sed":
+        return any(sed_quits(script) for script in sed_scripts(args))
+    if name in AWKS:
+        program = awk_program(args)
+        return program is not None and awk_exits(program)
+    return name in ("read", "cmp")
+
+
+def grep_stops(name: str, args: list[str]) -> bool:
+    """Whether a grep's options make it stop at a first match. grep reads options
+    anywhere before `--`; a short option that takes a value takes the rest of its
+    cluster, or the next word."""
+    early, values = GREP_EARLY[name], GREP_VALUES[name]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            return False
+        if arg.startswith("--"):
+            option, has_value, _ = arg.partition("=")
+            if option in GREP_EARLY_LONG:
+                return True
+            i += 0 if has_value or option not in GREP_LONG_VALUES else 1
+            continue
+        if not arg.startswith("-") or arg == "-":
+            continue
+        for at, letter in enumerate(arg[1:], start=1):
+            if letter in early:
+                return True
+            if letter in values:
+                i += 0 if arg[at + 1 :] else 1
+                break
+    return False
+
+
+def head_counts(args: list[str]) -> list[str]:
+    """The counts a head's options give, as written: `-n 5`, `-qn-1`, `--lines=4`,
+    `-c 10`. The old `-5` gives none, and stops early as any count but a negative."""
+    counts, i = [], 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg.startswith(("--lines", "--bytes")):
+            _, has_value, value = arg.partition("=")
+            if not has_value:
+                value = args[i] if i < len(args) else ""
+                i += 1
+            counts.append(value)
+        elif arg.startswith("-") and not arg.startswith("--"):
+            for at, letter in enumerate(arg[1:], start=1):
+                if letter in "nc":
+                    value = arg[at + 1 :]
+                    if not value:
+                        value = args[i] if i < len(args) else ""
+                        i += 1
+                    counts.append(value)
+                    break
+    return counts
+
+
+def sed_scripts(args: list[str]) -> list[str]:
+    """The scripts a sed runs: each -e or --expression, else its first operand. A
+    script in a file (-f) isn't read."""
+    scripts, operands, i = [], [], 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            operands += args[i:]
+            break
+        if arg.startswith("--"):
+            option, has_value, value = arg.partition("=")
+            if option in ("--expression", "--file", "--line-length") and not has_value:
+                value = args[i] if i < len(args) else ""
+                i += 1
+            if option == "--expression":
+                scripts.append(value)
+            elif option == "--file":
+                return []
+            continue
+        if not arg.startswith("-") or arg == "-":
+            operands.append(arg)
+            continue
+        for at, letter in enumerate(arg[1:], start=1):
+            if letter in "efl":
+                value = arg[at + 1 :]
+                if not value:
+                    value = args[i] if i < len(args) else ""
+                    i += 1
+                if letter == "e":
+                    scripts.append(value)
+                elif letter == "f":
+                    return []
+                break
+            if letter == "i":
+                break  # -i takes the rest of its cluster as a suffix
+    return scripts or operands[:1]
+
+
+def sed_quits(script: str) -> bool:
+    """Whether a sed script holds a q or Q command. It reads sed's syntax, command by
+    command: addresses, then the command, then its arguments, which may hold a q."""
+    i, end = 0, len(script)
+    while i < end:
+        if script[i] in " \t\n;{}!":
+            i += 1
+            continue
+        if script[i] == "#":
+            i = line_end(script, i)
+            continue
+        start = i
+        i = skip_address(script, i)
+        address = script[start:i]
+        while i < end and script[i] in " \t!":
+            i += 1
+        if i >= end:
+            break
+        command = script[i]
+        i += 1
+        if command in "qQ" and address != "$":  # at the last line it read all
+            return True
+        if command in "sy":
+            if i < end:  # s/regex/replacement/flags or y/from/to/
+                delimiter = script[i]
+                i = skip_delimited(script, i + 1, delimiter)
+                i = skip_delimited(script, i, delimiter)
+            while i < end and script[i] not in ";}\n":
+                if script[i] == "w":
+                    i = line_end(script, i)
+                    break
+                i += 1
+        elif command in "aicrRwWe":
+            i = line_end(script, i)
+        elif command in "btTv:":
+            while i < end and script[i] not in ";\n":
+                i += 1
+    return False
+
+
+def line_end(script: str, i: int) -> int:
+    """Where the line holding `i` ends, a line ended by a backslash running on."""
+    while i < len(script) and script[i] != "\n":
+        i += 2 if script[i] == "\\" else 1
+    return i
+
+
+def skip_delimited(script: str, i: int, delimiter: str) -> int:
+    """Past the text from `i` to the next unescaped `delimiter`, and the delimiter."""
+    while i < len(script) and script[i] != delimiter:
+        i += 2 if script[i] == "\\" else 1
+    return i + 1
+
+
+def skip_address(script: str, i: int) -> int:
+    """Past the address in front of a sed command, if any: one, or two around a comma."""
+    i = skip_one_address(script, i)
+    if script[i : i + 1] == ",":
+        i = skip_one_address(script, i + 1)
+    return i
+
+
+def skip_one_address(script: str, i: int) -> int:
+    """Past a line number (or first~step, +N, ~N), $, /regex/ or \\cregexc, with its
+    flags."""
+    end = len(script)
+    if i < end and script[i] in "+~":
+        i += 1
+    if i < end and script[i].isdigit():
+        while i < end and (script[i].isdigit() or script[i] == "~"):
+            i += 1
+        return i
+    if i < end and script[i] == "$":
+        return i + 1
+    if i < end and script[i] == "/":
+        i = skip_delimited(script, i + 1, "/")
+    elif i + 1 < end and script[i] == "\\":
+        i = skip_delimited(script, i + 2, script[i + 1])
+    else:
+        return i
+    while i < end and script[i] in "IM":
+        i += 1
+    return i
+
+
+def awk_program(args: list[str]) -> str | None:
+    """The program an awk runs: its first operand. None when it comes from a file
+    (-f), which isn't read."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            break
+        if not arg.startswith("-") or arg == "-":
+            return arg
+        if arg in ("-f", "--file") or arg.startswith("--file="):
+            return None
+        if arg in ("-F", "-v"):
+            i += 1
+    return args[i] if i < len(args) else None
+
+
+def awk_exits(program: str) -> bool:
+    """Whether an awk program holds `exit` outside an END block, its strings and its
+    regular expressions aside."""
+    code = awk_code(program)
+    while found := re.search(r"\bEND\s*\{", code):
+        depth, i = 0, found.end() - 1
+        while i < len(code):
+            depth += {"{": 1, "}": -1}.get(code[i], 0)
+            i += 1
+            if depth == 0:
+                break
+        code = code[: found.start()] + code[i:]
+    return re.search(r"\bexit\b", code) is not None
+
+
+def awk_code(program: str) -> str:
+    """An awk program with its strings, regular expressions and comments blanked out.
+    A `/` opens a regular expression where an operand may start: first, at a line's
+    start, or after an operator or an opening bracket."""
+    out, i, last = [], 0, ""
+    while i < len(program):
+        char = program[i]
+        if char == "#":
+            end = program.find("\n", i)
+            i = len(program) if end == -1 else end
+            continue
+        if char == '"' or char == "/" and (not last or last in "({[,;!~&|=<>?:+-*%^\n"):
+            end = i + 1
+            while end < len(program) and program[end] != char:
+                end += 2 if program[end] == "\\" else 1
+            out.append(" ")
+            i = end + 1
+            last = "x"
+            continue
+        out.append(char)
+        if not char.isspace() or char == "\n":
+            last = char
+        i += 1
+    return "".join(out)
+
+
+class Lint(NamedTuple):
+    """What linting one script found: (line, stage) for each stage that can stop
+    reading early, lines counted from 1; and whether all of it parsed."""
+
+    findings: list[tuple[int, str]]
+    parsed_whole: bool
+
+
+def lint(text: bytes) -> Lint:
+    """Lint one script: nothing unless it sets pipefail."""
+    lines = text.split(b"\n")
+    root = parse(text)
+    if not sets_pipefail(root):
+        return Lint([], True)
+    found = []
+    for node in nodes(root):
+        if node.type != "pipeline" or status_unread(node):
+            continue
+        # The marker on the stage's line, the pipeline's last, or the line above it.
+        marked = {node.start_point.row - 1, node.end_point.row}
+        for stage in readers(node):
+            rows = marked | {stage.start_point.row}
+            if any(IGNORE in lines[row] for row in rows if row >= 0):
+                continue
+            if stops_early(words_of(stage)):
+                first = stage.text.decode(errors="replace").split("\n")[0]
+                found.append((stage.start_point.row + 1, first))
+    return Lint(found, not root.has_error)
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    if not argv:
+        print(
+            "pipefail-lint: give the files to check (pipefail-lint -h)", file=sys.stderr
+        )
+        return 2
+    status, found = 0, False
+    for name in argv:
+        path = Path(name)
+        try:
+            text = path.read_bytes()
+        except OSError as error:
+            print(f"pipefail-lint: {name}: {error.strerror}", file=sys.stderr)
+            status = 2
+            continue
+        if not is_shell_script(path, text):
+            continue
+        result = lint(text)
+        if not result.parsed_whole:
+            print(
+                f"pipefail-lint: {name}: part of it didn't parse as a shell script, so a"
+                " finding there may be missed or on the wrong line",
+                file=sys.stderr,
+            )
+        for line, stage in result.findings:
+            print(f"{name}:{line}: `{stage}` can stop reading early")
+            found = True
+    if found:
+        print(FIX, file=sys.stderr)
+    return status or int(found)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

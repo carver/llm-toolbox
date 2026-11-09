@@ -48,7 +48,7 @@ from shellparse import (
     is_help,
     prepare,
     reads_stdin,
-    shell_options,
+    set_pipefail,
     shell_script,
 )
 
@@ -140,15 +140,6 @@ def shell_pipefail(words: list[str]) -> bool:
     """Whether a shell command starts its shell with pipefail on (-o pipefail)."""
     words, _ = command_of(words)
     return set_pipefail(words[1:], False)
-
-
-def set_pipefail(args: list[str], pipefail: bool) -> bool:
-    """``pipefail`` after set's or a shell's options ``args``: -o pipefail turns it on,
-    as does a cluster such as -euo pipefail, and +o pipefail off."""
-    for option, values in shell_options(args)[0]:
-        if "o" in option and "pipefail" in values:
-            pipefail = option[0] == "-"
-    return pipefail
 
 
 def main(argv=None) -> int:

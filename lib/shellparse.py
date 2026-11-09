@@ -12,8 +12,9 @@ left open, is split without regard to quotes; parses() says whether shlex can.
 command_of() finds the command a simple command runs, past variable settings, keywords
 such as `if` and `do`, and wrappers such as timeout, nice, env, sudo and xargs, whose
 options it reads with split_options(). Then SHELLS names the shells: shell_script()
-finds the script one runs with -c, and reads_stdin() says whether it reads its script
-from stdin. commit_args() finds the arguments of a `git commit`, bgrun_command() reads
+finds the script one runs with -c, reads_stdin() says whether it reads its script
+from stdin, and set_pipefail() whether set's or a shell's options turn pipefail on.
+commit_args() finds the arguments of a `git commit`, bgrun_command() reads
 bgrun's, and is_help() spots an option that asks for help.
 """
 
@@ -410,6 +411,15 @@ def shell_options(args: list[str]) -> tuple[list[tuple[str, list[str]]], list[st
         options.append((option, args[i : i + taken]))
         i += taken
     return options, args[i:]
+
+
+def set_pipefail(args: list[str], pipefail: bool) -> bool:
+    """``pipefail`` after set's or a shell's options ``args``: -o pipefail turns it on,
+    as does a cluster such as -euo pipefail, and +o pipefail off."""
+    for option, values in shell_options(args)[0]:
+        if "o" in option and "pipefail" in values:
+            pipefail = option[0] == "-"
+    return pipefail
 
 
 def shell_flags(words: list[str]) -> tuple[str, list[str]] | None:

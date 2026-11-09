@@ -145,3 +145,36 @@ def test_without_uv_it_says_to_install_uv(repo, tmp_path_factory):
     result = hook(repo, env={"PATH": str(bare)})
     assert result.returncode != 0
     assert "install uv" in result.stderr
+
+
+EARLY_READER = "#!/bin/bash\nset -euo pipefail\ngh api x | grep -qx main\n"
+
+
+def test_a_staged_shell_script_with_an_early_reader_under_pipefail_is_refused(repo):
+    stage(repo, EARLY_READER, "ops/tags")
+    stage(repo, "x = 1\n")
+
+    result = hook(repo)
+
+    assert result.returncode != 0
+    assert "ops/tags:3: `grep -qx main`" in result.stdout
+    assert "COMMIT REFUSED" in result.stderr
+
+
+def test_the_lint_reads_whats_staged_not_the_work_tree(repo):
+    stage(repo, EARLY_READER, "tags.sh")
+    (repo / "tags.sh").write_text("#!/bin/bash\nset -euo pipefail\nout=$(gh api x)\n")
+
+    result = hook(repo)
+
+    assert result.returncode != 0
+    assert "tags.sh:3:" in result.stdout
+
+
+def test_an_early_reader_only_in_the_work_tree_passes(repo):
+    stage(repo, "#!/bin/bash\nset -euo pipefail\nout=$(gh api x)\n", "tags.sh")
+    (repo / "tags.sh").write_text(EARLY_READER)
+
+    result = hook(repo)
+
+    assert result.returncode == 0, result.stdout + result.stderr

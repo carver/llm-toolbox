@@ -13,6 +13,16 @@ fi
 export GIT_LITERAL_PATHSPECS=1 # a file name such as a[1].py is a name, not a pattern
 tree=$(mktemp -d)
 trap 'rm -rf "$tree"' EXIT
+# Pipelines under pipefail whose reader can stop early, in the staged copy of each staged
+# file that names pipefail, so a commit without one never starts the lint's uv
+# environment; pipefail-lint skips what isn't a shell script (bin/pipefail-lint -h).
+lint="$(cd "$(dirname "$0")/.." && pwd)/bin/pipefail-lint"
+mkdir "$tree/lint"
+git diff --cached --name-only --diff-filter=ACMR -z | git checkout-index -z --stdin --prefix="$tree/lint/"
+if ! (cd "$tree/lint" && find . -type f -exec grep -lZ pipefail {} + | sed -z 's|^\./||' | xargs -0r "$lint"); then
+  echo "COMMIT REFUSED: pipefail-lint failed on the staged shell scripts (above)" >&2
+  exit 1
+fi
 # Check a snapshot of what's staged, not the working tree.
 check() {
   rm -rf "$tree/staged"

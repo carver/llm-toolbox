@@ -112,6 +112,34 @@ as a build.
 Measured in the first entry: the same throughput as one lane, with each job 1.5 to
 2.6 times slower.
 
+## pipefail-lint
+
+### tree-sitter-bash, repaired where it runs lines together (2026-11-09)
+
+A finding names its line, and `lib/shellparse.py`, which the gates share, keeps no
+positions: it joins continued lines and drops heredoc bodies. bashlex failed on 71 of
+the workspace's 144 shell scripts (case patterns, arithmetic, heredocs). tree-sitter-bash
+(0.23.3, the same in 0.25.1) parses all 144 without an error node, but misreads two
+shapes without a word, which hid findings:
+
+- After a pipeline of three stages or more, it runs the next line into the pipeline's
+  last command when that line holds `&&` or `||`, or a heredoc follows. A newline
+  between two words of a simple command, not after a backslash, can't be one bash
+  reads that way, so the lint puts a `;` after the first word and parses again.
+- It reads `a | b | c || d` as `a | (b | c || d)`. The lint takes a list it finds as
+  a pipeline's stage for that list's first command, and reads the `||` as the whole
+  pipeline's.
+
+tree-sitter 0.25.2 has wheels for Python 3.14; 0.24.0 doesn't, and would need a C build
+where uv picks the system Python.
+
+### Only files that name pipefail reach it in the commit hook (2026-11-09)
+
+The lint runs in `uv run --script`, which resolves its environment before the script
+can skip a file. The hook passes only staged files whose text holds `pipefail`, so a
+commit that stages none never starts it. This repo's README and docs name it, so a
+commit to them does start it: 0.05 s with uv's cache warm, PyPI with it cold.
+
 ## wt-ship and the commit checks
 
 The owner's rule: every commit that reaches remote main passes the full check.

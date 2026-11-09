@@ -147,6 +147,20 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   docstring or comment otherwise means rewrapping by hand. It lists the lines
   still too long (code, strings, kept examples) and exits 1 while any is left.
   `--check` reports without writing.
+- **pipefail-lint**: `pipefail-lint FILE...` flags, in each shell script that
+  sets pipefail, a pipeline stage that can stop reading its input early (`grep
+  -q`, `-m`, `-l`, `head`, sed's `q`, awk's `exit` outside END, `read`,
+  `cmp`): the writer may die of SIGPIPE, which fails the pipeline under
+  pipefail, now and then. filedrawer's `gh api ... | grep -qx main` took the
+  wrong branch in 11 of 400 runs that way, and shellcheck has no rule for it.
+  One `FILE:LINE:` line per finding, and the fix: capture first, `out=$(cmd)`,
+  then `grep -q ... <<<"$out"`. A pipeline whose status nothing reads (`||
+  true`, `local x=$(...)`, a command's `$(...)` word, `<(...)`) is spared,
+  and `# pipefail-lint: ignore` on one of its lines, or the line above,
+  spares one it flags wrongly. Files that aren't shell scripts (by name or
+  shebang) are skipped, so a hook can pass every staged file; this repo's
+  pre-commit hook lints the staged ones that name pipefail. It parses with
+  tree-sitter-bash, through `uv run --script`.
 - **mutate-check**: `mutate-check -- CMD` breaks code briefly with apply-edits
   blocks from stdin, runs CMD (a test run), and puts every file back, also when
   stopped. It exits 0 when CMD failed (the tests catch the break) and 1 when it
@@ -648,7 +662,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 It checks what's staged, running the tests in parallel (`pytest.ini`; `pytest -n0 FILE` runs one file
 without the few seconds of starting the workers) in a copy of the index outside any git checkout, so a
 test that passes in the repo but reads its git state fails there. `install.py` points git at `.githooks`. Its
-`pre-commit` runs the two ruff checks on what's staged. When only formatting fails, it formats each staged file that has no unstaged changes,
+`pre-commit` runs `pipefail-lint` on the staged files that name pipefail, then the two ruff checks on what's staged. When only formatting fails, it formats each staged file that has no unstaged changes,
 stages the result and names the file; any other unformatted file refuses the commit, as does every
 file of a `git commit PATH`. `agent-pre-commit` adds the tests (about half a minute, most of it build-paper's builds);
 `wt-ship` runs it on each commit when it lands. Both run the tools

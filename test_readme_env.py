@@ -1,7 +1,9 @@
 """Every env var a bin/ tool's -h names, its README entry names too.
 
 A tool is documented twice, in its docstring (what -h prints) and in README.md,
-and an edit to one is easy to leave out of the other."""
+and an edit to one is easy to leave out of the other. A tool that is a link to
+another, such as claude-json to claude-fresh, prints its target's docstring and
+answers to its target's entry."""
 
 import ast
 import re
@@ -48,11 +50,12 @@ def readme_entry(name: str) -> str:
 @pytest.mark.parametrize("tool", TOOLS, ids=lambda p: p.name)
 def test_readme_names_every_env_var_the_help_names(tool):
     docstring = ast.get_docstring(ast.parse(tool.read_text(encoding="utf-8"))) or ""
-    entry = readme_entry(tool.name)
+    entry_name = tool.resolve().name
+    entry = readme_entry(entry_name)
     missing = sorted(
         {v for v in env_vars(docstring) if not re.search(rf"\b{v}\b", entry)}
     )
-    assert not missing, f"README's {tool.name} entry doesn't name {missing}"
+    assert not missing, f"README's {entry_name} entry doesn't name {missing}"
 
 
 @pytest.mark.parametrize(

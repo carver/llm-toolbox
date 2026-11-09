@@ -234,6 +234,29 @@ post-rewrite), and a prepare-commit-msg hook can change a folded commit's messag
 hook files were never in the fingerprint, so a hook added under the old path ran
 unguarded too.
 
+### wt-ship refuses a message naming an unlanded commit by its ID (2026-11-09)
+
+In a filedrawer session, commit messages cited `cc417d7`, a commit of the same
+unlanded range; rebases rewrote it, and the messages were reworded by hand. The
+owner's rule: before any check, a word of a commit message that resolves (`git
+rev-parse --verify --quiet WORD^{commit}`) to a commit of this repo that the branch
+being landed onto doesn't hold, once the rebase is done, refuses the landing, one line
+per commit and word, naming `build-state reword SHA`. A hex word that resolves to no
+commit here is ignored.
+
+- Words of 7 to 64 lowercase hex digits count. 7 is git's default abbreviation, and
+  `cc417d7` is 7 long; a word that isn't an ID would have to match the start of one of
+  the repo's commits by chance (about N in 268 million, for N commits) and that commit
+  be off the branch. Shorter words are mostly English (added, decade).
+- A commit of the same landing is refused too, though its ID would hold if nothing
+  rebased again: a lost push race, or the branch moving under the claim, rebases it.
+- It runs after every rebase, so with --local before the wait for the main tree.
+
+Left to the owner (a review of the plan found them): worktrees share one object store,
+so another session's unlanded commit, a PR topic commit or a `cherry-pick -x` source
+resolves here and is refused though its ID will last; and `build-state reword` refuses
+a commit a remote-tracking branch holds, as after a push for CI.
+
 ### Rejected: `wt-ship --check CMD` (removed in 9927dd7)
 
 Nothing used it. It came with wt-ship's first version, for a repo that had no

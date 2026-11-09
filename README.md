@@ -196,7 +196,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   markers.
 - **wt-ship**: ships a worktree's commits. In a repo that pushes, it rebases
   onto the remote branch (the main tree's, by default), refuses leftover
-  conflict markers, and checks every commit it would push with the repo's
+  conflict markers, refuses a commit message that names, by its ID, a commit
+  the branch doesn't hold (7 to 64 hex digits that resolve to a commit here),
+  since a rebase changes an unlanded commit's ID (`build-state reword SHA`
+  rewords it), and checks every commit it would push with the repo's
   `agent-pre-commit`, through `agent-commit-gate --run`, which hands each the
   `CHECK_BASE` of the commit before or the main branch's tip: each commit with
   no pass on record, oldest first, checked out in turn in the worktree, first

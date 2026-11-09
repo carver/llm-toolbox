@@ -1851,3 +1851,107 @@ def test_local_sees_the_old_path_of_a_file_the_landing_renames(setup):
 
     assert done.returncode == 4, done.stderr
     assert not log.exists()
+
+
+def cite(wt, path, cited, length=7):
+    """Commit in `wt` with a message naming commit `cited` by its first `length` hex
+    digits, as an agent naming the commit it follows up does."""
+    return commit(
+        wt,
+        path,
+        "y = 2\n",
+        f"Follow up on {cited[:length]}\n\nAs {cited[:length]}'s test asked.",
+    )
+
+
+@pytest.mark.parametrize("length", [7, 12, 40])
+@pytest.mark.parametrize("args", [(), ("--local",)])
+def test_a_message_citing_an_unlanded_commit_is_refused_before_any_check(
+    setup, args, length
+):
+    origin, main, wt, _ = setup
+    ran = main.parent / "ran"
+    install_hook(main, "agent-pre-commit", f'echo check >> "{ran}"')
+    before = remote_main(origin), main_head(main)
+    first = commit(wt, "a.py", "x = 1\n", "Add a")
+    citing = cite(wt, "b.py", first, length)
+
+    done = ship(wt, *args)
+
+    assert done.returncode == 1
+    [line] = [ln for ln in done.stderr.splitlines() if first[:length] in ln]
+    assert citing[:12] in line and f"build-state reword {citing[:12]}" in line
+    assert not ran.exists()  # refused before any check ran
+    assert (remote_main(origin), main_head(main)) == before
+
+
+def test_a_rebase_that_rewrites_the_cited_commit_is_refused_too(setup):
+    _, main, wt, _ = setup
+    first = commit(wt, "a.py", "x = 1\n", "Add a")
+    cite(wt, "b.py", first)
+    commit(main, "c.py", "z = 3\n", "Theirs")  # so the landing rebases, rewriting both
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1
+    assert first[:7] in done.stderr and "build-state reword" in done.stderr
+    assert main_head(main) != git(wt, "rev-parse", "HEAD")
+
+
+def test_hex_words_that_name_no_unlanded_commit_pass(setup):
+    _, main, wt, _ = setup
+    landed = main_head(main)
+    tree = git(main, "rev-parse", "HEAD^{tree}")
+    commit(
+        wt,
+        "a.py",
+        "x = 1\n",
+        f"Add a\n\nAfter {landed[:7]} and {landed}, which main holds; not deadbeef1,"
+        f" a decade added, cafe, nor the tree {tree[:7]}.",
+    )
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+
+
+BUILD_STATE = SCRIPT.parent / "build-state"
+
+
+def test_the_reword_commands_it_lists_work_in_the_order_listed(setup):
+    _, _, wt, _ = setup
+    first = commit(wt, "a.py", "x = 1\n", "Add a")
+    second = cite(wt, "b.py", first)
+    third = commit(wt, "c.py", "z = 3\n", f"Fix {first[:7]} and {second[:7]}")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1
+    fixes = [ln for ln in done.stderr.splitlines() if ln.startswith("  ")]
+    assert [ln.split()[0] for ln in fixes] == [third[:12], second[:12]]
+    assert first[:7] in fixes[0] and second[:7] in fixes[0]
+    for line in fixes:
+        sha = line.rsplit(maxsplit=1)[-1]
+        reword = subprocess.run(
+            [str(BUILD_STATE), "reword", sha],
+            input="Reworded\n",
+            cwd=wt,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert reword.returncode == 0, reword.stderr
+
+
+@pytest.mark.parametrize(
+    "words", ["{id6} only", "x{id7} and {id7}_ and {id7}x"], ids=["six", "not alone"]
+)
+def test_a_cited_id_counts_only_from_7_digits_and_standing_alone(setup, words):
+    _, _, wt, _ = setup
+    first = commit(wt, "a.py", "x = 1\n", "Add a")
+    message = words.format(id6=first[:6], id7=first[:7])
+    commit(wt, "b.py", "y = 2\n", f"Follow up\n\n{message}")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr

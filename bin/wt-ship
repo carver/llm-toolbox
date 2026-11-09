@@ -17,7 +17,16 @@ In order, it:
    rebases onto it, folding them (autosquash). A conflict stops it with the rebase in
    progress: resolve the hunks (`conflicts -h`), finish with `conflicts --continue`,
    then run it again;
-3. refuses leftover conflict markers in what it would push;
+3. refuses leftover conflict markers in what it would push, and a commit message that
+   names, by its ID, a commit the branch doesn't hold, as when a message cites an
+   earlier commit of the same landing, whose ID a rebase changes: a word of 7 to 64
+   lowercase hex digits that `git rev-parse --verify WORD^{commit}` resolves to a
+   commit the branch doesn't hold, whether from before a rebase or after it. A hex
+   word that resolves to no commit here, such as another repo's commit, is ignored.
+   It lists each such commit with the IDs it names, newest first, and the fix for
+   each, `build-state reword SHA`, to name the commit by its subject instead, run in
+   the order listed. This runs after every rebase, so before any check, and with
+   --local before the wait;
 4. checks every commit it would push with the repo's agent-pre-commit hook, else none,
    and says so: each commit whose tree has no pass of the check, as its bytes are now,
    on agent-commit-gate's record, HEAD included, oldest first, each checked out in
@@ -98,6 +107,7 @@ moving under the claim each time (run it again later).
 
 import argparse
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -313,6 +323,9 @@ REJECTED = (
 
 
 FIXUP_PREFIXES = ("fixup! ", "squash! ", "amend! ")
+# A word of a commit message that may be a commit's ID: 7 to 64 hex digits, alone.
+# git abbreviates to 7 by default; shorter words are mostly English (added, decade).
+COMMIT_ID = re.compile(r"(?<![0-9A-Za-z_])[0-9a-f]{7,64}(?![0-9A-Za-z_])")
 # How many times a push may lose a race to another session's, each followed by a
 # rebase and the check, before wt-ship gives up; the same for a landing whose branch
 # moves during the check.
@@ -347,9 +360,57 @@ def prepare(upstream, mode):
     run_checks(upstream, mode)
 
 
+def stale_citations(upstream):
+    """(commit, words) for each commit since upstream, newest first, whose message
+    names, by ID, commits of this repo that upstream doesn't hold: IDs a rebase will
+    change, or has changed already."""
+    found = []
+    log = out("log", "-z", "--format=%H%n%B", f"{upstream}..HEAD")
+    for entry in filter(None, log.split("\0")):
+        sha, _, message = entry.partition("\n")
+        words = dict.fromkeys(COMMIT_ID.findall(message))
+        if unheld := [word for word in words if names_unheld(word, upstream)]:
+            found.append((sha, unheld))
+    return found
+
+
+def names_unheld(word, upstream):
+    """Whether `word` resolves to a commit of this repo that upstream doesn't hold. A
+    partial clone would fetch an ID it lacks from its remote; it may not."""
+    resolved = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{word}^{{commit}}"],
+        env=os.environ | {"GIT_NO_LAZY_FETCH": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return resolved.returncode == 0 and not is_ancestor(
+        resolved.stdout.strip(), upstream
+    )
+
+
+def refuse_stale_citations(upstream, mode):
+    """Stop when a commit message names, by ID, a commit upstream doesn't hold."""
+    if found := stale_citations(upstream):
+        raise Stop(
+            f"These commit messages name, by ID, commits {short(upstream)} doesn't"
+            " hold, and a rebase changes an unlanded commit's ID. Name each by its"
+            " subject instead, with `build-state reword SHA` and the new message on"
+            " stdin, newest commit first, as listed: rewording a commit changes the IDs"
+            " of those after it.\n"
+            + "\n".join(
+                f"  {named(sha)}: names {', '.join(words)}; build-state reword"
+                f" {sha[:12]}"
+                for sha, words in found
+            )
+            + f"\nThen run `{RERUN}` again; nothing was {mode.done}."
+        )
+
+
 def rebase_onto(upstream, mode):
     """Rebase onto upstream when HEAD lacks it, holds fixups to fold, or (--local)
-    holds commits the branch dropped; refuse markers."""
+    holds commits the branch dropped; refuse markers, and messages that name a commit
+    upstream doesn't hold."""
     skipped = not_replayed(upstream) if mode.fork_point else []
     if skipped:
         print(
@@ -362,6 +423,7 @@ def rebase_onto(upstream, mode):
     if skipped or has_fixups(upstream) or not is_ancestor(upstream, "HEAD"):
         rebase(upstream, mode)
     markers(upstream)
+    refuse_stale_citations(upstream, mode)
 
 
 def rebase_and_check(remote, branch):

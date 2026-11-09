@@ -32,6 +32,7 @@ Review holds the code to [standards.md](standards.md), in the same order, and a 
 Make logically isolated commits.
 Before every commit or amend, check `git diff --cached --stat`. Unstage anything you didn't write: the user may have edits in progress in the same tree.
 Read a commit's whole output, or check its exit status: when a hook fails, nothing is committed, and a `| tail` can hide that. The agent check prints one line when it passes and ends with `COMMIT REFUSED` when it fails, so there's no output worth filtering. Chain a series of commits with `&&`, never `;`: after a refused commit, the next one sweeps in what was staged for it.
+In a commit message, name an unlanded commit by its subject, not its ID: a rebase changes the ID, and `wt-ship` refuses a message that names, by its ID, a commit its branch doesn't hold.
 Before an unpushed branch is merged, fold fixes into the commits they fix (`git commit --fixup=<sha>`, then `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash <base>`; plain interactive rebase isn't available here). History shouldn't show detours.
 
 Before you start a change, and again on the finished diff, judge its merge danger:

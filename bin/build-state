@@ -56,15 +56,22 @@ fold may rewrite (after the base it folds from, in HEAD's history), or when wher
 pointed at start can no longer be read: a tag CI made on main, which a fetch brings in,
 doesn't. When either changed since start, finish names the refs and config
 keys (never config values: a remote URL can hold a token), exits 1 and keeps the state,
-before folding anything. A fix commit left unfolded (its target is older than the base)
-also fails finish. It does not push.
+before folding anything. Two kinds of config key it only names, saying to tell the
+user, and goes on: core.hooksPath (the hooks a fold runs can't change its trees,
+which finish checks after, and hook files were never in the fingerprint) and a
+branch's settings, for any branch but the build's own. Another session's install.py
+set core.hooksPath during a build. A fix commit left unfolded (its target is older than
+the base) also fails finish. It does not push.
 
 On a detached HEAD, as in a worktree that will land on main, there is no work branch.
-There the build's target is the branch the main worktree has checked out, when it's
-behind or ahead of the base; otherwise every branch at the base. A target counts
-locally and on every remote (refs/heads/X, refs/remotes/*/X). Another session's merge
+There the build's target is the branch the main worktree has checked out, when HEAD
+shares history with it: it forked from it, as a worktree holding a commit of its own
+does once another session lands, or is behind or ahead of it. Otherwise it's every
+branch at the base. A target counts locally and on every remote (refs/heads/X,
+refs/remotes/*/X). Another session's merge
 or push moves it, so a moved target doesn't fail finish: it finishes as usual, then
-says "X moved since start: rebase onto it" while HEAD lacks one of its commits.
+says "X moved since start", adding ": rebase onto it" while HEAD lacks one of its
+commits.
 """
 
 import argparse
@@ -135,10 +142,11 @@ def ancestor(older: str, newer: str) -> bool:
 
 
 def target_branches(base: str) -> list[str]:
-    """The branches a detached build will land on: the main worktree's branch when it's
-    behind or ahead of the base, else every branch at the base, local or remote."""
+    """The branches a detached build will land on: the main worktree's branch when HEAD
+    shares history with it (forked from it, or behind or ahead of it), else every
+    branch at the base, local or remote."""
     main = main_tree_branch()
-    if main and (ancestor(base, main) or ancestor(main, base)):
+    if main and meets(f"refs/heads/{main}"):
         return [main]
     listed = git("for-each-ref", "--format=%(refname) %(objectname)").stdout
     return sorted(
@@ -163,10 +171,14 @@ def rewritten_base(targets: set[str]) -> tuple[str, str] | None:
         *((name, f"refs/heads/{name}") for name in sorted(targets)),
         *([(upstream, upstream)] if upstream else []),
     ]:
-        meet = git("merge-base", "HEAD", ref, check=False).stdout.strip()
-        if meet:
+        if meet := meets(ref):
             return branch, meet
     return None
+
+
+def meets(ref: str) -> str:
+    """Where HEAD's history meets `ref`'s (their merge base); empty when it doesn't."""
+    return git("merge-base", "HEAD", ref, check=False).stdout.strip()
 
 
 def behind(branch: str) -> bool:
@@ -239,6 +251,19 @@ def on_work_commit(name: str, before: str | None, work: set[str]) -> bool:
     if before and not peeled(before):
         return True
     return any(peeled(ref) in work for ref in (name, before) if ref)
+
+
+def only_reported(key: str, work: list[str]) -> bool:
+    """Whether finish only reports a change to config `key`, rather than stopping:
+    core.hooksPath, the owner's call (hooks run in a fold, but its trees are checked
+    after, and hook files were never in the fingerprint), and a branch's settings for
+    any branch but the build's own, whose upstream finish reads."""
+    if key == "core.hookspath":
+        return True
+    if key.startswith("branch.") and key.count(".") >= 2:  # branch.NAME.KEY
+        branch = key.removeprefix("branch.").rpartition(".")[0]
+        return f"refs/heads/{branch}" not in work
+    return False
 
 
 def changes(
@@ -436,9 +461,12 @@ def finish(args: argparse.Namespace) -> int:
     found = None if ancestor(base, "HEAD") else rewritten_base(targets)
     # The commits the fold may rewrite, from where it will start.
     work = set(git("rev-list", f"{found[1] if found else base}..HEAD").stdout.split())
-    moved, moved_targets = [], set()
+    moved, moved_targets, reported = [], set(), []
     for change in changes(state["fingerprint"], fingerprint(state["work_refs"])):
         kind, _, name = change.partition(" ")
+        if kind == "config" and only_reported(name, state["work_refs"]):
+            reported.append(name)
+            continue
         before = state["fingerprint"]["refs"].get(name)
         if name.startswith("refs/tags/") and not on_work_commit(name, before, work):
             continue
@@ -447,6 +475,12 @@ def finish(args: argparse.Namespace) -> int:
             moved_targets.add(branch)
         elif branch not in others:
             moved.append(change)
+    if reported:
+        print(
+            "Config changed since start that finish only reports; tell the user:"
+            f" {', '.join(reported)}",
+            flush=True,
+        )
     if moved:
         return fail(
             "The repo changed outside the work branch since start:",
@@ -494,8 +528,8 @@ def finish(args: argparse.Namespace) -> int:
     if "refactor_base" in state:
         report_tests(state["refactor_base"])
     for branch in sorted(moved_targets):
-        if behind(branch):
-            print(f"{branch} moved since start: rebase onto it")
+        rebase = ": rebase onto it" if behind(branch) else ""
+        print(f"{branch} moved since start{rebase}")
     path.unlink()
     (path.parent / REVIEW_FILE).unlink(missing_ok=True)
     return 0

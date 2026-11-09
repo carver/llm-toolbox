@@ -677,7 +677,23 @@ def test_no_rebase_note_once_head_holds_the_moved_branch(repo, worktree):
     done = build_state(worktree, "finish")
 
     assert done.returncode == 0, done.stderr
-    assert "moved since start" not in done.stdout
+    assert "main moved since start" in done.stdout
+    assert "rebase" not in done.stdout
+
+
+def test_a_target_moved_back_is_still_named(repo, worktree):
+    # A forked build, then main rewound to the fork point: a landing lost.
+    commit(worktree, "own.py", "The owner's commit, not on main")
+    fork = git(repo, "rev-parse", "main").strip()
+    advance(repo, "refs/heads/main")
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    git(repo, "update-ref", "refs/heads/main", fork)
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "main moved since start" in done.stdout
 
 
 def test_a_build_on_a_branch_has_no_targets_beyond_its_branch(repo, tmp_path):
@@ -1171,3 +1187,64 @@ def test_finish_runs_no_check_even_on_a_commit_its_fold_rewrote(repo):
     assert done.returncode == 0, done.stderr
     assert subjects(repo, "HEAD~2") == ["Work", "More"]
     assert not checked.exists()
+
+
+def test_a_base_forked_from_main_still_lands_on_main(repo, worktree):
+    # The owner's commit in the worktree, and another session's landing on main: the
+    # base is neither behind main nor ahead of it.
+    commit(worktree, "own.py", "The owner's commit, not on main")
+    advance(repo, "refs/heads/main")
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    advance(repo, "refs/heads/main")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "main moved since start" in done.stdout
+
+
+def test_a_changed_hooks_path_is_reported_not_a_stop(repo, worktree):
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    git(repo, "config", "core.hooksPath", "/elsewhere/s3cret-hooks")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "core.hookspath" in done.stdout and "tell the user" in done.stdout
+    assert "s3cret" not in done.stdout + done.stderr
+
+
+def test_another_branchs_settings_are_reported_not_a_stop(repo, worktree):
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    git(repo, "config", "branch.topic.remote", "origin")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "branch.topic.remote" in done.stdout
+
+
+def test_a_setting_of_every_branch_still_stops_finish(repo, worktree):
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    git(repo, "config", "branch.autoSetupMerge", "always")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 1
+    assert "branch.autosetupmerge" in done.stderr
+
+
+def test_the_work_branchs_own_settings_still_stop_finish(repo):
+    git(repo, "checkout", "-q", "-b", "work")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    git(repo, "config", "branch.work.merge", "refs/heads/main")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    assert "branch.work.merge" in done.stderr

@@ -211,6 +211,29 @@ file, so every bash a check started had them back (a review of the plan found it
 The other way, a variable the persistent file's secrets block would honour, needs a
 change in sandbox-setup.
 
+### build-state finish stops only for what a fold, or the repo's safety, depends on (2026-11-09)
+
+The fingerprint came from an anki-cards retro (757b220): a subagent's `rebase --exec`
+rewrote the shared config from a worktree unnoticed. In a filedrawer session on
+2026-11-09, finish stopped three times on changes it had no reason to: twice
+`refs/heads/main`, as other sessions landed, and once `core.hooksPath`, which another
+session's install.py set. The build's base was a commit of the owner's in the
+worktree, so main was neither behind nor ahead of it and wasn't the target. Now:
+
+- In a detached build, the main tree's branch is the target whenever HEAD shares
+  history with it (`git merge-base`), so its moves only bring the note to rebase.
+- `core.hooksPath` (the owner's example of a key a fold can't be affected by) and the
+  settings of any branch but the build's own are reported, not a stop; the build
+  skill says to pass the report on to the user.
+- The rest of the config still stops finish. `remote.*` can't change a fold either, but
+  a test leaking into the real repo can point `remote.origin.url` at a temporary repo,
+  which is the damage the fingerprint is for, and wt-ship would push there next.
+
+Hooks do run in a fold (pre-rebase, post-checkout, prepare-commit-msg, post-commit,
+post-rewrite), and a prepare-commit-msg hook can change a folded commit's message, but
+hook files were never in the fingerprint, so a hook added under the old path ran
+unguarded too.
+
 ### Rejected: `wt-ship --check CMD` (removed in 9927dd7)
 
 Nothing used it. It came with wt-ship's first version, for a repo that had no

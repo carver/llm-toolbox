@@ -63,7 +63,7 @@ Run `build-state refactor` to record the **refactor base**. Apply the Fix list, 
 ## 6. Verify
 
 - Run the repo's checks, unless its commit hook runs them: then each commit ran them, and wt-ship runs the full check on every commit when it lands.
-- Run `build-state finish`. It folds each `fixup!` commit into the commit it fixes and leaves every other commit separate, then lists the commits since the base and the test files changed since the refactor base. It runs no check: a commit a fold rewrote gets its check from wt-ship. When it fails because a ref or config key moved, find what changed and tell the user before anything else.
+- Run `build-state finish`. It folds each `fixup!` commit into the commit it fixes and leaves every other commit separate, then lists the commits since the base and the test files changed since the refactor base. It runs no check: a commit a fold rewrote gets its check from wt-ship. When it fails because a ref or config key moved, or reports a config key that changed, find what changed and tell the user before anything else.
 - Read `git diff <refactor base>..HEAD` for each listed test file. Every test change must trace to a finding; a loosened assertion or deleted test that keeps things green is a failure to undo.
 - The commit list shows logically isolated commits.
 - Push now, if the repo pushes: the change is reviewed and refactored.

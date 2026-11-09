@@ -12,7 +12,7 @@ Also look for important conventions in the repositories that might be ill-formed
 
 ## 1. Mine the history
 
-Walk the whole transcript, first turn to last. Your context holds only a subagent's final report, so read its work in `session-digest`'s output: each subagent's tool calls, errors and retries, and what every agent and tool cost. Collect every instance of:
+Walk the whole transcript, first turn to last. Your context holds only a subagent's final report, so start from `session-digest --errors`: what every agent and tool cost, the user's turns, and each agent's failed calls, hooks and background tasks. To drill into one agent, such as its retries or what it tried before a failure, write the full digest (no flag; `--timelines` adds workflow agents) to your scratchpad and read that agent's section, from its `== <agent>` line. Collect every instance of:
 
 - **Mistakes**: wrong assumptions, retracted answers, reverted edits, user corrections.
 - **Waste**: dead ends, oversized reads or outputs, searches that took several tries to land.

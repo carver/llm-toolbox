@@ -344,7 +344,8 @@ def test_workflow_agent_errors_are_printed_in_full(workflow_config: Path) -> Non
         / "subagents"
         / "workflows"
     )
-    long_error = "trace line\n" + "detail " * 200 + "\nlast line of the error"
+    # Past the timeline's 400-character cut, within the 1000 an error prints whole.
+    long_error = "trace line\n" + "detail " * 100 + "\nlast line of the error"
     write_jsonl(
         run / "wf_abc123" / "agent-w9.jsonl",
         [
@@ -550,3 +551,264 @@ def test_workflow_agent_hook_errors_print_with_their_call(
     lines = [line.strip() for line in section.splitlines()]
     call = lines.index("> Bash: echo fine")
     assert lines[call + 1] == "HOOK ERROR PreToolUse:Bash bin/gate: gate broke"
+
+
+QUIET = [
+    user("Look around"),
+    assistant("q1", {"type": "text", "text": "Listing."}),
+    assistant("q2", tool_use("q3", "Bash", command="ls")),
+    user([result("q3", "a.py")]),
+]
+
+
+@pytest.fixture
+def errors_config(config: Path) -> Path:
+    subagents = config / "projects" / "-work-repo" / "sess1" / "subagents"
+    write_jsonl(subagents / "agent-quiet.jsonl", QUIET)
+    (subagents / "agent-quiet.meta.json").write_text(
+        json.dumps({"agentType": "Explore", "description": "Look around"})
+    )
+    return config
+
+
+def sections(out: str) -> dict[str, list[str]]:
+    """Each agent's section after the summary, by its header line."""
+    found: dict[str, list[str]] = {}
+    for chunk in out.split("\n== ")[1:]:
+        header, *lines = chunk.splitlines()
+        found[header] = [line for line in lines if line]
+    return found
+
+
+def test_errors_prints_the_users_turns_and_failed_calls_in_order(
+    errors_config: Path,
+) -> None:
+    out = sections(digest(errors_config, "--errors"))
+    assert out["main"] == [
+        "USER Fix the flaky test",
+        "  > Read: /repo/missing.py",
+        "    ERROR File does not exist.",
+        "USER No, keep the old name",
+    ]
+
+
+def test_errors_prints_a_subagents_failures_without_its_prompt(
+    errors_config: Path,
+) -> None:
+    out = sections(digest(errors_config, "--errors"))
+    assert out["agent-abc (general-purpose: Implement fix)"] == [
+        "  > Bash: pytest",
+        "    ERROR 1 failed",
+    ]
+
+
+def test_errors_gives_an_agent_with_nothing_to_show_no_section(
+    errors_config: Path,
+) -> None:
+    out = digest(errors_config, "--errors")
+    assert "agent-quiet" in out.split("\n== ")[0]  # its summary row stays
+    assert "== agent-quiet" not in out
+    assert set(sections(out)) == {"main", "agent-abc (general-purpose: Implement fix)"}
+
+
+def test_errors_keeps_the_summary(errors_config: Path) -> None:
+    def summary(out: str) -> str:
+        return out.split("\n== ")[0]
+
+    assert summary(digest(errors_config, "--errors")) == summary(digest(errors_config))
+
+
+def failed_make(tmp_path: Path, error: str) -> list[str]:
+    out = digest(
+        hook_session(
+            tmp_path,
+            [
+                assistant("r1", tool_use("t1", "Bash", command="make boom")),
+                user([result("t1", error, error=True)]),
+            ],
+        ),
+        "--errors",
+    )
+    return sections(out)["main"]
+
+
+def test_errors_prints_an_error_of_up_to_1000_characters_whole(tmp_path: Path) -> None:
+    error = "trace line\n" + "detail " * 100 + "\nlast line of the error"
+    assert failed_make(tmp_path, error) == [
+        "  > Bash: make boom",
+        "    ERROR trace line",
+        "          " + "detail " * 100,
+        "          last line of the error",
+    ]
+
+
+def test_errors_prints_a_longer_errors_first_200_and_last_800_characters(
+    tmp_path: Path,
+) -> None:
+    lines = "".join(f"line {i:04d}\n" for i in range(300))  # 10 characters each
+    error = "Exit code 1\n" + lines + "FAILED test_x"
+    section = "\n".join(failed_make(tmp_path, error))
+    assert "ERROR Exit code 1" in section
+    assert "line 0017" in section  # ends at character 200
+    assert "line 0018" not in section
+    assert f"…[{len(error) - 1000} chars]…" in section
+    assert "line 0221" not in section
+    assert "line 0222" in section  # the last 800: 79 lines and "FAILED test_x"
+    assert section.endswith("FAILED test_x")
+
+
+def test_errors_prints_a_failed_call_where_it_was_made(tmp_path: Path) -> None:
+    out = digest(
+        hook_session(
+            tmp_path,
+            [
+                assistant("r1", tool_use("t1", "Bash", command="make")),
+                task_notice("b2", "failed", "Background command failed"),
+                user([result("t1", "boom", error=True)]),
+            ],
+        ),
+        "--errors",
+    )
+    assert sections(out)["main"] == [
+        "  > Bash: make",
+        "    ERROR boom",
+        "NOTIFY b2 failed: Background command failed",
+    ]
+
+
+def test_errors_prints_failed_hooks_with_their_call_and_where_they_ran(
+    tmp_path: Path,
+) -> None:
+    stop_hook = hook_failed("", "stop hook broke", hookName="Stop", hookEvent="Stop")
+    out = digest(
+        hook_session(
+            tmp_path,
+            [
+                user("Fix it"),
+                assistant("r1", tool_use("t1", "Bash", command="ls")),
+                hook_failed("t1", "gate broke"),
+                user([result("t1", "a.py")]),
+                assistant("r2", tool_use("t2", "Bash", command="pwd")),
+                user([result("t2", "/repo")]),
+                stop_hook,
+            ],
+        ),
+        "--errors",
+    )
+    assert sections(out)["main"] == [
+        "USER Fix it",
+        "  > Bash: ls",
+        "    HOOK ERROR PreToolUse:Bash bin/gate: gate broke",
+        "    HOOK ERROR Stop bin/gate: stop hook broke",
+    ]
+
+
+def notice_text(task: str, status: str, summary: str) -> str:
+    return (
+        f"<task-notification>\n<task-id>{task}</task-id>\n<status>{status}</status>\n"
+        f"<summary>{summary}</summary>\n<result>report</result>\n</task-notification>"
+    )
+
+
+def task_notice(task: str, status: str, summary: str) -> dict:
+    return user(notice_text(task, status, summary))
+
+
+def queued(mode: str | None, prompt: str, **extra: object) -> dict:
+    """A prompt or notification that arrived while the agent worked, which Claude
+    Code logs as an attachment rather than a user turn."""
+    fields = {"commandMode": mode} if mode else {}
+    return {
+        "type": "attachment",
+        "timestamp": "2026-10-02T12:00:00Z",
+        "attachment": {
+            "type": "queued_command",
+            "prompt": prompt,
+            **fields,
+            **extra,
+        },
+    }
+
+
+QUEUED = [
+    user("Fix it"),
+    queued("prompt", "Also check the docs", origin={"kind": "human"}),
+    queued("task-notification", notice_text("b1", "completed", "Tests ran")),
+    queued("task-notification", notice_text("b2", "failed", "Build failed")),
+    queued(
+        None, '<agent-message from="a1">\nScope update</agent-message>', isMeta=True
+    ),
+    queued(
+        "prompt",
+        '<cross-session-message from="s2">\nhi</cross-session-message>',
+        isMeta=True,
+    ),
+]
+
+
+def test_queued_prompts_and_notifications_join_the_timeline(tmp_path: Path) -> None:
+    assert sections(digest(hook_session(tmp_path, QUEUED)))["main"] == [
+        "USER Fix it",
+        "USER Also check the docs",
+        "NOTIFY b1 completed: Tests ran",
+        "NOTIFY b2 failed: Build failed",
+    ]
+
+
+def test_errors_prints_queued_prompts_and_failed_notifications(tmp_path: Path) -> None:
+    out = digest(hook_session(tmp_path, QUEUED), "--errors")
+    assert sections(out)["main"] == [
+        "USER Fix it",
+        "USER Also check the docs",
+        "NOTIFY b2 failed: Build failed",
+    ]
+
+
+def test_errors_prints_notifications_of_tasks_that_did_not_complete(
+    tmp_path: Path,
+) -> None:
+    monitor = user(
+        "<task-notification>\n<task-id>m1</task-id>\n"
+        "<summary>Monitor event: tick</summary>\n</task-notification>"
+    )
+    out = digest(
+        hook_session(
+            tmp_path,
+            [
+                task_notice("b1", "completed", "Background command ran"),
+                task_notice(
+                    "b2", "failed", "Background command failed with exit code 1"
+                ),
+                task_notice("a3", "killed", 'Agent "probe" was stopped by Claude'),
+                monitor,
+            ],
+        ),
+        "--errors",
+    )
+    assert sections(out)["main"] == [
+        "NOTIFY b2 failed: Background command failed with exit code 1",
+        'NOTIFY a3 killed: Agent "probe" was stopped by Claude',
+    ]
+
+
+def test_errors_gives_a_workflow_agent_a_section_like_any_other(
+    workflow_config: Path,
+) -> None:
+    out = digest(workflow_config, "--errors")
+    assert sections(out)["abc123:build:harness (workflow phase Build)"] == [
+        "  > Bash: make boom",
+        "    ERROR boom: no rule",
+    ]
+    assert "failed calls" not in out
+
+
+def test_errors_and_timelines_do_not_combine(config: Path) -> None:
+    proc = subprocess.run(
+        [str(SCRIPT), "--cwd", "/work/repo", "--errors", "--timelines"],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "CLAUDE_CONFIG_DIR": str(config)},
+    )
+    assert proc.returncode == 2
+    assert "not allowed with" in proc.stderr

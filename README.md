@@ -497,7 +497,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   the tool call it ran for or, if it ran for none, where it ran; the summary
   counts hook errors per hook. Workflow agents, named
   `<run>:<label>`, show only their failed calls and hooks unless `--timelines`
-  is given.
+  is given. `--errors` prints the short form: the summary, then under each
+  agent its failed calls, failed hooks and failed task notifications, and the
+  main session's user turns, nothing else. An error over 1000 characters keeps
+  its first 200 and last 800.
   Images count about width × height / 750 tokens, from their header. Defaults to the
   newest session for the current directory (or its nearest parent with sessions),
   under `$CLAUDE_CONFIG_DIR` (default `~/.claude`).

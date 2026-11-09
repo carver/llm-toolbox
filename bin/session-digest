@@ -18,8 +18,19 @@ An image counts about width * height / 750 tokens, from its header (PNG, GIF,
 JPEG), capped at 1600.
 
 Workflow agents (Workflow tool runs) each get a summary row named
-<run>:<label>, and their errors and failed hooks are printed with the call
-they belong to; --timelines prints their full timelines too.
+<run>:<label>, and their errors (cut as --errors cuts them) and failed hooks
+are printed with the call they belong to; --timelines prints their full
+timelines too.
+
+--errors prints the short form. After the same summary, each agent gets a
+section with these, as they happened: the user's turns (the main session's
+only, since another agent wrote a subagent's prompt), each failed call with its
+error, each failed hook, and each task notification whose status isn't
+completed (failed, or killed when Claude stopped an agent). An error of up to
+1000 characters prints whole; a longer one prints its first 200 and its last
+800, where the cause usually is. It leaves out successful calls and the
+assistant's text, and an agent with none of these gets no section. Workflow
+agents get sections like the rest, so --errors doesn't go with --timelines.
 
 The session defaults to the newest one for the current directory's project,
 or its nearest parent directory's.
@@ -27,6 +38,9 @@ Logs live under $CLAUDE_CONFIG_DIR (default ~/.claude) in
 projects/<project>/<session>.jsonl, with subagents in
 projects/<project>/<session>/subagents/agent-<id>.jsonl and workflow agents in
 projects/<project>/<session>/subagents/workflows/<run>/agent-<id>.jsonl.
+
+Exit status: 0 printed; 1 no such session; 2 usage error, such as --errors with
+--timelines.
 """
 
 import argparse
@@ -43,6 +57,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 TEXT_LIMIT = 400
+# --errors prints an error up to ERROR_LIMIT characters whole, and of a longer one its
+# first ERROR_HEAD and last ERROR_LIMIT - ERROR_HEAD, where the cause usually is.
+ERROR_LIMIT = 1000
+ERROR_HEAD = 200
 BIGGEST = 5
 INPUT_LIMIT = 200
 CHARS_PER_TOKEN = 4
@@ -71,13 +89,20 @@ class Agent:
     totals: ToolStats = field(default_factory=ToolStats)
     tools: dict[str, ToolStats] = field(default_factory=dict)
     outputs: list[tuple[int, str]] = field(default_factory=list)
-    # The lines that show what failed, by tool call id: the call, then its failed
-    # hooks and its error in full. A hook that ran for no call has a key of its own.
-    failures: dict[str, list[str]] = field(default_factory=dict)
+    # What --errors prints, a block of lines each, as they happened: the user's turns
+    # (main's only), each failed call with its failed hooks and its error, each failed
+    # hook that ran for no call, and each task notification that didn't complete.
+    short_form: list[list[str]] = field(default_factory=list)
     hook_errors: Counter[str] = field(default_factory=Counter)
     context_in: int = 0
     output: int = 0
     workflow: bool = False
+
+    def header(self) -> str:
+        return "main" if self.name == "main" else f"{self.name} ({self.label})"
+
+    def short_form_text(self) -> str:
+        return "\n".join(line for block in self.short_form for line in block)
 
 
 def short(text: str, limit: int) -> str:
@@ -148,8 +173,10 @@ def jpeg_size(head: bytes) -> tuple[int, int] | None:
     return None
 
 
-def notification(text: str) -> str | None:
-    """One line for a <task-notification> turn, leaving out its report or event body."""
+def notification(text: str) -> tuple[str, bool] | None:
+    """One line for a <task-notification> turn, leaving out its report or event body,
+    and whether its task failed: a status other than completed (a Monitor event has
+    none)."""
     if not text.lstrip().startswith("<task-notification>"):
         return None
 
@@ -157,8 +184,10 @@ def notification(text: str) -> str | None:
         found = re.search(rf"<{name}>(.*?)</{name}>", text, re.DOTALL)
         return html.unescape(found.group(1).strip()) if found else ""
 
-    head = " ".join(filter(None, [tag("task-id"), tag("status")]))
-    return f"NOTIFY {head}: {short(tag('summary'), TEXT_LIMIT)}"
+    status = tag("status")
+    head = " ".join(filter(None, [tag("task-id"), status]))
+    line = f"NOTIFY {head}: {short(tag('summary'), TEXT_LIMIT)}"
+    return line, status not in ("", "completed")
 
 
 def hook_failure(attachment: dict) -> tuple[str, str] | None:
@@ -180,6 +209,14 @@ def hook_failure(attachment: dict) -> tuple[str, str] | None:
     return hook, output.splitlines()[-1]
 
 
+def clip(text: str) -> str:
+    if len(text) <= ERROR_LIMIT:
+        return text
+    tail = ERROR_LIMIT - ERROR_HEAD
+    cut = len(text) - ERROR_LIMIT
+    return f"{text[:ERROR_HEAD]}\n…[{cut} chars]…\n{text[-tail:]}"
+
+
 def read_jsonl(path: Path) -> list[dict]:
     records = []
     for line in path.read_text().splitlines():
@@ -193,6 +230,19 @@ def read_jsonl(path: Path) -> list[dict]:
 def hook_line(failure: tuple[str, str]) -> str:
     hook, error = failure
     return f"    HOOK ERROR {hook}: {short(error, TEXT_LIMIT)}"
+
+
+def failed_calls(records: list[dict]) -> set[str]:
+    """The ids of the tool calls whose result is an error, gathered before the calls
+    are read so a failed call's lines can go where the call was made."""
+    return {
+        block.get("tool_use_id")
+        for record in records
+        if record.get("type") == "user"
+        and isinstance((record.get("message") or {}).get("content"), list)
+        for block in record["message"]["content"]
+        if block.get("type") == "tool_result" and block.get("is_error")
+    }
 
 
 def hook_lines(records: list[dict]) -> dict[str, list[str]]:
@@ -218,18 +268,48 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
     pending: dict[str, tuple[str, str]] = {}
     requests: set[str] = set()
     hooks_by_call = hook_lines(records)
+    failing = failed_calls(records)
+    failures: dict[str, list[str]] = {}
+
+    def failed_block(call_id: str, call_line: str) -> list[str]:
+        """The failed call's block in the short form, which starts at its call."""
+        if call_id not in failures:
+            failures[call_id] = [call_line]
+            agent.short_form.append(failures[call_id])
+        return failures[call_id]
+
+    def user_turn(text: str) -> None:
+        line = f"USER {short(text, TEXT_LIMIT * 5)}"
+        agent.lines.append(line)
+        if agent.name == "main":
+            agent.short_form.append([line])
+
+    def task_notice(line: str, failed: bool) -> None:
+        agent.lines.append(line)
+        if failed:
+            agent.short_form.append([line])
+
     for record in records:
         message = record.get("message") or {}
         content = message.get("content")
         if record.get("type") == "attachment":
             attachment = record.get("attachment") or {}
-            if failure := hook_failure(attachment):
+            # A prompt or notification that arrived while the agent worked.
+            if attachment.get("type") == "queued_command":
+                prompt = attachment.get("prompt")
+                mode = attachment.get("commandMode")
+                if isinstance(prompt, str) and mode == "task-notification":
+                    if notice := notification(prompt):
+                        task_notice(*notice)
+                elif mode == "prompt" and not attachment.get("isMeta"):
+                    user_turn(str(prompt))
+            elif failure := hook_failure(attachment):
                 hook, _ = failure
                 agent.hook_errors[hook] += 1
                 # A hook that ran for no tool call prints where it ran.
                 if attachment.get("toolUseID") not in hooks_by_call:
                     agent.lines.append(hook_line(failure))
-                    agent.failures[f"hook {len(agent.failures)}"] = [hook_line(failure)]
+                    agent.short_form.append([hook_line(failure)])
         elif record.get("type") == "assistant":
             request = record.get("requestId") or message.get("id")
             usage = message.get("usage")
@@ -251,24 +331,22 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
                     if block["id"] in spawned:
                         line += f" -> {spawned[block['id']]}"
                     agent.lines.append(line)
-                    if hooks := hooks_by_call.get(block["id"]):
-                        agent.lines += hooks
-                        agent.failures[block["id"]] = [
-                            f"  > {call}",
-                            *hooks,
-                        ]
+                    hooks = hooks_by_call.get(block["id"], [])
+                    agent.lines += hooks
+                    if hooks or block["id"] in failing:
+                        failed_block(block["id"], line).extend(hooks)
         elif record.get("type") == "user":
             if isinstance(content, str):
                 if record.get("isMeta"):
                     agent.lines.append(f"USER (injected, {len(content)} chars)")
                 elif notice := notification(content):
-                    agent.lines.append(notice)
+                    task_notice(*notice)
                 else:
-                    agent.lines.append(f"USER {short(content, TEXT_LIMIT * 5)}")
+                    user_turn(content)
                 continue
             for block in content or []:
                 if block.get("type") == "text" and not record.get("isMeta"):
-                    agent.lines.append(f"USER {short(block['text'], TEXT_LIMIT * 5)}")
+                    user_turn(block["text"])
                 elif block.get("type") == "tool_result":
                     tool, call = pending.pop(block.get("tool_use_id"), ("?", "?"))
                     text, tokens, images = result_size(block.get("content") or "")
@@ -278,10 +356,11 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
                     agent.outputs.append((tokens, call))
                     if error:
                         agent.lines.append(f"    ERROR {short(text, TEXT_LIMIT)}")
-                        full = text.strip().replace("\n", "\n          ")
-                        agent.failures.setdefault(
-                            block.get("tool_use_id"), [f"  > {call}"]
-                        ).append(f"    ERROR {full}")
+                        full = clip(text.strip()).replace("\n", "\n          ")
+                        # Its call made the block, unless the call isn't in this log.
+                        failed_block(block.get("tool_use_id"), f"  > {call}").append(
+                            f"    ERROR {full}"
+                        )
                     else:
                         size = f"{len(text)} chars ~{tokens} tok"
                         if images:
@@ -409,10 +488,17 @@ def main(argv: list[str] | None = None) -> int:
         default=os.getcwd(),
         help="project directory whose sessions to search (default: current)",
     )
-    parser.add_argument(
+    form = parser.add_mutually_exclusive_group()
+    form.add_argument(
         "--timelines",
         action="store_true",
         help="also print workflow agents' full timelines (default: only their failed calls)",
+    )
+    form.add_argument(
+        "--errors",
+        action="store_true",
+        help="print only the summary, the user's turns and what failed (see above); "
+        "not with --timelines",
     )
     args = parser.parse_args(argv)
 
@@ -439,21 +525,25 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"session {session.stem}  ({session})")
     print("\n".join(summary(agents)))
+    if args.errors:
+        for agent in agents:
+            if agent.short_form:
+                print(f"\n== {agent.header()}")
+                print(agent.short_form_text())
+        return 0
     for agent in agents:
         if agent.workflow and not args.timelines:
             continue
-        header = "main" if agent.name == "main" else f"{agent.name} ({agent.label})"
-        print(f"\n== {header}")
+        print(f"\n== {agent.header()}")
         print("\n".join(agent.lines))
-    failed = [a for a in agents if a.workflow and a.failures]
+    failed = [a for a in agents if a.workflow and a.short_form]
     if failed and not args.timelines:
         print(
             "\n== workflow agents' failed calls (--timelines prints their full timelines)"
         )
         for agent in failed:
-            print(f"-- {agent.name} ({agent.label})")
-            for lines in agent.failures.values():
-                print("\n".join(lines))
+            print(f"-- {agent.header()}")
+            print(agent.short_form_text())
     return 0
 
 

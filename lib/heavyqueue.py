@@ -10,6 +10,11 @@ holder once its cores have stayed under half busy at every sample for
 HEAVY_QUIET_SECONDS, or at the first sample when it arrived to a free lane with nobody
 waiting.
 
+A `--quick` job, seconds of work, runs at once outside the queue, taking no slot, when
+its lane's cores have averaged under HEAVY_QUICK_BUSY busy for HEAVY_QUICK_SECONDS and
+SHARE_MEMORY is free (Lull); otherwise it joins the queue's front, keeps watching, and
+starts at its first quiet sample once it heads the lane.
+
 A waiter that asks to (`--share`) starts beside the holder, as its lane's sharer,
 when the share slot is free, the holder doesn't run `--alone`, 4 GiB of memory are
 free, and either both jobs' history says the waiter's usual cores fit in 75% of the
@@ -27,11 +32,11 @@ under one lock for both lanes, so a long and a normal job starting together neve
 share cores.
 
 It reads HEAVY_DIR, HEAVY_QUIET_SECONDS, HEAVY_POLL (seconds per sample),
-HEAVY_SHARE_SECONDS, HEAVY_STALL_SECONDS (before the PR hint), HEAVY_BUSY (the tests'
-stand-in for measuring), HEAVY_MEMINFO and HEAVY_VMSTAT (the tests' stand-ins for
-/proc/meminfo and /proc/vmstat), as bin/heavy's -h describes them; HEAVY_SLOT, which a
-job's environment carries so a heavy inside it runs at once; and RUSTC_WRAPPER, to
-start sccache's server before pinning.
+HEAVY_SHARE_SECONDS, HEAVY_STALL_SECONDS (before the PR hint), HEAVY_QUICK_SECONDS,
+HEAVY_QUICK_BUSY, HEAVY_BUSY (the tests' stand-in for measuring), HEAVY_MEMINFO and
+HEAVY_VMSTAT (the tests' stand-ins for /proc/meminfo and /proc/vmstat), as bin/heavy's
+-h describes them; HEAVY_SLOT, which a job's environment carries so a heavy inside it
+runs at once; and RUSTC_WRAPPER, to start sccache's server before pinning.
 """
 
 import math
@@ -67,6 +72,9 @@ SHARE_MEMORY_AGAIN = SHARE_MEMORY + 2**29
 # that long.
 SHARE_PATIENCE = 5.0
 SHARE_PATIENCE_POLLS = 5
+# What HEAVY_SLOT starts with for a --quick job run outside the queue, before the line
+# naming its heavy: a heavy inside it runs at once while that heavy lives.
+OUTSIDE = "outside "
 PR_HINT = (
     "heavy: the queue is busy. For build and test results without the wait, you can"
     " push a topic branch and open a PR, so GitHub's CI runs them (never main)."
@@ -142,6 +150,16 @@ def free_memory():
         if name == "MemAvailable" and words and words[0].isdigit():
             return int(words[0]) * 1024
     return None
+
+
+def memory_short(floor=SHARE_MEMORY):
+    """How much memory is free against what a job beside others takes, as `(1.0 GiB;
+    it takes 4 GiB)`, when less than floor is free or it can't be read; else None."""
+    memory = free_memory()
+    if memory is not None and memory >= floor:
+        return None
+    free = "unknown" if memory is None else f"{memory / 2**30:.1f} GiB"
+    return f"({free}; it takes {SHARE_MEMORY // 2**30} GiB)"
 
 
 def oom_kills():
@@ -223,13 +241,15 @@ def lower_priority(nice):
 class Job:
     """What a job runs with: its cores, an environment that lets a heavy inside it
     run at once and caps cargo's parallelism, and its nice. nested: it runs inside
-    another job, which holds the slot. Its caller tells it how CMD exited.
+    another job, which holds the slot. expendable: first in line for the OOM killer,
+    as a sharer is, at its nice. Its caller tells it how CMD exited.
     oom_kills_at_start: the VM's count of out-of-memory kills when it started."""
 
     cpus: list
     env: dict
     nice: int = 0
     nested: bool = False
+    expendable: bool = False
     status: int | None = None
     oom_kills_at_start: int | None = field(default_factory=oom_kills)
 
@@ -245,7 +265,7 @@ class Job:
                 f"heavy: can't pin to cores {span(self.cpus)} ({error.strerror}),"
                 " so it runs on any."
             )
-        if self.nice:
+        if self.nice or self.expendable:
             lower_priority(self.nice)
 
     def exited(self, status):
@@ -320,8 +340,11 @@ def lane_cores(lane, cpus):
 
 
 def inside_job():
-    """Whether this process runs inside a job holding a slot (HEAVY_SLOT names it)."""
+    """Whether this process runs inside a job: one holding a slot, or a --quick job
+    run outside the queue whose heavy lives (HEAVY_SLOT names either)."""
     token = os.environ.get("HEAVY_SLOT")
+    if token and token.startswith(OUTSIDE):
+        return not stale(Holder.parse(token.removeprefix(OUTSIDE)))
     return bool(token) and any(
         first_line(slot_text(lane, name) or "") == token
         for lane in LANES
@@ -330,14 +353,25 @@ def inside_job():
 
 
 @contextmanager
-def turn(long=False, command="", hint=True, alone=False, share=False, front=False):
+def turn(
+    long=False,
+    command="",
+    hint=True,
+    alone=False,
+    share=False,
+    front=False,
+    quick=False,
+):
     """Wait for this job's turn in its lane and for its cores to go quiet, or, with
     share, for room beside its lane's holder; then hold the slot while the body runs,
     yielding the Job to run with. Inside a job that holds a slot, yield at once.
     hint=False leaves out the PR hint, for a commit check, which has nothing to push
     yet. alone: no job shares the lane beside this one. front: join the lane's queue
     ahead of every waiter that didn't ask to (fifo.join's front), for wt-ship's checks
-    while it holds the main tree; the running job isn't stopped. A body that calls
+    while it holds the main tree; the running job isn't stopped. quick: seconds of
+    work, which runs at once outside the queue, taking no slot, while the lane's cores
+    are quiet enough (Lull), and otherwise waits at the front, with no PR hint, and
+    starts at its first quiet sample once it heads the lane. A body that calls
     job.exited(0) has its run remembered. Raises QueueError when the queue's folder
     can't be used."""
     if inside_job():
@@ -347,6 +381,14 @@ def turn(long=False, command="", hint=True, alone=False, share=False, front=Fals
         return
     cpus = sorted(os.sched_getaffinity(0))
     lane = "long" if long and split(cpus) else "normal"
+    lull = Lull(lane, cpus) if quick else None
+    if lull is not None:
+        why = lull.why_not(lull.first_look())
+        if why is None:
+            yield lull.job()
+            return
+        if slot_text(lane) is not None:  # else nothing it waits on needs a word
+            note(f"heavy: {why}, so this --quick job waits at the queue's front.")
     folder = lane_folder(lane)
     me = Holder.mine()
     known_as = heavyhistory.key(os.getcwd(), command)
@@ -357,6 +399,11 @@ def turn(long=False, command="", hint=True, alone=False, share=False, front=Fals
         about += "alone=1\n"
     if share:
         about += "share=1\n"
+    front = front or quick
+    if front:
+        about += "front=1\n"
+    if quick:
+        about += "quick=1\n"
     try:
         entry = fifo.join(folder, me, about, front=front)
     except OSError as error:
@@ -364,8 +411,20 @@ def turn(long=False, command="", hint=True, alone=False, share=False, front=Fals
     started = None
     try:
         started = Waiter(
-            lane, folder, me.line() + about, entry, hint, cpus, alone, share
+            lane,
+            folder,
+            me.line() + about,
+            entry,
+            hint and not quick,
+            cpus,
+            alone,
+            share,
+            lull,
         ).wait()
+        if started is None:  # a --quick job whose cores went quiet
+            entry.unlink(missing_ok=True)
+            yield lull.job()
+            return
         env = dict(os.environ) | {
             "HEAVY_SLOT": first_line(started.text),
             "CARGO_BUILD_JOBS": str(started.jobs),
@@ -418,6 +477,63 @@ class Watch:
         if len(self.samples) < count:
             return None
         return sum(self.samples[-count:]) / count
+
+
+class Lull:
+    """A --quick job's watch on its lane's cores, a sample a poll: it may run outside
+    the queue once they have averaged under HEAVY_QUICK_BUSY busy over the last
+    HEAVY_QUICK_SECONDS, whoever holds the lane, with SHARE_MEMORY free, since a
+    holder's quiet moment may hold gigabytes."""
+
+    def __init__(self, lane, cpus):
+        self.lane, self.cpus = lane, cpus
+        self.window = knob("HEAVY_QUICK_SECONDS", 2)
+        self.limit = knob("HEAVY_QUICK_BUSY", 0.25)
+        self.watch = Watch(max(1, round(self.window / knob("HEAVY_POLL", 1))))
+        self.measured = lane_cores(lane, cpus)
+
+    def sample(self):
+        """Sample the lane's cores for a poll: how busy they were on average over the
+        window, or None before a whole one. A change in the lane's cores (a long
+        job's quarter taken or given back) starts the window again."""
+        self.measured = lane_cores(self.lane, self.cpus)
+        self.watch.add(tuple(self.measured), busy_now(self.measured))
+        return self.watch.mean(self.window)
+
+    def first_look(self):
+        """Sample a whole window: how busy the cores were on average over it."""
+        while (mean := self.sample()) is None:
+            pass
+        return mean
+
+    def why_not(self, mean):
+        """Why this job, its cores mean busy over the window, can't run outside the
+        queue now, or None when it can."""
+        if fields(slot_text(self.lane) or "").get("alone"):
+            return "the lane's holder runs --alone, so nothing runs beside it"
+        if mean >= self.limit:
+            return (
+                f"cores {span(self.measured)} averaged {mean:.0%} busy over"
+                f" {self.window:g} s, not under {self.limit:.0%}"
+            )
+        short = memory_short()
+        return short and f"too little free memory to run outside the queue {short}"
+
+    def quiet(self):
+        """Sample one more poll: whether this job can now run outside the queue."""
+        mean = self.sample()
+        return mean is not None and self.why_not(mean) is None
+
+    def job(self):
+        """The Job of a run outside the queue: on the lane's cores, cargo's jobs to
+        match, first in line for the OOM killer, and a HEAVY_SLOT that names this
+        heavy, so a heavy inside it runs at once."""
+        cpus = lane_cores(self.lane, self.cpus)
+        env = os.environ | {
+            "HEAVY_SLOT": OUTSIDE + Holder.mine().line().strip(),
+            "CARGO_BUILD_JOBS": str(len(cpus)),
+        }
+        return Job(cpus, env, expendable=True)
 
 
 class Bid:
@@ -473,15 +589,11 @@ class Bid:
                 f" the {self.lane} lane."
             )
             return Verdict(None, ("taken", first_line(seen.shared)), line)
-        memory = free_memory()
         floor = SHARE_MEMORY_AGAIN if self.short_of_memory else SHARE_MEMORY
-        self.short_of_memory = memory is None or memory < floor
-        if self.short_of_memory:
-            free = "unknown" if memory is None else f"{memory / 2**30:.1f} GiB"
-            line = (
-                f"heavy: too little free memory to share the lane ({free}; it"
-                f" takes {SHARE_MEMORY // 2**30} GiB)."
-            )
+        short = memory_short(floor)
+        self.short_of_memory = short is not None
+        if short:
+            line = f"heavy: too little free memory to share the lane {short}."
             return Verdict(None, "memory", line)
         return None
 
@@ -568,16 +680,18 @@ class Bid:
 
 class Waiter:
     """One job's wait: to head its lane's queue with the slot free and its cores
-    quiet, or for room beside the lane's holder."""
+    quiet, or for room beside the lane's holder, or, for a --quick job (lull), for
+    its cores to go quiet enough to run outside the queue."""
 
-    def __init__(self, lane, folder, text, entry, hint, cpus, alone, share):
+    def __init__(self, lane, folder, text, entry, hint, cpus, alone, share, lull=None):
         self.lane, self.folder, self.text, self.entry = lane, folder, text, entry
-        self.hint, self.cpus, self.alone = hint, cpus, alone
+        self.hint, self.cpus, self.alone, self.lull = hint, cpus, alone, lull
         self.said = {}
         self.bid = Bid(lane, folder, text, entry, cpus, self.say) if share else None
 
     def wait(self):
-        """The Start of the job, once it has taken a slot."""
+        """The Start of the job, once it has taken a slot; or None for a --quick job
+        whose cores went quiet enough to run outside the queue."""
         quiet_for = knob("HEAVY_QUIET_SECONDS", 10)
         stall_after = knob("HEAVY_STALL_SECONDS", 600)
         crowd = self.crowd()
@@ -594,6 +708,10 @@ class Waiter:
             if blocker is not None:
                 self.say("lane", *blocker)
                 waited, head_since, quiet_since = True, None, None
+                if self.lull is not None:
+                    if self.lull.quiet():  # a poll's sample, in place of a sleep
+                        return None
+                    continue
                 if self.bid is None or seen.held is None:
                     time.sleep(knob("HEAVY_POLL", 1))
                     continue
@@ -606,7 +724,9 @@ class Waiter:
             share = busy_now(measured)
             if share < QUIET_SHARE:
                 quiet_since = quiet_since or time.monotonic()
-                if not waited or time.monotonic() - quiet_since >= quiet_for:
+                # A --quick job runs for less than the window would cost it.
+                window = waited and self.lull is None
+                if not window or time.monotonic() - quiet_since >= quiet_for:
                     started = self.start()
                     if started is not None:
                         self.entry.unlink(missing_ok=True)
@@ -737,9 +857,11 @@ def status():
                 f" {about.get('jobs', '?')} cargo jobs{usual(shared)}"
             )
         for place, (_, text) in enumerate(fifo.ahead(lane_folder(lane), None), 1):
-            holder = Holder.parse(text)
+            holder, about = Holder.parse(text), fields(text)
+            where = ", at the front" if about.get("front") else ""
+            where += " as --quick" if about.get("quick") else ""
             lines.append(
-                f"  {place}. waiting for {ago(holder)}: {doing(text)},"
+                f"  {place}. waiting for {ago(holder)}{where}: {doing(text)},"
                 f" {holder.session}{usual(text)}"
             )
     return "\n".join(lines)

@@ -82,7 +82,22 @@ def test_a_foreground_call_that_waits_on_heavy_is_refused(command):
 
     assert code == 2
     assert "bgrun --wait -o" in err and "run_in_background: true" in err
+    assert "heavy --quick -- CMD" in err
     assert len(err.splitlines()) <= 2
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "heavy --quick -- cargo nextest run --cargo-quiet -p server -E 'test(/^read::/)'",
+        "cd crates/server && heavy --quick -- cargo nextest run -E 'test(x)'",
+        "heavy --qu -- pytest -q test_x.py",
+        "timeout 600 heavy --quick -- make t",
+        "bgrun --wait -o log -- heavy --quick -- pytest -q test_x.py",
+    ],
+)
+def test_a_quick_run_passes_in_the_foreground(command):
+    assert run_hook(command) == (0, "")
 
 
 @pytest.mark.parametrize("command", WAITS_ON_HEAVY)
@@ -100,6 +115,7 @@ WRONG_ORDER = [
     "heavy -- bgrun -o log -- cargo test",
     "heavy --long -- bgrun --wait -o log -- cargo test",
     "heavy -- timeout 5 /usr/local/bin/bgrun -o log -- make",
+    "heavy --quick -- bgrun -o log -- make",
 ]
 
 
@@ -116,6 +132,8 @@ RUN_BARE = [
     "heavy -- wt-ship -C ../x --local --remove",
     "heavy -- git -C repo commit -m x",
     "heavy -- git --config-env x=Y commit -m x",
+    "heavy --quick -- git commit -m x",
+    "heavy --quick -- wt-ship -C ../x --local --remove",
 ]
 
 

@@ -58,6 +58,40 @@ landings are fewer full checks per landing and cheaper ones, not more at once.
 The script and its raw results (hyperfine JSON, vmstat logs) are in
 `/home/carver/code/claudedev/cache/heavy-lane-exp/` on the host disk, outside git.
 
+### `heavy --quick`: seconds of work runs at once on quiet cores, else next (2026-11-09)
+
+The user's design, in their words: "If load is low enough, run outside heavy,
+otherwise jump to the front of the line." A targeted test run in filedrawer, a few
+tests after a one-file edit, takes 4 to 6 s since filedrawer#35, but it waited behind
+every session's full checks, sometimes tens of minutes.
+
+- The agent marks the job (`--quick`), on trust, as the queue works: heavy's history
+  can't tell targeted runs apart, since each has its own command line.
+- When the normal lane's cores average under 25% busy over 2 s, it runs at once,
+  outside the queue, whoever holds the lane (one waiting on the network, say), except
+  an `--alone` one, which promises a timing nothing beside it: no slot, no entry. The
+  one-job-at-a-time rule above is about checks that take minutes;
+  a few seconds beside a holder that leaves its cores idle cost little. It also needs
+  4 GiB of memory free and runs first in line for the OOM killer, since a holder's
+  quiet moment may hold gigabytes (a review of the design found the case).
+- Otherwise it joins the front, after earlier front entries such as a landing's
+  checks, without stopping the running job, and keeps watching, so a holder that
+  idles lets it through. Heading the lane, it starts at the first quiet sample: a 5 s
+  job shouldn't wait 10 s of quiet.
+- One that runs past 60 s hears, as it ends, to drop `--quick` for runs like it; a
+  warning only.
+- heavy-gate lets `heavy --quick -- CMD` run as a foreground Bash call. Its wait for
+  the running job can pass the tool's default limit of two minutes, so the docs say
+  to give that call a timeout of 600000 ms; the gate doesn't check it, since the user
+  asked that the hooks accept `heavy --quick -- CMD`.
+
+Left open for the owner (the design review's other suggestions, each of which changes
+the design above or the trust the queue works on): a full HEAVY_QUIET_SECONDS window
+beside a holder; one outside run at a time, under a marker `heavy status` could show;
+quick jobs that yield to an ordinary head they've passed for a minute; a limit on the
+wait that gives up the place; the HEAVY_QUICK_* knobs honoured only with a private
+HEAVY_DIR; landings ahead of quick jobs that joined the front before them.
+
 ### Rejected: a second job on the holder's cores at nice 10 (71650a7, eadadb6, 2026-11-08)
 
 heavy let one more job start beside a holder that left cores idle, on the same cores
@@ -109,7 +143,8 @@ checks. Now each commit's check runs first outside the queue (`--no-queue`), so 
 docs-only landing never waits for the lane, and the checks that need it run together
 in one heavy job that joins the queue ahead of every ordinary waiter (the owner's
 design). The running job isn't stopped. The front goes only to a landing under the
-claim, and works on trust, as the queue does.
+claim and, since 2026-11-09, to a `heavy --quick` job (above), and works on trust, as
+the queue does.
 
 ### build-state finish only folds (1465ae5, 2026-11-08)
 

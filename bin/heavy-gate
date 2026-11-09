@@ -5,9 +5,13 @@ heavy waits its turn in a queue every session shares, then for quiet cores, with
 time limit, and a Bash call that waits on it is killed at the tool's own limit. So
 the hook refuses a Bash call that runs `heavy -- CMD` unless the call was made with
 run_in_background: true, and names the right form: `bgrun --wait -o LOG -- heavy --
-CMD` as a background call. Background call or not, it refuses heavy around bgrun
-(`heavy -- bgrun ...`), and around git commit and wt-ship, which queue their own
-checks and run bare. install.py registers it in ~/.claude/settings.json.
+CMD` as a background call. `heavy --quick -- CMD`, a run of seconds that waits at
+most for the running job and the queue's front, passes in the foreground; the
+refusal names it too. Such a wait can pass the Bash tool's default limit of two
+minutes, so give that call the tool's longest timeout, 600000 ms (not checked here).
+Background call or not, it refuses heavy around bgrun (`heavy -- bgrun ...`), and
+around git commit and wt-ship, which queue their own checks and run bare. install.py
+registers it in ~/.claude/settings.json.
 
 It reads the command as shell words and looks only at what runs: each simple command's
 command word, past variable settings, redirections, keywords such as `if` and `do`, and
@@ -49,7 +53,9 @@ RIGHT_FORM = (
 )
 FOREGROUND = (
     "Refused: heavy waits its turn with no time limit, and a Bash call that waits on it "
-    f"is killed at the tool's limit. Run {RIGHT_FORM}.\n"
+    f"is killed at the tool's limit. Run {RIGHT_FORM}. Only a run of seconds, such as "
+    "a few tests, may run in the foreground, as heavy --quick -- CMD with the call's "
+    "timeout at 600000.\n"
     "Where a background call can't notify you, drop --wait, then wait with "
     "`waitone --pid PID -t 300` and read LOG."
 )
@@ -106,7 +112,7 @@ def judge(words: list[str], blocks: bool) -> set[str]:
         return {RUN_BARE}
     if inner_name == "bgrun":
         return {WRONG_ORDER}
-    return {FOREGROUND} if blocks else set()
+    return {FOREGROUND} if blocks and not asks_quick(args) else set()
 
 
 def heavy_command(args: list[str]) -> list[str] | None:
@@ -119,6 +125,13 @@ def heavy_command(args: list[str]) -> list[str] | None:
         if is_help(word):
             return None
     return args if any("$" in word for word in args) else None
+
+
+def asks_quick(args: list[str]) -> bool:
+    """Whether heavy's options, the words before its `--`, ask for --quick, whole or
+    abbreviated as heavy's parser accepts."""
+    options = args[: args.index("--")] if "--" in args else []
+    return any(len(word) > 2 and "--quick".startswith(word) for word in options)
 
 
 def main(argv=None) -> int:

@@ -334,12 +334,24 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   runner (pytest-timeout, nextest's slow-timeout) or in the tests, and commit
   checks never share. A command's usual cores come from its last runs that
   exited 0, shared by every worktree of its repo. Nothing shares beside a
-  `heavy --alone` job, for timings. Stopped, it stops CMD's process group,
+  `heavy --alone` job, for timings. `heavy --quick` marks seconds of work, such
+  as a few tests after an edit, on trust: when the normal lane's cores average
+  under `$HEAVY_QUICK_BUSY` (0.25) busy over `$HEAVY_QUICK_SECONDS` (2) and
+  4 GiB of memory are free, it runs at once outside the queue, whoever holds
+  the lane (but never beside `--alone`), first in line for the OOM killer;
+  otherwise it waits at the queue's front, after earlier front entries such as
+  a landing's checks and ahead of every other waiter, until the
+  cores go that quiet or it heads the lane, where it starts at the first quiet
+  sample. One that ran past `$HEAVY_QUICK_MAX` (60) seconds hears, as it ends,
+  to drop `--quick` for runs like it. It goes with none of `--long`, `--alone`
+  and `--share`, and may run as a foreground Bash call, with a 600000 ms
+  timeout. Stopped, it stops CMD's process group,
   with SIGKILL after `$HEAVY_GRACE` seconds. `heavy status` shows each lane's
   holder, sharer, waiters, their usual cores and how busy the lane's cores
   are. A third job in a lane, or a head stalled for `$HEAVY_STALL_SECONDS`
   (600), gets a hint to push a topic branch and open a PR for CI's results
-  instead. A heavy inside a job (`$HEAVY_SLOT`) runs at once. The queue and
+  instead. A heavy inside a job (`$HEAVY_SLOT`), or inside a `--quick` run
+  outside the queue, runs at once. The queue and
   its history live in `$HEAVY_DIR`
   (`/tmp/heavy`). A Ctrl-Z while heavy holds the queue's lock, a moment at each
   look, stops it once it lets go; a wait of `$FIFO_LOCK_SECONDS` (5) for that lock
@@ -398,7 +410,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   refuses a Bash call running `heavy -- CMD` unless it was made with
   `run_in_background: true`, since heavy's queue has no time limit and the
   Bash tool kills a call at its own; the refusal names `bgrun --wait -o LOG --
-  heavy -- CMD` as a background call. Background or not, it refuses heavy
+  heavy -- CMD` as a background call, and `heavy --quick -- CMD` for a run of
+  seconds, which passes in the foreground (give that call a 600000 ms timeout,
+  since it may wait for the running job). Background or not, it refuses heavy
   around bgrun, git commit or wt-ship. It reads the command as shell words and
   looks only at what runs, through wrappers such as `timeout` and `nice`,
   `bash -c`, a heredoc fed to a shell and `$(...)`. A word that only mentions

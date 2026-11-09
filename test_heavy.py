@@ -56,6 +56,7 @@ def box(tmp_path):
         "HEAVY_BUSY": str(busy),
         "HEAVY_MEMINFO": str(tmp_path / "meminfo"),
         "HEAVY_QUIET_SECONDS": "0.2",
+        "HEAVY_QUICK_SECONDS": "0.1",
         "HEAVY_POLL": "0.05",
         "HEAVY_SHARE_SECONDS": "600",
         "HEAVY_STALL_SECONDS": "600",
@@ -1684,3 +1685,300 @@ def test_a_waiter_whose_fit_flickers_still_passes_a_stuck_one(
         finish(proc)
 
     assert shared, "the waiter behind never passed the stuck one"
+
+
+def env_report(tmp_path, name):
+    """A command that writes its HEAVY_SLOT (or `unset`), CARGO_BUILD_JOBS, cores and
+    oom_score_adj to a file, then exits."""
+    out = tmp_path / f"{name}.report"
+    script = tmp_path / f"{name}.py"
+    script.write_text(
+        "import json, os, pathlib\n"
+        "report = {\n"
+        "    'slot': os.environ.get('HEAVY_SLOT', 'unset'),\n"
+        "    'jobs': os.environ.get('CARGO_BUILD_JOBS'),\n"
+        "    'cores': sorted(os.sched_getaffinity(0)),\n"
+        "    'oom': int(pathlib.Path('/proc/self/oom_score_adj').read_text()),\n"
+        "}\n"
+        f"pathlib.Path({str(out)!r}).write_text(json.dumps(report))\n"
+    )
+    return [sys.executable, str(script)], out
+
+
+@pytest.fixture
+def memory(box):
+    """Memory enough for a --quick job to run outside the queue: 16 GiB free."""
+    tmp_path, _, _ = box
+    meminfo(tmp_path / "meminfo", 16)
+
+
+@pytest.mark.parametrize(
+    ("share", "extra"), [("0.2", {}), ("0.4", {"HEAVY_QUICK_BUSY": "0.5"})]
+)
+def test_a_quick_job_on_quiet_cores_runs_at_once_beside_the_holder(
+    box, background, memory, share, extra
+):
+    tmp_path, busy, _ = box
+    command, started, release = blocker(tmp_path, "a")
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+    holder = (lane(tmp_path) / "slot").read_text()
+    set_busy(busy, share)
+    quick, out = env_report(tmp_path, "quick")
+
+    q = background("--quick", "--", *quick, **extra)
+    ran = wait_or_warn(lambda: q.poll() is not None, "the quick job beside the holder")
+    still = a.poll() is None and (lane(tmp_path) / "slot").read_text() == holder
+    release.touch()
+    finish(a)
+    if not ran:
+        return
+    status, _, err = finish(q)
+
+    assert status == 0 and err == "", err
+    assert still, "the holder kept its slot"
+    assert entries(tmp_path) == []
+    ran = report(out)
+    assert (ran["jobs"], ran["cores"], ran["oom"]) == (str(len(CPUS)), CPUS, 1000)
+
+
+def test_a_heavy_inside_a_quick_run_outside_the_queue_runs_at_once(
+    box, background, memory
+):
+    tmp_path, busy, _ = box
+    command, started, release = blocker(tmp_path, "a")
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+    set_busy(busy, "0.1")
+    inner = tmp_path / "inner"
+
+    q = background("--quick", "--", str(SCRIPT), "--", "touch", str(inner))
+    ran = wait_or_warn(lambda: q.poll() is not None, "the inner heavy to run")
+    release.touch()
+    finish(a)
+    if not ran:
+        return
+    status, _, err = finish(q)
+
+    assert status == 0, err
+    assert inner.exists()
+
+
+def test_with_too_little_free_memory_a_quick_job_waits_at_the_front(box, background):
+    tmp_path, busy, _ = box
+    command, started, release = blocker(tmp_path, "a")
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+    set_busy(busy, "0.1")
+    log = tmp_path / "err"
+
+    q = background("--quick", "--", "true", stderr=log)
+    wait_until(lambda: len(entries(tmp_path)) == 1, "the quick job to queue")
+    meminfo(tmp_path / "meminfo", 16)
+    ran = wait_or_warn(lambda: q.poll() is not None, "the quick job to run")
+    holding = a.poll() is None
+    release.touch()
+    finish(a)
+    if not ran:
+        return
+    status, _, _ = finish(q)
+
+    assert status == 0, log.read_text()
+    assert "memory" in log.read_text() and holding
+
+
+def test_a_quick_job_on_busier_cores_goes_ahead_of_every_ordinary_waiter(
+    box, background, memory
+):
+    tmp_path, busy, _ = box
+    set_busy(busy, "0.4")  # quiet enough for a head to start, too busy for --quick
+    log = tmp_path / "log"
+    command, started, release = blocker(tmp_path, "a")
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+    b = background("--", "sh", "-c", f'echo b >> "{log}"', session="s-b")
+    wait_until(lambda: len(entries(tmp_path)) == 1, "b to queue")
+    q = background("--quick", "--", "sh", "-c", f'echo q >> "{log}"', session="s-q")
+    wait_until(lambda: len(entries(tmp_path)) == 2, "the quick job to queue")
+    first = entries(tmp_path)[0].read_text()
+    release.touch()
+
+    for proc in (a, b, q):
+        status, _, err = finish(proc)
+        assert status == 0, err
+    assert first.startswith("s-q "), first
+    assert log.read_text().split() == ["start", "a", "end", "a", "q", "b"]
+
+
+def test_a_quick_job_at_the_head_starts_at_the_first_quiet_sample(
+    box, background, memory
+):
+    # A quick job that needed the 600 s window can't end in time, however slowly a
+    # busy machine runs heavy, so no time bound has to allow for load.
+    tmp_path, busy, _ = box
+    set_busy(busy, "0.4")
+    command, started, release = blocker(tmp_path, "a")
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+    quick, out = env_report(tmp_path, "quick")
+    q = background("--quick", "--", *quick, HEAVY_QUIET_SECONDS="600")
+    wait_until(lambda: len(entries(tmp_path)) == 1, "the quick job to queue")
+    release.touch()
+
+    ran = wait_or_warn(lambda: q.poll() is not None, "the quick job to start", 60)
+    finish(a)
+    if not ran:
+        return
+    status, _, err = finish(q)
+
+    assert status == 0, err
+    assert report(out)["slot"].split()[0] == "s-test", "it took the slot"
+
+
+def test_a_waiting_quick_job_runs_once_the_cores_go_quiet(box, background, memory):
+    tmp_path, busy, _ = box
+    command, started, release = blocker(tmp_path, "a")
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+    set_busy(busy, "0.9")
+    ran = tmp_path / "ran"
+    q = background("--quick", "--", "touch", str(ran))
+    wait_until(lambda: len(entries(tmp_path)) == 1, "the quick job to queue")
+    set_busy(busy, "0.1")
+
+    went = wait_or_warn(lambda: q.poll() is not None, "the quick job to run")
+    holding = a.poll() is None and held(tmp_path)
+    release.touch()
+    finish(a)
+    if not went:
+        return
+    status, _, err = finish(q)
+
+    assert status == 0, err
+    assert ran.exists() and holding
+    assert entries(tmp_path) == []
+
+
+def test_a_quick_job_watches_the_cores_for_its_window_first(box, memory):
+    _, _, env = box
+    begun = time.monotonic()
+
+    done = heavy(env, "--quick", "--", "true", HEAVY_QUICK_SECONDS="0.6")
+
+    assert done.returncode == 0 and done.stderr == "", done.stderr
+    assert time.monotonic() - begun >= 0.6
+
+
+def test_a_quick_job_that_runs_long_hears_once_at_its_end_to_drop_quick(
+    box, background, memory
+):
+    tmp_path, _, _ = box
+    started, release = tmp_path / "started", tmp_path / "release"
+    command = (
+        f'touch "{started}"; while [ ! -e "{release}" ]; do sleep 0.05; done;'
+        " echo done >&2"
+    )
+
+    q = background("--quick", "--", "sh", "-c", command, HEAVY_QUICK_MAX="0.2")
+    wait_until(started.exists, "the job to start")
+    # fixed sleep: the job must outlast HEAVY_QUICK_MAX, which heavy doesn't say
+    time.sleep(0.4)
+    release.touch()
+    status, _, err = finish(q)
+
+    assert status == 0, err
+    lines = err.splitlines()
+    assert len(lines) == 2 and lines[0] == "done", err
+    assert "past 0.2 s" in lines[1] and "--quick" in lines[1], err
+
+
+@pytest.mark.parametrize("other", ["--long", "--alone", "--share"])
+def test_quick_goes_with_no_other_option(box, other):
+    _, _, env = box
+
+    done = heavy(env, "--quick", other, "--", "true")
+
+    assert done.returncode == 2
+    assert f"--quick can't go with {other}" in done.stderr, done.stderr
+
+
+def test_status_shows_a_quick_waiter_at_the_front(box, background):
+    tmp_path, busy, env = box
+    command, started, release = blocker(tmp_path, "a")
+    a = background("--", *command, session="s-holder")
+    wait_until(started.exists, "a to start")
+    set_busy(busy, "0.9")
+    b = background("--", "make", "check", session="s-plain")
+    wait_until(lambda: len(entries(tmp_path)) == 1, "b to queue")
+    q = background("--quick", "--", "make", "one", session="s-quick")
+    wait_until(lambda: len(entries(tmp_path)) == 2, "the quick job to queue")
+
+    shown = heavy(env, "status").stdout
+    set_busy(busy, "0.1")
+    release.touch()
+    for proc in (a, b, q):
+        finish(proc)
+
+    waiting = [ln for ln in shown.splitlines() if "waiting for" in ln]
+    assert len(waiting) == 2, shown
+    assert waiting[0].lstrip().startswith("1.") and "s-quick" in waiting[0], shown
+    assert "at the front" in waiting[0] and "--quick" in waiting[0], shown
+    assert "at the front" not in waiting[1] and "s-plain" in waiting[1], shown
+
+
+def test_a_quick_job_never_runs_beside_an_alone_holder(box, background, memory):
+    tmp_path, busy, _ = box
+    command, started, release = blocker(tmp_path, "a")
+    a = background("--alone", "--", *command)
+    wait_until(started.exists, "a to start")
+    set_busy(busy, "0.1")
+    ran = tmp_path / "ran"
+
+    q = background("--quick", "--", "touch", str(ran))
+    wait_until(lambda: len(entries(tmp_path)) == 1, "the quick job to queue")
+    early = ran.exists()
+    release.touch()
+    for proc in (a, q):
+        status, _, err = finish(proc)
+        assert status == 0, err
+
+    assert not early and ran.exists()
+
+
+def test_a_quick_job_starting_on_a_free_lane_says_nothing(box):
+    # Short of memory, it can't run outside the queue, but nothing holds it up.
+    _, _, env = box
+
+    done = heavy(env, "--quick", "--", "true")
+
+    assert done.returncode == 0 and done.stderr == "", done.stderr
+
+
+def test_a_quick_job_never_hears_the_pr_hint(box, background, memory):
+    tmp_path, busy, _ = box
+    set_busy(busy, "0.9")
+    log = tmp_path / "err"
+
+    q = background("--quick", "--", "true", HEAVY_STALL_SECONDS="0.2", stderr=log)
+    wait_until(has_text(log, "waiting for quiet cores"), "the busy reading")
+    # fixed sleep: past HEAVY_STALL_SECONDS, when a plain head hears the hint
+    time.sleep(0.5)
+    set_busy(busy, "0.1")
+    status, _, _ = finish(q)
+
+    assert status == 0, log.read_text()
+    assert "PR" not in log.read_text()
+
+
+def test_a_quick_heavy_inside_a_job_runs_at_once(box, background):
+    tmp_path, busy, _ = box
+    set_busy(busy, "0.4")  # quiet enough for the job, too busy for --quick
+    inner = tmp_path / "inner"
+
+    job = background("--", str(SCRIPT), "--quick", "--", "touch", str(inner))
+    if not wait_or_warn(lambda: job.poll() is not None, "the inner heavy to run"):
+        return
+    status, _, err = finish(job)
+
+    assert status == 0, err
+    assert inner.exists()

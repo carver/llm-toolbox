@@ -526,6 +526,21 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   newest session for the current directory (or its nearest parent with sessions),
   under `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
 
+- **session-scan**: has a cheaper model read a whole session's digest, every
+  agent, for /upskill. Writes `session-digest --timelines` to `--out DIR`, cuts
+  it into chunks of whole agent sections (`--chunk-chars`, default 60000; a
+  longer section is cut at a user turn), and sends each, after the digest's
+  summary and the user's turns, to `claude-fresh` (`-m`, default sonnet; `-j`
+  at once, default 4) with /upskill's six categories. Prints the candidate
+  findings it gets back, each with the digest lines it cites and the agent
+  whose section they are in, then calls made the same way (numbers aside) in
+  two agents or more, with their lines, then each chunk's candidate count.
+  Candidates with an unknown category or lines outside their chunk are dropped
+  and counted; a failed chunk is retried once after `SESSION_SCAN_BACKOFF`
+  seconds (default 30), and `--chunks N,M` rereads chunks of an earlier run in
+  DIR, such as a failed one or those a stopped run never read. Exit 3 when a
+  chunk failed twice.
+
 - **yt-transcript**: prints a YouTube video's captions, or the ones around
   the URL's timestamp (90 seconds before, 60 after, by default), each line
   prefixed with its clock time. For finding what a video said at a moment

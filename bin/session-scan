@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""Have a cheaper model read a whole session's digest, every agent, for a retrospective.
+
+    session-scan --out DIR [session]            # every chunk, candidates printed
+    session-scan --out DIR --chunks 3,7         # reread chunks of an earlier run
+
+A long session's full digest (session-digest) runs to half a million characters,
+more than one agent reads well. This cuts it into chunks and has a model read each
+chunk at once, through claude-fresh, for /upskill's six kinds of finding: Mistakes,
+Waste, Repetition, Missing context, Hungry tools and Skipped checks. The model
+reports candidates, each citing the digest lines that show it; the agent running
+the retrospective checks each one, since a cheap reader over-reports.
+
+It runs `session-digest --timelines` (workflow agents' full timelines included) for
+the session, which defaults to the newest one for --cwd, and writes into DIR:
+
+  digest.txt        the digest; the candidates' line numbers point into it
+  chunk-NN.txt      what each chunk's reader got
+  chunks.json       each chunk's line range and whether it was read
+  candidates.jsonl  one candidate per line: chunk, category, agent, first_line,
+                    last_line, finding
+
+A chunk holds whole agent sections, in order, up to --chunk-chars characters of
+lines. A longer section is cut at a user turn in the second half of the piece
+(an injected one doesn't count), else where it runs over, and a piece that
+doesn't start the section opens with a `== <agent> (continued)` header. Each
+reader gets, before its chunk's lines, the digest's summary and the main
+session's user turns, which hold the user's standing instructions and approvals;
+each line comes with its digest line number.
+
+A candidate whose category isn't one of the six, or whose lines fall outside its
+chunk, is dropped and counted. Its agent is the section its first line is in,
+whatever the model said. One spanning more than 150 lines is kept, marked (wide).
+A call made the same way in two agents or more, three times or more in all, with
+numbers (PIDs, timeouts) taken as equal, is listed under "repeated across agents"
+with the lines it is on: no chunk's reader sees them all.
+
+It prints each candidate, in digest-line order, as
+`L<first>-<last>  <agent>  <Category>: <finding>`, then the ten most repeated
+calls, then one line per chunk with its line range and candidate count, so a
+chunk with none stands out, then a summary line with the model and an estimate
+of the input tokens sent, retries included (characters / 4).
+
+A chunk whose call fails, or whose answer isn't the JSON asked for, is retried
+once, after SESSION_SCAN_BACKOFF seconds (default 30; the tests set it to 0). One
+that fails twice is named on stderr. chunks.json is written before any chunk is
+read and again as each one finishes, with its candidates, so `--chunks` can
+reread a failed chunk, or those a stopped run never read, from DIR, keeping the
+digest and so its line numbers. Stopped by SIGTERM, SIGINT or SIGHUP, it stops
+the readers it started, claude-fresh and its children.
+
+The reader's instructions (READER below) list /upskill's categories: a change to
+one goes in the other (skills/upskill/SKILL.md).
+
+Exit status: 0 every chunk read; 1 no such session; 2 usage error, such as
+--chunks with no earlier run in DIR; 3 a chunk failed twice; 128+N stopped by
+signal N.
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+CATEGORIES = (
+    "Mistakes",
+    "Waste",
+    "Repetition",
+    "Missing context",
+    "Hungry tools",
+    "Skipped checks",
+)
+WIDE = 150
+REPEATS = 10
+REPEAT_LINES = 5
+CHARS_PER_TOKEN = 4
+NUMBER_WIDTH = 8  # a chunk line's "NNNNNN  " prefix
+DIGEST = Path(__file__).resolve().parent / "session-digest"
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "enum": list(CATEGORIES)},
+                    "first_line": {"type": "integer"},
+                    "last_line": {"type": "integer"},
+                    "finding": {"type": "string"},
+                },
+                "required": ["category", "first_line", "last_line", "finding"],
+            },
+        }
+    },
+    "required": ["findings"],
+}
+
+READER = """\
+You read one part of a condensed log of a Claude Code session, an AI coding agent \
+and the subagents it started, for a retrospective. The aim is to find what cost \
+time or tokens, so the next session costs less. Report candidates: another agent \
+checks each one against the full log, so report anything plausible, but cite the \
+exact lines.
+
+How the log reads:
+- `== NAME (TYPE: DESCRIPTION)` starts an agent's section; `main` is the session \
+the user talked to. `(continued)` means the section began in an earlier part.
+- `USER ...` is a turn from the user or, in a subagent, the brief its parent \
+wrote. `USER (injected, N chars)` is text a skill or hook added.
+- An indented line of plain text is the agent's own words.
+- `> Tool: input` is a tool call; `-> agent-...` names the subagent it started. \
+A long input is cut, ending `…[+N chars]`.
+- `= N chars ~T tok` is the size of a successful call's output; `ERROR ...` is a \
+failed call's error. Calls sent together print first, their results after, in \
+order. `[3m12s]` is how long a call took (shown from a minute); `LONG` marks 40 \
+minutes or more; `user` marks time spent waiting for the user.
+- `HOOK ERROR` is a hook that failed. Hooks often refuse a command on purpose and \
+say what to do instead.
+- `NOTIFY id status: summary` is a background task's notification.
+- `CACHE REBUILT after T idle (5m cache): N tokens written` is a request that \
+resent the agent's whole context because its prompt cache had expired. The main \
+agent's cache lasts an hour, a subagent's five minutes.
+Before the lines come the digest's summary (each agent's and tool's cost, the \
+biggest outputs, the longest calls, the cache rebuilds) and the user's turns in \
+the main session, which hold their standing instructions and approvals. They are \
+context: cite the numbered lines, not them.
+
+The categories, by these exact names:
+- Mistakes: wrong assumptions, retracted answers, reverted edits, user \
+corrections, a fix that had to be redone.
+- Waste: dead ends, oversized reads or outputs, searches that took several \
+tries, work thrown away, slow paths: a LONG call, or a cache rebuild not after a \
+user turn; the same command taking a minute or more several times; polling \
+(repeated sleeps, waits or status checks).
+- Repetition: the same command sequence, lookup or explanation done more than \
+once, in one agent or across the agents you see.
+- Missing context: anything an agent learned by trial, by asking the user or by \
+digging through code that a doc could have told it, including a brief that left \
+a subagent to rediscover what its parent knew, and files that had to change \
+together with nothing pointing from one to the other.
+- Hungry tools: a tool or script whose output cost more tokens than the agent used.
+- Skipped checks: `--no-verify` or `git commit -n`.
+
+Not findings: one long call that did its job; a `user` wait; a hook refusal \
+followed by a correct retry (the hook working as designed); a subagent reading \
+its brief, a skill, a standards file or a tool's `-h` once; a test that fails \
+first on purpose (test-driven work) or a review finding a problem (the review \
+doing its job); ending a turn to wait for a notification; a check the user made \
+light on purpose (see their turns).
+
+For each finding give its category; first_line and last_line, the digest line \
+numbers (the left column) of the shortest range that shows it, at most about 30 \
+lines unless the pattern spans more; and the finding, one or two sentences \
+saying what happened and what it cost, specific enough to check: name the \
+command, file or number. Don't guess at what the log leaves out, such as an \
+output's content. Report each finding once. If you find nothing, return an \
+empty list."""
+
+
+class Digest:
+    """A session-digest's text: its summary, and each agent section's line range."""
+
+    def __init__(self, text: str) -> None:
+        self.lines = text.splitlines()
+        starts = [n for n, line in enumerate(self.lines, 1) if line.startswith("== ")]
+        ends = [n - 1 for n in starts[1:]] + [len(self.lines)]
+        self.sections = [range(s, e + 1) for s, e in zip(starts, ends, strict=True)]
+        cut = starts[0] - 1 if starts else len(self.lines)
+        self.summary = "\n".join(self.lines[:cut]).strip()
+
+    def text(self, n: int) -> str:
+        return self.lines[n - 1]
+
+    def section_of(self, n: int) -> range:
+        return next(s for s in self.sections if n in s)
+
+    def agent_at(self, n: int) -> str:
+        return self.text(self.section_of(n).start).removeprefix("== ").split(" (")[0]
+
+    def user_turns(self) -> str:
+        main = next((s for s in self.sections if self.text(s.start) == "== main"), [])
+        return "\n".join(self.text(n) for n in main if user_turn(self.text(n)))
+
+    def size(self, n: int) -> int:
+        return len(self.text(n)) + NUMBER_WIDTH + 1
+
+
+def user_turn(line: str) -> bool:
+    """A user's turn, or a subagent's brief; not text a skill or hook injected."""
+    return line.startswith("USER ") and not line.startswith("USER (injected")
+
+
+@dataclass
+class Chunk:
+    number: int
+    first: int
+    last: int
+    status: str = "unread"  # read, failed
+    error: str = ""
+
+    @property
+    def span(self) -> str:
+        return f"L{self.first}-{self.last}"
+
+    def agents(self, digest: Digest) -> list[str]:
+        return [
+            digest.agent_at(s.start)
+            for s in digest.sections
+            if s.start <= self.last and self.first <= s[-1]
+        ]
+
+    def body(self, digest: Digest) -> str:
+        lines = [f"{n:>6}  {digest.text(n)}" for n in range(self.first, self.last + 1)]
+        section = digest.section_of(self.first)
+        if self.first != section.start:
+            lines.insert(0, f"{'':>6}  {digest.text(section.start)} (continued)")
+        return "\n".join(lines)
+
+
+@dataclass
+class Candidate:
+    chunk: int
+    category: str
+    agent: str
+    first_line: int
+    last_line: int
+    finding: str
+
+    def line(self) -> str:
+        wide = " (wide)" if self.last_line - self.first_line + 1 > WIDE else ""
+        finding = " ".join(self.finding.split())
+        span = f"L{self.first_line}-{self.last_line}"
+        return f"{span}  {self.agent}  {self.category}: {finding}{wide}"
+
+
+def pieces(digest: Digest, section: range, limit: int) -> list[range]:
+    """The section, cut where it runs past limit: at the last user turn in the piece's
+    second half, where there is one, else at the line that runs over."""
+    out: list[range] = []
+    start, size = section.start, 0
+    for n in section:
+        if n > start and size + digest.size(n) > limit:
+            turns = [
+                t
+                for t in range(start + (n - start) // 2, n)
+                if t > start and user_turn(digest.text(t))
+            ]
+            cut = turns[-1] if turns else n
+            out.append(range(start, cut))
+            start, size = cut, sum(digest.size(t) for t in range(cut, n))
+        size += digest.size(n)
+    out.append(range(start, section[-1] + 1))
+    return out
+
+
+def make_chunks(digest: Digest, limit: int) -> list[Chunk]:
+    """Pieces packed in order. A piece that continues a section never fits beside
+    the one before it, so it starts a chunk, where its header goes."""
+    chunks: list[Chunk] = []
+    size = 0
+    for section in digest.sections:
+        for piece in pieces(digest, section, limit):
+            piece_size = sum(digest.size(n) for n in piece)
+            if chunks and size + piece_size <= limit:
+                chunks[-1].last = piece[-1]
+                size += piece_size
+            else:
+                chunks.append(Chunk(len(chunks) + 1, piece.start, piece[-1]))
+                size = piece_size
+    return chunks
+
+
+def repeated_calls(digest: Digest) -> list[tuple[str, int, list[int]]]:
+    """(call, agents, lines) for each call made the same way, numbers aside, in two
+    agents or more and three times or more in all, the most often first. The call is
+    shown as the first of them was made."""
+    seen: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for section in digest.sections:
+        agent = digest.agent_at(section.start)
+        for n in section:
+            if digest.text(n).startswith("  > "):
+                seen[re.sub(r"\d+", "N", digest.text(n))].append((agent, n))
+    found = [
+        (
+            digest.text(where[0][1])[4:],
+            len({a for a, _ in where}),
+            [n for _, n in where],
+        )
+        for where in seen.values()
+        if len(where) >= 3 and len({a for a, _ in where}) >= 2
+    ]
+    return sorted(found, key=lambda r: (-len(r[2]), r[0]))[:REPEATS]
+
+
+class Readers:
+    """The claude-fresh calls under way, so a stopped scan can stop them."""
+
+    def __init__(self) -> None:
+        self.running: set[subprocess.Popen] = set()
+        self.lock = threading.Lock()
+        self.sent = 0  # characters of prompt sent, every attempt
+
+    def ask(self, prompt: str, model: str) -> subprocess.CompletedProcess:
+        cmd = ["claude-fresh", "--json", json.dumps(SCHEMA), "-m", model]
+        cmd += ["--system-prompt", READER]
+        # Started under the lock, so a stop can't fall between its start and its entry.
+        with self.lock:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            self.running.add(proc)
+            self.sent += len(prompt) + len(READER)
+        try:
+            out, err = proc.communicate(prompt)
+        finally:
+            with self.lock:
+                self.running.discard(proc)
+        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+    def stop(self) -> None:
+        with self.lock:
+            for proc in self.running:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def read(self, prompt: str, model: str, backoff: float) -> list[dict]:
+        """The findings for one prompt, trying twice. Raises RuntimeError."""
+        error = ""
+        for attempt in range(2):
+            if attempt:
+                time.sleep(backoff)
+            proc = self.ask(prompt, model)
+            if proc.returncode != 0:
+                lines = proc.stderr.strip().splitlines()
+                error = lines[-1] if lines else f"exit {proc.returncode}"
+                continue
+            try:
+                return list(json.loads(proc.stdout)["findings"])
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                error = f"unreadable answer ({e})"
+        raise RuntimeError(error)
+
+
+def prompt_for(chunk: Chunk, digest: Digest) -> str:
+    return (
+        f"The digest's summary, for context:\n{digest.summary}\n\n"
+        f"The user's turns in the main session, for context:\n{digest.user_turns()}\n\n"
+        f"Timeline lines to review, each with its digest line number:\n"
+        f"{chunk.body(digest)}\n"
+    )
+
+
+def candidate_from(found: dict, chunk: Chunk, digest: Digest) -> Candidate | None:
+    """The model's finding as a candidate, or None when it isn't a valid one."""
+    try:
+        first, last = int(found["first_line"]), int(found["last_line"])
+        category, finding = found["category"], found["finding"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if category not in CATEGORIES or not isinstance(finding, str):
+        return None
+    if not chunk.first <= first <= last <= chunk.last:
+        return None
+    return Candidate(
+        chunk.number, category, digest.agent_at(first), first, last, finding
+    )
+
+
+def in_order(candidates: list[Candidate]) -> list[Candidate]:
+    return sorted(candidates, key=lambda c: (c.first_line, c.last_line))
+
+
+def write(path: Path, text: str) -> None:
+    """Whole or not at all: a scan stopped mid-write leaves the last version."""
+    part = path.with_name(f".{path.name}.part")
+    part.write_text(text)
+    part.replace(path)
+
+
+def save(out: Path, chunks: list[Chunk], candidates: list[Candidate]) -> None:
+    write(out / "chunks.json", json.dumps([asdict(c) for c in chunks]))
+    write(
+        out / "candidates.jsonl",
+        "".join(json.dumps(asdict(c)) + "\n" for c in in_order(candidates)),
+    )
+
+
+def load(out: Path) -> tuple[Digest, list[Chunk], list[Candidate]] | None:
+    try:
+        digest = Digest((out / "digest.txt").read_text())
+        chunks = [Chunk(**c) for c in json.loads((out / "chunks.json").read_text())]
+        lines = (out / "candidates.jsonl").read_text().splitlines()
+        candidates = [Candidate(**json.loads(line)) for line in lines if line]
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    return digest, chunks, candidates
+
+
+def chunk_list(text: str) -> set[int]:
+    try:
+        return {int(n) for n in text.split(",")}
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"not a list of chunk numbers: {text}"
+        ) from None
+
+
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="session-scan",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "session",
+        nargs="?",
+        help="session id or path to its .jsonl (default: newest for --cwd)",
+    )
+    parser.add_argument(
+        "--cwd",
+        default=os.getcwd(),
+        help="project directory whose sessions to search (default: current)",
+    )
+    parser.add_argument(
+        "--out",
+        required=True,
+        type=Path,
+        help="folder for the digest, chunks and candidates",
+    )
+    parser.add_argument(
+        "-m", "--model", default="sonnet", help="the reader's model (default sonnet)"
+    )
+    parser.add_argument(
+        "--chunk-chars",
+        type=int,
+        default=60000,
+        help="largest chunk, in characters of lines (default 60000)",
+    )
+    parser.add_argument(
+        "-j", "--jobs", type=int, default=4, help="chunks read at once (default 4)"
+    )
+    parser.add_argument(
+        "--chunks",
+        type=chunk_list,
+        help="reread these chunks (e.g. 3,7) of the earlier run in --out",
+    )
+    return parser.parse_args(argv)
+
+
+def start(
+    args: argparse.Namespace,
+) -> tuple[Digest, list[Chunk], list[Candidate]] | int:
+    """The digest, its chunks and the candidates kept from an earlier run; or the
+    exit status when there is nothing to read."""
+    if args.chunks:
+        run = load(args.out)
+        if run is None:
+            print(
+                f"session-scan: no earlier run in {args.out} to reread chunks of",
+                file=sys.stderr,
+            )
+            return 2
+        digest, chunks, candidates = run
+        unknown = args.chunks - {c.number for c in chunks}
+        if unknown:
+            numbers = ", ".join(map(str, sorted(unknown)))
+            print(f"session-scan: {args.out} has no chunk {numbers}", file=sys.stderr)
+            return 2
+        return digest, chunks, [c for c in candidates if c.chunk not in args.chunks]
+    cmd = [str(DIGEST), "--timelines", "--cwd", args.cwd]
+    proc = subprocess.run(
+        [*cmd, *filter(None, [args.session])],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        return 1
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "digest.txt").write_text(proc.stdout)
+    digest = Digest(proc.stdout)
+    return digest, make_chunks(digest, args.chunk_chars), []
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    backoff = float(os.environ.get("SESSION_SCAN_BACKOFF", "30"))
+    started = start(args)
+    if isinstance(started, int):
+        return started
+    digest, chunks, candidates = started
+    todo = [c for c in chunks if not args.chunks or c.number in args.chunks]
+    save(args.out, chunks, candidates)
+    readers = Readers()
+
+    def on_signal(signum: int, _frame) -> None:
+        readers.stop()
+        os._exit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, on_signal)
+
+    prompts = {c.number: prompt_for(c, digest) for c in todo}
+    for chunk in todo:
+        (args.out / f"chunk-{chunk.number:02d}.txt").write_text(prompts[chunk.number])
+    dropped = 0
+    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        reads = {
+            pool.submit(readers.read, prompts[c.number], args.model, backoff): c
+            for c in todo
+        }
+        for done in as_completed(reads):
+            chunk = reads[done]
+            try:
+                found = done.result()
+            except RuntimeError as e:
+                chunk.status, chunk.error = "failed", str(e)
+            else:
+                chunk.status, chunk.error = "read", ""
+                kept = [c for f in found if (c := candidate_from(f, chunk, digest))]
+                dropped += len(found) - len(kept)
+                candidates += kept
+            save(args.out, chunks, candidates)
+
+    report(args, digest, chunks, candidates, dropped, readers.sent)
+    failed = [c for c in chunks if c.status != "read"]
+    for chunk in failed:
+        print(
+            f"session-scan: chunk {chunk.number} ({chunk.span}: "
+            f"{', '.join(chunk.agents(digest))}) {chunk.status}: {chunk.error}; "
+            f"reread it with --chunks {chunk.number}",
+            file=sys.stderr,
+        )
+    return 3 if failed else 0
+
+
+def report(
+    args: argparse.Namespace,
+    digest: Digest,
+    chunks: list[Chunk],
+    candidates: list[Candidate],
+    dropped: int,
+    sent: int,
+) -> None:
+    for candidate in in_order(candidates):
+        print(candidate.line())
+    repeats = repeated_calls(digest)
+    if repeats:
+        print("\nrepeated across agents")
+        for call, agents, lines in repeats:
+            where = ", ".join(f"L{n}" for n in lines[:REPEAT_LINES])
+            more = ", …" if len(lines) > REPEAT_LINES else ""
+            print(f"{len(lines):>4}x in {agents} agents  {call[:200]}  ({where}{more})")
+    print()
+    counts = Counter(c.chunk for c in candidates)
+    for chunk in chunks:
+        state = (
+            f"{counts[chunk.number]} candidates"
+            if chunk.status == "read"
+            else chunk.status.upper()
+        )
+        agents = ", ".join(chunk.agents(digest))
+        print(f"chunk {chunk.number:02d}  {chunk.span}  {state}  {agents[:120]}")
+    read = sum(c.status == "read" for c in chunks)
+    print(
+        f"session-scan: {read} of {len(chunks)} chunks read by {args.model}, "
+        f"{len(candidates)} candidates, {dropped} dropped as invalid, "
+        f"~{sent // CHARS_PER_TOKEN} input tokens; "
+        f"digest: {args.out / 'digest.txt'}"
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

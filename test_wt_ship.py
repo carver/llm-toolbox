@@ -1661,20 +1661,24 @@ def test_a_landing_that_waited_while_main_moved_checks_each_commit_once(
 
 def test_a_waiter_keeps_waiting_while_the_holder_changes(setup, holder, background):
     _, main, wt, _ = setup
-    first, second = holder(), holder()
+    first, second, third = holder(), holder(), holder()
     flag(main).write_text(holder_flag(first))
     tip = commit(wt, "a.py", "x = 1\n", "Add a")
     shipping = background(wt, "--local", wait="8")
     waits_to_land(shipping)
-    # A loaded machine has 7 s of the 8 s wait to see the handover.
-    # fixed sleep: the handover comes a second into the wait
-    time.sleep(1)
+    # Each handover comes 3 s after the last, 5 s before the wait would end, and the
+    # last holder leaves at 10 s: past the first wait's 8 s, 4 s before the last
+    # restarted one ends, so only a wait that restarts lands, with room to spare.
+    # fixed sleep: the first handover's moment
+    time.sleep(3)
     flag(main).write_text(holder_flag(second))
-    # Only a wait that restarted at the handover lands.
-    # fixed sleep: the second holder keeps the flag past the first wait's deadline
-    time.sleep(8)
-    second.kill()
-    second.wait()
+    # fixed sleep: the second handover's moment
+    time.sleep(3)
+    flag(main).write_text(holder_flag(third))
+    # fixed sleep: the last holder keeps the flag past the first wait's deadline
+    time.sleep(4)
+    third.kill()
+    third.wait()
 
     status, _, err = finish(shipping)
 

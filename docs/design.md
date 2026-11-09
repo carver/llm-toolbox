@@ -231,11 +231,11 @@ nothing while it is empty. So the variable means two things: the file that holds
 secrets, and, set and empty, "source none here". A reader must never default it with
 `${AGENT_SECRETS_FILE:-...}` or Python's `or`, which read empty as unset; `-` keeps
 it. A bash started with a cleared environment (`env -i`, a test's own clean one) has
-no marker and still sources the file, and dot-files' tests start theirs so: their
-`clean_env()` keeps only HOME, PATH, TERM and LANG, so they need to pass
-AGENT_SECRETS_FILE through too (open, 2026-11-09). BASH_ENV stays stripped: it holds
-without the other repo's half, as on a sandbox whose persistent file predates the
-marker.
+no marker and still sources the file. dot-files' tests start theirs so, from
+`clean_env()`, which passes AGENT_SECRETS_FILE through as it finds it, empty too
+(2026-11-09), so their shells under a check get no secrets. BASH_ENV stays stripped:
+it holds without the other repo's half, as on a sandbox whose persistent file
+predates the marker.
 
 ### build-state finish stops only for what a fold, or the repo's safety, depends on (2026-11-09)
 

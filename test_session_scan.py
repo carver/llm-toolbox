@@ -215,7 +215,8 @@ def test_chunks_hold_whole_sections_in_order_up_to_the_limit(
         c=busy("c", 5),
     )
     out = tmp_path / "scan"
-    assert scan(env, out, "--chunk-chars", "600").returncode == 0
+    # No tails: the sizes this test packs are those of the lines alone.
+    assert scan(env, out, "--chunk-chars", "600", "--no-tails").returncode == 0
     bodies = chunk_bodies(out)
     assert len(bodies) > 1
     assert all(len(body) <= 600 + 1 for body in bodies)
@@ -559,3 +560,24 @@ def test_candidates_print_and_save_in_digest_line_order(
     printed = [line for line in proc.stdout.splitlines() if line.startswith("L")]
     assert [line.split(": ")[-1] for line in printed] == ["finding 1", "finding 0"]
     assert [c["finding"] for c in candidates(out)] == ["finding 1", "finding 0"]
+
+
+def test_the_digest_holds_whole_messages_and_output_tails(
+    env: dict, tmp_path: Path
+) -> None:
+    long = "My guess is the margin is too tight. " * 20
+    main = [user("Go"), assistant("r1", {"type": "text", "text": long})]
+    main += call("t1", "pytest", "....\n1 failed, 40 passed")
+    session(Path(env["CLAUDE_CONFIG_DIR"]), main)
+    out = tmp_path / "scan"
+    assert scan(env, out).returncode == 0
+    lines = digest_lines(out)
+    assert f"  {long.strip()}" in lines
+    assert "    | 1 failed, 40 passed" in lines
+
+
+def test_no_tails_leaves_the_outputs_out(env: dict, tmp_path: Path) -> None:
+    session(Path(env["CLAUDE_CONFIG_DIR"]), [user("Go"), *call("t1", "pytest", "1 ok")])
+    out = tmp_path / "scan"
+    assert scan(env, out, "--no-tails").returncode == 0
+    assert not any(line.startswith("    | ") for line in digest_lines(out))

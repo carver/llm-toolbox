@@ -11,8 +11,11 @@ Waste, Repetition, Missing context, Hungry tools and Skipped checks. The model
 reports candidates, each citing the digest lines that show it; the agent running
 the retrospective checks each one, since a cheap reader over-reports.
 
-It runs `session-digest --timelines` (workflow agents' full timelines included) for
-the session, which defaults to the newest one for --cwd, and writes into DIR:
+It runs `session-digest --timelines --whole-text --tails` for the session, which
+defaults to the newest one for --cwd: workflow agents' full timelines, the
+assistant's text whole, and each successful output's last three lines, where a
+misread test summary or exit line would show (--no-tails leaves them out). It
+writes into DIR:
 
   digest.txt        the digest; the candidates' line numbers point into it
   chunk-NN.txt      what each chunk's reader got
@@ -118,13 +121,18 @@ How the log reads:
 the user talked to. `(continued)` means the section began in an earlier part.
 - `USER ...` is a turn from the user or, in a subagent, the brief its parent \
 wrote. `USER (injected, N chars)` is text a skill or hook added.
-- An indented line of plain text is the agent's own words.
+- An indented line of plain text is the agent's own words, whole.
 - `> Tool: input` is a tool call; `-> agent-...` names the subagent it started. \
 A long input is cut, ending `…[+N chars]`.
 - `= N chars ~T tok` is the size of a successful call's output; `ERROR ...` is a \
 failed call's error. Calls sent together print first, their results after, in \
 order. `[3m12s]` is how long a call took (shown from a minute); `LONG` marks 40 \
 minutes or more; `user` marks time spent waiting for the user.
+- `| ...` lines under a successful call are its output's last lines (at most 3), \
+not the whole output: check what the agent said or did next against them, such \
+as a test summary it reported differently. A failure under mutate-check is a \
+caught mutant, the check working; and an exit status other than 0 isn't always \
+a failure (grep finding nothing, a check reporting).
 - `HOOK ERROR` is a hook that failed. Hooks often refuse a command on purpose and \
 say what to do instead.
 - `NOTIFY id status: summary` is a background task's notification.
@@ -462,6 +470,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=chunk_list,
         help="reread these chunks (e.g. 3,7) of the earlier run in --out",
     )
+    parser.add_argument(
+        "--no-tails",
+        action="store_true",
+        help="leave out each successful output's last lines",
+    )
     return parser.parse_args(argv)
 
 
@@ -485,7 +498,8 @@ def start(
             print(f"session-scan: {args.out} has no chunk {numbers}", file=sys.stderr)
             return 2
         return digest, chunks, [c for c in candidates if c.chunk not in args.chunks]
-    cmd = [str(DIGEST), "--timelines", "--cwd", args.cwd]
+    cmd = [str(DIGEST), "--timelines", "--whole-text", "--cwd", args.cwd]
+    cmd += [] if args.no_tails else ["--tails"]
     proc = subprocess.run(
         [*cmd, *filter(None, [args.session])],
         text=True,

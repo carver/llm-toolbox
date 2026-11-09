@@ -561,7 +561,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   under `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
 
 - **session-scan**: has a cheaper model read a whole session's digest, every
-  agent, for /upskill. Writes `session-digest --timelines` to `--out DIR`, cuts
+  agent, for /upskill. Writes `session-digest --timelines --whole-text --tails`
+  to `--out DIR` (`--no-tails` leaves the output tails out), cuts
   it into chunks of whole agent sections (`--chunk-chars`, default 60000; a
   longer section is cut at a user turn), and sends each, after the digest's
   summary and the user's turns, to `claude-fresh` (`-m`, default sonnet; `-j`

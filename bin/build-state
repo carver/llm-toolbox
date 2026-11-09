@@ -536,7 +536,10 @@ You may run the repo's own build and check commands; writing outputs git ignores
 fine. Run tools at the versions the repo pins (its hooks, pre-commit config or lock \
 files), not whatever `uvx` or `PATH` gives: another version reports what the repo's \
 checks don't. To see whether a test catches a break, use `mutate-check -- CMD` \
-(`mutate-check -h`), which puts the code back, rather than a scripted edit.
+(`mutate-check -h`), which puts the code back, rather than a scripted edit. To see how \
+the code behaves on a case, run the tests that reach it, a few at a time, through \
+`heavy --quick -- CMD` as a foreground call with the Bash timeout at 600000; judge a \
+case no test reaches from the code.
 {checked_at_landing}
 Run two separate reviews and report them under the headings `## Standards` and `## Spec`. \
 Don't merge or rerank findings across the two.

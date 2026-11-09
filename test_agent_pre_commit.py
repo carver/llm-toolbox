@@ -284,8 +284,8 @@ def test_nothing_changed_since_the_base_runs_the_suite(repo):
 
 
 def test_the_base_is_compared_with_whats_staged_not_only_with_head(repo):
-    """On wt-ship's or build-state finish's recheck, nothing is staged, and the change
-    is what the index holds against an older base."""
+    """On wt-ship's recheck, nothing is staged, and the change is what the index holds
+    against an older base."""
     change(repo, "bin/tool")
     git(repo, "commit", "-q", "--no-verify", "-m", "code")
     change(repo, "README.md")

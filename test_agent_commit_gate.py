@@ -530,7 +530,7 @@ def test_a_small_fix_commit_without_a_quick_check_skips_the_agent_check(
     assert run.returncode == 0, run.stderr
     assert (
         "skipped for a small fix commit" in run.stderr
-        and "build-state finish" in run.stderr
+        and "wt-ship runs it on each commit it lands" in run.stderr
     )
     assert ran(installed) == ["fast", "agent", "fast"]
 

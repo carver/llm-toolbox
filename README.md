@@ -278,17 +278,17 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   only the message, the check is skipped. Otherwise the check gets
   `$CHECK_BASE`, the nearest of HEAD's last 100 first-parent commits whose tree
   passed it, and may run only what the changes since need: `git diff --cached
-  --name-only "$CHECK_BASE"` lists them at commit time and on a `wt-ship` or
-  `build-state finish` recheck. A check that ignores it runs in full, as does
+  --name-only "$CHECK_BASE"` lists them at commit time and on a `wt-ship`
+  recheck. A check that ignores it runs in full, as does
   any with no base found; `agent-quick-check` gets the same base. An agent
   without llm-toolbox, such as a teammate's, runs the check every time.
   The check's output shows only when
   it fails, ending with `COMMIT REFUSED`; a pass prints one line. A small
   fixup!, squash! or amend! commit (found from the running `git commit`'s
   arguments) runs `agent-quick-check` instead, when the repo keeps one beside
-  `agent-pre-commit`, and otherwise skips the check, since `build-state finish`
-  checks each commit before the tip with no pass on record, and `wt-ship` the
-  tip. Small means at most 20 lines changed, in
+  `agent-pre-commit`, and otherwise skips the check, since `wt-ship` checks
+  each commit it lands with no pass on record. Small means at most 20 lines
+  changed, in
   files it only modifies in place (no mode change, no binary, symlink or
   submodule), none of them a test: a lint or syntax repair. Any
   other fix commit runs the full check. A repo's `agent-quick-check` holds only
@@ -416,16 +416,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `refactor` the refactor base. `finish` refuses leftover conflict markers,
   folds `fixup!` commits into the commits they fix, leaving every other commit
   separate and the tree as it was (a fix that conflicts gets the later commit
-  it was made on top of and the `reword` command that points it there), and
-  runs the repo's `agent-pre-commit` through `agent-commit-gate --run` on
-  each commit since the base but HEAD (`wt-ship` checks HEAD when it lands)
-  whose tree passed no version of it on the gate's record, checked out in
-  turn (it says so: meanwhile the tree holds that commit, not the folded tip),
-  with `CHECK_BASE` usually the commit before. A commit the agent hook passed is on the record, as is one a
-  fold rewrote to a tree that passed; a fold's new tree, finish's or one by
-  hand, is not, so a fix folded into a
-  commit before the code it needs fails naming that commit; HEAD ends back on
-  its branch either way. Then it lists the commits since the
+  it was made on top of and the `reword` command that points it there). It
+  runs no check: a fold's new tree has no pass on the gate's record, so
+  `wt-ship` checks it when it lands, and a fix folded into a commit before the
+  code it needs fails there, naming that commit. Then it lists the commits since the
   base and the test files changed since the refactor base, and fails naming
   any ref or config key that moved (a tag only when it points at a commit the
   fold may rewrite). In a detached worktree, the branch it lands on (the
@@ -434,9 +428,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   dir, with `/code-review`'s two briefs and its standards section copied from
   its SKILL.md, and prints a short prompt pointing at that file, to pass to the
   subagent; it says on stderr when the repo has no `CODING_STANDARDS.md`. When
-  `agent-commit-gate`'s record shows the repo's `agent-pre-commit` (as its bytes
-  are now) passed the commit's tree, the prompt says so, and tells the reviewer
-  to run only the tests a finding needs rather than the whole suite.
+  the repo has an `agent-pre-commit`, which `wt-ship` runs on every commit
+  when it lands, the prompt tells the reviewer to run only the tests a finding
+  needs rather than the whole suite.
   `reword SHA [FILE]` replaces a commit's message (FILE, or stdin), keeping
   every tree; it refuses during a rebase, with uncommitted changes, with merges
   after the commit, a later `fixup!` naming it, or the commit already pushed.

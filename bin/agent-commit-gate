@@ -10,9 +10,8 @@ A fix commit (fixup!, squash!, amend!) that is small, at most 20 lines changed i
 files it only modifies in place, none binary and none a test, runs the optional
 `agent-quick-check`
 beside it instead, the repo's fast static checks, or nothing when the repo has
-none: `build-state finish` runs the full check on each commit since its base but
-the tip with no pass on the record below, and wt-ship on the tip. Any other fix
-commit runs the full check.
+none: wt-ship runs the full check on each commit it lands that has no pass on the
+record below. Any other fix commit runs the full check.
 
 `--install REPO...` puts one line first in each repo's pre-commit hook (creating
 the hook if needed). When `$AI_AGENT` is set, as Claude Code sets it in its
@@ -32,7 +31,7 @@ teammate's, runs the check directly instead, every time. A check `--run` runs
 waits its turn in heavy's queue (bin/heavy), so agents' commit checks never run
 at once, and prints heavy's waiting lines; one that needs no build or test can
 skip the queue, as below.
-wt-ship and build-state finish recheck through `--run` too. While wt-ship checks a
+wt-ship rechecks through `--run` too. While wt-ship checks a
 worktree's commits before its tip, each checked out there in turn, a marker in the
 worktree's git dir names the run, and `--run` refuses a commit in that worktree, which
 would be lost when the tip comes back. The checks wt-ship starts carry its PID in
@@ -63,8 +62,8 @@ would quote, --no-renames to list both sides of a rename, and run it before
 unsetting git's variables or changing directory: `commit -a` and `commit
 PATHS` stage into an index of their own, which GIT_INDEX_FILE names. On
 wt-ship's recheck the base is usually the commit before, or for the first
-commit it checks, the main branch's tip, which passed when it landed; in
-build-state finish, the commit before. A check that ignores
+commit it checks, the main branch's tip, which passed when it landed. A check that
+ignores
 CHECK_BASE runs in full, as does any check when no base is found. The pass line
 names the base it was given. agent-quick-check gets CHECK_BASE too: the nearest
 commit that passed agent-pre-commit, whose checks include the quick ones.
@@ -309,7 +308,7 @@ def is_small_fix():
     every file modified in place (none added, deleted, renamed or copied, no mode
     changed, no submodule or symlink), none binary and none a test. Such a fix is
     likely a lint or syntax repair, which the full check can wait for until
-    build-state finish. An empty change, as in a reword, is small. -z keeps paths as
+    wt-ship lands it. An empty change, as in a reword, is small. -z keeps paths as
     they are: without it git quotes one with a tab, a quote or a non-ASCII letter."""
     raw = git_out("diff", "--cached", "--raw", "-z", "-M", "HEAD")
     counts = git_out("diff", "--cached", "--numstat", "-z", "-M", "HEAD")
@@ -339,7 +338,7 @@ def is_small_fix():
 
 def is_fix_commit(args):
     """Whether a `git commit` with these arguments makes a fixup!, squash! or amend!
-    commit, which build-state finish folds and checks."""
+    commit, which build-state finish folds and wt-ship checks."""
     words, subject = iter(args), None
     for word in words:
         if word == "--":
@@ -688,8 +687,8 @@ def run_check(path):
                 code = run_quiet(quick, QUICK_NAME, base, queue=False)
             return refuse_if_staged_changed(code, before, QUICK_NAME)
         print(
-            f"{HOOK_NAME}: skipped for a small fix commit; build-state finish runs it on "
-            "each commit before the tip with no pass on record, wt-ship on the tip",
+            f"{HOOK_NAME}: skipped for a small fix commit; wt-ship runs it on each "
+            "commit it lands with no pass on record",
             file=sys.stderr,
         )
         return 0

@@ -7,9 +7,10 @@
     build-state refactor    record the refactor base (HEAD), before applying review fixes
     build-state show        print the recorded bases
     build-state finish      fold fixups into the commits they fix, check the fingerprint,
-                            run the repo's agent-pre-commit on each commit before
-                            HEAD with no pass on record, print the commits since the
-                            base and the test files changed since the refactor base
+                            print the commits since the base and the test files
+                            changed since the refactor base. It runs no
+                            agent-pre-commit: wt-ship checks each commit when it
+                            lands
     build-state review-prompt BRIEF
                             write the review subagent's prompt for the commit at HEAD
                             to build-review-prompt.md in the git dir, and print a short
@@ -19,10 +20,10 @@
                             Standards and Spec briefs, copied verbatim from its
                             SKILL.md (fails when they can't be found there); on stderr,
                             a nudge to write a CODING_STANDARDS.md when the repo has none.
-                            When agent-commit-gate's record shows the repo's
-                            agent-pre-commit, as its bytes are now, passed HEAD's tree,
-                            the file says so and tells the reviewer to run only the
-                            tests a finding needs, not the whole suite
+                            When the repo has an agent-pre-commit, which wt-ship runs
+                            on every commit when it lands, the file tells the
+                            reviewer to run only the tests a finding needs, not the
+                            whole suite
     build-state reword SHA [FILE]
                             replace commit SHA's message with FILE's text (stdin
                             without FILE), keeping every tree; refuses with
@@ -41,27 +42,11 @@ names changed the same lines, so finish then names the last commit before the fi
 change its conflicting files, which the fix was made on top of, and how to point the
 fix at it with reword.
 
-Small fix commits get only the repo's agent-quick-check when they're made, if that, and
-a fold, finish's own or one done by hand, puts each fix into an earlier commit. A fix
-folded into an earlier commit than the code it needs leaves that commit broken while
-HEAD passes. So after its fold, finish runs agent-pre-commit on every commit since the
-base but HEAD, oldest first, whose tree passed no version of it by agent-commit-gate's
-record (`agent-commit-gate -h`). HEAD is wt-ship's to check when it lands, and each
-check waits its turn in heavy's queue. The record goes by tree: a commit the agent hook
-passed is on it, as is one a fold rewrote to a tree that passed. A fold's new tree is
-not, nor a small fix commit's, nor one a person committed or committed with unstaged
-changes: each of those is checked. A pass of an earlier version of the check counts,
-since finish asks whether each commit builds on its own. A commit without
-agent-pre-commit, in a repo that keeps it in its tree and added it since, has none to
-pass.
-Each commit is checked out for its check, forced, since some checks read or write the
-work tree, and finish says so as it starts: until it ends, the tree holds that commit,
-not the branch's folded tip. Each is checked through agent-commit-gate --run, which hands it CHECK_BASE:
-the nearest commit before it that passed, usually the one just before, so the check
-can run only what that commit changed. Then HEAD goes back to the branch's folded
-tip, also when finish is stopped by Ctrl-C, SIGTERM or SIGHUP, which stop the check
-too. The first failure names its commit, keeps the build open and leaves the branch
-folded.
+finish runs no check. A fold, finish's own or one done by hand, puts each fix into an
+earlier commit, and a fix folded into an earlier commit than the code it needs leaves
+that commit broken while HEAD passes; wt-ship finds it, since it checks every commit it
+lands that has no pass on agent-commit-gate's record (`wt-ship -h`), and a fold's new
+tree has none.
 
 The fingerprint is every ref except the work branch and its upstream, the stash, and the
 branches checked out in other linked worktrees at start or at finish, which other sessions
@@ -83,20 +68,17 @@ says "X moved since start: rebase onto it" while HEAD lacks one of its commits.
 """
 
 import argparse
-import contextlib
 import hashlib
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import passrecord
+import commitcheck
 
 # tests/x.py, test/x.py, spec/x.rb, test_x.py, x_test.go, x.test.ts, x.spec.js
 TEST_FILE = re.compile(
@@ -104,7 +86,6 @@ TEST_FILE = re.compile(
 )
 # The subjects of commits that finish folds into the commits they name.
 FIXES = ("fixup! ", "squash! ", "amend! ")
-GATE = Path(__file__).resolve().parent / "agent-commit-gate"
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -435,86 +416,6 @@ def conflict_hint(base: str) -> list[str]:
     ]
 
 
-@contextlib.contextmanager
-def back_at_head() -> Iterator[None]:
-    """Return HEAD to where it is now, on its branch, however the block ends: a
-    SIGTERM or SIGHUP stops it the way Ctrl-C does."""
-    # The full ref, since a tag may share the branch's short name.
-    ref = git("symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
-    branch = ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else ""
-    tip = head()
-
-    def stop(signum: int, frame: object) -> None:
-        raise KeyboardInterrupt
-
-    handlers = {s: signal.signal(s, stop) for s in (signal.SIGTERM, signal.SIGHUP)}
-    try:
-        yield
-    finally:
-        git("checkout", "-q", "--force", *([branch] if branch else ["--detach", tip]))
-        for signum, handler in handlers.items():
-            signal.signal(signum, handler)
-
-
-def agent_hook() -> Path | None:
-    """The repo's agent-pre-commit; None when it has none."""
-    # --git-path is relative to the current directory, which may be a subdirectory.
-    hooks = Path(git("rev-parse", "--git-path", "hooks").stdout.strip()).resolve()
-    hook = hooks / "agent-pre-commit"
-    return hook if hook.is_file() and os.access(hook, os.X_OK) else None
-
-
-def without_pass(base: str) -> list[str]:
-    """The commits since the base but HEAD, which wt-ship checks, oldest first, whose
-    trees passed no version of the repo's agent-pre-commit, by agent-commit-gate's
-    record."""
-    # rev-list, not log, which a config such as log.showSignature adds lines to.
-    listed = git(
-        "rev-list", "--reverse", "--no-commit-header", "--format=%H %T", f"{base}..HEAD"
-    ).stdout
-    commits = [line.split() for line in listed.splitlines()][:-1]
-    passed = passrecord.passed_any_version()
-    return [sha for sha, tree in commits if tree not in passed]
-
-
-def tree_of(commit: str) -> str:
-    return git("rev-parse", f"{commit}^{{tree}}").stdout.strip()
-
-
-def passes(argv: list[str], top: str) -> bool:
-    """Whether the check passes, run at the top of the tree as git runs a hook, in a
-    process group of its own, which dies when finish is stopped."""
-    env = os.environ | {"AGENT_PRE_COMMIT": "1"}
-    check = subprocess.Popen(argv, env=env, cwd=top, start_new_session=True)
-    try:
-        return check.wait() == 0
-    except BaseException:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(check.pid, signal.SIGKILL)
-        check.wait()
-        raise
-
-
-def first_failing(hook: Path, commits: list[str]) -> str | None:
-    """Run the agent check `hook` through agent-commit-gate --run on each commit in
-    turn, oldest first, and return the first that fails; None when every one passes. A
-    commit without the hook, which a repo that keeps it in its tree may have, has no
-    check to pass. Each commit is checked out, index and work tree both, since some
-    checks read the work tree, and forced, so nothing one check leaves reaches the next;
-    HEAD comes back to where it was after, on its branch. The caller made sure no
-    tracked file has changes."""
-    top = git("rev-parse", "--show-toplevel").stdout.strip()
-    with back_at_head():
-        for sha in commits:
-            print(git("log", "-1", "--format=  %h %s", sha).stdout, end="", flush=True)
-            git("checkout", "-q", "--force", "--detach", sha)
-            if not (hook.is_file() and os.access(hook, os.X_OK)):
-                print("    no agent-pre-commit at this commit, so nothing to check")
-            elif not passes([str(GATE), "--run", str(hook)], top):
-                return sha
-    return None
-
-
 def report_tests(refactor_base: str) -> None:
     changed = git("diff", "--name-only", refactor_base, "HEAD").stdout.splitlines()
     if tests := [name for name in changed if TEST_FILE.search(name)]:
@@ -590,25 +491,6 @@ def finish(args: argparse.Namespace) -> int:
             "These fix commits before the base, so they weren't folded:",
             *(f"  {subject}" for subject in unfolded),
         )
-    hook = agent_hook()
-    unchecked = without_pass(base) if hook else []
-    if unchecked:
-        print(
-            f"Checking with agent-pre-commit the {len(unchecked)} commit"
-            f"{'' if len(unchecked) == 1 else 's'} before HEAD with no pass on record, "
-            "each checked out here in turn: until finish ends, the tree holds that "
-            "commit, not the folded tip, so read or change nothing in it.",
-            flush=True,
-        )
-    if unchecked and (broken := first_failing(hook, unchecked)):
-        named = git("log", "-1", "--format=%h %s", "--abbrev=12", broken).stdout.strip()
-        return fail(
-            f"The repo's agent-pre-commit fails at {named}, a commit with no pass on",
-            "record. When a fold, finish's or one by hand, put a fix into an earlier",
-            "commit than the code it needs, that commit breaks while HEAD passes: fix",
-            f"it with `git commit --fixup={broken[:12]}`, or move that code into it,",
-            "and run finish again. The branch stays folded, at HEAD.",
-        )
     if "refactor_base" in state:
         report_tests(state["refactor_base"])
     for branch in sorted(moved_targets):
@@ -633,11 +515,11 @@ POINTER = """\
 Your instructions for this review are in {path}. Read that whole file first, then \
 follow it. Report only: edit no files and make no commits.
 """
-# In the review prompt when the repo's agent check passed the tree under review.
-PASSED = """
-The repo's agent check, agent-pre-commit, already passed on this commit's tree, so \
-don't run the whole test suite: run the tests a finding needs, and `mutate-check` to \
-see whether a test catches a break.
+# In the review prompt when the repo has an agent check.
+CHECKED_AT_LANDING = """
+wt-ship runs the repo's agent check, agent-pre-commit, on every commit it lands that \
+has no pass on record, so don't run the whole test suite: run the tests a finding \
+needs, and `mutate-check` to see whether a test catches a break.
 """
 REVIEW_PROMPT = """\
 Review the changes in {top} since {base}, up to {sha}. Report only: edit no files and \
@@ -655,7 +537,7 @@ fine. Run tools at the versions the repo pins (its hooks, pre-commit config or l
 files), not whatever `uvx` or `PATH` gives: another version reports what the repo's \
 checks don't. To see whether a test catches a break, use `mutate-check -- CMD` \
 (`mutate-check -h`), which puts the code back, rather than a scripted edit.
-{passed}
+{checked_at_landing}
 Run two separate reviews and report them under the headings `## Standards` and `## Spec`. \
 Don't merge or rerank findings across the two.
 
@@ -735,8 +617,6 @@ def review_prompt(args: argparse.Namespace) -> int:
         GLOBAL_STANDARDS,
         *(str(top / n) for n in REPO_STANDARDS if (top / n).is_file()),
     ]
-    hook = agent_hook()
-    passed = hook is not None and passrecord.passed(tree_of(sha), hook)
     prompt_file = state_file().parent / REVIEW_FILE
     prompt_file.write_text(
         REVIEW_PROMPT.format(
@@ -745,7 +625,11 @@ def review_prompt(args: argparse.Namespace) -> int:
             sha=sha,
             commits=git("log", "--oneline", "--reverse", f"{base}..{sha}").stdout,
             brief=args.brief.resolve(),
-            passed=PASSED if passed else "",
+            checked_at_landing=(
+                CHECKED_AT_LANDING
+                if commitcheck.runnable(commitcheck.hook_path())
+                else ""
+            ),
             sources=", ".join(sources),
             sources_section=section(text, SOURCES_HEADING),
             standards=briefs["Standards"],

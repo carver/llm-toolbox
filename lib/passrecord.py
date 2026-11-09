@@ -1,4 +1,5 @@
-"""The record of trees that passed a repo's agent check, agent-pre-commit.
+"""The records of trees that passed a repo's agent checks: agent-pre-commit's, and the
+commit check's (agent-commit-check), each a file of its own.
 
 It lives in the repo's common git dir, which every worktree shares: a line for each
 tree that passed, `<tree> <the check's fingerprint>`, newest last, the last RECORD_SIZE.
@@ -18,20 +19,24 @@ from contextlib import contextmanager
 from pathlib import Path
 
 PASS_RECORD = "agent-pre-commit-passed"
+# The passes of a repo's agent-commit-check, the commit check its commits may run in
+# the full check's place: a record of their own, so wt-ship never takes one for a pass
+# of the full check.
+COMMIT_CHECK_RECORD = "agent-commit-check-passed"
 RECORD_SIZE = 1000
 # How long a pass waits for another's write to the record before it goes unrecorded.
 RECORD_LOCK_SECONDS = 5
 
 
-def record_path():
-    """The pass record's path, in the common git dir; None outside a repository."""
+def record_path(name=PASS_RECORD):
+    """The record's path, in the common git dir; None outside a repository."""
     run = subprocess.run(
         ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
         capture_output=True,
         text=True,
         check=False,
     )
-    return Path(run.stdout.strip(), PASS_RECORD) if run.returncode == 0 else None
+    return Path(run.stdout.strip(), name) if run.returncode == 0 else None
 
 
 def recorded(record):
@@ -83,11 +88,11 @@ def record_lock(record):
         yield
 
 
-def remember(record, key):
+def remember(record, key, name="agent-pre-commit"):
     """Add key to the record, newest last, keeping the last RECORD_SIZE: rewritten
     whole and renamed into place, under the record's lock, so passes in two worktrees
     keep both. A lock held too long, or a failed write, leaves the pass unrecorded,
-    which costs a fuller run later, and says so."""
+    which costs a fuller run later, and says so, naming the check `name`."""
     part = record.with_name(f"{record.name}.{os.getpid()}")
     try:
         with record_lock(record):
@@ -97,4 +102,4 @@ def remember(record, key):
             part.replace(record)
     except OSError as error:
         part.unlink(missing_ok=True)
-        print(f"agent-pre-commit: passed; couldn't record it: {error}", file=sys.stderr)
+        print(f"{name}: passed; couldn't record it: {error}", file=sys.stderr)

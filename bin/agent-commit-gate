@@ -11,7 +11,20 @@ files it only modifies in place, none binary and none a test, runs the optional
 `agent-quick-check`
 beside it instead, the repo's fast static checks, or nothing when the repo has
 none: wt-ship runs the full check on each commit it lands that has no pass on the
-record below. Any other fix commit runs the full check.
+record below. Any other fix commit runs the full check, or the commit check where
+the repo keeps one.
+
+The commit check: a repo that keeps an executable `agent-commit-check` beside
+`agent-pre-commit` runs it at each commit that isn't a small fix, in the full
+check's place, with its passes on a record of their own,
+`agent-commit-check-passed`, beside the full one. wt-ship reads only the full
+record, so it runs `agent-pre-commit` on each such commit when it lands. The line
+--install writes says its run is a commit's by setting AGENT_CHECK_AT_COMMIT=1; the
+gate takes it out of the environment of every check, and a run without it, such as
+wt-ship's recheck or a hook still on an older line, runs the full check. At a
+commit, CHECK_BASE and the skip below count a pass of either check; otherwise only
+the full check's. The commit check waits its turn in heavy's queue unless it names
+$CHECK_QUEUE_EXIT, as below.
 
 `--install REPO...` puts one line first in each repo's pre-commit hook (creating
 the hook if needed). When `$AI_AGENT` is set, as Claude Code sets it in its
@@ -52,8 +65,9 @@ a check may read more than the tree.
 
 Before it runs the check, `--run` looks through HEAD's first-parent history,
 HEAD and up to 99 commits before it, for the nearest commit whose tree passed
-this same check, and exports it as $CHECK_BASE (a full SHA; unset when none
-is found). A repo's check may then run only what the changes since that commit
+the check (at a commit with a commit check, either check), and exports it as
+$CHECK_BASE (a full SHA; unset when none is found). A repo's check may then run
+only what the changes since that commit
 need. To list the changed paths, use
     git diff --cached --name-only "$CHECK_BASE"
 which works at commit time, when the index holds what's staged, and on a
@@ -70,15 +84,17 @@ commit that passed agent-pre-commit, whose checks include the quick ones.
 
 A check that runs only what the change needs may need no build or test at all, as
 for a docs-only commit, and then has no reason to wait behind other sessions' builds.
-Such a check says so by naming $CHECK_QUEUE_EXIT anywhere in its file (agent-pre-commit
-or agent-quick-check). `--run` then runs it first outside heavy's queue, pinned to one
+Such a check says so by naming $CHECK_QUEUE_EXIT anywhere in its file (agent-pre-commit,
+agent-commit-check or agent-quick-check). `--run` then runs it first outside heavy's
+queue, pinned to one
 core with CARGO_BUILD_JOBS=1, and with CHECK_QUEUE_EXIT=75. Before it starts a build or
 a test, the check exits with that code, after printing a line saying why; `--run`
 shows the line, waits its turn in the queue as for any other check, and runs it again
 there without the variable. Any other exit is the check's outcome, and a pass line
 then says it ran outside heavy's queue. A check that doesn't name it waits in the
-queue (agent-pre-commit) or runs outside it (agent-quick-check), as before, and never
-sees an inherited CHECK_QUEUE_EXIT. The one core keeps a check whose handling broke
+queue (agent-pre-commit, agent-commit-check) or runs outside it (agent-quick-check),
+as before, and never sees an inherited CHECK_QUEUE_EXIT. The one core keeps a check
+whose handling broke
 from loading the machine. Beyond that the queue works on trust, as the --no-verify
 refusal below does: a check that names the variable and never exits with its code
 never waits.
@@ -105,6 +121,7 @@ import sys
 import time
 from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import commitcheck
@@ -119,12 +136,14 @@ COMMENT = (
 # The line runs the whole hook again as a program, where it skips itself, so what the
 # hook formats and stages is in the index before the check starts. The hook is shared,
 # so an agent without llm-toolbox runs the check directly, every time, and its refusal
-# still ends with the line --run prints.
+# still ends with the line --run prints. AT_COMMIT tells --run it runs for a commit,
+# where a repo's COMMIT_CHECK_NAME may stand in for HOOK_NAME.
+AT_COMMIT = "AGENT_CHECK_AT_COMMIT"
 LINE = (
     'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
     'export AGENT_PRE_COMMIT=1; "$0" || exit; '
     "if command -v agent-commit-gate >/dev/null; then "
-    f'agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}"; '
+    f'{AT_COMMIT}=1 agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}"; '
     f'else "$(dirname "$0")/{HOOK_NAME}" || '
     f'{{ echo "COMMIT REFUSED: {HOOK_NAME} failed" >&2; exit 1; }}; fi; exit; fi'
 )
@@ -133,7 +152,7 @@ OLD_COMMENTS = (
     f"# Agents' commits also run the slower {HOOK_NAME} (llm-toolbox agent-commit-gate).",
 )
 # Earlier versions of LINE, which --install replaces: before --run, before the refusal
-# line, then before the line ran the hook first.
+# line, before the line ran the hook first, then before it said it runs for a commit.
 OLD_LINES = (
     (
         'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
@@ -151,6 +170,14 @@ OLD_LINES = (
         f'AGENT_PRE_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}" || exit; '
         f'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/{HOOK_NAME}" || '
         f'{{ echo "COMMIT REFUSED: {HOOK_NAME} failed" >&2; exit 1; }}; fi; fi'
+    ),
+    (
+        'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
+        'export AGENT_PRE_COMMIT=1; "$0" || exit; '
+        "if command -v agent-commit-gate >/dev/null; then "
+        f'agent-commit-gate --run "$(dirname "$0")/{HOOK_NAME}"; '
+        f'else "$(dirname "$0")/{HOOK_NAME}" || '
+        f'{{ echo "COMMIT REFUSED: {HOOK_NAME} failed" >&2; exit 1; }}; fi; exit; fi'
     ),
 )
 # How many of HEAD's first-parent commits, HEAD included, --run looks through for one
@@ -272,6 +299,9 @@ def commits(command):
 FIX_SUBJECT = ("fixup!", "squash!", "amend!")
 # The optional fast check a small fix commit runs instead of HOOK_NAME, beside it.
 QUICK_NAME = "agent-quick-check"
+# The optional check every other commit runs instead of HOOK_NAME, beside it, when the
+# line says the run is a commit's; wt-ship runs HOOK_NAME on the commit when it lands.
+COMMIT_CHECK_NAME = "agent-commit-check"
 # A check that names this variable runs first outside heavy's queue, with it set to
 # QUEUE_EXIT, the exit status that asks for the queue (sysexits' EX_TEMPFAIL).
 QUEUE_EXIT_NAME = "CHECK_QUEUE_EXIT"
@@ -502,8 +532,9 @@ def install(repo):
 
 def check_env(env, base):
     """`env` for a check: CHECK_BASE set to `base` (None: unset), and CHECK_QUEUE_EXIT
-    left out."""
-    env = {k: v for k, v in env.items() if k not in ("CHECK_BASE", QUEUE_EXIT_NAME)}
+    and AT_COMMIT left out, so nothing the check starts takes itself for a commit's."""
+    gone = ("CHECK_BASE", QUEUE_EXIT_NAME, AT_COMMIT)
+    env = {k: v for k, v in env.items() if k not in gone}
     if base:
         env["CHECK_BASE"] = base
     return env
@@ -600,9 +631,44 @@ def run_quiet(path, name, base, queue=True):
     return report(name, base, run, took)
 
 
-def check_base(passed, fingerprint):
+class Check(NamedTuple):
+    """A check the gate may run, its bytes, and the record of the trees that passed it
+    (`passrecord`)."""
+
+    path: str
+    name: str
+    content: bytes
+    record: Path | None
+    passed: frozenset
+
+    @classmethod
+    def at(cls, path, name, record_name):
+        record = passrecord.record_path(record_name)
+        passed = frozenset(passrecord.recorded(record)) if record else frozenset()
+        return cls(path, name, Path(path).read_bytes(), record, passed)
+
+    def key(self, tree):
+        """The record's line for `tree` passing this check as its bytes are now."""
+        return passrecord.pass_key(tree, passrecord.fingerprint(self.content))
+
+    def passed_tree(self, tree):
+        return self.key(tree) in self.passed
+
+
+def commit_check(path):
+    """The repo's COMMIT_CHECK_NAME beside `path`, as a Check, when the line says this
+    run is a commit's and the repo has one; None otherwise."""
+    if os.environ.get("AGENT_CHECK_AT_COMMIT") != "1":
+        return None
+    found = os.path.join(os.path.dirname(path), COMMIT_CHECK_NAME)
+    if not (os.path.isfile(found) and os.access(found, os.X_OK)):
+        return None
+    return Check.at(found, COMMIT_CHECK_NAME, passrecord.COMMIT_CHECK_RECORD)
+
+
+def check_base(checks):
     """The nearest of HEAD's first BASE_SEARCH first-parent commits, HEAD included,
-    whose tree passed the check with this fingerprint; None when there's none."""
+    whose tree passed one of `checks`; None when there's none."""
     log = git_out(
         "log",
         "--no-show-signature",
@@ -613,10 +679,8 @@ def check_base(passed, fingerprint):
     )
     for line in (log or "").splitlines():
         # Only `<commit> <tree>`, whatever else a config adds to git log's output.
-        if (
-            len(words := line.split()) == 2
-            and passrecord.pass_key(words[1], fingerprint) in passed
-        ):
+        words = line.split()
+        if len(words) == 2 and any(check.passed_tree(words[1]) for check in checks):
             return words[0]
     return None
 
@@ -647,13 +711,16 @@ def no_unstaged_changes():
 
 
 def run_check(path):
-    """Run the agent check at `path`, unless HEAD's tree is the tree being checked and
-    passed this check already, as when an amend changes only the message or wt-ship
-    rechecks a commit it didn't rebase. The key is the tree and the check's own content,
-    on a record every worktree shares. A pass counts only with no unstaged changes to
-    tracked files, since some checks read the working tree rather than the index. The
-    check gets CHECK_BASE, the nearest first-parent commit whose tree passed it. A
-    check that passes but leaves what's staged changed refuses the commit."""
+    """Run the agent check at `path`, or at a commit the repo's COMMIT_CHECK_NAME in
+    its place (commit_check), unless HEAD's tree is the tree being checked and passed
+    already, as when an amend changes only the message or wt-ship rechecks a commit it
+    didn't rebase. At a commit a pass of either check counts; otherwise only the agent
+    check's. The key is the tree and the check's own content, on a record every
+    worktree shares, one record per check. A pass counts only with no unstaged changes
+    to tracked files, since some checks read the working tree rather than the index.
+    The check gets CHECK_BASE, the nearest first-parent commit whose tree passed a
+    check that counts. A check that passes but leaves what's staged changed refuses
+    the commit."""
     hook = Path(path)
     if (busy := commitcheck.blocking_commits()) is not None:
         print(
@@ -668,14 +735,14 @@ def run_check(path):
         print(f"{path}: no executable agent check", file=sys.stderr)
         print(f"COMMIT REFUSED: no {HOOK_NAME} to run", file=sys.stderr)
         return 1
-    record = passrecord.record_path()
-    passed = set(passrecord.recorded(record)) if record else set()
-    content = hook.read_bytes()
-    fingerprint = passrecord.fingerprint(content)
-    base = check_base(passed, fingerprint)
+    full = Check.at(path, HOOK_NAME, passrecord.PASS_RECORD)
+    at_commit = commit_check(path)
+    counted = [check for check in (full, at_commit) if check is not None]
     before = staged()
     fix = (args := running_commit_args()) is not None and is_fix_commit(args)
     if fix and is_small_fix():
+        # The quick check's base passed the full check, whose checks include its own.
+        base = check_base([full])
         # Beside `path` as given, so a ./ path stays one.
         quick = os.path.join(os.path.dirname(path), QUICK_NAME)
         if os.path.isfile(quick) and os.access(quick, os.X_OK):
@@ -693,18 +760,24 @@ def run_check(path):
         )
         return 0
     tree = git_out("write-tree")
-    key = passrecord.pass_key(tree, fingerprint) if tree else None
-    if key in passed and tree == git_out("rev-parse", "-q", "--verify", "HEAD^{tree}"):
-        print(
-            f"{HOOK_NAME}: skipped, tree {tree[:12]} already passed it", file=sys.stderr
-        )
-        return 0
+    if tree and tree == git_out("rev-parse", "-q", "--verify", "HEAD^{tree}"):
+        for check in counted:
+            if check.passed_tree(tree):
+                print(
+                    f"{check.name}: skipped, tree {tree[:12]} already passed it",
+                    file=sys.stderr,
+                )
+                return 0
+    check = at_commit or full
+    base = check_base(counted)
     clean = no_unstaged_changes()
-    run = run_outside_first if names_queue_exit(content) else run_quiet
-    code = refuse_if_staged_changed(run(path, HOOK_NAME, base), before, HOOK_NAME)
+    run = run_outside_first if names_queue_exit(check.content) else run_quiet
+    code = refuse_if_staged_changed(
+        run(check.path, check.name, base), before, check.name
+    )
     # Some checks read the work tree, so it must match the index from start to end.
-    if code == 0 and clean and no_unstaged_changes() and key and record:
-        passrecord.remember(record, key)
+    if code == 0 and clean and no_unstaged_changes() and tree and check.record:
+        passrecord.remember(check.record, check.key(tree), check.name)
     return code
 
 
@@ -749,7 +822,7 @@ def main(argv=None):
             "Commit blocked: --no-verify (-n) skips the pre-commit hook, which runs "
             f"this repo's checks, {HOOK_NAME} included. Fix what they report and "
             "commit without it. An amend that changes only the message already skips "
-            f"{HOOK_NAME}, since its tree passed.",
+            "the agent check, since its tree passed it.",
             file=sys.stderr,
         )
         return 2

@@ -1,6 +1,6 @@
 #!/bin/sh
 # For an agent's commit, the next line reruns this whole hook, then the slower agent-pre-commit on what it staged; keep it first (llm-toolbox agent-commit-gate).
-if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then export AGENT_PRE_COMMIT=1; "$0" || exit; if command -v agent-commit-gate >/dev/null; then agent-commit-gate --run "$(dirname "$0")/agent-pre-commit"; else "$(dirname "$0")/agent-pre-commit" || { echo "COMMIT REFUSED: agent-pre-commit failed" >&2; exit 1; }; fi; exit; fi
+if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then export AGENT_PRE_COMMIT=1; "$0" || exit; if command -v agent-commit-gate >/dev/null; then AGENT_CHECK_AT_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/agent-pre-commit"; else "$(dirname "$0")/agent-pre-commit" || { echo "COMMIT REFUSED: agent-pre-commit failed" >&2; exit 1; }; fi; exit; fi
 # Formatting only: clippy takes over five seconds here, so it runs in CI
 # along with the tests.
 set -e

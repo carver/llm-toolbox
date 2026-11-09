@@ -1,6 +1,6 @@
 #!/bin/sh
 # For an agent's commit, the next line reruns this whole hook, then the slower agent-pre-commit on what it staged; keep it first (llm-toolbox agent-commit-gate).
-if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then export AGENT_PRE_COMMIT=1; "$0" || exit; if command -v agent-commit-gate >/dev/null; then agent-commit-gate --run "$(dirname "$0")/agent-pre-commit"; else "$(dirname "$0")/agent-pre-commit" || { echo "COMMIT REFUSED: agent-pre-commit failed" >&2; exit 1; }; fi; exit; fi
+if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then export AGENT_PRE_COMMIT=1; "$0" || exit; if command -v agent-commit-gate >/dev/null; then AGENT_CHECK_AT_COMMIT=1 agent-commit-gate --run "$(dirname "$0")/agent-pre-commit"; else "$(dirname "$0")/agent-pre-commit" || { echo "COMMIT REFUSED: agent-pre-commit failed" >&2; exit 1; }; fi; exit; fi
 # Lint and format-check what's staged, formatting and restaging what it can, in a second or two.
 # Enabled by install.py (core.hooksPath). The test suite is too slow for this; agent-pre-commit runs it.
 set -e

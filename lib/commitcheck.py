@@ -50,6 +50,14 @@ def out(*args):
     return git(*args).stdout.strip()
 
 
+def gate_env():
+    """The environment to run agent-commit-gate --run in for a landing's check: as a
+    git hook runs it, and never with AGENT_CHECK_AT_COMMIT, which would let the commit
+    check stand in for the full one."""
+    env = {k: v for k, v in os.environ.items() if k != "AGENT_CHECK_AT_COMMIT"}
+    return env | {"AGENT_PRE_COMMIT": "1"}
+
+
 def run_stoppable(argv, env=None, cwd=None):
     """Run argv to its end, in a process group of its own, and return its exit status.
     When this run is stopped meanwhile, that whole group is stopped too, so no check
@@ -184,7 +192,7 @@ def first_failing(hook, commits, gate):
     me = Holder.mine()
     # Whole, so a run killed mid-write can't leave a marker nobody can read.
     fifo.write_whole(path, f"{me.line()}tip={tip}\nbranch={branch}\n")
-    env = os.environ | {"AGENT_PRE_COMMIT": "1", "CHECKING_EARLIER_COMMITS_PID": me.pid}
+    env = gate_env() | {"CHECKING_EARLIER_COMMITS_PID": me.pid}
     # The check runs at the top of the work tree, as git runs a hook.
     argv = [str(gate), "--run", str(hook)]
     try:

@@ -292,7 +292,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   files it only modifies in place (no mode change, no binary, symlink or
   submodule), none of them a test: a lint or syntax repair. Any
   other fix commit runs the full check. A repo's `agent-quick-check` holds only
-  its fast static checks, such as a linter or a type checker, and no tests.
+  its fast static checks, such as a linter or a type checker, and no tests. A
+  repo that keeps an `agent-commit-check` beside them runs it at each commit
+  that isn't a small fix, in the full check's place, with its passes on a record of their own,
+  so `wt-ship` runs the full check on each such commit when it lands; the line
+  marks a commit's run with `AGENT_CHECK_AT_COMMIT=1`, and a hook on an older
+  line runs the full check, as before.
   `install.py` also registers it as a Claude Code hook that refuses `git commit
   --no-verify`, except in a repo with no agent check, such as a scratch repo.
   The check runs once it's its turn in `heavy`'s queue, whose waiting lines

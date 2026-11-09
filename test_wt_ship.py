@@ -1590,3 +1590,17 @@ def alive(pid):
         return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
     except (FileNotFoundError, IndexError):
         return False
+
+
+def test_an_inherited_commit_mark_doesnt_spare_a_landing_the_full_check(setup):
+    _, main, wt, _ = setup
+    install_hook(main, "agent-pre-commit", "exit 3")
+    install_hook(main, "agent-commit-check", "exit 0")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    commit(wt, "b.py", "y = 2\n", "Add b")
+    before = main_head(main)
+
+    done = ship(wt, "--local", env={"AGENT_CHECK_AT_COMMIT": "1"})
+
+    assert done.returncode == 1, done.stderr
+    assert main_head(main) == before

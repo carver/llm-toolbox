@@ -77,10 +77,11 @@ def path_without(tool, path=None):
 # names a commit of the repo being committed, which the gate hands the suite's own check,
 # and CHECK_QUEUE_EXIT asks that check to leave heavy's queue. wt-ship sets
 # CHECKING_EARLIER_COMMITS_PID for the checks it runs on earlier commits, which lets the
-# gate run while its marker stands.
+# gate run while its marker stands, and the hook's line sets AGENT_CHECK_AT_COMMIT.
 AGENT_VARS = (
     "AI_AGENT",
     "AGENT_PRE_COMMIT",
+    "AGENT_CHECK_AT_COMMIT",
     "CHECK_BASE",
     "CHECK_QUEUE_EXIT",
     "CHECKING_EARLIER_COMMITS_PID",

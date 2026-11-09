@@ -261,10 +261,9 @@ def run_checks(upstream, mode):
                 f" into it, then run `{RERUN}` again; nothing was {mode.done}, and the"
                 f" branch stays at its tip.{note}"
             )
-    env = os.environ | {"AGENT_PRE_COMMIT": "1"}
     # At the top of the work tree, as git runs a hook, wherever wt-ship started.
     top = out("rev-parse", "--show-toplevel")
-    code = run_stoppable([str(GATE), "--run", str(hook)], env, cwd=top)
+    code = run_stoppable([str(GATE), "--run", str(hook)], commitcheck.gate_env(), top)
     if code != 0:
         note = "" if earlier else upstream_note(upstream, hook)
         raise Stop(

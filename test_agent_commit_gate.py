@@ -198,6 +198,14 @@ OLD_LINES = {
         'else AGENT_PRE_COMMIT=1 "$(dirname "$0")/agent-pre-commit" || '
         '{ echo "COMMIT REFUSED: agent-pre-commit failed" >&2; exit 1; }; fi; fi'
     ),
+    "before the commit mark": (
+        'if [ -n "${AI_AGENT:-}" ] && [ -z "${AGENT_PRE_COMMIT:-}" ]; then '
+        'export AGENT_PRE_COMMIT=1; "$0" || exit; '
+        "if command -v agent-commit-gate >/dev/null; then "
+        'agent-commit-gate --run "$(dirname "$0")/agent-pre-commit"; '
+        'else "$(dirname "$0")/agent-pre-commit" || '
+        '{ echo "COMMIT REFUSED: agent-pre-commit failed" >&2; exit 1; }; fi; exit; fi'
+    ),
 }
 
 
@@ -1364,3 +1372,184 @@ def test_a_check_never_shares_a_lane(installed, held_lane, committing, monkeypat
     held_lane.kill()
     if finishes_or_warns(commit_run):
         assert commit_run.returncode == 0, commit_run.err()
+
+
+# A repo's agent-commit-check, the commit check, runs at each commit in place of
+# agent-pre-commit, on a record of its own, so wt-ship runs the full check when it lands.
+
+
+def install_commit_check(repo, body=""):
+    """Give the repo an agent-commit-check that notes `commit` in the run log, then
+    runs `body`."""
+    hook(
+        repo,
+        "agent-commit-check",
+        f'echo commit >> "$(git rev-parse --git-dir)/ran"\n{body}',
+    )
+
+
+def recheck(repo):
+    """Run the agent check through the gate with no commit above it, as wt-ship does."""
+    return subprocess.run(
+        [str(SCRIPT), "--run", str(repo / ".githooks" / "agent-pre-commit")],
+        cwd=repo,
+        env=without_repo_vars(os.environ) | {"AGENT_PRE_COMMIT": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_a_commit_runs_the_commit_check_in_place_of_the_agent_check(installed):
+    install_commit_check(installed)
+
+    assert commit(installed).returncode == 0
+
+    assert ran(installed) == ["fast", "commit"]
+
+
+def test_a_failing_commit_check_refuses_the_commit(installed):
+    install_commit_check(installed, "exit 4")
+
+    run = commit(installed)
+
+    assert run.returncode != 0
+    assert "COMMIT REFUSED: agent-commit-check failed" in run.stderr, run.stderr
+
+
+def test_a_recheck_runs_the_full_check_on_a_tree_only_the_commit_check_passed(
+    installed,
+):
+    install_commit_check(installed)
+    assert commit(installed).returncode == 0
+
+    done = recheck(installed)
+
+    assert done.returncode == 0, done.stderr
+    assert ran(installed) == ["fast", "commit", "agent"]
+
+
+def test_the_commit_checks_base_is_the_last_commit_it_passed(installed):
+    noting_bases(installed, "agent-commit-check")
+    assert commit(installed).returncode == 0
+    first = head(installed)
+    edit(installed, "more\n")
+
+    assert commit(installed).returncode == 0
+
+    assert bases(installed) == ["none", first]
+
+
+def test_no_check_inherits_the_variable_that_marks_a_commit(installed):
+    install_commit_check(
+        installed,
+        'echo "mark-${AGENT_CHECK_AT_COMMIT:-unset}" >> "$(git rev-parse --git-dir)/ran"',
+    )
+
+    assert commit(installed).returncode == 0
+
+    assert ran(installed) == ["fast", "commit", "mark-unset"]
+
+
+def test_an_amend_of_only_the_message_skips_the_commit_check_it_passed(installed):
+    install_commit_check(installed)
+    assert commit(installed).returncode == 0
+
+    run = commit(installed, "--amend")
+
+    assert run.returncode == 0, run.stderr
+    assert ran(installed) == ["fast", "commit", "fast"]
+
+
+def test_the_commit_check_waits_its_turn_in_heavys_queue(installed):
+    install_commit_check(
+        installed, 'echo "slot-${HEAVY_SLOT:+set}" >> "$(git rev-parse --git-dir)/ran"'
+    )
+
+    assert commit(installed).returncode == 0
+
+    assert ran(installed) == ["fast", "commit", "slot-set"]
+
+
+def test_a_commit_check_naming_the_queue_exit_runs_outside_the_queue_first(installed):
+    install_commit_check(
+        installed,
+        'echo "exit-${CHECK_QUEUE_EXIT:-unset}" >> "$(git rev-parse --git-dir)/ran"',
+    )
+
+    assert commit(installed).returncode == 0
+
+    assert ran(installed) == ["fast", "commit", "exit-75"]
+
+
+def test_a_repo_still_on_the_old_line_runs_the_full_check_at_each_commit(installed):
+    old = OLD_LINES["before the commit mark"]
+    hook(
+        installed, "pre-commit", f'{old}\necho fast >> "$(git rev-parse --git-dir)/ran"'
+    )
+    install_commit_check(installed)
+
+    assert commit(installed).returncode == 0
+
+    assert ran(installed) == ["fast", "agent"]
+
+
+def test_the_commit_checks_base_may_be_a_commit_the_full_check_passed(installed):
+    assert commit(installed).returncode == 0  # the full check, as on a landed tip
+    first = head(installed)
+    noting_bases(installed, "agent-commit-check")
+    edit(installed, "more\n")
+
+    assert commit(installed).returncode == 0
+
+    assert bases(installed) == [first]
+
+
+def test_an_amend_skips_the_commit_check_on_a_tree_the_full_check_passed(installed):
+    assert commit(installed).returncode == 0
+    install_commit_check(installed)
+
+    run = commit(installed, "--amend")
+
+    assert run.returncode == 0, run.stderr
+    assert ran(installed) == ["fast", "agent", "fast"]
+
+
+def test_a_small_fix_commit_runs_the_quick_check_though_a_commit_check_exists(
+    installed,
+):
+    install_commit_check(installed)
+    quick_check(installed)
+    assert commit(installed).returncode == 0
+    edit(installed, "better\n")
+
+    run = commit(installed, "--fixup=HEAD")
+
+    assert run.returncode == 0, run.stderr
+    assert ran(installed) == ["fast", "commit", "fast", "quick"]
+
+
+def test_the_quick_checks_base_counts_only_full_passes(installed):
+    assert commit(installed).returncode == 0
+    first = head(installed)
+    install_commit_check(installed)
+    edit(installed, "more\n")
+    assert commit(installed).returncode == 0  # the commit check's pass
+    noting_bases(installed, "agent-quick-check")
+    edit(installed, "most\n")
+
+    assert commit(installed, "--fixup=HEAD").returncode == 0
+
+    assert bases(installed) == [first]
+
+
+def test_a_rechecks_base_counts_only_full_passes(installed):
+    install_commit_check(installed)
+    assert commit(installed).returncode == 0
+    noting_bases(installed)
+
+    done = recheck(installed)
+
+    assert done.returncode == 0, done.stderr
+    # The commit check's pass of HEAD's tree is no base: the full check runs whole.
+    assert bases(installed) == ["none"]

@@ -3,7 +3,8 @@
 # requires-python = ">=3.12"
 # ///
 """Run one headless call to a fresh Claude: no tools, settings, hooks, MCP
-servers, CLAUDE.md or saved session. Prompt on stdin, answer on stdout.
+servers, CLAUDE.md, auto memory or saved session. Prompt on stdin, answer on
+stdout.
 
     claude-fresh --json SCHEMA < prompt   # the schema-shaped answer, one line of JSON
     claude-fresh --text < prompt          # the reply's text
@@ -19,7 +20,17 @@ the child's environment, because `claude -p` prefers it over the login.
 The call is locked down for prompts that carry untrusted text. By default it
 gets no tools, no user/project/local settings or hooks, no MCP servers, no
 saved session, and runs in an empty temporary directory so no CLAUDE.md loads.
---tools opts named tools back in and pre-approves them.
+--tools opts named tools back in and pre-approves them. Auto memory is always
+off (CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 in the child's environment): the model
+gets no memory instructions, and Claude Code makes no memory folder.
+
+A Claude Code that ignores that variable still makes a project folder for the
+temporary directory, ~/.claude/projects/<name>/ ($CLAUDE_CONFIG_DIR/projects/
+when that is set), with an empty memory/ in it. When the call ends, by a
+failure, a timeout or Ctrl-C too, claude-fresh removes memory/ if it is still
+an empty folder, then the project folder if that is empty too; one that holds
+anything, such as a transcript, stays. A directory whose path isn't ASCII keeps
+both: Claude Code's name for it may differ from the one computed here.
 
 The schema constrains shape, not meaning. Validate the fields in your code.
 
@@ -31,8 +42,10 @@ Exit status: 0 success, 1 the call failed (message on stderr), 2 usage error.
 """
 
 import argparse
+import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -80,9 +93,62 @@ def claude_command(args: argparse.Namespace, schema: dict | None) -> list[str]:
     return cmd
 
 
+def project_folder_name(path: str) -> str | None:
+    """The folder Claude Code (2.1) keeps under projects/ for a project at `path`, or
+    None for a path that isn't ASCII, where JavaScript's UTF-16 count may differ."""
+    if not path.isascii():
+        return None
+    name = re.sub(r"[^a-zA-Z0-9]", "-", path)
+    if len(name) <= 200:
+        return name
+    # Past 200 characters, the first 200 and Math.abs(hash).toString(36) of the path,
+    # the hash being Java's String.hashCode as a signed 32-bit int.
+    unsigned = 0
+    for char in path:
+        unsigned = (unsigned * 31 + ord(char)) & 0xFFFFFFFF
+    number = abs(unsigned - (1 << 32) if unsigned >> 31 else unsigned)
+    digits = ""
+    while True:
+        number, digit = divmod(number, 36)
+        digits = "0123456789abcdefghijklmnopqrstuvwxyz"[digit] + digits
+        if not number:
+            return f"{name[:200]}-{digits}"
+
+
+def project_folder(work_dir: str) -> str | None:
+    """The project folder Claude Code keeps for `work_dir` when it starts there, or
+    None when its name isn't known."""
+    name = project_folder_name(os.path.realpath(work_dir))
+    if name is None:
+        return None
+    config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(config, "projects", name)
+
+
+def remove_empty_folders(project: str) -> None:
+    """Remove the project folder's memory/, then the project folder, each only if it
+    is an empty folder. rmdir refuses a folder with anything in it, a link and a
+    missing path; opening the project folder with O_NOFOLLOW keeps a project folder
+    that is a link from being gone through."""
+    try:
+        fd = os.open(project, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        with contextlib.suppress(OSError):
+            os.rmdir("memory", dir_fd=fd)
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.rmdir(project)
+
+
 def call(cmd: list[str], prompt: str, timeout: float) -> dict:
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     with tempfile.TemporaryDirectory(prefix="claude-fresh-") as empty_dir:
+        # Named before the call, as Claude Code names it at its start.
+        project = project_folder(empty_dir)
         try:
             proc = subprocess.run(
                 cmd,
@@ -98,6 +164,9 @@ def call(cmd: list[str], prompt: str, timeout: float) -> dict:
             raise CallFailed(f"claude timed out after {timeout:g}s")
         except OSError as err:
             raise CallFailed(f"claude did not start: {err}")
+        finally:
+            if project is not None:
+                remove_empty_folders(project)
     try:
         reply = json.loads(proc.stdout)
     except json.JSONDecodeError:

@@ -277,7 +277,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   drops `ANTHROPIC_API_KEY`), and by default gives the model no tools,
   settings, hooks, MCP servers or CLAUDE.md, since prompts often carry
   untrusted text. `--tools` opts named tools back in. A refused call says why,
-  including the reason `claude -p` gives only in its JSON output.
+  including the reason `claude -p` gives only in its JSON output. Auto memory
+  is off (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), so the model gets no memory
+  instructions and Claude Code makes no memory folder. A Claude Code that
+  ignores the variable still makes one for the call's temporary directory,
+  under `~/.claude/projects/` (`$CLAUDE_CONFIG_DIR/projects/` when that is
+  set): when the call ends, claude-fresh removes it if it is still empty, then
+  the call's project folder if that is empty too.
   `claude-json` is a link to it that keeps the old `-s SCHEMA` form.
 - **pre-commit-run**: runs the pre-commit framework from a repo's pre-commit
   hook. A person sees its output as it runs; an agent (`AI_AGENT` set) sees it

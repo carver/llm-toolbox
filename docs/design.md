@@ -523,3 +523,44 @@ lacked.
 
 The scored runs and the held-out check are kept outside the repo, in
 cache/session-scan/ of this workspace.
+
+## claude-fresh
+
+### Auto memory off, and the call's empty folders removed (2026-11-09)
+
+Claude Code makes `<config>/projects/<name>/memory` at the start of every call,
+named for the call's working directory, and claude-fresh gives each call a new
+temporary one. On 2026-11-09 the owner's VM held 4,312 such folders, all empty
+(2,618 from `claude-json`, 964 from `claude-fresh`, two months of cron and script
+calls), and sandbox-setup's `link-claude-memory` spent about 30% of its run time,
+every minute, checking them.
+
+So the child gets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` (the owner's choice,
+2026-11-09): a throwaway call on untrusted text gets no memory instructions, and
+Claude Code 2.1.321 then made no `projects/` folder at all, run offline as below.
+A Claude Code that ignores the variable still makes the folders, so when the call
+ends claude-fresh removes `memory/` and then the project folder, each with
+`rmdir`: it refuses a folder with anything in it (a transcript keeps the project
+folder), a link and a missing path, with no gap between a check and the removal.
+The project folder is opened with `O_NOFOLLOW` for the first `rmdir`, so one that
+is a link is never gone through.
+
+What Claude Code 2.1.321 does was read from its binary and checked by running it
+offline (`unshare -n`, a scratch `HOME` and `CLAUDE_CONFIG_DIR`, so no API call):
+`<config>` is `$CLAUDE_CONFIG_DIR`, else `~/.claude`; the folder appears even when
+the call fails; `<name>` is the physical path, a link's target, with each character
+but a letter or digit made `-`, and past 200 characters, the first 200, `-` and the
+base-36 absolute value of the path's Java `String.hashCode`. JavaScript counts
+UTF-16 code units, so a path that isn't ASCII is left alone. With
+`--no-session-persistence` the call writes no transcript, so the project folder
+holds only the memory folder.
+
+The path is worked out before the call, as Claude Code works it out at its start,
+so a link that moves during the call doesn't change it. The name holds the call's
+random directory name, so another project shares it only by chance (the naming is
+many-to-one: `/tmp/claude-fresh-ab_c1234` and `/tmp/claude/fresh/ab/c1234` share
+one), and even then only empty folders go, which Claude Code makes again when it
+next starts. Where Claude Code puts the memory elsewhere, the computed folder is
+missing and nothing goes: a working directory inside a git repository (checked:
+the memory folder is the repository's), `CLAUDE_CODE_PROJECT_DIR_NAME`,
+`autoMemoryDirectory` or `CLAUDE_CODE_REMOTE_MEMORY_DIR`.

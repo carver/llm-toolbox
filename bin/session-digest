@@ -192,7 +192,12 @@ def human(n: int) -> str:
 def describe_input(name: str, tool_input: dict) -> str:
     for key in ("command", "file_path", "pattern", "url", "query", "skill"):
         if key in tool_input:
-            return short(str(tool_input[key]), INPUT_LIMIT)
+            text = short(str(tool_input[key]), INPUT_LIMIT)
+            # Two reads of one file may be two parts of it.
+            part = ", ".join(
+                f"{k} {tool_input[k]}" for k in ("offset", "limit") if k in tool_input
+            )
+            return f"{text} ({part})" if name == "Read" and part else text
     if name == "Agent" and "description" in tool_input:
         return str(tool_input["description"])
     return short(json.dumps(tool_input), INPUT_LIMIT)

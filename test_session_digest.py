@@ -1150,3 +1150,22 @@ def test_a_cache_of_both_lifetimes_is_named_by_the_hour(tmp_path: Path) -> None:
     assert lines == [
         "  CACHE REBUILT after 1h30m idle (1h cache): 700.0k tokens written"
     ]
+
+
+@pytest.mark.parametrize(
+    ("tool_input", "shown"),
+    [
+        ({"offset": 200, "limit": 100}, "Read: /repo/big.py (offset 200, limit 100)"),
+        ({"offset": 200}, "Read: /repo/big.py (offset 200)"),
+        ({}, "Read: /repo/big.py"),
+    ],
+)
+def test_a_read_shows_the_part_of_the_file_it_read(
+    tmp_path: Path, tool_input: dict, shown: str
+) -> None:
+    records = [
+        assistant("r1", tool_use("t1", "Read", file_path="/repo/big.py", **tool_input)),
+        user([result("t1", "x")]),
+    ]
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    assert f"  > {shown}" in sections(digest(tmp_path))["main"]

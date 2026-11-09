@@ -70,13 +70,22 @@ unset CHECK_BASE CHECK_QUEUE_EXIT
 [ -n "$every" ] || [ -n "$tests" ] || exit 0
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# sh runs no EXIT trap on a signal it doesn't trap, and heavy stops a check with SIGTERM
+# to its process group: a full run leaves hundreds of MB here.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 git checkout-index -a --prefix="$work/tree/"
 cd "$work/tree"
+# pytest's temp files go under $work, which the trap removes, not in the temp root
+# every pytest run on the machine shares unless told otherwise: at exit, pytest
+# deletes the oldest runs' folders there, tens of thousands of files after a full run
+# of this suite, minutes where that root is on a slow disk. The variable, unlike
+# --basetemp, also reaches the pytest runs a test starts.
+export PYTEST_DEBUG_TEMPROOT="$work"
 if [ -n "$every" ]; then
   uv run -q --no-project --with-requirements requirements-dev.txt pytest -q -p no:cacheprovider
 else
-  # A temp folder of their own: at exit, pytest deletes the oldest runs' folders in
-  # its shared one, thousands of files after a full run, a minute or more on one core.
   # shellcheck disable=SC2086 # one word per test file
-  uv run -q --no-project --with-requirements requirements-dev.txt pytest -q -p no:cacheprovider -n0 --basetemp="$work/tmp" $tests
+  uv run -q --no-project --with-requirements requirements-dev.txt pytest -q -p no:cacheprovider -n0 $tests
 fi

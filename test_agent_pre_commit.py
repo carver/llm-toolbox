@@ -7,13 +7,15 @@ PATH, which note their calls, so no real check runs. Two commit through the gate
 
 import os
 import shutil
+import signal
 import subprocess
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from conftest import path_without, without_repo_vars
+from conftest import path_without, wait_until, without_repo_vars
 
 ROOT = Path(__file__).resolve().parent
 HOOK = ROOT / ".githooks" / "agent-pre-commit"
@@ -319,19 +321,77 @@ def test_failing_tests_fail_the_check(repo):
     assert run.tests == {"test_skill_refs.py"}
 
 
-def test_the_few_tests_keep_their_temp_files_in_a_folder_the_hook_removes(repo):
-    """At exit, pytest deletes the oldest runs' folders in its shared temp root, which
-    after a full run holds thousands of files: a minute or two on one core."""
+def writes_to_its_temp_root(repo, then=""):
+    """Swap in a fake uv that writes a file under the pytest temp root it's given, as
+    pytest does, notes that root, then runs the shell lines `then`. Returns the file
+    that holds the root."""
+    seen = repo.parent / "temp-root"
+    (repo.parent / "fakes" / "uv").write_text(
+        FAKE_UV.replace(
+            "exit",
+            'root=${PYTEST_DEBUG_TEMPROOT:?}\nmkdir -p "$root/pytest-of-x"\n'
+            f'echo f > "$root/pytest-of-x/f"\necho "$root" > "{seen}"\n{then}exit',
+        )
+    )
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("path", "tests"),
+    [("skills/coding/SKILL.md", {"test_skill_refs.py"}), ("bin/tool", SUITE)],
+    ids=["the few tests", "the whole suite"],
+)
+def test_each_run_keeps_its_temp_files_in_a_root_the_hook_removes(
+    repo, tmp_path, path, tests
+):
+    """At exit, pytest deletes the oldest runs' folders in its temp root, which every
+    pytest run on the machine shares unless told otherwise: after a full run of this
+    suite, tens of thousands of files, minutes on the slow disk it may be on. The
+    variable, unlike --basetemp, also reaches a test's own nested pytest run."""
+    shared = tmp_path / "shared-root"
+    shared.mkdir()
+    seen = writes_to_its_temp_root(repo)
+    change(repo, path)
+
+    run = check(repo, env={"PYTEST_DEBUG_TEMPROOT": str(shared)})
+
+    assert run.code == 0, run.err
+    assert run.tests == tests
+    assert list(shared.iterdir()) == []
+    assert not Path(seen.read_text().strip()).exists()
+
+
+def test_a_stopped_run_still_removes_its_temp_root(repo, tmp_path):
+    """heavy stops a check with SIGTERM to its process group, and sh runs no EXIT
+    trap on a signal it doesn't trap: a stopped full run would leave hundreds of MB
+    on the sandbox's own disk."""
+    started = tmp_path / "started"
+    seen = writes_to_its_temp_root(repo, then=f'touch "{started}"\nsleep 60\n')
     change(repo, "skills/coding/SKILL.md")
+    env = env_for(
+        repo,
+        {
+            "CHECK_BASE": git(repo, "rev-parse", "HEAD"),
+            "PYTEST_DEBUG_TEMPROOT": str(tmp_path),
+        },
+    )
+    hook = subprocess.Popen(
+        [str(repo / ".githooks" / "agent-pre-commit")],
+        cwd=repo,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        wait_until(started.exists, "the fake pytest started", seconds=30)
+        os.killpg(hook.pid, signal.SIGTERM)
+        hook.wait(timeout=30)
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(hook.pid, signal.SIGKILL)
 
-    assert check(repo, queue_exit=QUEUE_EXIT).code == 0
-
-    pytest_args = next(line for line in calls(repo) if " pytest " in line).split()
-    given = [
-        arg.split("=", 1)[1] for arg in pytest_args if arg.startswith("--basetemp=")
-    ]
-    assert len(given) == 1, pytest_args
-    assert not Path(given[0]).exists()
+    assert not Path(seen.read_text().strip()).exists()
 
 
 def test_the_tests_see_neither_variable(repo, tmp_path):

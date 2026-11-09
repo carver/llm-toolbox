@@ -553,7 +553,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   is given. `--errors` prints the short form: the summary, then under each
   agent its failed calls, failed hooks and failed task notifications, and the
   main session's user turns, nothing else. An error over 1000 characters keeps
-  its first 200 and last 800.
+  its first 200 and last 800. For a model reading the whole session,
+  `--whole-text` prints the assistant's text whole (user turns up to 10000
+  characters) and `--tails` each successful output's last three lines.
   Images count about width × height / 750 tokens, from their header. Defaults to the
   newest session for the current directory (or its nearest parent with sessions),
   under `$CLAUDE_CONFIG_DIR` (default `~/.claude`).

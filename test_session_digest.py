@@ -1169,3 +1169,140 @@ def test_a_read_shows_the_part_of_the_file_it_read(
     ]
     write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
     assert f"  > {shown}" in sections(digest(tmp_path))["main"]
+
+
+def one_session(tmp_path: Path, records: list[dict], *flags: str) -> list[str]:
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    return sections(digest(tmp_path, *flags))["main"]
+
+
+LONG_TEXT = "I think the flake is the margin. " * 30  # 990 characters
+
+
+def test_whole_text_prints_the_assistants_text_whole(tmp_path: Path) -> None:
+    records = [user("Go"), assistant("r1", {"type": "text", "text": LONG_TEXT})]
+    assert (
+        one_session(tmp_path, records, "--whole-text")[-1] == f"  {LONG_TEXT.strip()}"
+    )
+    cut = one_session(tmp_path, records)[-1]
+    assert cut.endswith("chars]") and len(cut) < 450
+
+
+def test_whole_text_prints_a_user_turn_up_to_10000_characters(tmp_path: Path) -> None:
+    turn = "x" * 15_000
+    whole = one_session(tmp_path, [user(turn)], "--whole-text")[0]
+    assert whole == f"USER {'x' * 10_000}…[+5000 chars]"
+
+
+def call_with_output(output: str | list) -> list[dict]:
+    return [
+        user("Go"),
+        assistant("r1", tool_use("t1", "Bash", command="pytest")),
+        user([result("t1", output)]),
+    ]
+
+
+def test_tails_print_an_outputs_last_three_lines(tmp_path: Path) -> None:
+    out = one_session(tmp_path, call_with_output("a\nb\n\nc  d\ne\n\n"), "--tails")
+    assert out[-4:] == ["    = 13 chars ~3 tok", "    | b", "    | c d", "    | e"]
+
+
+def test_tails_keep_no_more_than_300_characters(tmp_path: Path) -> None:
+    output = "\n".join(c * 200 for c in "abc")
+    out = one_session(tmp_path, call_with_output(output), "--tails")
+    # The line that doesn't fit whole keeps its end.
+    assert out[-3:] == [
+        "    = 602 chars ~150 tok",
+        f"    | …{'b' * 100}",
+        f"    | {'c' * 200}",
+    ]
+
+
+def test_a_tail_leaves_out_claude_codes_notices(tmp_path: Path) -> None:
+    output = (
+        "1 failed, 40 passed\n"
+        "Shell cwd was reset to /home/carver/code/claudedev/llm-toolbox\n"
+    )
+    out = one_session(tmp_path, call_with_output(output), "--tails")
+    assert out[-1] == "    | 1 failed, 40 passed"
+
+
+@pytest.mark.parametrize("tool", ["Read", "Write", "Edit", "Agent"])
+def test_file_and_agent_tools_get_no_tail(tmp_path: Path, tool: str) -> None:
+    records = [
+        user("Go"),
+        assistant("r1", tool_use("t1", tool, file_path="/repo/a.py")),
+        user([result("t1", "the end of the file")]),
+    ]
+    out = one_session(tmp_path, records, "--tails")
+    assert out[-1].startswith("    = ")
+
+
+def test_subagents_get_whole_text_and_tails(config: Path) -> None:
+    subagents = config / "projects" / "-work-repo" / "sess1" / "subagents"
+    write_jsonl(
+        subagents / "agent-abc.jsonl",
+        [
+            user("Do it"),
+            assistant("s1", {"type": "text", "text": LONG_TEXT}),
+            assistant("s2", tool_use("u1", "Bash", command="pytest")),
+            user([result("u1", "1 passed")]),
+        ],
+    )
+    out = sections(digest(config, "--whole-text", "--tails"))
+    sub = out["agent-abc (general-purpose: Implement fix)"]
+    assert f"  {LONG_TEXT.strip()}" in sub
+    assert "    | 1 passed" in sub
+
+
+def test_subagents_written_at_once_keep_one_order(config: Path) -> None:
+    # Twelve names, so the directory's own order is unlikely to be sorted too.
+    subagents = config / "projects" / "-work-repo" / "sess1" / "subagents"
+    names = [f"{c}{n}" for n, c in enumerate("qwertyuiopzx")]
+    for name in names:
+        write_jsonl(subagents / f"agent-{name}.jsonl", [user(f"Brief {name}")])
+    for log in subagents.glob("agent-*.jsonl"):
+        os.utime(log, (1_700_000_000, 1_700_000_000))
+    headers = [h.split()[0] for h in sections(digest(config)) if h != "main"]
+    assert headers == sorted(["agent-abc", *(f"agent-{n}" for n in names)])
+
+
+def test_a_long_last_line_keeps_its_end(tmp_path: Path) -> None:
+    output = "x" * 1000 + " 1 failed, 40 passed"
+    out = one_session(tmp_path, call_with_output(output), "--tails")
+    assert out[-1] == f"    | …{output[-300:]}"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("\n\n", id="blank"),
+        pytest.param([{"type": "image", "source": {"data": ""}}], id="images only"),
+    ],
+)
+def test_an_output_with_no_text_has_no_tail(tmp_path: Path, output: str | list) -> None:
+    out = one_session(tmp_path, call_with_output(output), "--tails")
+    assert out[-1].startswith("    = ")
+
+
+def test_a_failed_call_gets_its_error_not_a_tail(tmp_path: Path) -> None:
+    records = [
+        user("Go"),
+        assistant("r1", tool_use("t1", "Bash", command="pytest")),
+        user([result("t1", "boom\n1 failed", error=True)]),
+    ]
+    out = one_session(tmp_path, records, "--tails")
+    assert out[-1] == "    ERROR boom 1 failed"
+
+
+@pytest.mark.parametrize("flag", ["--whole-text", "--tails"])
+def test_whole_text_and_tails_do_not_go_with_errors(config: Path, flag: str) -> None:
+    proc = subprocess.run(
+        [str(SCRIPT), "--cwd", "/work/repo", "--errors", flag],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "CLAUDE_CONFIG_DIR": str(config)},
+    )
+    assert proc.returncode == 2

@@ -28,7 +28,7 @@ tests_for() {
     README.md) echo test_readme_env.py test_skill_refs.py ;;
     GLOBAL_CLAUDE.md | skills/*) echo test_skill_refs.py ;;
     skill-patches/*) echo test_install.py test_skill_refs.py ;;
-    CLAUDE.md | CODING_STANDARDS.md) ;;
+    CLAUDE.md | CODING_STANDARDS.md | docs/*) ;;
     *) return 1 ;;
   esac
 }

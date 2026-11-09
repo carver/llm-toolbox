@@ -37,4 +37,4 @@ The rules a reviewer holds this repo's code to. The global standards in `~/.agen
 
 ## Checks
 
-`.githooks/pre-commit` runs `ruff check` and `ruff format --check` on what's staged, and formats a staged file with no unstaged changes. `ruff.toml` brings the extensionless scripts in `bin/` into both. An agent's commit also runs `.githooks/agent-pre-commit`: every test, or for a change to the repo's prose alone, the few its map names. The README's Checks section has the details.
+`.githooks/pre-commit` runs `ruff check` and `ruff format --check` on what's staged, and formats a staged file with no unstaged changes. `ruff.toml` brings the extensionless scripts in `bin/` into both. An agent's commit then runs `.githooks/agent-commit-check`, which runs no test, so run the tests you wrote or touched before committing. `wt-ship` runs `.githooks/agent-pre-commit` on each commit when it lands: every test, or for a change to the repo's prose alone, the few its map names. The README's Checks section has the details.

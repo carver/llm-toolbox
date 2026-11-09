@@ -124,6 +124,10 @@ when it lands. The hook's line marks a commit's run with AGENT_CHECK_AT_COMMIT=1
 rather than the gate finding `git commit` among its parents, which a check that runs
 the gate's own tests under an agent's commit would fool.
 
+filedrawer opted in with clippy (its pre-commit hook has no Rust lint); llm-toolbox
+and sandbox-setup, whose pre-commit hooks run ruff, with a commit check that runs no
+test (2026-11-08).
+
 ### Rejected: `wt-ship --check CMD` (removed in 9927dd7)
 
 Nothing used it. It came with wt-ship's first version, for a repo that had no

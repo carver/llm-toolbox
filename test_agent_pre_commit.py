@@ -205,8 +205,9 @@ def test_docs_changes_run_the_tests_each_path_needs(repo):
     assert run.tests == {"test_install.py", "test_readme_env.py", "test_skill_refs.py"}
 
 
-def test_a_change_no_test_reads_runs_none_but_still_lints(repo):
-    change(repo, "CODING_STANDARDS.md")
+@pytest.mark.parametrize("path", ["CODING_STANDARDS.md", "docs/design.md"])
+def test_a_change_no_test_reads_runs_none_but_still_lints(repo, path):
+    change(repo, path)
 
     run = check(repo, queue_exit=QUEUE_EXIT)
 
@@ -392,3 +393,15 @@ def test_a_code_commit_runs_the_suite_in_heavys_queue(repo):
     assert "agent-pre-commit: passed" in done.stderr
     assert "outside heavy's queue" not in done.stderr
     assert ran_tests(repo) == SUITE
+
+
+def test_the_commit_check_runs_no_test_and_never_waits_in_the_queue():
+    """What agent-commit-gate runs at an agent's commit in agent-pre-commit's place:
+    ruff ran in the pre-commit hook, and wt-ship runs the suite when the commit lands.
+    It names CHECK_QUEUE_EXIT, so the gate runs it outside heavy's queue."""
+    check = Path(__file__).resolve().parent / ".githooks" / "agent-commit-check"
+
+    done = subprocess.run([str(check)], capture_output=True, text=True, check=False)
+
+    assert done.returncode == 0, done.stderr
+    assert "CHECK_QUEUE_EXIT" in check.read_text()

@@ -590,16 +590,19 @@ without the few seconds of starting the workers) in a copy of the index outside 
 test that passes in the repo but reads its git state fails there. `install.py` points git at `.githooks`. Its
 `pre-commit` runs the two ruff checks on what's staged. When only formatting fails, it formats each staged file that has no unstaged changes,
 stages the result and names the file; any other unformatted file refuses the commit, as does every
-file of a `git commit PATH`. `agent-pre-commit` adds the tests (about half a minute, most of it build-paper's builds), and
-`pre-commit` runs it after its own checks when an agent commits. Both run the tools
+file of a `git commit PATH`. `agent-pre-commit` adds the tests (about half a minute, most of it build-paper's builds);
+`wt-ship` runs it on each commit when it lands. Both run the tools
 through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.
 
-At an agent's commit, `agent-commit-gate` hands `agent-pre-commit` a `CHECK_BASE`,
+An agent's commit runs `.githooks/agent-commit-check` in `agent-pre-commit`'s
+place: no tests, since `pre-commit` ran ruff, and the agent runs the tests it
+wrote or touched before committing. `wt-ship` runs `agent-pre-commit` on each
+commit when it lands, where `agent-commit-gate` hands it a `CHECK_BASE`,
 and the hook runs only the tests the change since then can affect. A change to
 `README.md`, `GLOBAL_CLAUDE.md`, `skills/` or `skill-patches/` runs the one to three
-tests that read those files, under two seconds on one core, so the commit doesn't
-wait for heavy's queue. A change to `CLAUDE.md` or `CODING_STANDARDS.md`
+tests that read those files, under two seconds on one core, so the landing doesn't
+wait for heavy's queue. A change to `CLAUDE.md`, `CODING_STANDARDS.md` or `docs/`
 runs none. Any other path, the hook itself included, runs every test, and the hook
 first asks the gate for heavy's queue (`CHECK_QUEUE_EXIT`, `agent-commit-gate -h`).
 The map is at the top of the hook.

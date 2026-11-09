@@ -1,0 +1,9 @@
+#!/bin/sh
+# The commit check: what llm-toolbox's agent-commit-gate runs at an agent's commit in
+# agent-pre-commit's place, when the pre-commit hook's line sets AGENT_CHECK_AT_COMMIT
+# (`agent-commit-gate -h`). It runs no test: the pre-commit hook already ran ruff on
+# what's staged, the agent runs the tests it wrote or touched before it commits, and
+# wt-ship runs agent-pre-commit, the whole suite, on each commit when it lands. It
+# names $CHECK_QUEUE_EXIT, so the gate runs it outside heavy's queue, where it passes
+# at once.
+exit 0

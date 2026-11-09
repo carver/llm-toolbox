@@ -12,6 +12,14 @@ or was cancelled (by a timeout, say) gets a line with its error's last line,
 under the tool call it ran for (or where it ran, if it ran for none), and the
 summary counts them per hook. Output bodies are left out; their size is given
 in characters and estimated tokens (chars / 4).
+A call that took a minute or more ends its line with its time, as [3m12s], or
+[1h05m] from an hour; one of 40 minutes or more is marked [47m03s LONG], since
+the agent's prompt cache may expire before its next request. AskUserQuestion and
+ExitPlanMode last as long as the user takes to answer: their time reads
+[31m00s user], never LONG. A call that started in the background returned at
+once and isn't timed. Calls sent in one batch run one after another, so a call is
+timed from the result before it. The summary lists the five longest calls of a
+minute or more, and every LONG call beyond them.
 A background task's notification gets one line, its id, status and summary,
 without the report: a subagent's report shows in that agent's own timeline.
 An image counts about width * height / 750 tokens, from its header (PNG, GIF,
@@ -54,6 +62,7 @@ import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 TEXT_LIMIT = 400
@@ -67,6 +76,15 @@ CHARS_PER_TOKEN = 4
 IMAGE_TOKENS = 1600
 IMAGE_EDGE = 1568
 HOOK_FAILURES = ("hook_non_blocking_error", "hook_cancelled")
+# A call that took SLOW seconds or more shows its time; LONG or more is marked, since
+# the prompt cache may expire before the agent's next request.
+SLOW = 60
+LONG = 40 * 60
+# A call whose result starts with one of these went to the background and returned at
+# once. Its result can be logged much later, when the agent next wakes, so it isn't timed.
+BACKGROUND_STARTS = ("Command running in background", "Async agent launched")
+# These last as long as the user takes to answer: their time is tagged user, never LONG.
+USER_WAITS = ("AskUserQuestion", "ExitPlanMode")
 
 
 @dataclass
@@ -89,6 +107,7 @@ class Agent:
     totals: ToolStats = field(default_factory=ToolStats)
     tools: dict[str, ToolStats] = field(default_factory=dict)
     outputs: list[tuple[int, str]] = field(default_factory=list)
+    slow_calls: list[tuple[float, str]] = field(default_factory=list)
     # What --errors prints, a block of lines each, as they happened: the user's turns
     # (main's only), each failed call with its failed hooks and its error, each failed
     # hook that ran for no call, and each task notification that didn't complete.
@@ -209,6 +228,41 @@ def hook_failure(attachment: dict) -> tuple[str, str] | None:
     return hook, output.splitlines()[-1]
 
 
+def timestamp(record: dict) -> datetime | None:
+    """The record's time; one without a zone is read as UTC, as the logs write it."""
+    try:
+        when = datetime.fromisoformat(str(record["timestamp"]))
+    except (KeyError, ValueError):
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=UTC)
+
+
+def clock(seconds: float) -> str:
+    """A span as 3m12s, or as 1h05m from an hour."""
+    minutes, secs = divmod(int(seconds), 60)
+    if minutes >= 60:
+        return f"{minutes // 60}h{minutes % 60:02d}m"
+    return f"{minutes}m{secs:02d}s"
+
+
+def long_mark(seconds: float) -> str:
+    return "LONG" if seconds >= LONG else ""
+
+
+def call_time(
+    tool: str, text: str, started: datetime | None, ended: datetime | None
+) -> tuple[str, float | None]:
+    """The tag for a call's line, and its seconds when it joins the longest calls."""
+    if not (started and ended) or text.startswith(BACKGROUND_STARTS):
+        return "", None
+    seconds = (ended - started).total_seconds()
+    if seconds < SLOW:
+        return "", None
+    if tool in USER_WAITS:
+        return f"[{clock(seconds)} user]", None
+    return f"[{' '.join(filter(None, [clock(seconds), long_mark(seconds)]))}]", seconds
+
+
 def clip(text: str) -> str:
     if len(text) <= ERROR_LIMIT:
         return text
@@ -265,7 +319,10 @@ def hook_lines(records: list[dict]) -> dict[str, list[str]]:
 
 
 def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
-    pending: dict[str, tuple[str, str]] = {}
+    pending: dict[str, tuple[str, str, datetime | None]] = {}
+    # Calls sent in one batch run one after another, so a call's clock starts no
+    # earlier than the result before it.
+    last_result: datetime | None = None
     requests: set[str] = set()
     hooks_by_call = hook_lines(records)
     failing = failed_calls(records)
@@ -326,7 +383,7 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
                     agent.lines.append(f"  {short(block['text'], TEXT_LIMIT)}")
                 elif block.get("type") == "tool_use":
                     call = f"{block['name']}: {describe_input(block['name'], block.get('input', {}))}"
-                    pending[block["id"]] = (block["name"], call)
+                    pending[block["id"]] = (block["name"], call, timestamp(record))
                     line = f"  > {call}"
                     if block["id"] in spawned:
                         line += f" -> {spawned[block['id']]}"
@@ -348,24 +405,36 @@ def digest(agent: Agent, records: list[dict], spawned: dict[str, str]) -> Agent:
                 if block.get("type") == "text" and not record.get("isMeta"):
                     user_turn(block["text"])
                 elif block.get("type") == "tool_result":
-                    tool, call = pending.pop(block.get("tool_use_id"), ("?", "?"))
+                    tool, call, started = pending.pop(
+                        block.get("tool_use_id"), ("?", "?", None)
+                    )
                     text, tokens, images = result_size(block.get("content") or "")
                     error = bool(block.get("is_error"))
                     agent.totals.add(error, tokens)
                     agent.tools.setdefault(tool, ToolStats()).add(error, tokens)
                     agent.outputs.append((tokens, call))
+                    ended = timestamp(record)
+                    if started and last_result:
+                        started = max(started, last_result)
+                    last_result = ended or last_result
+                    tag, seconds = call_time(tool, text, started, ended)
+                    if seconds is not None:
+                        agent.slow_calls.append((seconds, call))
                     if error:
-                        agent.lines.append(f"    ERROR {short(text, TEXT_LIMIT)}")
+                        tagged = f"{tag} " if tag else ""
+                        agent.lines.append(
+                            f"    ERROR {tagged}{short(text, TEXT_LIMIT)}"
+                        )
                         full = clip(text.strip()).replace("\n", "\n          ")
                         # Its call made the block, unless the call isn't in this log.
                         failed_block(block.get("tool_use_id"), f"  > {call}").append(
-                            f"    ERROR {full}"
+                            f"    ERROR {tagged}{full}"
                         )
                     else:
                         size = f"{len(text)} chars ~{tokens} tok"
                         if images:
                             size += f" ({images} images)"
-                        agent.lines.append(f"    = {size}")
+                        agent.lines.append(f"    = {size} {tag}".rstrip())
     return agent
 
 
@@ -464,6 +533,22 @@ def summary(agents: list[Agent]) -> list[str]:
     outputs = [(tokens, a.name, call) for a in agents for tokens, call in a.outputs]
     for tokens, name, call in sorted(outputs, key=lambda o: -o[0])[:BIGGEST]:
         lines.append(f"{human(tokens):>7}  {name:<{width}} {short(call, 100)}")
+    slow = sorted(
+        ((seconds, a.name, call) for a in agents for seconds, call in a.slow_calls),
+        key=lambda s: -s[0],
+    )
+    longest = slow[:BIGGEST] + [s for s in slow[BIGGEST:] if s[0] >= LONG]
+    if longest:
+        lines += [
+            "",
+            "longest calls",
+            f"{SLOW} s or more; LONG: {LONG // 60} min or more, so the prompt cache may expire",
+        ]
+        for seconds, name, call in longest:
+            lines.append(
+                f"{clock(seconds):>7} {long_mark(seconds):<4}  "
+                f"{name:<{width}} {short(call, 100)}"
+            )
     hook_errors = sum((a.hook_errors for a in agents), Counter())
     if hook_errors:
         lines += ["", "hook errors"]

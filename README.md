@@ -506,9 +506,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **session-digest**: condenses a Claude Code session log, and each of its
   subagents' and workflow agents' logs, for a retrospective. Prints what each
   agent and tool cost (calls, errors, estimated tokens of tool output, API
-  tokens in and out) and its five biggest tool outputs,
+  tokens in and out), its five biggest tool outputs and its longest calls,
   then each subagent's timeline: user turns, the assistant's text, one line per
-  tool call with its output's size, one line per background task notification
+  tool call with its output's size and, for a call of a minute or more, how
+  long it took (`LONG` from 40 minutes, when the prompt cache may expire),
+  one line per background task notification
   (id, status, summary), and every error in full. A hook that failed or was
   cancelled (by a timeout, say) gets a line with its error's last line, under
   the tool call it ran for or, if it ran for none, where it ran; the summary

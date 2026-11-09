@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -812,3 +813,181 @@ def test_errors_and_timelines_do_not_combine(config: Path) -> None:
     )
     assert proc.returncode == 2
     assert "not allowed with" in proc.stderr
+
+
+START = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
+
+
+def timed_calls(*calls: tuple[str, float, bool]) -> list[dict]:
+    """A session of Bash calls, each (command, seconds it took, failed), one after
+    another from START."""
+    records: list[dict] = [user("Go")]
+    now = START
+    for n, (command, seconds, failed) in enumerate(calls):
+        call = assistant(f"r{n}", tool_use(f"t{n}", "Bash", command=command))
+        call["timestamp"] = now.isoformat().replace("+00:00", "Z")
+        now += timedelta(seconds=seconds)
+        done = user([result(f"t{n}", "boom" if failed else "ok", error=failed)])
+        done["timestamp"] = now.isoformat().replace("+00:00", "Z")
+        records += [call, done]
+    return records
+
+
+def timed_digest(
+    tmp_path: Path, *calls: tuple[str, float, bool], flags: tuple[str, ...] = ()
+) -> str:
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", timed_calls(*calls))
+    return digest(tmp_path, *flags)
+
+
+def test_a_call_of_a_minute_or_more_shows_how_long_it_took(tmp_path: Path) -> None:
+    out = sections(timed_digest(tmp_path, ("quick", 59, False), ("slow", 192, False)))
+    assert out["main"][1:] == [
+        "  > Bash: quick",
+        "    = 2 chars ~0 tok",
+        "  > Bash: slow",
+        "    = 2 chars ~0 tok [3m12s]",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("seconds", "tag"),
+    [
+        (40 * 60 - 1, "[39m59s]"),
+        (40 * 60, "[40m00s LONG]"),
+        (47 * 60 + 3, "[47m03s LONG]"),
+        (65 * 60 + 59, "[1h05m LONG]"),
+    ],
+)
+def test_a_call_of_40_minutes_or_more_is_marked_long(
+    tmp_path: Path, seconds: int, tag: str
+) -> None:
+    out = sections(timed_digest(tmp_path, ("wt-ship", seconds, False)))
+    assert out["main"][-1] == f"    = 2 chars ~0 tok {tag}"
+
+
+def test_a_slow_failed_call_shows_its_time_in_both_forms(tmp_path: Path) -> None:
+    full = sections(timed_digest(tmp_path, ("make", 120, True)))
+    assert full["main"][-1] == "    ERROR [2m00s] boom"
+    short_form = sections(
+        timed_digest(tmp_path, ("make", 120, True), flags=("--errors",))
+    )
+    assert short_form["main"][-1] == "    ERROR [2m00s] boom"
+
+
+@pytest.mark.parametrize("stamp", [None, "not a time"])
+def test_a_call_without_a_readable_timestamp_shows_no_time(
+    tmp_path: Path, stamp: str | None
+) -> None:
+    records = timed_calls(("slow", 600, False))
+    if stamp is None:
+        del records[-1]["timestamp"]
+    else:
+        records[-1]["timestamp"] = stamp
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    assert sections(digest(tmp_path))["main"][-1] == "    = 2 chars ~0 tok"
+
+
+def longest_calls(out: str) -> list[list[str]]:
+    summary = out.split("\n== ")[0]
+    assert "longest calls" in summary
+    block = summary.split("longest calls")[1].strip().split("\n\n")[0]
+    return [line.split() for line in block.splitlines()[1:]]  # after the legend
+
+
+def test_summary_lists_the_five_longest_calls_of_a_minute_or_more(
+    tmp_path: Path,
+) -> None:
+    calls = [(f"c{m}", m * 60, False) for m in (2, 6, 1, 3, 5, 4)]
+    rows = longest_calls(timed_digest(tmp_path, *calls, ("fast", 30, False)))
+    assert rows == [[f"{m}m00s", "main", "Bash:", f"c{m}"] for m in (6, 5, 4, 3, 2)]
+
+
+def test_summary_lists_every_long_call_beyond_the_five(tmp_path: Path) -> None:
+    calls = [(f"c{m}", m * 60, False) for m in (41, 42, 43, 44, 45, 46, 3)]
+    rows = longest_calls(timed_digest(tmp_path, *calls))
+    assert [row[-1] for row in rows] == ["c46", "c45", "c44", "c43", "c42", "c41"]
+    assert rows[0] == ["46m00s", "LONG", "main", "Bash:", "c46"]
+
+
+def test_summary_has_no_longest_calls_when_none_took_a_minute(config: Path) -> None:
+    assert "longest calls" not in digest(config)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Command running in background with ID: b5nf. Output is being written to: /t",
+        "Async agent launched successfully. (This tool result is internal metadata)",
+    ],
+)
+def test_a_call_started_in_the_background_shows_no_time(
+    tmp_path: Path, reply: str
+) -> None:
+    # It returned at once; its result can be logged when the agent next wakes.
+    records = timed_calls(("heavy -- make", 3 * 3600, False))
+    records[-1]["message"]["content"][0]["content"] = reply
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    out = digest(tmp_path)
+    assert (
+        sections(out)["main"][-1] == f"    = {len(reply)} chars ~{len(reply) // 4} tok"
+    )
+    assert "longest calls" not in out
+
+
+def test_a_call_moved_to_the_background_keeps_its_time(tmp_path: Path) -> None:
+    reply = "Command was moved to the background (ID: bab) after running for 2m"
+    records = timed_calls(("make", 120, False))
+    records[-1]["message"]["content"][0]["content"] = reply
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    assert sections(digest(tmp_path))["main"][-1].endswith(" [2m00s]")
+
+
+@pytest.mark.parametrize("tool", ["AskUserQuestion", "ExitPlanMode"])
+def test_a_wait_on_the_user_is_tagged_user_and_never_long(
+    tmp_path: Path, tool: str
+) -> None:
+    records = timed_calls(("ask", 50 * 60, False))
+    records[1]["message"]["content"][0]["name"] = tool
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    out = digest(tmp_path)
+    assert sections(out)["main"][-1] == "    = 2 chars ~0 tok [50m00s user]"
+    assert "longest calls" not in out
+
+
+def test_a_call_of_exactly_a_minute_shows_its_time(tmp_path: Path) -> None:
+    out = sections(timed_digest(tmp_path, ("make", 60, False)))
+    assert out["main"][-1] == "    = 2 chars ~0 tok [1m00s]"
+
+
+def test_a_call_whose_start_has_no_timestamp_shows_no_time(tmp_path: Path) -> None:
+    records = timed_calls(("slow", 600, False))
+    del records[1]["timestamp"]
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    assert sections(digest(tmp_path))["main"][-1] == "    = 2 chars ~0 tok"
+
+
+def test_a_timestamp_without_a_zone_is_read_as_utc(tmp_path: Path) -> None:
+    records = timed_calls(("slow", 120, False))
+    records[1]["timestamp"] = "2026-10-02T12:00:00"
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    assert sections(digest(tmp_path))["main"][-1] == "    = 2 chars ~0 tok [2m00s]"
+
+
+def test_calls_of_one_batch_are_each_timed_from_the_previous_result(
+    tmp_path: Path,
+) -> None:
+    # Three calls sent at once run one after another, three minutes each.
+    def stamp(record: dict, minutes: int) -> dict:
+        record["timestamp"] = (START + timedelta(minutes=minutes)).isoformat()
+        return record
+
+    records = [user("Go")]
+    records += [
+        stamp(assistant("r1", tool_use(f"t{n}", "Bash", command=f"wait{n}")), 0)
+        for n in (1, 2, 3)
+    ]
+    records += [stamp(user([result(f"t{n}", "ok")]), 3 * n) for n in (1, 2, 3)]
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    times = [line for line in sections(digest(tmp_path))["main"] if "= 2 chars" in line]
+    assert times == ["    = 2 chars ~0 tok [3m00s]"] * 3

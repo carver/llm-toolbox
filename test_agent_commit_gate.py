@@ -1038,9 +1038,24 @@ def queues_or_warns(commit_run, lane):
     )
 
 
+def group_ended(pgid):
+    """Whether every process in group `pgid` has exited, a zombie counting as exited."""
+    for name in os.listdir("/proc"):
+        # State, parent, group; None or short when it exited while being read.
+        fields = fifo.stat_fields(name) if name.isdigit() else None
+        if fields and len(fields) > 2 and fields[0] != "Z" and int(fields[2]) == pgid:
+            return False
+    return True
+
+
 def finishes_or_warns(commit_run):
+    """Wait for the commit and its hook, which share its process group. A Ctrl-C ends
+    git at once, while the hook may still be printing its refusal to the shared stderr
+    file, so git's exit alone would let a test read it too soon."""
     return wait_or_warn(
-        lambda: commit_run.poll() is not None, "the commit never finished", 30
+        lambda: commit_run.poll() is not None and group_ended(commit_run.pid),
+        "the commit never finished",
+        30,
     )
 
 

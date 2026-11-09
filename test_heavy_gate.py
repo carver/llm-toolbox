@@ -9,11 +9,14 @@ import pytest
 SCRIPT = Path(__file__).resolve().parent / "bin" / "heavy-gate"
 
 
-def run_hook(command, background=None, tool="Bash"):
-    """The hook's exit status and stderr for one call, its input shaped as Claude Code sends it."""
+def run_hook(command, background=None, tool="Bash", timeout=None):
+    """The hook's exit status and stderr for one call, its input shaped as Claude Code sends it.
+    ``timeout`` is the Bash call's own, in ms."""
     tool_input = {"command": command, "description": "Run it"}
     if background is not None:
         tool_input["run_in_background"] = background
+    if timeout is not None:
+        tool_input["timeout"] = timeout
     event = {
         "session_id": "s",
         "transcript_path": "/t.jsonl",
@@ -86,21 +89,55 @@ def test_a_foreground_call_that_waits_on_heavy_is_refused(command):
     assert len(err.splitlines()) <= 2
 
 
+WAITS_ON_QUICK = [
+    "heavy --quick -- cargo nextest run --cargo-quiet -p server -E 'test(/^read::/)'",
+    "cd crates/server && heavy --quick -- cargo nextest run -E 'test(x)'",
+    "heavy --qu -- pytest -q test_x.py",
+    "timeout 600 heavy --quick -- make t",
+    "bgrun --wait -o log -- heavy --quick -- pytest -q test_x.py",
+    "bash -c 'heavy --quick -- pytest -q test_x.py'",
+]
+
+
+@pytest.mark.parametrize("command", WAITS_ON_QUICK)
+@pytest.mark.parametrize("timeout", [600000, "600000"])
+def test_a_quick_run_passes_in_the_foreground_with_the_longest_timeout(
+    command, timeout
+):
+    assert run_hook(command, timeout=timeout) == (0, "")
+
+
+def assert_refused_for_its_timeout(code, err):
+    assert code == 2
+    assert "timeout parameter to 600000" in err and "run_in_background: true" in err
+    assert len(err.splitlines()) == 1
+
+
+@pytest.mark.parametrize("command", WAITS_ON_QUICK)
+def test_a_quick_run_in_the_foreground_without_a_timeout_is_refused(command):
+    assert_refused_for_its_timeout(*run_hook(command))
+
+
 @pytest.mark.parametrize(
-    "command",
-    [
-        "heavy --quick -- cargo nextest run --cargo-quiet -p server -E 'test(/^read::/)'",
-        "cd crates/server && heavy --quick -- cargo nextest run -E 'test(x)'",
-        "heavy --qu -- pytest -q test_x.py",
-        "timeout 600 heavy --quick -- make t",
-        "bgrun --wait -o log -- heavy --quick -- pytest -q test_x.py",
-    ],
+    "timeout", [120000, 599999, "ten minutes", "²", [600000], True, 10**400]
 )
-def test_a_quick_run_passes_in_the_foreground(command):
-    assert run_hook(command) == (0, "")
+def test_a_quick_run_with_a_shorter_or_unreadable_timeout_is_refused(timeout):
+    assert_refused_for_its_timeout(
+        *run_hook("heavy --quick -- make t", timeout=timeout)
+    )
 
 
-@pytest.mark.parametrize("command", WAITS_ON_HEAVY)
+@pytest.mark.parametrize("timeout", [None, 600000])
+def test_a_plain_heavy_beside_a_quick_one_gets_the_plain_refusal(timeout):
+    code, err = run_hook(
+        "heavy --quick -- make t && heavy -- make all", timeout=timeout
+    )
+
+    assert code == 2
+    assert "bgrun --wait -o" in err
+
+
+@pytest.mark.parametrize("command", WAITS_ON_HEAVY + WAITS_ON_QUICK)
 @pytest.mark.parametrize("background", [True, "true"])
 def test_the_same_call_in_the_background_passes(command, background):
     assert run_hook(command, background=background) == (0, "")
@@ -167,6 +204,7 @@ def test_heavy_around_a_self_queueing_command_is_refused_anywhere(command, backg
         "ls ~/.local/bin/heavy",
         "command -v heavy",
         "bgrun -o log -- heavy -- cargo test",
+        "bgrun -o log -- heavy --quick -- pytest -q test_x.py",
         "pid=$(bgrun -o log -C ~/x -- heavy -- cargo test) && echo $pid",
         "HEAVY_DIR=$(mktemp -d) HEAVY_BUSY=b bin/heavy -- true",
         "env HEAVY_SLOT=x heavy -- true",

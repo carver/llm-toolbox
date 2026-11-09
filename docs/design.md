@@ -80,10 +80,14 @@ every session's full checks, sometimes tens of minutes.
   job shouldn't wait 10 s of quiet.
 - One that runs past 60 s hears, as it ends, to drop `--quick` for runs like it; a
   warning only.
-- heavy-gate lets `heavy --quick -- CMD` run as a foreground Bash call. Its wait for
-  the running job can pass the tool's default limit of two minutes, so the docs say
-  to give that call a timeout of 600000 ms; the gate doesn't check it, since the user
-  asked that the hooks accept `heavy --quick -- CMD`.
+- heavy-gate lets `heavy --quick -- CMD` run as a foreground Bash call only when the
+  call's own timeout is 600000 ms, the tool's longest. Its wait for the running job
+  can pass the tool's default limit of two minutes, and the call is then killed
+  mid-wait. The gate first left the timeout unchecked, since the user asked that the
+  hooks accept `heavy --quick -- CMD`; on 2026-11-09 the user decided otherwise:
+  "reject a quick without a timeout." A `timeout` command around heavy doesn't count.
+  Nor is 600000 ms a promise: a quick job behind several front entries can wait
+  longer, so the refusal also offers the background call.
 
 Left open for the owner (the design review's other suggestions, each of which changes
 the design above or the trust the queue works on): a full HEAVY_QUIET_SECONDS window

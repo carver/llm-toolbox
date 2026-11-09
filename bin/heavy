@@ -38,8 +38,9 @@ it more than its run, and it never hears the PR hint. A --quick job that ran pas
 HEAVY_QUICK_MAX seconds hears once, as it ends, to run ones like it, or the build
 before them, without --quick; nothing is stopped. A --quick call may run in the
 foreground, but the running job can take minutes to end, so give the Bash call the
-tool's longest timeout (600000 ms). --quick goes with none of --long, --alone and
---share: each pair is a usage error that says why.
+tool's longest timeout (600000 ms); heavy-gate refuses the call without it. --quick
+goes with none of --long, --alone and --share: each pair is a usage error that says
+why.
 
 A lane holds one more job when its holder leaves cores idle. The first waiter in line
 that asks to (--share) and fits starts beside the holder at nice 10, so the holder

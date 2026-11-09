@@ -345,7 +345,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   sample. One that ran past `$HEAVY_QUICK_MAX` (60) seconds hears, as it ends,
   to drop `--quick` for runs like it. It goes with none of `--long`, `--alone`
   and `--share`, and may run as a foreground Bash call, with a 600000 ms
-  timeout. Stopped, it stops CMD's process group,
+  timeout; heavy-gate refuses the call without it. Stopped, it stops CMD's
+  process group,
   with SIGKILL after `$HEAVY_GRACE` seconds. `heavy status` shows each lane's
   holder, sharer, waiters, their usual cores and how busy the lane's cores
   are. A third job in a lane, or a head stalled for `$HEAVY_STALL_SECONDS`
@@ -411,13 +412,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `run_in_background: true`, since heavy's queue has no time limit and the
   Bash tool kills a call at its own; the refusal names `bgrun --wait -o LOG --
   heavy -- CMD` as a background call, and `heavy --quick -- CMD` for a run of
-  seconds, which passes in the foreground (give that call a 600000 ms timeout,
-  since it may wait for the running job). Background or not, it refuses heavy
-  around bgrun, git commit or wt-ship. It reads the command as shell words and
-  looks only at what runs, through wrappers such as `timeout` and `nice`,
-  `bash -c`, a heredoc fed to a shell and `$(...)`. A word that only mentions
-  heavy passes, as do `heavy status`, `heavy -h`, `bgrun` without `--wait`, and
-  a heavy with `HEAVY_DIR` or `HEAVY_SLOT` set in front of it.
+  seconds, which passes in the foreground only when the call's own timeout is
+  600000 ms (a `timeout` command doesn't count), since it may wait minutes for
+  the running job. Background or not,
+  it refuses heavy around bgrun, git commit or wt-ship. It reads the command as
+  shell words and looks only at what runs, through wrappers such as `timeout`
+  and `nice`, `bash -c`, a heredoc fed to a shell and `$(...)`. A word that only
+  mentions heavy passes, as do `heavy status`, `heavy -h`, `bgrun` without
+  `--wait`, and a heavy with `HEAVY_DIR` or `HEAVY_SLOT` set in front of it.
 - **pipe-status-gate**: a Claude Code hook, which `install.py` registers, that
   refuses a Bash command piping `git commit`, `wt-ship` or `bgrun --wait` into
   another command. A pipeline exits with its last command's status, so in

@@ -80,6 +80,12 @@ HOOKS = [
         {"timeout": 10},
     ),
     (
+        "PreToolUse",
+        "Bash",
+        "gh-body-gate",
+        {"timeout": 10},
+    ),
+    (
         "PostToolUse",
         "Bash",
         "issue-view-hint",

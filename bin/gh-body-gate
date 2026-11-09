@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""A Claude Code PreToolUse hook that refuses a gh issue or pr post whose body slop-lint
+flags, before the text is public.
+
+It judges `gh issue create|new|comment|edit` and `gh pr create|new|comment|edit`, found
+as the other gates find what runs (lib/shellparse.py): past variable settings and
+wrappers such as timeout and env; in the script of bash -c, eval or a heredoc fed to a
+shell; in $(...), backticks and <(...); and in the command bgrun runs. It reads the body
+from --body-file FILE or -F FILE, and from --body TEXT or -b TEXT, in each form gh's
+flag parser takes (-FFILE, --body=TEXT, -dF FILE). The text goes to the slop-lint beside
+this hook on stdin, and a finding refuses the command with slop-lint's lines, each
+labelled with the file's path (or `body` for inline text), and the way out: fix the
+text, or end a line slop-lint wrongly flags with `<!-- slop-lint: ignore -->`.
+install.py registers it in ~/.claude/settings.json.
+
+A body file is read where the command will read it: an absolute or ~ path, or a
+relative one against the event's cwd. A relative path passes when the event has no
+cwd or the command changes directory (cd, pushd or popd anywhere, a -C, --chdir, -D or
+--cwd among the wrappers in front of gh, or bgrun's -C). Only a regular file in UTF-8
+is read; anything else passes. Since the hook runs before the command, a file the same
+call writes may be stale: a command that redirects output into a word holding the
+file's name, or names it and isn't one that only reads or removes files (cat, echo,
+printf, gh, slop-lint, rm, ls, wc, head, tail, grep, rg, diff, stat, test), counts as
+writing it, as does a heredoc body that names it (apply-edits' `--- PATH`). With one
+writer, a bare `cat > FILE <<'EOF'`, the heredoc's body is judged instead; with any
+other writer the body passes. A script that rewrites the file without naming it is
+missed.
+
+--body-file - (or /dev/stdin, /dev/fd/0) is judged when a heredoc feeds gh, directly
+or through a bare `cat <<'EOF' |`, on a line that opens only that heredoc; stdin from
+anything else passes. Inline text is the word as the shell reads it, quotes removed and
+a variable left as its name, with each command substitution replaced by what it prints
+when that's known without running anything: `$(cat <<'EOF' ... EOF)` its heredoc's
+body, `$(cat FILE)` and `$(< FILE)` the file, read as above. Any other substitution
+counts as printing nothing, so the text around it is still judged.
+
+An edit keeps text that's already there: when an edit's body has findings, the hook
+fetches the current body (`gh issue|pr view TARGET --json body`) and drops each finding
+on a line the current body already holds, so an owner's own dashes don't refuse a
+ticked box. When the fetch fails or is slow, every finding stands.
+
+A command the hook can't parse, such as one with a quote left open, passes, as does
+every body it can't read or judge: slop-lint failing in any way but a finding, or the
+hook's deadline (7 s, for every slop-lint run and fetch) running out. gh api, gh pr
+review, gh release and titles aren't judged. It catches a mistake, not an agent set on
+getting past it: an alias, a variable holding gh or the path, a body written in
+GH_EDITOR, or a script that posts all pass.
+
+For the tests, $GH_BODY_GATE_SLOP_LINT names another slop-lint and
+$GH_BODY_GATE_DEADLINE another deadline in seconds.
+
+    gh-body-gate < hook-input.json    # as Claude Code calls it
+
+Exit status: 0 allowed, 2 refused (the reason on stderr), 1 input that isn't JSON.
+"""
+
+import json
+import os
+import re
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from shellparse import (
+    MARK,
+    SHELLS,
+    Command,
+    bgrun_command,
+    command_of,
+    commands,
+    is_help,
+    parses,
+    prepare,
+    reads_stdin,
+    shell_script,
+)
+
+SLOP_LINT = os.environ.get("GH_BODY_GATE_SLOP_LINT") or str(
+    Path(__file__).resolve().parent / "slop-lint"
+)
+WAY_OUT = (
+    "Fix the text, or end a line slop-lint wrongly flags with "
+    "`<!-- slop-lint: ignore -->`."
+)
+ACTIONS = {"create", "new", "comment", "edit"}
+KINDS = {"issue", "pr"}
+# gh's flags for a body, and what each holds.
+BODY_FLAGS = {"--body": "text", "-b": "text", "--body-file": "file", "-F": "file"}
+# gh's short flags that take no value (draft, editor, fill, web), which may come first
+# in a cluster such as -dF FILE, and those that take one.
+SHORT_BOOLS = set("defw")
+SHORT_VALUES = set("BHRTalmprt")
+# The --add-* and --remove-* flags take a value, but for these.
+LONG_PREFIXES = ("--add-", "--remove-")
+LONG_BOOLS = {"--remove-milestone", "--remove-parent", "--remove-type"}
+LONG_VALUES = {
+    "--title",
+    "--label",
+    "--assignee",
+    "--milestone",
+    "--project",
+    "--template",
+    "--base",
+    "--head",
+    "--reviewer",
+    "--repo",
+    "--recover",
+    "--type",
+    "--parent",
+    "--blocked-by",
+    "--blocking",
+}
+STDIN = {"-", "/dev/stdin", "/dev/fd/0"}
+# Commands that name a file without writing it, but through a redirection.
+READERS = {
+    "cat",
+    "echo",
+    "printf",
+    "gh",
+    "slop-lint",
+    "rm",
+    "ls",
+    "wc",
+    "head",
+    "tail",
+    "grep",
+    "rg",
+    "diff",
+    "stat",
+    "test",
+    "[",
+}
+MOVERS = {"cd", "pushd", "popd"}
+# Wrapper options that run the command in another directory (env -C, sudo -D, bgrun -C).
+CHDIR_OPTIONS = {"-C", "--chdir", "-D", "--cwd"}
+# For every slop-lint run and fetch together; Claude Code's timeout for the hook is 10 s.
+DEADLINE = float(os.environ.get("GH_BODY_GATE_DEADLINE") or 7)
+FETCH_LIMIT = 4.0
+FINDING = re.compile(r"-:([0-9]+):[0-9]+: \S+: ")
+# A task list's box, ticked or not, which an edit may change on the owner's line.
+TASK_BOX = re.compile(r"^(\s*(?:[-*+]|[0-9]+[.)])\s+)\[[ xX]\]")
+# $(< FILE): the file, one word, maybe quoted.
+READ_FILE = re.compile(r"\s*<(?![<(&])\s*([^\s<>|&;()]+)\s*")
+
+
+@dataclass
+class Post:
+    """A gh command that posts a body: `gh issue comment` and the like, what it posts on
+    (its first word after the action, as `5`), the repo -R names, each body flag's kind
+    ("text" or "file") and value, and whether a wrapper runs it in another directory."""
+
+    kind: str
+    action: str
+    target: str | None
+    repo: str | None
+    sources: list[tuple[str, str]]
+    chdir: bool = False
+
+    @property
+    def name(self) -> str:
+        return f"gh {self.kind} {self.action}"
+
+
+@dataclass
+class Body:
+    post: Post
+    label: str
+    text: str
+
+
+@dataclass
+class Scan:
+    """What a walk through a command found, run from the folder ``cwd``: the posts; the
+    stdin bodies heredocs feed them; every simple command; the heredocs a bare cat
+    writes into a file, as (target, body); every other heredoc's body; each
+    substitution's text, by its marker's number; whether the command changes directory;
+    and whether some part failed to parse."""
+
+    cwd: str | None = None
+    posts: list[Post] = field(default_factory=list)
+    stdin_bodies: list[tuple[Post, str]] = field(default_factory=list)
+    commands: list[Command] = field(default_factory=list)
+    heredoc_writes: list[tuple[str, str]] = field(default_factory=list)
+    heredoc_bodies: list[str] = field(default_factory=list)
+    substitutions: list[str] = field(default_factory=list)
+    moved: bool = False
+    unparsed: bool = False
+
+
+def refusal(command: str, cwd: str | None) -> str | None:
+    """The refusal a Bash command earns, or None when it passes."""
+    if "gh" not in command:
+        return None
+    found = Scan(cwd)
+    scan(command, found)
+    if found.unparsed:
+        return None
+    deadline = time.monotonic() + DEADLINE
+    flagged, lines = None, []
+    for body in bodies(found):
+        hits = findings(body.text, deadline) if body.text.strip() else []
+        if hits and body.post.action == "edit":
+            hits = new_lines_only(body, hits, cwd, deadline)
+        if hits:
+            flagged = flagged or body.post
+            lines += [body.label + hit[1:] for hit in hits]
+    if flagged is None:
+        return None
+    header = f"Refused: slop-lint flagged the body {flagged.name} would post:"
+    return "\n".join([header, *lines, WAY_OUT])
+
+
+def scan(command: str, found: Scan) -> None:
+    """Walk a shell command, and the scripts inside it, into ``found``."""
+    cleaned, substitutions, heredocs = prepare(
+        command, first_mark=len(found.substitutions)
+    )
+    found.substitutions += substitutions
+    if not parses(cleaned):
+        found.unparsed = True
+        return
+    for simple in commands(cleaned):
+        found.commands.append(simple)
+        note(simple.words, found)
+    for substitution in substitutions:
+        scan(substitution, found)
+    for opener, body in heredocs:
+        read_heredoc(opener, body, found)
+
+
+def note(words: list[str], found: Scan, chdir: bool = False) -> None:
+    """Note what one simple command runs. ``chdir``: a wrapper around it runs it in
+    another directory."""
+    run, _ = command_of(words)
+    if not run:
+        return
+    chdir = chdir or changes_dir(words[: len(words) - len(run)])
+    name, args = Path(run[0]).name, run[1:]
+    if name in MOVERS:
+        found.moved = True
+    elif name in SHELLS:
+        script = shell_script(run)
+        if script is not None:
+            scan(script, found)
+    elif name == "eval":
+        scan(" ".join(args), found)
+    elif name == "bgrun":
+        parsed = bgrun_command(args)
+        if parsed is not None:
+            rest = parsed[1]
+            note(rest, found, chdir or changes_dir(args[: len(args) - len(rest)]))
+    elif name == "gh":
+        post = gh_post(args)
+        if post is not None:
+            post.chdir = chdir
+            found.posts.append(post)
+
+
+def changes_dir(words: list[str]) -> bool:
+    return any(
+        word in CHDIR_OPTIONS or word.startswith(("--chdir=", "--cwd="))
+        for word in words
+    )
+
+
+def gh_post(args: list[str]) -> Post | None:
+    """The post gh's arguments make, or None when they make none or ask for help."""
+    positional, sources, repo = [], [], None
+    words = iter(args)
+    for arg in words:
+        if arg == "--":
+            positional += words
+            break
+        if not arg.startswith("-") or arg == "-":
+            positional.append(arg)
+            continue
+        flag, value = option(arg)
+        if flag == "-h":
+            return None
+        if not flag:
+            continue
+        if value is None:
+            value = next(words, None)
+        if value is not None and flag in BODY_FLAGS:
+            sources.append((BODY_FLAGS[flag], value))
+        elif flag in ("-R", "--repo"):
+            repo = value
+    if len(positional) < 2 or positional[0] not in KINDS:
+        return None
+    if positional[1] not in ACTIONS:
+        return None
+    target = positional[2] if len(positional) > 2 else None
+    return Post(positional[0], positional[1], target, repo, sources)
+
+
+def option(arg: str) -> tuple[str, str | None]:
+    """(the flag, the value written into the word or None) of an option that takes a
+    value, as gh's flag parser reads ``arg``: a long one, maybe with =VALUE, or the
+    first short one after a cluster of bools (-dF FILE, -FFILE). ("", None) for an
+    option that takes none, and ("-h", None) for help."""
+    if is_help(arg):
+        return "-h", None
+    if arg.startswith("--"):
+        flag, equals, value = arg.partition("=")
+        takes = flag in BODY_FLAGS or flag in LONG_VALUES
+        if flag in LONG_BOOLS or not takes and not flag.startswith(LONG_PREFIXES):
+            return "", None
+        return flag, value if equals else None
+    for i, letter in enumerate(arg[1:], 2):
+        if letter == "h":
+            return "-h", None
+        if letter in SHORT_VALUES or f"-{letter}" in BODY_FLAGS:
+            return f"-{letter}", arg[i:].removeprefix("=") if arg[i:] else None
+        if letter not in SHORT_BOOLS:
+            break
+    return "", None
+
+
+def read_heredoc(opener: str, body: str, found: Scan) -> None:
+    """Note what reads a heredoc: a shell, whose script it is; gh, or a bare cat piped
+    into gh, whose stdin body it is; a bare cat writing it into a file; or anything
+    else."""
+    cleaned, _, opened = prepare(opener)
+    simples = commands(cleaned)
+    if any(reads_stdin(simple.words) for simple in simples):
+        scan(body, found)
+        return
+    if len(opened) == 1:
+        for i, simple in enumerate(simples):
+            if not any(is_heredoc(op) for op, _ in simple.redirects):
+                continue
+            post = stdin_post(simple)
+            if post is None and is_bare_cat(simple):
+                targets = [target for op, target in simple.redirects if ">" in op]
+                if targets:
+                    found.heredoc_writes += [(target, body) for target in targets]
+                    return
+                if simple.piped and i + 1 < len(simples):
+                    post = stdin_post(simples[i + 1])
+            if post is not None:
+                found.stdin_bodies.append((post, body))
+                return
+    found.heredoc_bodies.append(body)
+
+
+def is_heredoc(operator: str) -> bool:
+    return operator.startswith("<<") and not operator.startswith("<<<")
+
+
+def stdin_post(simple: Command) -> Post | None:
+    """The post a simple command makes when it reads its body from stdin."""
+    run, _ = command_of(simple.words)
+    if not run or Path(run[0]).name != "gh":
+        return None
+    post = gh_post(run[1:])
+    if post is None or ("file", "-") not in normalized(post.sources):
+        return None
+    return post
+
+
+def normalized(sources: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    return [
+        (kind, "-" if kind == "file" and value in STDIN else value)
+        for kind, value in sources
+    ]
+
+
+def is_bare_cat(simple: Command) -> bool:
+    return innermost(simple.words) in (["cat"], ["cat", "-"])
+
+
+def innermost(words: list[str]) -> list[str]:
+    """The words of the command a simple command runs, past wrappers and bgrun."""
+    while True:
+        words, _ = command_of(words)
+        if not words or Path(words[0]).name != "bgrun":
+            return words
+        parsed = bgrun_command(words[1:])
+        if parsed is None:
+            return []
+        words = parsed[1]
+
+
+def bodies(found: Scan) -> list[Body]:
+    """Each body the command's posts would send that the hook can know."""
+    out = []
+    for post in found.posts:
+        for kind, value in post.sources:
+            if kind == "text":
+                out.append(Body(post, "body", inline_text(value, found, post)))
+            elif value not in STDIN and (body := file_body(value, found, post)):
+                out.append(body)
+    out += [Body(post, "body", text) for post, text in found.stdin_bodies]
+    return out
+
+
+def inline_text(word: str, found: Scan, post: Post) -> str:
+    """A --body word's text, each substitution in it replaced by what it prints."""
+
+    def printed(marker: re.Match[str]) -> str:
+        index = int(marker.group(1))
+        if index >= len(found.substitutions):
+            return ""
+        return substitution_output(found.substitutions[index], found, post) or ""
+
+    return MARK.sub(printed, word)
+
+
+def substitution_output(substitution: str, found: Scan, post: Post) -> str | None:
+    """What a substitution prints, when that's known without running it: a bare cat's
+    heredoc, or a file that cat or `<` reads. None otherwise."""
+    if redirect := READ_FILE.fullmatch(substitution):
+        try:
+            words = shlex.split(redirect.group(1))
+        except ValueError:
+            return None
+        body = file_body(words[0], found, post) if len(words) == 1 else None
+        return body.text if body else None
+    cleaned, _, heredocs = prepare(substitution, first_mark=0)
+    if not parses(cleaned):
+        return None
+    simples = commands(cleaned)
+    if len(simples) != 1:
+        return None
+    simple = simples[0]
+    if is_bare_cat(simple) and len(heredocs) == 1:
+        return heredocs[0][1]
+    if len(simple.words) == 2 and simple.words[0] == "cat" and not simple.redirects:
+        body = file_body(simple.words[1], found, post)
+        return body.text if body else None
+    return None
+
+
+def file_body(word: str, found: Scan, post: Post) -> Body | None:
+    """The body of ``post`` in the file a word names, as gh will read it, labelled
+    with its path; None when the hook can't know it."""
+    if "$" in word or "`" in word or MARK.search(word) or word in STDIN:
+        return None
+    name = Path(word).name
+    if not name:
+        return None
+    writers = [simple for simple in found.commands if writes(simple, name)]
+    naming = [body for body in found.heredoc_bodies if name in body]
+    if writers or naming:
+        # The one writer may be a bare cat writing a heredoc into the file.
+        written = [
+            body for target, body in found.heredoc_writes if Path(target).name == name
+        ]
+        alone = len(writers) == 1 and not naming and len(written) == 1
+        return Body(post, word, written[0]) if alone else None
+    path = os.path.expanduser(word)
+    if not os.path.isabs(path):
+        cwd = found.cwd
+        if found.moved or post.chdir or not cwd or not os.path.isabs(cwd):
+            return None
+        path = os.path.join(cwd, path)
+    path = os.path.normpath(path)
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return None
+        return Body(post, path, Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def writes(simple: Command, name: str) -> bool:
+    """Whether a simple command may write the file called ``name``."""
+    if any(">" in op and name in target for op, target in simple.redirects):
+        return True
+    run = innermost(simple.words)
+    if not run:
+        return False
+    command = Path(run[0]).name
+    if command in READERS or command in SHELLS or command == "eval":
+        return False
+    return any(name in word for word in run[1:])
+
+
+def findings(text: str, deadline: float) -> list[str]:
+    """slop-lint's finding lines for ``text``, empty when it finds nothing or fails."""
+    ran = run_within(
+        [SLOP_LINT, "-"], deadline - time.monotonic(), text, {"PYTHONUTF8": "1"}
+    )
+    if ran is None or ran[0] != 1:
+        return []
+    return [line for line in ran[1].splitlines() if FINDING.match(line)]
+
+
+def run_within(
+    command: list[str],
+    timeout: float,
+    text: str | None = None,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> tuple[int, str] | None:
+    """(exit status, stdout) of a command given ``text`` on stdin, run in a process
+    group of its own, which is stopped, children and all, when it outlasts ``timeout``
+    seconds. None when it can't start or doesn't end in time."""
+    if timeout <= 0:
+        return None
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL if text is None else subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            encoding="utf-8",
+            errors="replace",
+            cwd=cwd,
+            env={**os.environ, **(env or {})},
+            start_new_session=True,
+        )
+    except OSError:
+        return None
+    try:
+        out, _ = process.communicate(text, timeout=timeout)
+    except BaseException as error:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        if isinstance(error, subprocess.TimeoutExpired):
+            return None
+        raise
+    return process.returncode, out
+
+
+def new_lines_only(
+    body: Body, hits: list[str], cwd: str | None, deadline: float
+) -> list[str]:
+    """The findings of an edit's body on lines the current body doesn't hold; all of
+    them when the current body can't be fetched."""
+    current = current_body(body.post, cwd, deadline)
+    if current is None:
+        return hits
+    held = {as_held(line) for line in current.splitlines()}
+    lines = body.text.splitlines()
+    kept = []
+    for hit in hits:
+        number = int(FINDING.match(hit).group(1))
+        if number > len(lines) or as_held(lines[number - 1]) not in held:
+            kept.append(hit)
+    return kept
+
+
+def as_held(line: str) -> str:
+    """A body's line as an edit compares it: without trailing space, and with a task
+    list's box unticked."""
+    return TASK_BOX.sub(r"\1[ ]", line.rstrip())
+
+
+def current_body(post: Post, cwd: str | None, deadline: float) -> str | None:
+    """The body an edit would replace, from gh, or None when gh can't say in time."""
+    command = ["gh", post.kind, "view"]
+    command += [post.target] if post.target else []
+    command += ["--repo", post.repo] if post.repo else []
+    command += ["--json", "body", "--jq", ".body"]
+    ran = run_within(
+        command,
+        min(deadline - time.monotonic(), FETCH_LIMIT),
+        env={"GH_PROMPT_DISABLED": "1"},
+        cwd=cwd if cwd and os.path.isdir(cwd) else None,
+    )
+    if ran is None or ran[0] != 0 or not ran[1].strip():
+        return None
+    return ran[1]
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if any(arg in ("-h", "--help") for arg in argv):
+        print(__doc__)
+        return 0
+    try:
+        event = json.load(sys.stdin)
+    except json.JSONDecodeError as error:
+        print(
+            f"gh-body-gate: the hook input isn't JSON ({error}); it reads the "
+            "PreToolUse event Claude Code sends on stdin.",
+            file=sys.stderr,
+        )
+        return 1
+    if event.get("tool_name") != "Bash":
+        return 0
+    command = (event.get("tool_input") or {}).get("command") or ""
+    reason = refusal(command, event.get("cwd"))
+    if reason:
+        print(reason, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

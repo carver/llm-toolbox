@@ -434,6 +434,21 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   commit --dry-run`, a pipe into `git commit`, `||`, and a `|` in quotes, a
   heredoc's body or a comment. It reads the command as heavy-gate does, through
   `lib/shellparse.py`, nested scripts included.
+- **gh-body-gate**: a Claude Code hook, which `install.py` registers, that
+  refuses a `gh issue` or `gh pr` `create`, `comment` or `edit` whose body
+  `slop-lint` flags, before the text is public, with slop-lint's lines and the
+  way out: fix the text, or end a line it wrongly flags with
+  `<!-- slop-lint: ignore -->`. It reads the body from `--body-file`/`-F` (a
+  file, or a heredoc on stdin) and from `--body`/`-b` text, where a
+  `$(cat <<'EOF' ... EOF)`, `$(cat FILE)` or `$(< FILE)` counts as the text it
+  prints. A file the same call writes is judged by the heredoc a bare `cat`
+  writes into it, and passes when anything else may write it. An edit is judged
+  only on lines the current body lacks, which it fetches with `gh ... view`. It
+  finds gh as heavy-gate does, through `lib/shellparse.py`, and lets pass any
+  command it can't parse, any body it can't read, and slop-lint failing.
+  `gh api`, `gh pr review` and titles aren't judged. For the tests,
+  `$GH_BODY_GATE_SLOP_LINT` names another slop-lint and
+  `$GH_BODY_GATE_DEADLINE` another deadline.
 - **issue-view-hint**: a Claude Code hook, which `install.py` registers. After a
   `gh issue view` that printed task-list boxes, or any with `--comments`, it
   adds a note for the agent: the body and the comments come out separately, and

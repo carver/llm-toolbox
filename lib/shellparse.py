@@ -2,10 +2,12 @@
 
 prepare() cleans a command for shlex: it drops comments and heredoc bodies, joins
 continued lines, and sets aside each $(...), backtick or <(...) substitution and each
-heredoc's body, which a hook judges as scripts of their own. commands() splits what's
-left into simple commands: the words of each, without the redirections; whether its
-output goes into a pipe; and whether it sits inside a compound command. A command shlex
-can't parse, such as one with a quote left open, is split without regard to quotes.
+heredoc's body, which a hook judges as scripts of their own; with first_mark, each
+substitution leaves a numbered marker, so a hook can tell which one a word holds.
+commands() splits what's left into simple commands: the words of each, without the
+redirections, which it keeps apart; whether its output goes into a pipe; and whether it
+sits inside a compound command. A command shlex can't parse, such as one with a quote
+left open, is split without regard to quotes; parses() says whether shlex can.
 
 command_of() finds the command a simple command runs, past variable settings, keywords
 such as `if` and `do`, and wrappers such as timeout, nice, env, sudo and xargs, whose
@@ -17,7 +19,7 @@ bgrun's, and is_help() spots an option that asks for help.
 
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Characters shlex returns as operator tokens: separators and redirections.
@@ -58,6 +60,10 @@ WRAPPERS = {
     "xargs": ({"-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s", "--max-args"}, 0),
     "flock": ({"-w", "--timeout", "-E", "--conflict-exit-code"}, 1),
 }
+# What prepare() leaves for substitution N when given first_mark: characters from
+# Unicode's private use area, which shlex keeps inside a word and a command never holds.
+MARK_FORMAT = "{}"
+MARK = re.compile("([0-9]+)")
 GIT_VALUES = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
 BGRUN_VALUES = {"-o", "--output", "-C", "--cwd", "--tail"}
 
@@ -65,13 +71,16 @@ BGRUN_VALUES = {"-o", "--output", "-C", "--cwd", "--tail"}
 @dataclass
 class Command:
     """A simple command's words; whether its output goes into a pipe, because `|` or `|&`
-    follows it or a compound command around it; and whether it sits inside a compound
+    follows it or a compound command around it; whether it sits inside a compound
     command: ( ... ), { ...; }, if ... fi, case ... esac, or a for, while, until or
-    select loop."""
+    select loop; and its redirections, each as (operator, target), such as (">>", "log")
+    or ("<<", "EOF"). A redirection after a compound command's close, as in
+    `( ... ) > log`, goes to the last simple command before it."""
 
     words: list[str]
     piped: bool
     grouped: bool
+    redirects: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -83,25 +92,44 @@ class _Output:
     case: bool = False
 
 
-def commands(cleaned: str) -> list[Command]:
-    """Each simple command in ``cleaned``, a command prepare() has cleaned, in order."""
+def _lexer(cleaned: str) -> shlex.shlex:
     lexer = shlex.shlex(cleaned, posix=True, punctuation_chars=OPERATORS)
     lexer.whitespace, lexer.whitespace_split, lexer.commenters = " \t\r", True, ""
+    return lexer
+
+
+def parses(cleaned: str) -> bool:
+    """Whether shlex can split ``cleaned``, a command prepare() has cleaned: no quote
+    is left open."""
     try:
-        tokens = list(lexer)
+        list(_lexer(cleaned))
+    except ValueError:
+        return False
+    return True
+
+
+def commands(cleaned: str) -> list[Command]:
+    """Each simple command in ``cleaned``, a command prepare() has cleaned, in order."""
+    try:
+        tokens = list(_lexer(cleaned))
     except ValueError:  # a quote left open
         tokens = FALLBACK.findall(cleaned)
     # Each command's words, with its own output and those of the compound commands
-    # around it; the compound commands open now, innermost last; the output a `|` would
-    # take now; the words of the command being read.
-    found: list[tuple[list[str], list[_Output]]] = []
+    # around it, and its redirections; the compound commands open now, innermost last;
+    # the output a `|` would take now; the words of the command being read, and its
+    # redirections so far.
+    found: list[tuple[list[str], list[_Output], list[tuple[str, str]]]] = []
     groups: list[_Output] = []
     pipe_source: _Output | None = None
     words: list[str] = []
+    redirects: list[tuple[str, str]] = []
 
     def end() -> None:
-        nonlocal words, pipe_source
+        nonlocal words, pipe_source, redirects
         if not words:
+            if redirects and found:  # after a compound command's close
+                found[-1][2].extend(redirects)
+                redirects = []
             return
         closed = None
         for word in words:
@@ -112,8 +140,8 @@ def commands(cleaned: str) -> list[Command]:
             elif word not in KEYWORDS:
                 break
         own = _Output()
-        found.append((words, [own, *groups]))
-        pipe_source, words = closed or own, []
+        found.append((words, [own, *groups], redirects))
+        pipe_source, words, redirects = closed or own, [], []
 
     def close() -> None:
         """A `)`: it ends a subshell, or a case's pattern."""
@@ -124,10 +152,11 @@ def commands(cleaned: str) -> list[Command]:
         else:
             pipe_source = groups.pop() if groups else None
 
-    redirected = False
+    redirection = None  # the operator whose target the next token is
     for token in tokens:
-        if redirected:
-            redirected = False
+        if redirection is not None:
+            redirects.append((redirection, token))
+            redirection = None
             continue
         if not is_operator(token):
             words.append(token)
@@ -139,7 +168,7 @@ def commands(cleaned: str) -> list[Command]:
                 # The rest of the token redirects, and the next one is its target.
                 if words and words[-1].isdigit():
                     words.pop()  # the file descriptor of 2>FILE
-                redirected = True
+                redirection = token[i:]
                 break
             if char == ")":
                 close()
@@ -155,8 +184,8 @@ def commands(cleaned: str) -> list[Command]:
             i += 1
     end()
     return [
-        Command(words, any(o.piped for o in outputs), len(outputs) > 1)
-        for words, outputs in found
+        Command(words, any(o.piped for o in outputs), len(outputs) > 1, redirects)
+        for words, outputs, redirects in found
     ]
 
 
@@ -164,13 +193,17 @@ def is_operator(token: str) -> bool:
     return bool(token) and all(c in OPERATORS for c in token)
 
 
-def prepare(text: str) -> tuple[str, list[str], list[tuple[str, str]]]:
+def prepare(
+    text: str, first_mark: int | None = None
+) -> tuple[str, list[str], list[tuple[str, str]]]:
     """(``text`` ready for shlex; the bodies of its command substitutions outside single
     quotes and of its process substitutions outside quotes; each heredoc's body, with the
     line that opened it). Drops comments and heredoc bodies, joins continued lines, turns
     $'...' into a plain quoted word and each substitution into a placeholder, so the word
-    around it stays one word. A quoted word of operator characters alone, such as '|',
-    becomes underscores, since shlex drops the quotes and would return it as an operator."""
+    around it stays one word. The placeholder is `_`, or with ``first_mark`` a marker
+    (MARK) numbered from it, the substitutions in order. A quoted word of operator
+    characters alone, such as '|', becomes underscores, since shlex drops the quotes and
+    would return it as an operator."""
     out, substitutions, heredocs = [], [], []
     delimiters, line_start, quote, i = [], 0, None, 0
     while i < len(text):
@@ -222,8 +255,11 @@ def prepare(text: str) -> tuple[str, list[str], list[tuple[str, str]]]:
         ):
             start = i + (1 if char == "`" else 2)
             end = substitution_end(text, start, char)
+            if first_mark is None:
+                out.append("_")
+            else:
+                out.append(MARK_FORMAT.format(first_mark + len(substitutions)))
             substitutions.append(text[start:end])
-            out.append("_")
             i = end + 1
             continue
         if char == "\n":

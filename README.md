@@ -409,7 +409,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   commit before the code it needs fails naming that commit; HEAD ends back on
   its branch either way. Then it lists the commits since the
   base and the test files changed since the refactor base, and fails naming
-  any ref or config key that moved. In a detached worktree, the branch it lands on (the
+  any ref or config key that moved (a tag only when it points at a commit the
+  fold may rewrite). In a detached worktree, the branch it lands on (the
   main tree's) may move: finish then says to rebase onto it. `review-prompt
   BRIEF` writes the review subagent's prompt for the commit at HEAD to the git
   dir, with `/code-review`'s two briefs and its standards section copied from

@@ -66,7 +66,10 @@ folded.
 The fingerprint is every ref except the work branch and its upstream, the stash, and the
 branches checked out in other linked worktrees at start or at finish, which other sessions
 move (a symbolic ref, such as origin/HEAD, counts by the ref it points to), and every entry
-of the repo's config. When either changed since start, finish names the refs and config
+of the repo's config. A tag counts only when it points, at start or now, at a commit the
+fold may rewrite (after the base it folds from, in HEAD's history), or when where it
+pointed at start can no longer be read: a tag CI made on main, which a fetch brings in,
+doesn't. When either changed since start, finish names the refs and config
 keys (never config values: a remote URL can hold a token), exits 1 and keeps the state,
 before folding anything. A fix commit left unfolded (its target is older than the base)
 also fails finish. It does not push.
@@ -239,6 +242,22 @@ def fingerprint(work: list[str]) -> dict[str, dict[str, str]]:
         "config": config,
         "refs": {n: s for n, s in refs.items() if n not in ignored},
     }
+
+
+def on_work_commit(name: str, before: str | None, work: set[str]) -> bool:
+    """Whether tag `name`, as it was at start (`before`) or is now, points at one of the
+    `work` commits, which the fold may rewrite, leaving the tag on the old commit. A start
+    value that no longer resolves, as a deleted annotated tag's pruned object doesn't,
+    counts: where it pointed can't be told. Any other tag, such as one CI made on main
+    and a fetch brought in, the fold can't touch."""
+
+    def peeled(ref: str) -> str:
+        found = git("rev-parse", "-q", "--verify", f"{ref}^{{commit}}", check=False)
+        return found.stdout.strip()
+
+    if before and not peeled(before):
+        return True
+    return any(peeled(ref) in work for ref in (name, before) if ref)
 
 
 def changes(
@@ -513,9 +532,15 @@ def finish(args: argparse.Namespace) -> int:
         return fail("There are uncommitted changes: commit or stash them first.")
     targets = set(state.get("targets", []))
     others = set(state.get("others", [])) | other_worktree_branches()
+    found = None if ancestor(base, "HEAD") else rewritten_base(targets)
+    # The commits the fold may rewrite, from where it will start.
+    work = set(git("rev-list", f"{found[1] if found else base}..HEAD").stdout.split())
     moved, moved_targets = [], set()
     for change in changes(state["fingerprint"], fingerprint(state["work_refs"])):
         kind, _, name = change.partition(" ")
+        before = state["fingerprint"]["refs"].get(name)
+        if name.startswith("refs/tags/") and not on_work_commit(name, before, work):
+            continue
         branch = branch_name(name) if kind == "refs" else None
         if branch in targets:
             moved_targets.add(branch)
@@ -527,7 +552,6 @@ def finish(args: argparse.Namespace) -> int:
             *(f"  {name}" for name in moved),
         )
     if not ancestor(base, "HEAD"):
-        found = rewritten_base(targets)
         if found is None:
             return fail(
                 f"The base {base[:12]} isn't in HEAD's history, and HEAD meets no branch",

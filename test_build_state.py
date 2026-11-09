@@ -97,6 +97,90 @@ def test_finish_fails_and_names_what_changed_when_another_ref_or_the_config_move
     assert build_state(repo, "finish").returncode == 1
 
 
+def test_finish_ignores_a_tag_made_meanwhile_off_the_work(repo):
+    # As CI tags a release on main and a fetch brings the tag in.
+    build_state(repo, "start")
+    base = git(repo, "rev-parse", "HEAD").strip()
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+    git(repo, "tag", "-a", "-m", "release", "release-v2", base)
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert subjects(repo, base) == ["Work"]
+
+
+def test_finish_still_stops_for_a_tag_made_meanwhile_on_the_work(repo):
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+    git(repo, "tag", "on-work", work)
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    assert "refs/tags/on-work" in done.stderr
+
+
+def test_finish_still_stops_for_a_tag_deleted_meanwhile_from_the_work(repo):
+    base = git(repo, "rev-parse", "HEAD").strip()
+    work = commit(repo, "a.py", "Work")
+    git(repo, "tag", "on-work", work)
+    build_state(repo, "start", "--base", base)
+    commit(repo, "a.py", "fix", f"--fixup={work}")
+    git(repo, "tag", "-d", "on-work")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    assert "refs/tags/on-work" in done.stderr
+
+
+def test_finish_stops_for_a_deleted_annotated_tag_on_the_work_even_once_pruned(repo):
+    # Its tag object is gone, so where it pointed can't be read: it counts.
+    base = git(repo, "rev-parse", "HEAD").strip()
+    work = commit(repo, "a.py", "Work")
+    git(repo, "tag", "-a", "-m", "x", "on-work", work)
+    build_state(repo, "start", "--base", base)
+    commit(repo, "a.py", "fix", f"--fixup={work}")
+    git(repo, "tag", "-d", "on-work")
+    git(repo, "gc", "-q", "--prune=now")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    assert "refs/tags/on-work" in done.stderr
+
+
+def test_finish_ignores_a_tag_on_main_ahead_of_the_base(repo, worktree):
+    build_state(worktree, "start")
+    work = commit(worktree, "a.py", "Work")
+    commit(worktree, "a.py", "fix", f"--fixup={work}")
+    advance(repo, "refs/heads/main")
+    git(repo, "tag", "release", "main")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+
+
+def test_finish_ignores_a_tag_on_main_after_main_was_rewritten(repo, worktree):
+    # The fold starts where HEAD meets the rewritten main, not at the recorded base.
+    base = git(worktree, "rev-parse", "HEAD").strip()
+    build_state(worktree, "start")
+    work = commit(worktree, "a.py", "Work")
+    commit(worktree, "a.py", "fix", f"--fixup={work}")
+    git(repo, "commit", "-q", "--amend", "-m", "start, reworded elsewhere")
+    advance(repo, "refs/heads/main")
+    git(worktree, "rebase", "-q", "--onto", "main", base)
+    git(repo, "tag", "-a", "-m", "release", "release-v2", "main")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+
+
 def test_start_refuses_while_a_build_is_open_unless_forced(repo):
     build_state(repo, "start")
     first_base = git(repo, "rev-parse", "HEAD").strip()

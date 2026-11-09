@@ -23,6 +23,11 @@ from pathlib import Path
 
 import pytest
 
+from leftover_processes import (  # noqa: F401  autouse fixtures, registered by import
+    _leftover_processes_of_module,
+    _leftover_processes_of_test,
+)
+
 # Not all of these are repo-local, but each can send a git call elsewhere.
 ALWAYS_UNSET = {
     "GIT_DIR",

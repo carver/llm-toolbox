@@ -463,3 +463,53 @@ more, such as after a big tool output, kept its cache and isn't one.
 The first rule. It caught all four of the main session's rebuilds, but only one
 of the 17 in subagents, whose cache lasts five minutes; the 16 it missed held
 about 3.2M tokens.
+
+### session-scan checks its own candidates, with opus (2026-11-09)
+
+/upskill's agent had to check 80 to 130 candidates itself, one call each, at the
+end of a session that may already hold 500k tokens of context: every check resends
+it, some 64M tokens for 128 checks, against the scan's 400k. Now verifiers check
+the candidates (claude-fresh, no tools: the digest has whole messages and output
+tails, the raw log is too big to read through tools, and no tools means text in
+the logs can't make a verifier read files), and one merge call groups the real
+ones into findings. The agent reads the findings, the candidates the verifier
+couldn't settle, and the dismissed list with a reason each, and judges those with
+its own memory of the session; that read costs it a few thousand tokens.
+
+Measured on a8a346b2's whole-text-and-tails run, against its scored candidates
+(44 real, 17 themes):
+
+| verifier | real kept | its real that were real | findings | themes with none kept |
+|---|---|---|---|---|
+| sonnet | 34 | 34 of 51 | 12 | 2 |
+| opus | 37 | 37 of 48 | 17 | 3 |
+| opus, after the two prompt fixes below | 40 | 40 of 62 | 23 | 1 (fixed in that session) |
+
+Each run read about 275k input tokens. Opus kept more, so it is the default. Both
+had dismissed subagent cache rebuilds because the prompt called ending a turn to
+wait "not a finding"; the prompt now says the rebuild after such a wait is still
+its cost, and to say real when torn between real and trivial, since the agent
+judges every real one again. One merge answer grouped 15 of 62 real candidates
+and left the rest as findings of one; a merge that leaves over half ungrouped is
+asked again (about 15k tokens), and the better answer kept.
+
+Held out: session 4e895eaf (llm-toolbox), whose old /upskill, reading the whole
+digest itself, pitched 9 findings; the owner acted on 6. The scan (sonnet
+reading, opus checking; 245k and 160k input tokens) gave 14 findings. Of the 9:
+5 found (one in part), 1 dismissed, 3 with no candidate at all. The verifier
+dismissed 33 candidates, and only one of them was worth pitching: an old finding
+the reader had put down to the wrong cause (polling, where the cost was a review
+rerunning a suite that had passed), so the prompt now tells the verifier to judge
+the event behind a candidate, not how it is put. The three no reader raised
+fell outside the categories as written: a change to a shared tool that slowed
+other sessions, a problem the agent noted and left for later, and a design
+premise the user had to correct. The categories now name the first two kinds of
+cost; rereading those chunks, the reader then raised the first, not the second.
+So the scan also lists, by pattern, every line where an agent set something
+aside ("left for later", "out of scope", "TODO"): 5 lines on that session, the
+missed one among them. A premise the user corrected sits in the user's turns,
+which /upskill's agent reads itself. The scan found 5 real findings the old pitch
+lacked.
+
+The scored runs and the held-out check are kept outside the repo, in
+cache/session-scan/ of this workspace.

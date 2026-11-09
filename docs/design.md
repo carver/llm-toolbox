@@ -208,8 +208,8 @@ secret, such as filedrawer's `ops/smoke-staging eval`, still runs.
 
 BASH_ENV goes too: it names `/etc/sandbox-persistent.sh`, which sources the secrets
 file, so every bash a check started had them back (a review of the plan found it).
-The other way, a variable the persistent file's secrets block would honour, needs a
-change in sandbox-setup.
+The other way, a variable the persistent file's secrets block would honour, came
+later, below; BASH_ENV stays stripped as well.
 
 The secrets file also exports EBAY_CERT_ID, eBay's client secret, whose name no part
 marks. So the gate also leaves out every name that the file `$AGENT_SECRETS_FILE`
@@ -220,8 +220,22 @@ file's `export` commands with `lib/shellparse.py` rather than sourcing it in a b
 and listing what it exported: that would run the owner's file at every check, with
 whatever command substitutions it holds, and pass every value through another
 process. The variable is named for the environment it describes, not after the gate,
-so another tool may read it. It isn't the marker above: the secrets block still
-sources the file wherever it runs, so BASH_ENV stays stripped.
+so another tool may read it.
+
+It is the marker too (the owner's call, 2026-11-09): a check that starts `bash
+--login` or `bash -i` (dot-files' tests do) reads the secrets block again through
+`/etc/profile.d` or `/etc/bash.bashrc`, whatever BASH_ENV says, and the block sourced
+the file every time. Now each check gets AGENT_SECRETS_FILE set to empty, after the
+gate reads the names, and sandbox-setup's block keeps a value it inherits and sources
+nothing while it is empty. So the variable means two things: the file that holds the
+secrets, and, set and empty, "source none here". A reader must never default it with
+`${AGENT_SECRETS_FILE:-...}` or Python's `or`, which read empty as unset; `-` keeps
+it. A bash started with a cleared environment (`env -i`, a test's own clean one) has
+no marker and still sources the file, and dot-files' tests start theirs so: their
+`clean_env()` keeps only HOME, PATH, TERM and LANG, so they need to pass
+AGENT_SECRETS_FILE through too (open, 2026-11-09). BASH_ENV stays stripped: it holds
+without the other repo's half, as on a sandbox whose persistent file predates the
+marker.
 
 ### build-state finish stops only for what a fold, or the repo's safety, depends on (2026-11-09)
 

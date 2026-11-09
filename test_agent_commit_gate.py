@@ -1688,14 +1688,22 @@ SECRET_NAMED = (
 )
 LOOKALIKES = ("MONKEY", "SSH_AUTH_SOCK", "KEYRING_DIR", "BYPASS_CACHE", "TOKENS_SEEN")
 PLANTED = dict.fromkeys(SECRET_NAMED + LOOKALIKES, "fake")
+# The check writes down the names it received in `names`, and in `empty` the names of
+# those whose value is empty.
 NOTE_NAMES = (
-    "awk 'BEGIN { for (name in ENVIRON) print name }'"
-    ' > "$(git rev-parse --git-dir)/names"'
+    'awk -v dir="$(git rev-parse --git-dir)" \'BEGIN { for (name in ENVIRON) {'
+    ' print name > (dir "/names");'
+    ' if (ENVIRON[name] == "") print name > (dir "/empty") } }\''
 )
 
 
 def names_received(repo):
     return set((repo / ".git" / "names").read_text().split())
+
+
+def empty_names_received(repo):
+    path = repo / ".git" / "empty"
+    return set(path.read_text().split()) if path.exists() else set()
 
 
 def full_check(repo, env=PLANTED):
@@ -1747,6 +1755,16 @@ def test_no_check_gets_a_variable_whose_name_marks_a_secret(installed, run_check
     assert set(LOOKALIKES) <= received
 
 
+@EVERY_CHECK
+def test_every_check_gets_the_secrets_file_variable_empty(installed, run_check):
+    # The gate's own environment has no AGENT_SECRETS_FILE here. A check's login bash
+    # in the sandbox sources the secrets file unless the variable is set and empty.
+    done = run_check(installed)
+
+    assert done.returncode == 0, done.stderr
+    assert "AGENT_SECRETS_FILE" in empty_names_received(installed)
+
+
 def test_a_bash_the_check_starts_doesnt_source_the_secrets_back(installed, tmp_path):
     # As /etc/sandbox-persistent.sh, which BASH_ENV names, sources the secrets file.
     startup = tmp_path / "persistent.sh"
@@ -1794,7 +1812,7 @@ def test_no_check_gets_a_name_the_secrets_file_exports(installed, run_check, tmp
     received = names_received(installed)
     assert not received & set(EXPORTED)
     assert set(NOT_EXPORTED) <= received
-    assert "AGENT_SECRETS_FILE" in received  # a path, which the check may keep
+    assert "AGENT_SECRETS_FILE" in empty_names_received(installed)  # read, then emptied
 
 
 def no_file(path):
@@ -1840,3 +1858,4 @@ def test_an_empty_secrets_file_variable_strips_nothing_more(installed):
 
     assert done.returncode == 0, done.stderr
     assert "FAKE_CERT_ID" in names_received(installed)
+    assert "AGENT_SECRETS_FILE" in empty_names_received(installed)

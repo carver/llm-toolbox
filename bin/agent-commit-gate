@@ -67,14 +67,20 @@ word that isn't a name there, written through an expansion (`export "$n"`), give
 none, and `declare -x`, `set -a` and the files it sources aren't read. Every name it
 exports leaves the checks, so keep only secrets there. With the variable unset or
 empty, or a file that isn't a regular one or can't be read, nothing more is left out,
-and nothing said; AGENT_SECRETS_FILE itself, a path, stays. That holds for each check,
-at a commit or in wt-ship's recheck, in every repo. A test's failure message once
-printed the environment a subprocess received, and a secret's value reached an
-agent's output. A job that needs a secret runs as `heavy -- CMD`, which keeps the
-environment. This catches a mistake, not a check set on a secret: a commit can empty
-AGENT_SECRETS_FILE (and BASH_ENV, where a bash hook would set it again), and a check
-can still read the secrets file, or the environment of the process that ran it in
-/proc.
+and nothing said. Once the gate has read the file, and whatever the variable held, the
+check gets AGENT_SECRETS_FILE set to empty, which tells a startup file that sources
+the secrets file only while that variable isn't empty to source none: the sandbox's
+does so for a login or an interactive bash, which reads it whatever BASH_ENV says, so
+no bash started with the check's environment gets the secrets back. One started with
+a cleared environment (`env -i`, a test's own clean one) has no such marker and gets
+them. That holds for each check, at a commit or in wt-ship's
+recheck, in every repo. A test's failure message once printed the environment a
+subprocess received, and a secret's value reached an agent's output. A job that needs
+a secret runs as `heavy -- CMD`, which keeps the environment. This catches a mistake,
+not a check set on a secret: a commit can empty AGENT_SECRETS_FILE (and BASH_ENV,
+where a bash hook would set it again), a check can unset it before it starts a login
+bash, and a check can still read the secrets file, or the environment of the process
+that ran it in /proc.
 
 `--run` records each tree that passes in agent-pre-commit-passed, in the repo's
 common git dir, which every worktree shares: the last 1,000, each with the SHA-1
@@ -209,7 +215,8 @@ OLD_LINES = (
 )
 # The parts of a variable's name that mark it a secret, which no check gets.
 SECRET_PARTS = frozenset({"KEY", "TOKEN", "SECRET", "PASSWORD", "PASS"})
-# The variable that names a file whose every exported name no check gets either.
+# The variable that names a file whose every exported name no check gets either; each
+# check gets it set to empty, which tells a startup file to source no secrets file.
 SECRETS_FILE_NAME = "AGENT_SECRETS_FILE"
 # How much of that file it reads: a file of exports runs to a few KB, and the parse
 # takes time with the square of a word's length (a 1 MiB word, 24 s; 64 KiB, 0.05 s).
@@ -625,14 +632,16 @@ def secrets_file_names(env):
 
 def check_env(env, base):
     """`env` for a check: CHECK_BASE set to `base` (None: unset), every secret-named
-    variable, every name the secrets file exports and BASH_ENV left out, and
-    CHECK_QUEUE_EXIT and AT_COMMIT left out, so nothing the check starts takes itself
-    for a commit's."""
+    variable, every name the secrets file exports and BASH_ENV left out,
+    SECRETS_FILE_NAME emptied once read, so a startup file that honours it sources no
+    secrets file in a bash the check starts, and CHECK_QUEUE_EXIT and AT_COMMIT left
+    out, so nothing the check starts takes itself for a commit's."""
     gone = {
         *("CHECK_BASE", QUEUE_EXIT_NAME, AT_COMMIT, "BASH_ENV"),
         *secrets_file_names(env),
     }
     env = {k: v for k, v in env.items() if k not in gone and not secret_named(k)}
+    env[SECRETS_FILE_NAME] = ""
     if base:
         env["CHECK_BASE"] = base
     return env

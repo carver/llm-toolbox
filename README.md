@@ -317,7 +317,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   exports (its `export` commands, read without running it; nothing more when
   it's unset or unreadable), nor BASH_ENV, through which bash would source them
   back, since a test's failure message once printed a secret's value;
-  `heavy -- CMD` keeps them for a job that needs one.
+  `heavy -- CMD` keeps them for a job that needs one. The check gets
+  `AGENT_SECRETS_FILE` set to empty, which tells a login or interactive bash
+  it starts to source no secrets file (sandbox-setup's secrets block reads it
+  so).
   The check's output shows only when
   it fails, ending with `COMMIT REFUSED`; a pass prints one line. A small
   fixup!, squash! or amend! commit (found from the running `git commit`'s

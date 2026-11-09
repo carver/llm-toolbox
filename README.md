@@ -494,7 +494,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   code it needs fails there, naming that commit. Then it lists the commits since the
   base and the test files changed since the refactor base, and fails naming
   any ref or config key that moved (a tag only when it points at a commit the
-  fold may rewrite); `core.hooksPath` and another branch's settings it only
+  fold may rewrite); `core.hooksPath`, another branch's settings and a
+  remote-tracking ref other than the target's or the upstream (a topic pushed
+  for CI, or what a fetch moved, counted unless it holds a work commit) it only
   reports, and goes on. In a detached worktree, the
   branch it lands on (the main tree's, when HEAD shares history with it) may
   move: finish then names it, and says to rebase onto it while HEAD lacks one

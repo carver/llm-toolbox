@@ -56,12 +56,18 @@ fold may rewrite (after the base it folds from, in HEAD's history), or when wher
 pointed at start can no longer be read: a tag CI made on main, which a fetch brings in,
 doesn't. When either changed since start, finish names the refs and config
 keys (never config values: a remote URL can hold a token), exits 1 and keeps the state,
-before folding anything. Two kinds of config key it only names, saying to tell the
-user, and goes on: core.hooksPath (the hooks a fold runs can't change its trees,
-which finish checks after, and hook files were never in the fingerprint) and a
-branch's settings, for any branch but the build's own. Another session's install.py
-set core.hooksPath during a build. A fix commit left unfolded (its target is older than
-the base) also fails finish. It does not push.
+before folding anything. Some changes, which can't change what a fold makes, it only
+reports, in one line saying to tell the user, and goes on: core.hooksPath (the hooks a
+fold runs can't change its trees, which finish checks after, and hook files were never
+in the fingerprint), a branch's settings, for any branch but the build's own, and a
+remote-tracking ref (refs/remotes/) made, moved or deleted, other than the build's
+target or upstream, such as a topic branch pushed to get CI's results and deleted
+after, which neither a fold nor a landing reads. Another session's install.py set
+core.hooksPath during a build. A
+remote-tracking ref is named when it pointed at a commit the fold may rewrite, at
+start or now, or is a symbolic ref repointed; the rest, as a fetch in any worktree
+moves them, are counted. A fix commit left unfolded (its target is older than the
+base) also fails finish. It does not push.
 
 On a detached HEAD, as in a worktree that will land on main, there is no work branch.
 There the build's target is the branch the main worktree has checked out, when HEAD
@@ -82,6 +88,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -278,6 +285,68 @@ def changes(
     )
 
 
+@dataclass
+class Changed:
+    """What changed since start, sorted by what finish does with it: each change that
+    stops it ("kind name"), the targets that moved, and what it only reports: config
+    keys and remote-tracking refs by name, and a count of the remote-tracking refs off
+    the work."""
+
+    stops: list[str] = field(default_factory=list)
+    targets: set[str] = field(default_factory=set)
+    config: list[str] = field(default_factory=list)
+    remote_refs: list[str] = field(default_factory=list)
+    remote_refs_off_work: int = 0
+
+    def report(self) -> str | None:
+        """The line that names what finish only reports; None when there's nothing."""
+        named = [*self.config, *self.remote_refs]
+        if count := self.remote_refs_off_work:
+            other = "other " if self.remote_refs else ""
+            refs = "ref" if count == 1 else "refs"
+            named.append(f"{count} {other}remote-tracking {refs} off the work")
+        if not named:
+            return None
+        return (
+            "Changed since start, which finish only reports; tell the user:"
+            f" {', '.join(named)}"
+        )
+
+
+def changed_since_start(
+    state: dict, work: set[str], targets: set[str], others: set[str]
+) -> Changed:
+    """Each change to the fingerprint since start, sorted (Changed). `work` holds the
+    commits the fold may rewrite; `others`, the branches other worktrees have out."""
+    changed = Changed()
+    before, now = state["fingerprint"], fingerprint(state["work_refs"])
+    for change in changes(before, now):
+        kind, _, name = change.partition(" ")
+        if kind == "config":
+            if only_reported(name, state["work_refs"]):
+                changed.config.append(name)
+            else:
+                changed.stops.append(change)
+            continue
+        was = before["refs"].get(name)
+        if name.startswith("refs/tags/") and not on_work_commit(name, was, work):
+            continue
+        branch = branch_name(name)
+        if branch in targets:
+            changed.targets.add(branch)
+        elif branch in others:
+            continue
+        elif name.startswith("refs/remotes/"):
+            values = {was, now["refs"].get(name)} - {None}
+            if any(value.startswith("-> ") or value in work for value in values):
+                changed.remote_refs.append(name)
+            else:
+                changed.remote_refs_off_work += 1
+        else:
+            changed.stops.append(change)
+    return changed
+
+
 def load(path: Path) -> dict | None:
     if not path.exists():
         print("No build is open here: run `build-state start` first.", file=sys.stderr)
@@ -461,30 +530,13 @@ def finish(args: argparse.Namespace) -> int:
     found = None if ancestor(base, "HEAD") else rewritten_base(targets)
     # The commits the fold may rewrite, from where it will start.
     work = set(git("rev-list", f"{found[1] if found else base}..HEAD").stdout.split())
-    moved, moved_targets, reported = [], set(), []
-    for change in changes(state["fingerprint"], fingerprint(state["work_refs"])):
-        kind, _, name = change.partition(" ")
-        if kind == "config" and only_reported(name, state["work_refs"]):
-            reported.append(name)
-            continue
-        before = state["fingerprint"]["refs"].get(name)
-        if name.startswith("refs/tags/") and not on_work_commit(name, before, work):
-            continue
-        branch = branch_name(name) if kind == "refs" else None
-        if branch in targets:
-            moved_targets.add(branch)
-        elif branch not in others:
-            moved.append(change)
-    if reported:
-        print(
-            "Config changed since start that finish only reports; tell the user:"
-            f" {', '.join(reported)}",
-            flush=True,
-        )
-    if moved:
+    changed = changed_since_start(state, work, targets, others)
+    if report := changed.report():
+        print(report, flush=True)
+    if changed.stops:
         return fail(
             "The repo changed outside the work branch since start:",
-            *(f"  {name}" for name in moved),
+            *(f"  {name}" for name in changed.stops),
         )
     if not ancestor(base, "HEAD"):
         if found is None:
@@ -527,7 +579,7 @@ def finish(args: argparse.Namespace) -> int:
         )
     if "refactor_base" in state:
         report_tests(state["refactor_base"])
-    for branch in sorted(moved_targets):
+    for branch in sorted(changed.targets):
         rebase = ": rebase onto it" if behind(branch) else ""
         print(f"{branch} moved since start{rebase}")
     path.unlink()

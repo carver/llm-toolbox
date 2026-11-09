@@ -237,6 +237,15 @@ worktree, so main was neither behind nor ahead of it and wasn't the target. Now:
 - `core.hooksPath` (the owner's example of a key a fold can't be affected by) and the
   settings of any branch but the build's own are reported, not a stop; the build
   skill says to pass the report on to the user.
+- A remote-tracking ref made, moved or deleted is reported too, unless it's the
+  target's (named as moved) or the upstream (left out of the fingerprint): the
+  owner's call (2026-11-09), after a topic branch pushed to get CI's results, and
+  deleted after, stopped finish. Nothing a fold or a landing does reads one: the fold
+  is given its base, `rewritten_base` reads the upstream and the targets, and wt-ship
+  lands on `REMOTE/TARGET`. Worktrees share refs, so one fetch anywhere can move
+  dozens; the report names a ref only when it pointed at a commit the fold may
+  rewrite, at start or now (the CI push of the build's own work), or is a symbolic
+  ref repointed, and counts the rest.
 - The rest of the config still stops finish. `remote.*` can't change a fold either, but
   a test leaking into the real repo can point `remote.origin.url` at a temporary repo,
   which is the damage the fingerprint is for, and wt-ship would push there next.
@@ -245,6 +254,11 @@ Hooks do run in a fold (pre-rebase, post-checkout, prepare-commit-msg, post-comm
 post-rewrite), and a prepare-commit-msg hook can change a folded commit's message, but
 hook files were never in the fingerprint, so a hook added under the old path ran
 unguarded too.
+
+Left to the owner (a review of the plan found them): a build on a named branch still
+stops on a CI push made with `git push -u`, which sets the work branch's own
+`branch.*.remote` and `.merge`; and a push over another session's remote branch is
+only reported, or not at all when another worktree has that branch checked out.
 
 ### wt-ship refuses a message naming an unlanded commit by its ID (2026-11-09)
 

@@ -570,7 +570,87 @@ def test_repointing_a_symbolic_ref_counts_as_a_change(repo):
 
     done = build_state(repo, "finish")
 
-    assert done.returncode == 1 and "refs/remotes/origin/HEAD" in done.stderr
+    # Reported, by name, as a remote-tracking ref: a fold doesn't read it.
+    assert done.returncode == 0, done.stderr
+    assert "refs/remotes/origin/HEAD" in reported(done)
+
+
+def reported(done):
+    """The line finish prints for what changed that it only reports."""
+    return next((ln for ln in done.stdout.splitlines() if "tell the user" in ln), "")
+
+
+def test_a_push_of_the_work_for_ci_is_reported_not_a_stop(repo, worktree):
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    # As `git push origin HEAD:refs/heads/ci-topic` would.
+    git(worktree, "update-ref", "refs/remotes/origin/ci-topic", "HEAD")
+    commit(worktree, "a.py", "Review fix")
+    git(repo, "update-ref", "refs/remotes/origin/theirs", "main")  # and a fetch
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    line = reported(done)
+    assert "refs/remotes/origin/ci-topic" in line
+    assert "1 other remote-tracking ref off the work" in line
+
+
+def test_deleting_the_ci_branch_is_reported_not_a_stop(repo, worktree):
+    commit(worktree, "a.py", "Work")
+    git(worktree, "update-ref", "refs/remotes/origin/ci-topic", "HEAD")  # pushed for CI
+    build_state(worktree, "start", "--base", "HEAD~1")
+    # As `git push -d origin ci-topic` would.
+    git(worktree, "update-ref", "-d", "refs/remotes/origin/ci-topic")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "refs/remotes/origin/ci-topic" in reported(done)
+
+
+def test_remote_refs_off_the_work_are_counted_not_named(repo, worktree):
+    for name in ("one", "two"):
+        git(repo, "update-ref", f"refs/remotes/origin/{name}", "HEAD")
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    # A fetch in any worktree: two branches moved, one new.
+    advance(repo, "refs/remotes/origin/one")
+    advance(repo, "refs/remotes/origin/two")
+    git(repo, "update-ref", "refs/remotes/origin/three", "main")
+    git(repo, "config", "core.hooksPath", ".githooks")  # reported, but no ref
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    line = reported(done)
+    assert "3 remote-tracking refs off the work" in line and "origin/one" not in line
+
+
+def test_the_targets_remote_twin_moving_alone_is_named_as_moved(repo, worktree):
+    git(repo, "update-ref", "refs/remotes/origin/main", "main")
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Work")
+    advance(repo, "refs/remotes/origin/main")  # a fetch of another session's push
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "main moved since start: rebase onto it" in done.stdout
+    assert not reported(done)
+
+
+def test_a_build_on_a_branch_reports_another_remote_tracking_ref(repo):
+    git(repo, "checkout", "-q", "-b", "work")
+    git(repo, "update-ref", "refs/remotes/origin/main", "main")
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    advance(repo, "refs/remotes/origin/main")  # a fetch of another session's push
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert reported(done).endswith(": 1 remote-tracking ref off the work")
 
 
 def advance(repo, ref):

@@ -31,20 +31,25 @@ from fifo import Holder
 
 HOOK_NAME = "agent-pre-commit"
 MARKER = "checking-earlier-commits"
-# The modes of an executable file, or a link to one, in a git tree.
-RUNNABLE_MODES = ("100755", "120000")
+# Modes of the entries in a git tree.
+EXECUTABLE, LINK, DIRECTORY = "100755", "120000", "040000"
+# The links one path may pass through, as Linux's MAXSYMLINKS and git's own
+# `cat-file --follow-symlinks` allow; a path that needs more counts as a loop.
+MAX_LINKS = 40
 
 
 class GitError(Exception):
     """A git command failed; the message names it and what git printed."""
 
 
-def git(*args, check=True):
-    run = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+def git(*args, check=True, text=True):
+    """Run git; with text=False its output stays bytes, for file names that needn't
+    be UTF-8."""
+    run = subprocess.run(["git", *args], capture_output=True, text=text, check=False)
     if check and run.returncode != 0:
-        raise GitError(
-            f"git {' '.join(args)} failed:\n{run.stdout}{run.stderr}".rstrip()
-        )
+        said = run.stdout + run.stderr
+        said = said if text else os.fsdecode(said)
+        raise GitError(f"git {' '.join(args)} failed:\n{said}".rstrip())
     return run
 
 
@@ -78,7 +83,9 @@ def hook_path():
     """Where the repo's agent check lives, whether or not it's there: the hooks
     directory git uses (`core.hooksPath`, else the common git dir's hooks)."""
     # --git-path is relative to the current directory, which may be a subdirectory.
-    return Path(out("rev-parse", "--git-path", "hooks")).resolve() / HOOK_NAME
+    # No links resolved: a hooks directory that is a link in the work tree is each
+    # commit's to follow (holds_check), not the tip's.
+    return Path(os.path.abspath(out("rev-parse", "--git-path", "hooks"))) / HOOK_NAME
 
 
 def runnable(hook):
@@ -96,12 +103,52 @@ def in_tree(hook):
 
 
 def holds_check(commit, path):
-    """Whether `commit` has an executable file, or a link, at `path`."""
+    """Whether `path` leads to an executable file in `commit`'s tree, read from git's
+    objects alone, since the commit isn't checked out. It walks the path as the file
+    system will once the commit is: a link's relative target goes from the link's own
+    directory, `..` climbs from where the links so far led, and a link on the way,
+    such as a directory link, is followed too, up to MAX_LINKS in all. A link out of
+    the tree doesn't count, be its target absolute or one that climbs above the top:
+    the commit doesn't hold what it names, which is whatever the machine checking it
+    has there."""
+    todo = path.split("/")
+    walked = []  # the directories the walk is in, from the top, none of them a link
+    links = 0
+    while todo:
+        name = todo.pop(0)
+        if name in ("", "."):
+            continue
+        if name == "..":
+            if not walked:
+                return False  # above the top of the tree
+            walked.pop()
+            continue
+        here = "/".join([*walked, name])
+        mode = entry_mode(commit, here)
+        if mode == DIRECTORY:
+            walked.append(name)
+        elif mode == LINK and links < MAX_LINKS:
+            links += 1
+            blob = git("cat-file", "blob", f"{commit}:{here}", text=False).stdout
+            target = os.fsdecode(blob)  # back to the same bytes when git reads it
+            if target.startswith("/"):
+                return False
+            todo[:0] = target.split("/")
+        else:
+            # Missing, past MAX_LINKS, or a file, which must end the path.
+            return mode == EXECUTABLE and not todo
+    return False  # a directory
+
+
+def entry_mode(commit, path):
+    """The mode of the entry at `path` in `commit`'s tree, as ls-tree prints it; None
+    when there's none."""
     # --full-tree: ls-tree reads paths relative to the current directory otherwise.
+    # --literal-pathspecs: a link's target is a path, never pathspec magic.
     listed = git(
-        "ls-tree", "--full-tree", commit, "--", path, check=False
+        "--literal-pathspecs", "ls-tree", "--full-tree", commit, "--", path, text=False
     ).stdout.split()
-    return bool(listed) and listed[0] in RUNNABLE_MODES
+    return listed[0].decode() if listed else None
 
 
 def dropping_check(upstream, hook):

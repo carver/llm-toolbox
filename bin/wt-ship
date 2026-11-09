@@ -44,7 +44,8 @@ In order, it:
    back and the marker goes however the checks end, unless the run is killed outright,
    and then the next run names the tip to put back. A repo that keeps the check in its
    tree (core.hooksPath inside it) fails a commit that drops it while the branch has
-   it;
+   it: the commit must hold an executable file there, or a link that leads to one in
+   the commit's own tree;
 5. pushes HEAD to REMOTE/BRANCH. When another session's push wins the race (a
    non-fast-forward rejection), it fetches, rebases, checks and pushes again, up to
    10 tries in all, then stops saying to run it again;
@@ -255,7 +256,8 @@ def run_checks(upstream, mode):
     hook = commitcheck.hook_path()
     if dropped := commitcheck.dropping_check(upstream, hook):
         raise Stop(
-            f"{named(dropped)} has no {CHECK}, which {short(upstream)} has, so it would"
+            f"{named(dropped)} has no {CHECK} in its own tree, an executable file or a"
+            f" link that leads to one there, which {short(upstream)} has, so it would"
             f" land without the check. Put it back in that commit (`git commit"
             f" --fixup={dropped[:12]}`), then run `{RERUN}` again; nothing was"
             f" {mode.done}."

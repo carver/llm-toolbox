@@ -210,7 +210,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   tree holds an earlier commit, a marker in
   the worktree's git dir makes `agent-commit-gate` refuse commits there, and a
   run killed before it put the tip back leaves the next one naming the tip. A
-  repo that keeps the check in its tree fails a commit that drops it. Then it
+  repo that keeps the check in its tree fails a commit that drops it, or keeps a
+  link to it that leads to no executable file in that commit. Then it
   pushes with one retry when another push wins the race, and confirms the
   remote holds HEAD. Then it prints the range, a notice for other sessions and
   whether the main tree is behind; `--remove` removes the worktree, and `-C DIR`

@@ -1457,15 +1457,21 @@ def test_a_run_killed_mid_check_leaves_the_next_one_naming_the_tip(
     assert main_head(main) == before
 
 
-@pytest.mark.parametrize("where", [".", "sub"])
-def test_a_commit_that_drops_the_check_kept_in_the_tree_fails(setup, where):
-    _, main, wt, _ = setup
+def keep_the_check_in_the_tree(main):
+    """Keep the check in the main tree's branch: core.hooksPath .githooks, which
+    holds an executable agent-pre-commit that passes."""
     git(main, "config", "core.hooksPath", ".githooks")
     (main / ".githooks").mkdir()
     (main / ".githooks" / "agent-pre-commit").write_text("#!/bin/sh\nexit 0\n")
     (main / ".githooks" / "agent-pre-commit").chmod(0o755)
     git(main, "add", ".githooks")
     git(main, "commit", "-qm", "Add the check")
+
+
+@pytest.mark.parametrize("where", [".", "sub"])
+def test_a_commit_that_drops_the_check_kept_in_the_tree_fails(setup, where):
+    _, main, wt, _ = setup
+    keep_the_check_in_the_tree(main)
     git(wt, "checkout", "-q", "--detach", "main")
     git(wt, "rm", "-q", ".githooks/agent-pre-commit")
     git(wt, "commit", "-qm", "Drop the check")
@@ -1479,6 +1485,98 @@ def test_a_commit_that_drops_the_check_kept_in_the_tree_fails(setup, where):
     assert done.returncode == 1, done.stderr
     assert "Drop the check" in done.stderr, done.stderr
     assert main_head(main) == before
+
+
+def keep_the_check_behind_a_link(main):
+    """Keep the check in the main tree's branch as filedrawer does: core.hooksPath
+    .githooks, where agent-pre-commit is a link to ../bin/agent-pre-commit."""
+    git(main, "config", "core.hooksPath", ".githooks")
+    (main / "bin").mkdir()
+    (main / "bin" / "agent-pre-commit").write_text("#!/bin/sh\nexit 0\n")
+    (main / "bin" / "agent-pre-commit").chmod(0o755)
+    (main / ".githooks").mkdir()
+    (main / ".githooks" / "agent-pre-commit").symlink_to("../bin/agent-pre-commit")
+    git(main, "add", "bin", ".githooks")
+    git(main, "commit", "-qm", "Add the check")
+
+
+def delete_the_target(wt):
+    git(wt, "rm", "-q", "bin/agent-pre-commit")
+
+
+def unexecute_the_target(wt):
+    (wt / "bin" / "agent-pre-commit").chmod(0o644)
+    git(wt, "add", "bin/agent-pre-commit")
+
+
+@pytest.mark.parametrize("breaking", [delete_the_target, unexecute_the_target])
+def test_a_commit_that_breaks_the_link_to_the_check_fails(setup, breaking):
+    _, main, wt, _ = setup
+    keep_the_check_behind_a_link(main)
+    git(wt, "checkout", "-q", "--detach", "main")
+    breaking(wt)
+    git(wt, "commit", "-qm", "Break the check")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    before = main_head(main)
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1, done.stderr
+    assert "Break the check" in done.stderr, done.stderr
+    assert main_head(main) == before
+
+
+def test_a_commit_that_keeps_the_link_to_the_check_lands_checked(setup):
+    _, main, wt, _ = setup
+    keep_the_check_behind_a_link(main)
+    git(wt, "checkout", "-q", "--detach", "main")
+    tip = commit(wt, "bin/agent-pre-commit", "exit 0\n", "Change the check")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert "Checking with agent-pre-commit the 1 commit" in done.stdout, done.stdout
+    assert main_head(main) == tip
+
+
+def test_a_later_link_to_the_hooks_folder_doesnt_hide_an_earlier_drop(setup):
+    _, main, wt, _ = setup
+    keep_the_check_in_the_tree(main)
+    git(wt, "checkout", "-q", "--detach", "main")
+    git(wt, "rm", "-q", ".githooks/agent-pre-commit")
+    git(wt, "commit", "-qm", "Drop the check")
+    # The tip keeps a copy of the check, through a link at the hooks folder.
+    (wt / "elsewhere").mkdir()
+    (wt / "elsewhere" / "agent-pre-commit").write_text("#!/bin/sh\nexit 0\n")
+    (wt / "elsewhere" / "agent-pre-commit").chmod(0o755)
+    (wt / ".githooks").symlink_to("elsewhere")
+    git(wt, "add", "elsewhere", ".githooks")
+    git(wt, "commit", "-qm", "Move the hooks elsewhere")
+    before = main_head(main)
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1, done.stderr
+    assert "Drop the check" in done.stderr, done.stderr
+    assert main_head(main) == before
+
+
+def test_a_commit_that_moves_the_check_behind_a_link_lands_checked(setup):
+    _, main, wt, _ = setup
+    keep_the_check_in_the_tree(main)
+    git(wt, "checkout", "-q", "--detach", "main")
+    (wt / "bin").mkdir()
+    git(wt, "mv", ".githooks/agent-pre-commit", "bin/agent-pre-commit")
+    (wt / ".githooks" / "agent-pre-commit").symlink_to("../bin/agent-pre-commit")
+    git(wt, "add", ".githooks")
+    git(wt, "commit", "-qm", "Move the check behind a link")
+    tip = git(wt, "rev-parse", "HEAD")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert "Checking with agent-pre-commit the 1 commit" in done.stdout, done.stdout
+    assert main_head(main) == tip
 
 
 def test_commits_that_passed_are_not_checked_out_again(setup):

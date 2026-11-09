@@ -13,7 +13,7 @@ If a change looks too big to hold in your context (many files, or an already lon
 
 First find the **design forks**: places where the request leaves a choice open and a reasonable implementer could go either way. Ask the user about each one, leading with your recommendation, before any code exists. Use the `grilling` skill when the request itself is ambiguous.
 
-Write the **brief** to a file. It is the spec the reviewers check the code against, and a reviewer has seen none of this conversation, so it carries everything that matters:
+Write the **brief** to a file named for the change, such as `brief-<topic>.md`: subagents running builds at once share one scratchpad, and a plain `brief.md` gets overwritten. It is the spec the reviewers check the code against, and a reviewer has seen none of this conversation, so it carries everything that matters:
 
 - the repo path, and the goal in the user's words
 - every decision and constraint the user stated, including changes made mid-build
@@ -61,7 +61,7 @@ Run `build-state refactor` to record the **refactor base**. Apply the Fix list, 
 ## 6. Verify
 
 - Run the repo's checks.
-- Run `build-state finish`. It folds each `fixup!` commit into the commit it fixes and leaves every other commit separate, then lists the commits since the base and the test files changed since the refactor base. When it fails because a ref or config key moved, find what changed and tell the user before anything else.
+- Run `build-state finish`. It folds each `fixup!` commit into the commit it fixes and leaves every other commit separate, runs the repo's `agent-pre-commit` on each commit but the tip whose tree no check has passed, such as one a fold rewrote, its own or by hand, then lists the commits since the base and the test files changed since the refactor base. When it fails because a ref or config key moved, find what changed and tell the user before anything else.
 - Read `git diff <refactor base>..HEAD` for each listed test file. Every test change must trace to a finding; a loosened assertion or deleted test that keeps things green is a failure to undo.
 - The commit list shows logically isolated commits.
 - Push now, if the repo pushes: the change is reviewed and refactored.

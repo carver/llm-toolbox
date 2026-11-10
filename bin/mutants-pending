@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""List the mutants runs nobody has triaged yet, and the open `Tests:` issues, for
+/upskill to pitch.
+
+    mutants-pending                  the repo of the current directory
+    mutants-pending REPO_DIR...      each of these
+
+A repo takes part when its HEAD holds `.github/workflows/mutants.yml` with a header
+line `# Tracking issue: #N`; any other repo prints nothing and asks GitHub nothing.
+Its GitHub name comes from the origin remote's URL.
+
+A run is triaged once a comment on issue N, by the repo's owner, a collaborator or a
+member, holds a line `Triaged run: <the run's URL>`, as the mutants-triage skill
+writes; a stranger's comment counts for nothing on a public repo. Pending: each of the
+50 newest completed runs on main, by schedule or by hand, newer than the newest
+triaged one, that uploaded a `mutants` artifact (a run that skipped has none); one
+whose artifact has expired is listed as such, since it can no longer be triaged.
+Also listed: open issues titled `Tests:` by those same authors, and the workflow when
+GitHub has disabled it (a public repo's schedule stops after 60 days with no
+activity), with its last run's age, or when its last run is over 3 days old.
+
+Each gh call is bounded by MUTANTS_PENDING_GH_SECONDS (default 30). MUTANTS_PENDING_NOW
+(an ISO time) stands in for the clock, for the tests.
+
+Exit status: 0 listed (or nothing to list); 1 gh failed, said in one line on stderr.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+WORKFLOW = ".github/workflows/mutants.yml"
+TRACKING = re.compile(r"^# Tracking issue: #(\d+)\s*$", re.MULTILINE)
+REMOTE = re.compile(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$")
+TRUSTED = {"OWNER", "COLLABORATOR", "MEMBER"}
+EVENTS = {"schedule", "workflow_dispatch"}
+STALE_DAYS = 3
+GH_SECONDS = float(os.environ.get("MUTANTS_PENDING_GH_SECONDS", "30"))
+
+
+class Failed(Exception):
+    """A gh call failed; the message says which and why."""
+
+
+def gh(path: str, pages: bool = False):
+    argv = ["gh", "api", *(["--paginate", "--slurp"] if pages else []), path]
+    try:
+        done = subprocess.run(
+            argv, capture_output=True, text=True, timeout=GH_SECONDS, check=False
+        )
+    except subprocess.TimeoutExpired:
+        raise Failed(f"gh api {path} took past {GH_SECONDS:g} seconds") from None
+    if done.returncode:
+        said = (done.stderr or done.stdout).strip().splitlines()
+        reason = said[-1] if said else "no message"
+        hint = " (is mutants.yml pushed to GitHub yet?)" if "404" in reason else ""
+        raise Failed(f"gh api {path} failed: {reason}{hint}")
+    return json.loads(done.stdout)
+
+
+def git(directory: Path, *args: str) -> str | None:
+    done = subprocess.run(
+        ["git", "-C", str(directory), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return done.stdout if done.returncode == 0 else None
+
+
+def now() -> datetime:
+    given = os.environ.get("MUTANTS_PENDING_NOW")
+    return datetime.fromisoformat(given) if given else datetime.now(UTC)
+
+
+def triaged_runs(repo: str, issue: str) -> set[int]:
+    """The ids of the runs a trusted comment on the tracking issue marks triaged."""
+    line = re.compile(
+        rf"^Triaged run: https://github\.com/{re.escape(repo)}/actions/runs/(\d+)",
+        re.MULTILINE,
+    )
+    return {
+        int(run)
+        for page in gh(f"repos/{repo}/issues/{issue}/comments", pages=True)
+        for comment in page
+        if comment["author_association"] in TRUSTED
+        for run in line.findall(comment["body"])
+    }
+
+
+def report(directory: Path) -> list[str]:
+    """The lines to print for one repo; none when it has no tracked workflow."""
+    header = git(directory, "show", f"HEAD:{WORKFLOW}")
+    url = git(directory, "remote", "get-url", "origin")
+    tracking = TRACKING.search(header or "")
+    named = REMOTE.search((url or "").strip())
+    if not tracking or not named:
+        return []
+    repo, issue = named.group(1), tracking.group(1)
+    newest_triaged = max(triaged_runs(repo, issue), default=0)
+    runs = gh(
+        f"repos/{repo}/actions/workflows/mutants.yml/runs"
+        "?branch=main&status=completed&per_page=50"
+    )["workflow_runs"]
+    lines = []
+    for run in runs:
+        if run["event"] not in EVENTS or run["id"] <= newest_triaged:
+            continue
+        artifacts = gh(f"repos/{repo}/actions/runs/{run['id']}/artifacts")["artifacts"]
+        results = [a for a in artifacts if a["name"] == "mutants"]
+        if results:
+            day = run["created_at"][:10]
+            gone = (
+                " (its results expired untriaged)"
+                if all(a["expired"] for a in results)
+                else ""
+            )
+            lines.append(f"  run {day} {run['conclusion']}: {run['html_url']}{gone}")
+    for page in gh(f"repos/{repo}/issues?state=open&per_page=100", pages=True):
+        for found in page:
+            if (
+                found["title"].startswith("Tests:")
+                and found["author_association"] in TRUSTED
+                and "pull_request" not in found
+            ):
+                lines.append(f"  open: #{found['number']} {found['title']}")
+    state = gh(f"repos/{repo}/actions/workflows/mutants.yml")["state"]
+    if state != "active":
+        lines.append(f"  the workflow is {state}: GitHub runs it no more")
+    if runs:
+        age = (now() - datetime.fromisoformat(runs[0]["created_at"])).days
+        if age > STALE_DAYS or state != "active":
+            lines.append(f"  last run {age} days ago")
+    head = f"{repo} (tracking issue #{issue})"
+    return [f"{head}:", *lines] if lines else [f"{head}: nothing pending"]
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    try:
+        for directory in args or ["."]:
+            for line in report(Path(directory)):
+                print(line)
+    except Failed as error:
+        print(f"mutants-pending: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

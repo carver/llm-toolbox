@@ -58,6 +58,12 @@ Look for candidates for improvement in these categories.
 - **Information access**: look for opportunities to increase the agent's access to information. Teeing dev server logs, readonly access to third-party services. _Use when_ the agent lacked a piece of information it needed.
 
 
-## 4. Pitch
+## 4. Mutation results
+
+Run `mutants-pending REPO_DIR...` with each repo the session worked in. It lists the daily mutants runs nobody has triaged since the last triage, the open `Tests:` issues, and a mutants workflow that stopped running; it prints nothing for a repo with no mutants workflow. Each listed run is a pitch item: triage it with that repo's `mutants-triage` skill. A run whose results expired untriaged can't be triaged: pitch triaging the next run, which covers new lines only, or a full run where the repo has one. The open `Tests:` issues are one pitch item together, with their count and the oldest's age: write their tests. A disabled workflow is one: re-enable it (`gh workflow enable mutants.yml`); an active one whose last run is days old is one too: find why with `gh run list --workflow mutants.yml`.
+
+Done when every repo the session worked in has been asked, and each item it listed is a pitch item.
+
+## 5. Pitch
 
 Make no changes yet. Present a numbered list, biggest payoff first. Each item: the finding with its evidence from the transcript, the proposed fix, and its size. Ask questions wherever you're unsure. Then stop: the user picks which ones to follow through on now.

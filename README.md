@@ -171,6 +171,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   Prints `base=SHA` and `skip=true|false` for `$GITHUB_OUTPUT`. It asks GitHub
   with `gh api`, each call bounded by `$MUTANTS_BASE_GH_SECONDS` (60), and fails
   on any gh error rather than guess.
+- **mutants-pending**: `mutants-pending [REPO_DIR...]` lists, for each repo whose
+  `.github/workflows/mutants.yml` names a `# Tracking issue: #N`, the completed
+  runs with results newer than the newest one a trusted comment on issue N marks
+  `Triaged run: URL`, the open `Tests:` issues, and a workflow GitHub disabled or
+  whose last run is over 3 days old. `/upskill` runs it and pitches each item;
+  each repo's `mutants-triage` skill does the triage. Each gh call is bounded by
+  `$MUTANTS_PENDING_GH_SECONDS` (30); `$MUTANTS_PENDING_NOW` stands in for the
+  clock in the tests.
 - **mutate-check**: `mutate-check -- CMD` breaks code briefly with apply-edits
   blocks from stdin (or from `--edits FILE`, for a run under bgrun, which
   gives its job no stdin), runs CMD (a test run), and puts every file back, also

@@ -49,7 +49,7 @@ Spawn one review subagent in the foreground, and wait for its report before doin
 
 Sort every finding into one of:
 
-- **Spec gap**: missing or wrong behaviour. Fix it now, red/green, and rerun the checks.
+- **Spec gap**: missing or wrong behaviour. Fix it now, red/green, as a `fixup!` of the commit it belongs to, and rerun the checks. `build-state finish` refuses any other commit between the review and the refactor base, since no review saw it.
 - **Fix**: a documented-standard violation, or a judgement-call smell whose fix makes this code clearer.
 - **Skip**: a judgement call that doesn't pay here, or one outside this change. Give a one-line reason.
 - **Ask**: a finding that changes a decision the user made. Ask the user before going on.
@@ -65,7 +65,7 @@ Run `build-state refactor` to record the **refactor base**. Apply the Fix list, 
 ## 6. Verify
 
 - Run the repo's checks, unless its commit hook runs them: then each commit ran them, and wt-ship runs the full check on every commit when it lands.
-- Run `build-state finish`. It folds each `fixup!` commit into the commit it fixes and leaves every other commit separate, then lists the commits since the base and the test files changed since the refactor base. It runs no check: a commit a fold rewrote gets its check from wt-ship. When it fails because a ref or config key moved, or reports a config key or remote-tracking ref that changed, find what changed and tell the user before anything else.
+- Run `build-state finish`. It refuses a build whose review (`review-prompt`) or refactor base (`refactor`) wasn't recorded, or that holds a commit, between the two, that isn't a fix: run the step it names. It folds each `fixup!` commit into the commit it fixes and leaves every other commit separate, then lists the commits since the base and the test files changed since the refactor base. It runs no check: a commit a fold rewrote gets its check from wt-ship. When it fails because a ref or config key moved, or reports a config key or remote-tracking ref that changed, find what changed and tell the user before anything else.
 - Read `git diff <refactor base>..HEAD` for each listed test file. Every test change must trace to a finding; a loosened assertion or deleted test that keeps things green is a failure to undo.
 - The commit list shows logically isolated commits.
 - Push now, if the repo pushes: the change is reviewed and refactored.

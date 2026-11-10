@@ -535,7 +535,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **build-state**: `/build`'s bookkeeping. `start` records the base commit
   (HEAD, or `--base REV`) and the repo's fingerprint (every other ref but the
   stash and other worktrees' branches, and the config with its values hashed),
-  `refactor` the refactor base. `finish` refuses leftover conflict markers,
+  `refactor` the refactor base, and `review-prompt` the commit its review
+  covers. `finish` first refuses a build whose state `start` marked
+  (`checks_steps`) that recorded no review, no refactor base after it, or a
+  commit between the two that isn't a fix (commits after the refactor base
+  count as the refactor's own), then leftover conflict markers,
   folds `fixup!` commits into the commits they fix, leaving every other commit
   separate and the tree as it was (a fix that conflicts gets the later commit
   it was made on top of and the `reword` command that points it there). It

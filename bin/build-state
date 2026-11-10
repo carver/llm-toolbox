@@ -8,11 +8,15 @@
     build-state show        print the recorded bases
     build-state finish      fold fixups into the commits they fix, check the fingerprint,
                             print the commits since the base and the test files
-                            changed since the refactor base. It runs no
+                            changed since the refactor base. It refuses a build
+                            with no review (review-prompt) recorded, no refactor
+                            base after it, or a commit between the two that isn't
+                            a fixup!, squash! or amend!. It runs no
                             agent-pre-commit: wt-ship checks each commit when it
                             lands
     build-state review-prompt BRIEF
-                            write the review subagent's prompt for the commit at HEAD
+                            record HEAD as the commit the review covers, write
+                            the review subagent's prompt for it
                             to build-review-prompt.md in the git dir, and print a short
                             prompt that points the reviewer at it. The file holds the
                             base, the commits, the brief as its spec, the standards
@@ -432,7 +436,9 @@ def start(args: argparse.Namespace) -> int:
     if path.exists() and not args.force:
         base = load(path)["base"]
         print(
-            f"A build is already open, from base {base}: finish it, or start --force.",
+            f"A build is already open, from base {base}: review its commit"
+            " (review-prompt), record the refactor base (refactor) and finish it"
+            " before starting the next, or start --force.",
             file=sys.stderr,
         )
         return 1
@@ -459,6 +465,9 @@ def start(args: argparse.Namespace) -> int:
             "targets": targets,
             "others": sorted(other_worktree_branches()),
             "fingerprint": fingerprint(work),
+            # finish checks the review and refactor steps only of a build this marks,
+            # so a build an earlier build-state started finishes as it would have.
+            "checks_steps": True,
         },
     )
     print(f"base {base}")
@@ -470,6 +479,7 @@ def refactor(args: argparse.Namespace) -> int:
     if (state := load(path)) is None:
         return 1
     state["refactor_base"] = head()
+    state["refactor_tree"] = tree_of("HEAD")
     save(path, state)
     print(f"refactor base {state['refactor_base']}")
     return 0
@@ -479,6 +489,8 @@ def show(args: argparse.Namespace) -> int:
     if (state := load(state_file())) is None:
         return 1
     print(f"base {state['base']}")
+    if "reviewed" in state:
+        print(f"reviewed {state['reviewed']}")
     if "refactor_base" in state:
         print(f"refactor base {state['refactor_base']}")
     return 0
@@ -658,6 +670,67 @@ def report_tests(refactor_base: str) -> None:
         print(git("diff", "--stat", refactor_base, "HEAD", "--", *tests).stdout, end="")
 
 
+def skipped_steps(state: dict) -> list[str]:
+    """Why the build can't finish yet, when it skipped a step /build runs for each
+    commit: a review of its commits (review-prompt), then the refactor base
+    (refactor), with nothing but fixes committed between them."""
+    reviewed = current(state.get("reviewed"), state.get("reviewed_tree"))
+    refactored = current(state.get("refactor_base"), state.get("refactor_tree"))
+    if "reviewed" not in state:
+        return [
+            "No review was recorded for this build: run `build-state review-prompt",
+            "BRIEF` and the review it prints, then `build-state refactor`, before",
+            "finish. /build reviews each commit before the next one starts.",
+        ]
+    if reviewed is None:
+        return [
+            f"The reviewed commit {state['reviewed'][:12]} isn't in HEAD's history,",
+            "nor is its tree: it was rewritten since the review (a rebase, or a fold",
+            "into it), so no review covers these commits. Run `build-state",
+            "review-prompt BRIEF` and the review again, then `build-state refactor`,",
+            "then finish.",
+        ]
+    if refactored is None or not ancestor(reviewed, refactored):
+        return [
+            "No refactor base was recorded after the review: run `build-state",
+            "refactor` before applying its Fix list, then finish.",
+        ]
+    unreviewed = [
+        f"  {sha[:12]} {subject}"
+        for sha, subject in commits(f"{reviewed}..{refactored}")
+        if not subject.startswith(FIXES)
+    ]
+    if unreviewed:
+        return [
+            "These commits came after the review and before the refactor base, and",
+            "aren't fixes (fixup!) of a reviewed commit, so no review saw them:",
+            *unreviewed,
+            "Review them (`build-state review-prompt BRIEF`), or make each a fixup",
+            "of the commit it fixes, then record the refactor base again.",
+        ]
+    return []
+
+
+def tree_of(rev: str) -> str:
+    return git("rev-parse", f"{rev}^{{tree}}").stdout.strip()
+
+
+def current(sha: str | None, tree: str | None) -> str | None:
+    """Recorded commit `sha` as HEAD's history now holds it: itself, or after a reword,
+    which keeps every tree, the newest commit there with its `tree`; None when neither
+    is there."""
+    if sha is None:
+        return None
+    if ancestor(sha, "HEAD"):
+        return sha
+    if tree is not None:
+        for line in git("log", "--format=%H %T", "HEAD").stdout.splitlines():
+            commit, commit_tree = line.split()
+            if commit_tree == tree:
+                return commit
+    return None
+
+
 def finish(args: argparse.Namespace) -> int:
     path = state_file()
     if (state := load(path)) is None:
@@ -665,6 +738,8 @@ def finish(args: argparse.Namespace) -> int:
     base = state["base"]
     if git("status", "--porcelain", "--untracked-files=no").stdout:
         return fail("There are uncommitted changes: commit or stash them first.")
+    if state.get("checks_steps") and (skipped := skipped_steps(state)):
+        return fail(*skipped)
     targets = set(state.get("targets", []))
     others = set(state.get("others", [])) | other_worktree_branches()
     found = (
@@ -876,6 +951,9 @@ def review_prompt(args: argparse.Namespace) -> int:
             spec=briefs["Spec"],
         )
     )
+    state["reviewed"] = sha
+    state["reviewed_tree"] = tree_of(sha)
+    save(state_file(), state)
     print(POINTER.format(path=prompt_file), end="")
     return 0
 

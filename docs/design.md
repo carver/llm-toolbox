@@ -302,6 +302,28 @@ rebase onto a fetched main, then a force-push), `rewritten_base` folds from that
 and fails on the fixes before it; skipping such an upstream would lose a
 collaborator's real rewrite of a shared branch.
 
+### build-state finish refuses a build that skipped its review or refactor (2026-11-09)
+
+The one stop beside a fold's and the repo's safety (above). In a filedrawer session
+on 2026-11-09 the agent wrote its second commit's work before the first commit's
+review, and never ran `build-state refactor`, so finish's list of test files changed
+since the refactor base compared nothing. `review-prompt` now records the commit it
+covers, and finish refuses, keeping the state, when no review was recorded, when no
+refactor base was recorded after it, and when a commit between the two isn't a fix
+(`fixup!`, `squash!`, `amend!`): work no review saw, or when the reviewed commit was
+rewritten since into a new tree, as by a rebase, which takes a new review. A reword
+keeps every tree, so finish finds the reviewed commit and the refactor base by their
+trees after one, as after the reword a conflicting fold's hint gives. Commits after the
+refactor base are the refactor's own, so a new commit made there still finishes
+unreviewed: an accepted gap (the owner's call, 2026-11-09), since a rule on the
+files those commits touch would also refuse honest refactors, such as a helper
+moved to a new file. Rejected: a warning at finish, which comes after the next
+commit's work is already written, the very mistake (the owner's call, 2026-11-09: "We
+shouldn't change the essence of a feature to avoid breaking changes"). `start` marks
+the builds it opens (`checks_steps`), and finish checks the steps only of a marked
+build, so a build another session opened before this landed, whose review an older
+`review-prompt` never recorded, finishes as before (the owner's call, 2026-11-09).
+
 ### wt-ship refuses a message naming an unlanded commit by its ID (2026-11-09)
 
 In a filedrawer session, commit messages cited `cc417d7`, a commit of the same

@@ -1,5 +1,6 @@
 """bin/build-state, run against a throwaway repo."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -42,7 +43,12 @@ def commit(repo, path, message, *flags):
     return git(repo, "rev-parse", "HEAD").strip()
 
 
-def build_state(repo, *args, env=None):
+def build_state(repo, *args, env=None, reviewed=True):
+    """Run build-state in `repo`. Before a finish, unless `reviewed` is False, record a
+    review of HEAD and a refactor base at HEAD where the build has none, as /build's
+    steps would: most tests here are about folding, not about the order of steps."""
+    if args[:1] == ("finish",) and reviewed:
+        record_review_steps(repo)
     return subprocess.run(
         [str(SCRIPT), *args],
         cwd=repo,
@@ -51,6 +57,24 @@ def build_state(repo, *args, env=None):
         text=True,
         check=False,
     )
+
+
+def record_review_steps(repo):
+    state = Path(git(repo, "rev-parse", "--absolute-git-dir").strip()) / (
+        "build-state.json"
+    )
+    if not state.is_file():
+        return
+    head = git(repo, "rev-parse", "HEAD").strip()
+    tree = git(repo, "rev-parse", "HEAD^{tree}").strip()
+    recorded = json.loads(state.read_text())
+    for sha_key, tree_key in (
+        ("reviewed", "reviewed_tree"),
+        ("refactor_base", "refactor_tree"),
+    ):
+        if sha_key not in recorded:
+            recorded |= {sha_key: head, tree_key: tree}
+    state.write_text(json.dumps(recorded))
 
 
 def subjects(repo, since):
@@ -191,6 +215,151 @@ def test_start_refuses_while_a_build_is_open_unless_forced(repo):
         forced.returncode == 0
         and git(repo, "rev-parse", "HEAD").strip() in forced.stdout
     )
+
+
+def test_start_refusal_says_to_review_refactor_and_finish_the_open_build(repo):
+    build_state(repo, "start")
+    refused = build_state(repo, "start")
+    assert "review-prompt" in refused.stderr, refused.stderr
+    assert "refactor" in refused.stderr, refused.stderr
+
+
+def review(repo, tmp_path):
+    (tmp_path / "brief.md").write_text("Parse dates.\n")
+    shown = build_state(
+        repo,
+        "review-prompt",
+        str(tmp_path / "brief.md"),
+        "--skill",
+        str(code_review_skill(tmp_path)),
+    )
+    assert shown.returncode == 0, shown.stderr
+
+
+def refused_keeping_the_build(repo, done, *words):
+    assert done.returncode == 1, done.stdout + done.stderr
+    for word in words:
+        assert word in done.stderr, done.stderr
+    assert build_state(repo, "show").returncode == 0
+
+
+def test_a_build_started_before_finish_checked_its_steps_finishes_as_before(repo):
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    # The state an earlier build-state wrote, with no mark that it checks the steps.
+    state = Path(git(repo, "rev-parse", "--absolute-git-dir").strip()) / (
+        "build-state.json"
+    )
+    recorded = json.loads(state.read_text())
+    del recorded["checks_steps"]
+    state.write_text(json.dumps(recorded))
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_finish_refuses_a_build_with_no_review(repo):
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    refused_keeping_the_build(repo, done, "review-prompt")
+
+
+def test_finish_refuses_a_reviewed_build_with_no_refactor_base(repo, tmp_path):
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    review(repo, tmp_path)
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    refused_keeping_the_build(repo, done, "refactor")
+
+
+def test_finish_refuses_a_refactor_base_recorded_before_the_review(repo, tmp_path):
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    build_state(repo, "refactor")
+    commit(repo, "parser.py", "Parse times")
+    review(repo, tmp_path)
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    refused_keeping_the_build(repo, done, "refactor")
+
+
+def test_a_reword_after_the_review_needs_no_new_review(repo, tmp_path):
+    build_state(repo, "start")
+    first = commit(repo, "parser.py", "Parse dates")
+    review(repo, tmp_path)
+    reworded = subprocess.run(
+        [str(SCRIPT), "reword", first],
+        cwd=repo,
+        input="Parse ISO dates\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert reworded.returncode == 0, reworded.stderr
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_finish_asks_for_a_new_review_when_the_reviewed_commit_was_rewritten(
+    repo, tmp_path
+):
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    review(repo, tmp_path)
+    # A rewrite that changes the tree, as a rebase onto new work does.
+    git(repo, "commit", "-q", "--amend", "--allow-empty", "-m", "Parse dates")
+    (repo / "parser.py").write_text("changed\n")
+    git(repo, "commit", "-q", "-a", "--amend", "-m", "Parse dates")
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    refused_keeping_the_build(repo, done, "review-prompt", "rewritten")
+
+
+def test_show_says_which_commit_the_review_covered(repo, tmp_path):
+    build_state(repo, "start")
+    sha = commit(repo, "parser.py", "Parse dates")
+    review(repo, tmp_path)
+    assert f"reviewed {sha}" in build_state(repo, "show").stdout
+
+
+def test_finish_refuses_a_commit_made_after_the_review_that_isnt_a_fix(repo, tmp_path):
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    review(repo, tmp_path)
+    commit(repo, "times.py", "Parse times")
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    refused_keeping_the_build(repo, done, "Parse times")
+
+
+def test_finish_takes_fixes_after_the_review_and_commits_after_the_refactor_base(
+    repo, tmp_path
+):
+    build_state(repo, "start")
+    first = commit(repo, "parser.py", "Parse dates")
+    review(repo, tmp_path)
+    commit(repo, "parser.py", "Fix", f"--fixup={first}")
+    build_state(repo, "refactor")
+    commit(repo, "helpers.py", "Name the date helpers")
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    assert done.returncode == 0, done.stdout + done.stderr
 
 
 CODE_REVIEW = Path.home() / ".agents/skills/code-review/SKILL.md"
@@ -361,10 +530,11 @@ def test_finish_without_start_says_so(repo):
     assert done.returncode == 1 and "build-state start" in done.stderr
 
 
-def test_finish_lists_the_test_files_changed_since_the_refactor_base(repo):
+def test_finish_lists_the_test_files_changed_since_the_refactor_base(repo, tmp_path):
     build_state(repo, "start")
     commit(repo, "tests/test_parser.py", "Test parsing")
     commit(repo, "test_cli.py", "Test the CLI")
+    review(repo, tmp_path)
     assert build_state(repo, "refactor").returncode == 0
     commit(repo, "parser.py", "Tidy the parser")
     commit(repo, "tests/test_parser.py", "Tidy the parser's test")
@@ -441,6 +611,7 @@ def test_the_command_a_conflicting_fold_prints_lets_it_fold_from_a_subfolder(rep
     third = commit_files(repo, "Third", "sub/b.py")
     fix = commit_files(repo, "fix", "a.py", "sub/b.py", flags=[f"--fixup={first}"])
     commit_files(repo, "Later", "a.py")
+    record_review_steps(repo)
     tree = git(repo, "rev-parse", "HEAD^{tree}")
     sub = repo / "sub"
     path = {"PATH": f"{SCRIPT.parent}:{os.environ['PATH']}"}
@@ -505,6 +676,7 @@ def test_a_squash_commit_folds_without_opening_an_editor(repo):
     build_state(repo, "start")
     first = commit(repo, "a.py", "First")
     commit(repo, "a.py", "more", f"--squash={first}")
+    record_review_steps(repo)
 
     done = subprocess.run(
         [str(SCRIPT), "finish"],

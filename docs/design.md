@@ -702,7 +702,14 @@ operand is 62nd.
 
 CMD runs once unmutated first: a command that fails would read every mutant as
 caught. That, and a run that judges no mutant, exit 3, so neither passes for "none
-survived". Each mutant's timeout is ten times the unmutated run, at least 30
+survived". The owner then asked (2026-11-09) for the judge to read that run, not
+just its status, and for a stop after the first 3 mutants when all 3 are
+inconclusive: the first dogfood run, `--diff` over its own change with `pytest -x`
+under this repo's `-n auto`, read 89 of 100 mutants as inconclusive in about 12
+minutes of full-suite runs. Under pytest-xdist, `-x` ends the run by raising
+`Interrupted`, which pytest reports as exit 2, its status for a collection error
+too; so an exit of 2, 4 or 5 whose summary counts a failed test is now a catch, in
+both modes. The rerun read 97 of 100 as caught. Each mutant's timeout is ten times the unmutated run, at least 30
 seconds: the other mode's 600 would cost ten minutes per hanging mutant, such as a
 deleted loop counter.
 

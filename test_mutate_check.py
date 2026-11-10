@@ -557,6 +557,25 @@ def test_a_cargo_command_that_isnt_a_test_run_is_still_caught(
     assert result.returncode == 0, result.stdout
 
 
+# cargo 1.98's `cargo test -q nomatch` on a crate with one test: it passes.
+CARGO_RAN_NO_TEST = (
+    "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured;"
+    " 1 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0"
+    " passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s\n\n"
+)
+
+
+def test_a_rust_test_run_that_passes_with_no_test_run_is_inconclusive(
+    repo: Path, cargo: dict[str, str]
+) -> None:
+    cargo_prints(repo, CARGO_RAN_NO_TEST, 0)
+
+    result = check(repo, BREAK, "cargo", "test", "-q", "nomatch", env=cargo)
+
+    assert result.returncode == 3, result.stdout
+    assert "inconclusive: the command passed, but no test ran" in result.stdout
+
+
 @pytest.mark.parametrize(
     ("command", "output", "status"),
     [
@@ -646,6 +665,10 @@ LABEL = BASE_CALC + (
 )
 SUMMARY = (
     "mutate-check: {} caught, {} survived, {} inconclusive, {} skipped (didn't parse)"
+)
+NO_MUTANT_RAN = (
+    "mutate-check: no mutant ran: unmutated, the command has to pass with tests run,"
+    " and"
 )
 
 
@@ -1004,10 +1027,55 @@ def test_a_command_that_fails_unmutated_runs_no_mutant(project: Path) -> None:
     result = diff_check(project, "sh", "-c", f"echo run >> {log}; echo broken; exit 1")
 
     assert result.returncode == 3, result.stdout + result.stderr
-    assert "fails with no mutation" in result.stdout
-    assert "  broken" in result.stdout.splitlines()
+    assert result.stdout.splitlines() == [f"{NO_MUTANT_RAN} it exited 1", "  broken"]
     assert log.read_text() == "run\n"
     assert (project / "calc.py").read_text() == LABEL
+
+
+def test_a_command_that_passes_unmutated_with_no_test_run_runs_no_mutant(
+    project: Path,
+) -> None:
+    (project / "calc.py").write_text(LABEL)
+    fake = project.parent / "fakebin"
+    fake.mkdir()
+    (fake / "cargo").write_text(
+        f"#!/bin/sh\necho run >> runs.log\nprintf '%s' '{CARGO_RAN_NO_TEST}'\n"
+    )
+    (fake / "cargo").chmod(0o755)
+    env = os.environ | {"PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
+
+    result = diff_check(project, "cargo", "test", "-q", "nomatch", env=env)
+
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert (
+        result.stdout.splitlines()[0] == f"{NO_MUTANT_RAN} it passed, but no test ran"
+    )
+    assert (project / "runs.log").read_text() == "run\n"
+
+
+def test_three_inconclusive_mutants_in_a_row_stop_the_run(project: Path) -> None:
+    (project / "calc.py").write_text(LABEL)
+    fake = project.parent / "fakebin"
+    fake.mkdir()
+    # Passes unmutated, then each run stops at collection, as a broken import does.
+    (fake / "pytest").write_text(
+        "#!/bin/sh\necho run >> runs.log\n"
+        '[ "$(wc -l < runs.log)" -eq 1 ] && { echo "1 passed in 0.01s"; exit 0; }\n'
+        "echo 'Interrupted: 1 error during collection'; echo '1 error in 0.05s'; exit 2\n"
+    )
+    (fake / "pytest").chmod(0o755)
+
+    result = diff_check(project, str(fake / "pytest"))
+
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert (project / "runs.log").read_text() == "run\n" * 4
+    stopped = "the first 3 mutants were all inconclusive; the last one's run:"
+    assert result.stdout.splitlines() == [
+        f"mutate-check: stopped: {stopped}",
+        "  inconclusive: the command exited 2 before any test judged the mutation",
+        "    1 error in 0.05s",
+        SUMMARY.format(0, 0, 3, 0) + "; 3 not run",
+    ]
 
 
 WAIT = BASE_CALC + "\n\ndef wait(n):\n    while n > 0:\n        n -= 1\n    return n\n"

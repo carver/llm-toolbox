@@ -172,8 +172,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   error, such as unused code under `-D warnings`), pytest collected nothing (not
   pytest-xdist's exit 2 for `-x` after a failure, which is a catch), a
   `cargo test` or `cargo nextest` run failed without running a test (a filter
-  nextest refused or that matched nothing), or CMD ran past `--timeout` (600
-  seconds by default). Stopping CMD stops its process group: SIGTERM, then
+  nextest refused or that matched nothing, or a `cargo test` that passed without
+  running one), or CMD ran past `--timeout` (600 seconds by default). Stopping CMD stops its process group: SIGTERM, then
   SIGKILL after `$MUTATE_CHECK_GRACE` seconds. CMD runs with
   `PYTHONDONTWRITEBYTECODE=1`, so a same-size mutation put back within the second
   leaves no `.pyc` that a later import takes for current, and a file put back gets
@@ -185,9 +185,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   work tree included; tests and their helpers left alone): a statement deleted, a
   condition negated, an and/or operand dropped, `==`/`!=` and `True`/`False`
   swapped, a string that's a value changed, a shell default changed. It runs CMD
-  unmutated first, then once per mutant, each statement's first before any second,
-  up to `--max` (40), each with a timeout of ten times the unmutated run, at least
-  30 seconds (`$MUTATE_CHECK_MIN_TIMEOUT`). It prints `FILE:LINE: what changed`
+  unmutated first, and runs no mutant unless that run passes with tests run. Then
+  it runs CMD once per mutant, each statement's first before any second, up to
+  `--max` (40), each with a timeout of ten times the unmutated run, at least 30
+  seconds (`$MUTATE_CHECK_MIN_TIMEOUT`), and stops if the first 3 are all
+  inconclusive. It prints `FILE:LINE: what changed`
   for each mutant that survived and a summary line, and exits 0 when none
   survived, 1 when one did, and 3 when no mutant was judged. For a builder to find
   what the tests let through before a review does.

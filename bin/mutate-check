@@ -30,7 +30,8 @@ pytest exiting 2, 4 or 5 (collection errors, usage, no tests) with no `N failed`
 its summary (under pytest-xdist, -x exits 2 after a failure), or a `cargo test` or
 `cargo nextest` run that fails with no line saying a test ran, is inconclusive: no test
 judged it. So is a command that runs past --timeout (default 600 seconds), which is
-stopped: a hang isn't a catch.
+stopped: a hang isn't a catch. A cargo test run that passes with no test run (a
+filter that matched none) is inconclusive too.
 
 The cargo case covers nextest refusing a filter (exit 94) or finding no test to run
 (exit 4). A test ran when the output, colour codes aside, has libtest's `test result:`,
@@ -83,9 +84,12 @@ continue that ends a loop, a final `exit 0`, True and False in a decorator (as
 "__main__"` and `if TYPE_CHECKING`. A mutant that doesn't compile (Python's compile,
 bash -n) is skipped, and two that read the same run once.
 
-CMD runs unmutated first; if that fails or hangs, no mutant runs, and if it rewrites
-a code file, mutate-check puts the file back and stops. Then CMD runs once per
-mutant, judged as above, up to --max N (default 40): each statement's first mutant
+CMD runs unmutated first, and unless that run reads as a pass with tests run, so
+that a mutant could be judged, no mutant runs: it prints what the run did, such as
+failing, hanging, or a cargo test run that ran no test. If it rewrites a code file,
+mutate-check puts the file back and stops. Then CMD runs once per mutant, judged as
+above, up to --max N (default 40), and if the first 3 are all inconclusive, it stops
+there and prints the last one's verdict: each statement's first mutant
 before any statement's second, and last, deleting a message (a call whose arguments
 are all f-strings or strings with spaces, an echo to stderr) or a shell setting
 (set, shopt). Each run stops after --timeout, or else ten times the unmutated run
@@ -100,9 +104,9 @@ done: `bgrun --wait -o LOG -- heavy -- mutate-check --diff BASE -- CMD`.
 
 Exit status with --diff: 0 no mutant survived; 1 one did; 2 usage error, BASE isn't
 a commit, CMD rewrote a code file, or a file couldn't be put back; 3 no mutant was
-judged: CMD failed or hung unmutated, every mutant was inconclusive or skipped, or
-a changed code file couldn't be read and the rest had no mutants; 128+N stopped by
-signal N, after putting the file back.
+judged: the unmutated run didn't pass with tests run, the first 3 mutants or all of
+them were inconclusive or skipped, or a changed code file couldn't be read and the
+rest had no mutants; 128+N stopped by signal N, after putting the file back.
 """
 
 import ast
@@ -274,6 +278,10 @@ UNUSED_HINT = (
 TESTS_RAN = re.compile(
     r"^test result: |^running \d+ tests?$|^\s*Summary \[[^\]]*\]\s*[1-9]"
 )
+# A line that says a test ran and passed: libtest's summary, or nextest's.
+TESTS_PASSED = re.compile(
+    r"^test result: \w+\. [1-9]\d* passed|^\s*Summary \[[^\]]*\]\s*[1-9]\d* tests? run"
+)
 COLOUR = re.compile(r"\x1b\[[0-9;]*m")
 # `cargo`, then any `+toolchain` or `-flag` words, then a subcommand that runs tests,
 # anywhere in the command, so also inside `sh -c '...'` or after `heavy --`.
@@ -326,21 +334,28 @@ def summary(output: str) -> list[str]:
 
 @dataclass(frozen=True)
 class Verdict:
-    """What a run with a mutation in place says: CAUGHT, MISSED or INCONCLUSIVE, and
-    the lines that tell why."""
+    """What a run with a mutation in place says: CAUGHT, MISSED or INCONCLUSIVE, the
+    lines that report it, and what the run did, said of an unmutated run."""
 
     status: int
     report: list[str]
+    reason: str
 
 
 def judge(code: int, output: str, command: list[str]) -> Verdict:
     """The verdict on the command's run with a mutation in place: a failure is a catch
-    only when tests ran."""
-    if code == 0:
-        return Verdict(
-            MISSED, ["mutate-check: not caught: the command passed with the mutation"]
-        )
+    only when tests ran, and a pass is a miss only when one could have."""
     lines = output.splitlines()
+    if (
+        code == 0
+        and runs_cargo_tests(command)
+        and not any(map(TESTS_PASSED.search, lines))
+    ):
+        report = ["mutate-check: inconclusive: the command passed, but no test ran"]
+        return Verdict(INCONCLUSIVE, report, "it passed, but no test ran")
+    if code == 0:
+        report = ["mutate-check: not caught: the command passed with the mutation"]
+        return Verdict(MISSED, report, "it passed")
     # A Rust build that failed, or a cargo test run, with no line saying a test ran
     no_rust_test = not tests_ran(lines) and (
         runs_cargo_tests(command) or rust_build_failed(lines)
@@ -361,13 +376,14 @@ def judge(code: int, output: str, command: list[str]) -> Verdict:
         ]
         if any(RUST_UNUSED.search(line) for line in errors):
             report.append(UNUSED_HINT)
-        return Verdict(INCONCLUSIVE, report)
+        return Verdict(INCONCLUSIVE, report, f"it exited {code} before any test ran")
     return Verdict(
         CAUGHT,
         [
             f"mutate-check: caught: the command exited {code}",
             *(f"  {line}" for line in summary(output)),
         ],
+        f"it exited {code}",
     )
 
 
@@ -405,6 +421,7 @@ class Options:
 # --diff BASE: mutants made from the Python and shell lines a diff adds or changes.
 
 DEFAULT_MAX = 40
+EARLY_STOP = 3
 TIMEOUT_FACTOR = 10
 MIN_TIMEOUT = 30.0
 SHOWN_SOURCE = 72
@@ -1168,6 +1185,8 @@ class Tally:
     inconclusive: int = 0
     skipped: int = 0
     left_out: int = 0
+    # Mutants an early stop kept from running.
+    not_run: int = 0
 
     def judged(self) -> int:
         return self.caught + self.survived + self.inconclusive
@@ -1177,26 +1196,25 @@ class Tally:
             f"mutate-check: {self.caught} caught, {self.survived} survived,"
             f" {self.inconclusive} inconclusive, {self.skipped} skipped (didn't parse)"
         )
-        return line + (
-            f"; {self.left_out} left out by --max {limit}" if self.left_out else ""
-        )
+        if self.left_out:
+            line += f"; {self.left_out} left out by --max {limit}"
+        return line + (f"; {self.not_run} not run" if self.not_run else "")
 
 
 def baseline(
     command: list[str], timeout: float | None, diff: Diff, least: float
 ) -> float:
     """Run the command with no mutation, and give each mutant's timeout: `timeout`, or
-    TIMEOUT_FACTOR times this run, at least `least` seconds. Raises Unjudged when it
-    fails or hangs, and UsageError when it won't start or rewrites a code file."""
+    TIMEOUT_FACTOR times this run, at least `least` seconds. Raises Unjudged unless the
+    judge reads the run as a pass with tests run, and UsageError when the command won't
+    start or rewrites a code file."""
     allowed = timeout or DEFAULT_TIMEOUT
     started = time.monotonic()
+    said = "mutate-check: no mutant ran: unmutated, the command has to pass with tests"
     try:
         code, output = run(command, allowed)
     except TimedOut:
-        raise Unjudged(
-            f"mutate-check: the command hung past {allowed:g} seconds with no mutation,"
-            " so it can't judge one"
-        ) from None
+        raise Unjudged(f"{said} run, and it hung past {allowed:g} seconds") from None
     except OSError as e:
         raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
     took = time.monotonic() - started
@@ -1211,12 +1229,11 @@ def baseline(
             " mutants' places are wrong; give a command that leaves the code alone"
         )
         raise UsageError("\n".join([said, *failed]))
-    if code != 0:
-        said = (
-            f"mutate-check: the command fails with no mutation (exit {code}), so it"
-            " can't judge one; fix it first"
+    verdict = judge(code, output, command)
+    if verdict.status != MISSED:
+        raise Unjudged(
+            "\n".join([f"{said} run, and {verdict.reason}", *verdict.report[1:]])
         )
-        raise Unjudged("\n".join([said, *(f"  {line}" for line in summary(output))]))
     return timeout or max(least, TIMEOUT_FACTOR * took)
 
 
@@ -1227,10 +1244,12 @@ def holds_original(file: CodeFile) -> bool:
         return False
 
 
-def mutant_run(file: CodeFile, text: bytes, command: list[str], timeout: float) -> int:
+def mutant_run(
+    file: CodeFile, text: bytes, command: list[str], timeout: float
+) -> Verdict:
     """Run the command with the file holding `text`, put the file back, and give the
-    verdict's status, INCONCLUSIVE for a hang. Raises Stopped, and UsageError when the
-    file can't be written or put back, or the command won't start."""
+    verdict, inconclusive for a hang. Raises Stopped, and UsageError when the file
+    can't be written or put back, or the command won't start."""
     signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
     try:
         try:
@@ -1241,9 +1260,10 @@ def mutant_run(file: CodeFile, text: bytes, command: list[str], timeout: float) 
             )
         # A stop that came while the file was being written lands here, inside the try.
         signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
-        status = judge(*run(command, timeout), command).status
+        verdict = judge(*run(command, timeout), command)
     except TimedOut:
-        status = INCONCLUSIVE
+        hung = f"the command hung past {timeout:g} seconds"
+        verdict = Verdict(INCONCLUSIVE, [f"mutate-check: inconclusive: {hung}"], hung)
     except OSError as e:
         raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
     finally:
@@ -1251,16 +1271,19 @@ def mutant_run(file: CodeFile, text: bytes, command: list[str], timeout: float) 
     if failed:
         raise UsageError("\n".join(failed))
     signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
-    return status
+    return verdict
 
 
 def run_mutants(
     diff: Diff, command: list[str], timeout: float, limit: int, tally: Tally
 ) -> None:
     """Run the command once for each mutant, up to `limit`, counting the verdicts and
-    printing a line for each that survived."""
+    printing a line for each that survived. When the first EARLY_STOP are all
+    inconclusive, the rest would most likely be too: it stops, and prints the last
+    one's verdict."""
     seen = set()
-    for mutant in in_turn(diff):
+    queue = in_turn(diff)
+    for place, mutant in enumerate(queue):
         file = diff.files[mutant.path]
         text = mutant.applied_to(file.original.content)
         digest = hashlib.sha256(text).digest()
@@ -1272,15 +1295,24 @@ def run_mutants(
         elif not PARSES[file.kind](text):
             tally.skipped += 1
         else:
-            status = mutant_run(file, text, command, timeout)
-            if status == MISSED:
+            verdict = mutant_run(file, text, command, timeout)
+            if verdict.status == MISSED:
                 tally.survived += 1
                 where = f"{os.path.relpath(mutant.path)}:{mutant.line}"
                 print(f"{where}: {mutant.description}", flush=True)
-            elif status == CAUGHT:
+            elif verdict.status == CAUGHT:
                 tally.caught += 1
             else:
                 tally.inconclusive += 1
+            if tally.inconclusive == tally.judged() == EARLY_STOP:
+                print(
+                    f"mutate-check: stopped: the first {EARLY_STOP} mutants were all"
+                    " inconclusive; the last one's run:"
+                )
+                for line in verdict.report:
+                    print(f"  {line.removeprefix('mutate-check: ')}")
+                tally.not_run = len(queue) - place - 1
+                return
 
 
 def diff_main(options: Options) -> int:

@@ -33,7 +33,13 @@ The state lives in the worktree's git dir, as build-state.json, beside the revie
 prompt; finish removes both.
 
 finish folds only fixup!, squash! and amend! commits (`git commit --fixup=SHA`), each
-into the commit it names, with an autosquash rebase onto the base. Every other commit
+into the commit it names, with an autosquash rebase onto the base. A fix that names a
+commit before the base, as one for an earlier commit of a build started again for each
+commit, folds too, from that commit's parent, while no ref holds it and no merge sits
+after it; one that names shared history, or no commit, stops finish and says why. A
+build on a branch holds its own commits, so there only fixes after the base fold. After
+a wider fold, the commits finish lists from the base include the rewritten earlier
+ones. Every other commit
 stays as it is, in order, so logically separate commits stay separate. It refuses
 uncommitted changes and leftover conflict markers since the base. On a conflict it aborts
 the rebase, and when the folded tree differs from the tree before, it resets to that;
@@ -493,6 +499,79 @@ def conflict_markers(base: str) -> list[str]:
     ]
 
 
+def fixed_name(subject: str) -> str:
+    """What a fix commit's subject names: the subject or object name after its
+    fixup!/squash!/amend! prefixes, as `git rebase --autosquash` reads it."""
+    while subject.startswith(FIXES):
+        subject = subject.partition(" ")[2]
+    return subject
+
+
+def names_commit(name: str, sha: str, subject: str) -> bool:
+    """Whether a fix naming `name` names commit `sha` with `subject`, as autosquash
+    matches it: by the start of the subject, or an object name."""
+    return sha.startswith(name) or subject.startswith(name)
+
+
+def commits(revs: str) -> list[tuple[str, str]]:
+    """Each commit `git log revs` lists, newest first: its object name and subject."""
+    lines = git("log", "--format=%H %s", revs).stdout.splitlines()
+    return [tuple(line.split(" ", 1)) for line in lines]
+
+
+def fold_base(base: str) -> tuple[str, list[str]]:
+    """Where to fold from, and why it isn't earlier: the base, or, when fixes name
+    commits before it, as in a build of several commits started again for each, the
+    parent of the earliest of them. That holds while no branch, tag or remote holds
+    any of them and no merge sits in the way, which the rebase would flatten."""
+    later = commits(f"{base}..HEAD")
+    names = {fixed_name(subject) for _, subject in later if subject.startswith(FIXES)}
+    names = {
+        name
+        for name in names
+        if not any(
+            names_commit(name, sha, subject)
+            for sha, subject in later
+            if not subject.startswith(FIXES)
+        )
+    }
+    if not names:
+        return base, []
+    history = commits(base)
+    targets, why = [], []
+    for name in sorted(names):
+        found = next((sha for sha, s in history if names_commit(name, sha, s)), None)
+        if found is None:
+            why.append(
+                f"  {name}: no commit in HEAD's history has that subject or name"
+            )
+        elif held := git(
+            "for-each-ref", "--format=%(refname)", "--contains", found
+        ).stdout.split():
+            why.append(f"  {found[:12]} ({name}) is held by {', '.join(held)}")
+        else:
+            targets.append(found)
+    if why:
+        return base, why
+    earliest = next((t for t in targets if all(ancestor(t, o) for o in targets)), None)
+    parent = git("rev-parse", "-q", "--verify", f"{earliest}^", check=False)
+    if earliest is None or parent.returncode != 0:
+        return base, [
+            "  the commits they name have no one earliest commit with a parent"
+        ]
+    fold_from = parent.stdout.strip()
+    if git("rev-list", "--merges", f"{fold_from}..HEAD").stdout.strip():
+        return base, [
+            f"  a merge sits after {earliest[:12]}, and folding would flatten it"
+        ]
+    print(
+        f"Folding from {fold_from[:12]}, before {earliest[:12]}, the earliest commit a"
+        " fix names: no branch, tag or remote holds it.",
+        flush=True,
+    )
+    return fold_from, []
+
+
 def fold_fixups(base: str) -> bool:
     """Autosquash onto the base; on failure, abort and say why."""
     # ":" accepts the todo list as is, and a squash! commit's combined message.
@@ -535,9 +614,7 @@ def conflict_hint(base: str) -> list[str]:
     kind = next((kind for kind in FIXES if subject.startswith(kind)), None)
     if kind is None:
         return []
-    named = subject
-    while named.startswith(FIXES):
-        named = named.partition(" ")[2]
+    named = fixed_name(subject)
     log = git(
         *("log", "--format=%H %s", f"{base}..{fix}~1", "--"),
         *(f":(top,literal){file}" for file in files),
@@ -595,7 +672,8 @@ def finish(args: argparse.Namespace) -> int:
         if ancestor(base, "HEAD")
         else rewritten_base(targets, start_upstream(state))
     )
-    # The commits the fold may rewrite, from where it will start.
+    # The commits the fold may rewrite, from the base. A fold that starts earlier
+    # rewrites only commits no ref holds (`fold_base`), which no ref check needs.
     work = set(git("rev-list", f"{found[1] if found else base}..HEAD").stdout.split())
     changed = changed_since_start(state, work, targets, others)
     if report := changed.report():
@@ -626,7 +704,8 @@ def finish(args: argparse.Namespace) -> int:
             *(f"  {marker}" for marker in markers),
         )
     before = head()
-    if not fold_fixups(base):
+    fold_from, why = fold_base(base)
+    if not fold_fixups(fold_from):
         return 1
     if (
         git("rev-parse", "HEAD^{tree}").stdout
@@ -641,8 +720,10 @@ def finish(args: argparse.Namespace) -> int:
     subjects = git("log", "--format=%s", f"{base}..HEAD").stdout.splitlines()
     if unfolded := [subject for subject in subjects if subject.startswith(FIXES)]:
         return fail(
-            "These fix commits before the base, so they weren't folded:",
+            "These fix commits name commits before the base, and weren't folded:",
             *(f"  {subject}" for subject in unfolded),
+            "because",
+            *why,
         )
     if "refactor_base" in state:
         report_tests(state["refactor_base"])

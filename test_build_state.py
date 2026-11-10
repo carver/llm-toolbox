@@ -530,6 +530,94 @@ def test_a_fixup_for_a_commit_before_the_base_fails_finish(repo):
     assert done.returncode == 1 and "fixup! start" in done.stderr
 
 
+def test_a_fixup_of_an_earlier_builds_unpushed_commit_folds_into_it(repo, worktree):
+    build_state(worktree, "start")
+    first = commit(worktree, "a.py", "First")
+    assert build_state(worktree, "finish").returncode == 0
+    build_state(worktree, "start")
+    commit(worktree, "b.py", "Second")
+    commit(worktree, "a.py", "fix first", f"--fixup={first}")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert subjects(worktree, "main") == ["First", "Second"]
+    assert "fix first" in (worktree / "a.py").read_text()
+    assert git(worktree, "show", "HEAD~1:a.py") == "First\nfix first\n"
+    assert "First" in done.stdout and "folding from" in done.stdout.lower()
+
+
+def test_fixes_of_two_earlier_commits_and_of_the_builds_own_all_fold(repo, worktree):
+    first = commit(worktree, "a.py", "First")
+    second = commit(worktree, "b.py", "Second")
+    build_state(worktree, "start")
+    third = commit(worktree, "c.py", "Third")
+    commit(worktree, "b.py", "fix second", f"--fixup={second}")
+    commit(worktree, "a.py", "fix first", f"--fixup={first}")
+    commit(worktree, "c.py", "fix third", f"--fixup={third}")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert subjects(worktree, "main") == ["First", "Second", "Third"]
+    for rev, path, text in [
+        ("HEAD~2", "a.py", "First\nfix first\n"),
+        ("HEAD~1", "b.py", "Second\nfix second\n"),
+        ("HEAD", "c.py", "Third\nfix third\n"),
+    ]:
+        assert git(worktree, "show", f"{rev}:{path}") == text
+
+
+def test_a_fixup_of_a_commit_on_a_remote_tracking_ref_still_fails_finish(
+    repo, worktree
+):
+    first = commit(worktree, "a.py", "First")
+    git(worktree, "update-ref", "refs/remotes/origin/topic", first)
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "fix first", f"--fixup={first}")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 1
+    assert "fixup! First" in done.stderr and "refs/remotes/origin/topic" in done.stderr
+
+
+def test_a_fixup_naming_no_commit_fails_finish_saying_so(repo, worktree):
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "fixup! Nothing like this")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 1
+    assert "fixup! Nothing like this" in done.stderr and "no commit" in done.stderr
+
+
+def test_a_merge_in_the_wider_range_stops_the_wider_fold(repo, worktree):
+    first = commit(worktree, "a.py", "First")
+    git(worktree, "checkout", "-q", "-b", "side", "HEAD~1")
+    commit(worktree, "s.py", "Side")
+    git(worktree, "checkout", "-q", "--detach", first)
+    git(worktree, "merge", "-q", "--no-ff", "-m", "Merge side", "side")
+    git(worktree, "branch", "-D", "side")
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "fix first", f"--fixup={first}")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 1 and "merge" in done.stderr
+
+
+def test_a_fixup_of_a_commit_on_a_branch_still_fails_finish(repo, worktree):
+    first = commit(worktree, "a.py", "First")
+    git(worktree, "branch", "pushed")
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "fix first", f"--fixup={first}")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 1 and "fixup! First" in done.stderr
+
+
 def test_the_work_branchs_upstream_may_move(repo):
     git(repo, "config", "branch.main.remote", "origin")
     git(repo, "config", "branch.main.merge", "refs/heads/main")

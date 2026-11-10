@@ -216,19 +216,23 @@ class TimedOut(Exception):
 def run(command: list[str], timeout: float) -> tuple[int, str]:
     """The command's exit status and output. Stopped, or past `timeout` seconds (then
     raising TimedOut), it stops the command too, killing it if it ignores SIGTERM for 5
-    seconds ($MUTATE_CHECK_GRACE, which the tests shorten)."""
+    seconds ($MUTATE_CHECK_GRACE, which the tests shorten). Raises UsageError when the
+    command won't start."""
     # Read before the command starts, so a bad value stops here rather than mid-stop
     grace = float(os.environ.get("MUTATE_CHECK_GRACE", "5"))
     # Its own process group, so stopping it stops what it started, such as the test
     # binaries cargo runs, too. PYTHONDONTWRITEBYTECODE: the docstring says why.
-    child = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"},
-    )
+    try:
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    except OSError as e:
+        raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
     try:
         output, _ = child.communicate(timeout=timeout)
     except Stopped:
@@ -406,10 +410,7 @@ def mutated_run(edits: str, command: list[str], timeout: float) -> tuple[int, st
     )
     if applied.returncode != 0:
         raise UsageError(applied.stderr.rstrip())
-    try:
-        return run(command, timeout)
-    except OSError as e:
-        raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
+    return run(command, timeout)
 
 
 @dataclass(frozen=True)
@@ -428,7 +429,6 @@ EARLY_STOP = 3
 TIMEOUT_FACTOR = 10
 MIN_TIMEOUT = 30.0
 SHOWN_SOURCE = 72
-PYTHON, SHELL = "Python", "shell"
 # A folder, or a file's stem, that holds tests or their helpers.
 TEST_PART = re.compile(r"(^|[_-])tests?(ing)?([_-]|$)")
 HUNK = re.compile(r"@@ -\S+ \+(\d+)(?:,\d+)? @@")
@@ -503,7 +503,7 @@ SYMBOL = {
     ast.NotIn: "not in",
 }
 # What an and/or's remaining operand needs brackets for, where the and/or stood.
-LOOSE = (ast.IfExp, ast.Lambda, ast.NamedExpr)
+LOW_PRECEDENCE = (ast.IfExp, ast.Lambda, ast.NamedExpr)
 DISPLAYS = (ast.List, ast.Tuple, ast.Set, ast.Dict)
 HEX_DIGEST = re.compile(r"[0-9a-fA-F]{32}")
 
@@ -549,6 +549,17 @@ class PythonFile:
             for node in ast.walk(display)
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         }
+
+    @staticmethod
+    def parses(text: bytes) -> bool:
+        """Whether Python compiles the text: syntax, and what the symbol table checks."""
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                compile(text, "<mutant>", "exec", dont_inherit=True)
+        except (SyntaxError, ValueError):
+            return False
+        return True
 
     def mutants(self) -> list[Mutant]:
         return [
@@ -755,7 +766,7 @@ def dropped_operand(f: PythonFile, node: ast.AST) -> Iterator[Mutant]:
         yield f.mutant(
             node,
             DROP,
-            f"({new})" if isinstance(kept, LOOSE) else new,
+            f"({new})" if isinstance(kept, LOW_PRECEDENCE) else new,
             f"dropped from the {word}: {short(f.source(value))}",
             at=value,
         )
@@ -815,17 +826,6 @@ PYTHON_OPERATORS = (
 )
 
 
-def python_parses(text: bytes) -> bool:
-    """Whether Python compiles the text: syntax, and what the symbol table checks."""
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            compile(text, "<mutant>", "exec", dont_inherit=True)
-    except (SyntaxError, ValueError):
-        return False
-    return True
-
-
 BASH = shutil.which("bash")
 SHELL_CONDITION = re.compile(
     r"(\s*(?:if|elif|while|until)\s+)(.*?)(\s*;\s*(?:then|do)\b.*)?"
@@ -858,11 +858,20 @@ class ShellFile:
             lines = [line.decode() for line in text.splitlines(keepends=True)]
         except UnicodeDecodeError as e:
             raise NotMutated("isn't UTF-8") from e
-        if not shell_parses(text):
+        if not self.parses(text):
             raise NotMutated("doesn't parse")
         self.path, self.changed = path, changed
         self.lines = [line.rstrip("\r\n") for line in lines]
         self.starts = line_starts(text)
+
+    @staticmethod
+    def parses(text: bytes) -> bool:
+        """Whether `bash -n` reads the text."""
+        assert BASH is not None
+        checked = subprocess.run(
+            [BASH, "-n"], input=text, capture_output=True, check=False
+        )
+        return checked.returncode == 0
 
     def offset(self, index: int, col: int) -> int:
         """The byte offset of character `col` of line `index`, counted from 0."""
@@ -1024,19 +1033,13 @@ def continues(line: str) -> bool:
     return not text.lstrip().startswith("#") and text.endswith(CONTINUED)
 
 
-def shell_parses(text: bytes) -> bool:
-    assert BASH is not None
-    checked = subprocess.run([BASH, "-n"], input=text, capture_output=True, check=False)
-    return checked.returncode == 0
+# The kind of a code file: the class that makes its mutants and checks they parse.
+Kind = type[PythonFile] | type[ShellFile]
 
 
-MUTATORS = {PYTHON: PythonFile, SHELL: ShellFile}
-PARSES = {PYTHON: python_parses, SHELL: shell_parses}
-
-
-def shebang_kind(path: Path) -> str | None:
-    """PYTHON or SHELL by the file's #! line: a python, or `uv run ... --script`, or
-    sh, bash or dash, also through env."""
+def shebang_kind(path: Path) -> Kind | None:
+    """PythonFile or ShellFile by the file's #! line: a python, or `uv run ...
+    --script`, or sh, bash or dash, also through env."""
     try:
         with path.open("rb") as f:
             first = f.readline(256)
@@ -1053,8 +1056,8 @@ def shebang_kind(path: Path) -> str | None:
     if re.fullmatch(r"python[\d.]*", program) or (
         program == "uv" and "--script" in words
     ):
-        return PYTHON
-    return SHELL if program in ("sh", "bash", "dash") else None
+        return PythonFile
+    return ShellFile if program in ("sh", "bash", "dash") else None
 
 
 def env_option(word: str) -> bool:
@@ -1062,8 +1065,8 @@ def env_option(word: str) -> bool:
     return word.startswith("-") or "=" in word
 
 
-def code_kind(path: Path, name: str) -> str | None:
-    """PYTHON or SHELL for a code file, by its name or else its #! line; None for
+def code_kind(path: Path, name: str) -> Kind | None:
+    """PythonFile or ShellFile for a code file, by its name or else its #! line; None for
     tests, their helpers, and anything that isn't code."""
     parts = PurePosixPath(name)
     folders_and_stem = (*parts.parent.parts, parts.stem)
@@ -1072,9 +1075,9 @@ def code_kind(path: Path, name: str) -> str | None:
     if path.is_symlink() or not path.is_file():
         return None
     if parts.suffix == ".py":
-        return PYTHON
+        return PythonFile
     if parts.suffix in (".sh", ".bash"):
-        return SHELL
+        return ShellFile
     return None if parts.suffix else shebang_kind(path)
 
 
@@ -1108,28 +1111,65 @@ def added_lines(patch: str) -> set[int]:
 
 
 @dataclass(frozen=True)
-class CodeFile:
+class Snapshot:
+    """A code file with mutants: its kind, and what to put back after each."""
+
     path: Path
-    kind: str
+    kind: Kind
     original: Original
 
 
 @dataclass(frozen=True)
 class Diff:
-    """The code a diff changed: each file and its mutants, the commit it starts from,
-    and how many code files it changed but has no mutants for."""
+    """The code a diff changed: each file and its mutants, the commit the diff starts
+    from, and how many code files it changed but has no mutants for."""
 
-    files: dict[Path, CodeFile]
+    files: dict[Path, Snapshot]
     mutants: list[Mutant]
-    start: str
+    base_commit: str
     not_mutated: int
+
+
+SHOWN_NAMES = 5
+
+
+def named(names: list[str]) -> str:
+    """The names, cut to SHOWN_NAMES and how many more."""
+    shown = ", ".join(names[:SHOWN_NAMES])
+    more = len(names) - SHOWN_NAMES
+    return f"{shown} and {more} more" if more > 0 else shown
 
 
 def read_diff(base: str) -> Diff:
     """The mutants of the lines that the diff since BASE's merge base with HEAD adds or
-    changes, work tree included. Prints a line for each code file left without. Raises
+    changes, work tree included. Prints a line for the code files left without. Raises
     UsageError when git can't make the diff."""
     top = Path(git("rev-parse", "--show-toplevel").strip())
+    base_commit = merge_base(base)
+    files: dict[Path, Snapshot] = {}
+    mutants: list[Mutant] = []
+    reasons: dict[str, list[str]] = {}
+    for path, kind, changed in changed_code(top, base_commit):
+        text = path.read_bytes()
+        try:
+            found = kind(path, text, changed).mutants()
+        except NotMutated as e:
+            reasons.setdefault(str(e), []).append(os.path.relpath(path))
+            continue
+        files[path] = Snapshot(path, kind, Original(text, path.stat().st_mode))
+        mutants += found
+    untracked = untracked_code(top)
+    if untracked:
+        hint = "untracked, so not mutated (git add -N brings one in)"
+        print(f"mutate-check: {hint}: {named(untracked)}")
+    for reason, names in reasons.items():
+        print(f"mutate-check: {reason}, so not mutated: {named(names)}")
+    not_mutated = sum(map(len, reasons.values()))
+    return Diff(files, mutants, base_commit, not_mutated)
+
+
+def merge_base(base: str) -> str:
+    """The commit that BASE and HEAD both come from. Raises UsageError."""
     try:
         commit = git(
             "rev-parse", "--verify", "--quiet", "--end-of-options", base + "^{commit}"
@@ -1137,50 +1177,43 @@ def read_diff(base: str) -> Diff:
     except UsageError:
         raise UsageError(f"mutate-check: --diff {base}: not a commit") from None
     try:
-        start = git("merge-base", commit.strip(), "HEAD").strip()
+        return git("merge-base", commit.strip(), "HEAD").strip()
     except UsageError:
         message = f"mutate-check: --diff {base}: no history in common with HEAD"
         raise UsageError(message) from None
-    listed = git("diff", "--name-status", "-z", "-M", "--no-relative", start, "--")
+
+
+def changed_code(top: Path, base_commit: str) -> Iterator[tuple[Path, Kind, set[int]]]:
+    """Each code file the work tree changes since `base_commit`, with its kind and
+    the numbers of its added or changed lines."""
+    listed = git(
+        "diff", "--name-status", "-z", "-M", "--no-relative", base_commit, "--"
+    )
     fields = iter(listed.split("\0"))
-    files: dict[Path, CodeFile] = {}
-    mutants: list[Mutant] = []
-    reasons: dict[str, list[str]] = {}
     for status in fields:
         if not status:
             continue
-        paths = [next(fields), next(fields)] if status[0] in "RC" else [next(fields)]
+        # A rename names the old path, then the new one.
+        paths = [next(fields), next(fields)] if status[0] == "R" else [next(fields)]
         path = top / paths[-1]
         kind = code_kind(path, paths[-1])
         if status[0] in "DU" or kind is None:
             continue
         patch = git(
             *("diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "-M"),
-            *("--inter-hunk-context=0", "--no-relative", start, "--"),
+            *("--inter-hunk-context=0", "--no-relative", base_commit, "--"),
             *(str(top / p) for p in paths),
         )
         changed = added_lines(patch)
-        if not changed:
-            continue
-        text = path.read_bytes()
-        try:
-            found = MUTATORS[kind](path, text, changed).mutants()
-        except NotMutated as e:
-            reasons.setdefault(str(e), []).append(os.path.relpath(path))
-            continue
-        files[path] = CodeFile(path, kind, Original(text, path.stat().st_mode))
-        mutants += found
-    untracked = git("-C", str(top), "ls-files", "-z", "--others", "--exclude-standard")
-    names = [name for name in untracked.split("\0") if name]
-    left = [os.path.relpath(top / n) for n in names if code_kind(top / n, n)]
-    if left:
-        print(
-            f"mutate-check: untracked, so not mutated (git add -N brings one in): {', '.join(left)}"
-        )
-    for reason, names in reasons.items():
-        print(f"mutate-check: {reason}, so not mutated: {', '.join(names)}")
-    not_mutated = sum(map(len, reasons.values()))
-    return Diff(files, mutants, start, not_mutated)
+        if changed:
+            yield path, kind, changed
+
+
+def untracked_code(top: Path) -> list[str]:
+    """The code files git doesn't track and doesn't ignore, as paths from here."""
+    listed = git("-C", str(top), "ls-files", "-z", "--others", "--exclude-standard")
+    names = [name for name in listed.split("\0") if name]
+    return [os.path.relpath(top / n) for n in names if code_kind(top / n, n)]
 
 
 def in_turn(diff: Diff) -> list[Mutant]:
@@ -1242,8 +1275,6 @@ def baseline(
         code, output = run(command, allowed)
     except TimedOut:
         raise Unjudged(f"{said} run, and it hung past {allowed:g} seconds") from None
-    except OSError as e:
-        raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
     took = time.monotonic() - started
     rewritten = {
         f.path: f.original for f in diff.files.values() if not holds_original(f)
@@ -1264,7 +1295,7 @@ def baseline(
     return timeout or max(least, TIMEOUT_FACTOR * took)
 
 
-def holds_original(file: CodeFile) -> bool:
+def holds_original(file: Snapshot) -> bool:
     try:
         return file.path.read_bytes() == file.original.content
     except OSError:
@@ -1272,7 +1303,7 @@ def holds_original(file: CodeFile) -> bool:
 
 
 def mutant_run(
-    file: CodeFile,
+    file: Snapshot,
     text: bytes,
     command: list[str],
     timeout: float,
@@ -1287,7 +1318,7 @@ def mutant_run(
     try:
         try:
             put(file.path, Original(text, file.original.mode))
-            if file.kind == PYTHON:
+            if file.kind is PythonFile:
                 stamp = max(time.time_ns(), stamps.get(file.path, 0) + 1_000_000_000)
                 os.utime(file.path, ns=(stamp, stamp))
                 stamps[file.path] = stamp
@@ -1301,8 +1332,6 @@ def mutant_run(
     except TimedOut:
         hung = f"the command hung past {timeout:g} seconds"
         verdict = Verdict(INCONCLUSIVE, [f"mutate-check: inconclusive: {hung}"], hung)
-    except OSError as e:
-        raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
     finally:
         failed = restore({file.path: file.original})
     if failed:
@@ -1330,7 +1359,7 @@ def run_mutants(
         seen.add((mutant.path, digest))
         if tally.judged() == limit:
             tally.left_out += 1
-        elif not PARSES[file.kind](text):
+        elif not file.kind.parses(text):
             tally.skipped += 1
         else:
             verdict = mutant_run(file, text, command, timeout, stamps)
@@ -1376,7 +1405,7 @@ def diff_main(options: Options) -> int:
             uncommitted = "; it's HEAD, so only uncommitted changes count"
             print(
                 f"mutate-check: no Python or shell line changed since {options.base},"
-                f" so nothing to mutate{uncommitted if diff.start == head else ''}"
+                f" so nothing to mutate{uncommitted if diff.base_commit == head else ''}"
             )
             return CAUGHT
         timeout = baseline(options.command, options.timeout, diff, least)

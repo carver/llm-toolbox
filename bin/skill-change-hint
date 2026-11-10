@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""A Claude Code hook that tells an agent when a skill it loaded has changed on disk since.
+
+An agent follows the copy of a skill it loaded, so a SKILL.md edited mid-session goes
+unseen: on 2026-11-10 a session kept running steps the build skill had dropped an hour
+before. This hook records each load, and before the agent's next Bash or Agent call it
+adds a note for each SKILL.md whose mtime is newer than when it was loaded:
+
+    skill `build` changed at 01:04 since you loaded it (~/.claude/skills/build/SKILL.md);
+    read it again before its next step.
+
+Once per change: after a note it stays quiet until the file changes again, and loading
+the skill again takes the new copy as read. It never blocks, and any error inside it
+exits 0 with nothing said. install.py registers it for three events:
+
+- PostToolUse on Skill: a load by the Skill tool, whose event names the skill.
+- UserPromptSubmit: a slash command, whose prompt starts `/name`.
+- PreToolUse on Bash|Agent: the check.
+
+A skill's SKILL.md is found as Claude Code finds it: the user's skills
+($CLAUDE_CONFIG_DIR, else ~/.claude, then skills/NAME), then the project's
+($CLAUDE_PROJECT_DIR, then the event's cwd and each folder above it, .claude/skills/NAME),
+and `plugin:name` through ~/.claude/plugins/installed_plugins.json. One it can't find,
+such as a built-in command, is skipped.
+
+The loads are kept per session and per subagent (the event's agent_id), in
+${XDG_STATE_HOME:-~/.local/state}/skill-change-hint/, and a file untouched for a week
+is removed when the next load is recorded.
+
+    skill-change-hint < hook-input.json    # as Claude Code calls it
+"""
+
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+KEEP_DAYS = 7
+# A slash command at the start of a prompt, raw or in the tags a transcript holds.
+SLASH = re.compile(r"\A\s*(?:<command-name>)?/([\w.:-]+)(?=\s|<|\Z)")
+UNSAFE = re.compile(r"[^\w.-]")
+
+
+def state_file(event: dict) -> Path:
+    """The file holding this session's (or subagent's) loads."""
+    base = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    key, agent = event["session_id"], event.get("agent_id")
+    if not isinstance(key, str) or not key or not isinstance(agent, str | None):
+        raise ValueError("no session id")
+    if agent:
+        key += "@" + agent
+    name = UNSAFE.sub("_", key).lstrip(".") or "_"
+    return Path(base) / "skill-change-hint" / f"{name}.json"
+
+
+def config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def plugin_skill(plugin: str, skill: str) -> Path | None:
+    """The plugin's SKILL.md, when exactly one installed copy of the plugin has it."""
+    listing = config_dir() / "plugins" / "installed_plugins.json"
+    try:
+        plugins = json.loads(listing.read_text())["plugins"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    found = {
+        path
+        for key, installs in plugins.items()
+        if key.split("@", 1)[0] == plugin and isinstance(installs, list)
+        for install in installs
+        if isinstance(install, dict) and isinstance(install.get("installPath"), str)
+        for path in [Path(install["installPath"]) / "skills" / skill / "SKILL.md"]
+        if path.is_file()
+    }
+    return found.pop() if len(found) == 1 else None
+
+
+def find_skill(name: str, cwd: str | None) -> Path | None:
+    """The SKILL.md Claude Code loads for a skill name, or None when there's none on disk."""
+    if not name or "/" in name or name.startswith("."):
+        return None
+    if ":" in name:
+        plugin, _, skill = name.partition(":")
+        return plugin_skill(plugin, skill) if plugin and skill else None
+    roots = [config_dir()]
+    if os.environ.get("CLAUDE_PROJECT_DIR"):
+        roots.append(Path(os.environ["CLAUDE_PROJECT_DIR"]) / ".claude")
+    if cwd:
+        here = Path(cwd)
+        roots += [folder / ".claude" for folder in (here, *here.parents)]
+    for root in roots:
+        path = root / "skills" / name / "SKILL.md"
+        if path.is_file():
+            return path
+    return None
+
+
+def loaded_name(event: dict) -> str | None:
+    """The skill this event loads, if any."""
+    kind = event.get("hook_event_name")
+    if kind == "PostToolUse" and event.get("tool_name") == "Skill":
+        return event["tool_input"]["skill"]
+    if kind == "UserPromptSubmit":
+        match = SLASH.match(event["prompt"])
+        return match.group(1) if match else None
+    return None
+
+
+def read_state(path: Path) -> dict:
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def write_state(path: Path, state: dict) -> None:
+    """Replace the file in one step, so a reader never sees half of it."""
+    import tempfile  # here, not at the top: it costs ~5 ms on every Bash call's check
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(state, out)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def remove_old(folder: Path) -> None:
+    cutoff = time.time() - KEEP_DAYS * 86400
+    for path in folder.iterdir():
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def record(event: dict, name: str) -> None:
+    path = find_skill(name, event.get("cwd"))
+    if path is None:
+        return
+    file = state_file(event)
+    state = read_state(file)
+    state[name] = {"path": str(path), "loaded": path.stat().st_mtime_ns, "warned": 0}
+    write_state(file, state)
+    remove_old(file.parent)
+
+
+def when(mtime_ns: int) -> str:
+    """HH:MM, with the date in front when it isn't today."""
+    moment = time.localtime(mtime_ns / 1e9)
+    today = time.localtime()[:3] == moment[:3]
+    return time.strftime("%H:%M" if today else "%Y-%m-%d %H:%M", moment)
+
+
+def check(event: dict) -> str:
+    """The notes for skills changed since loaded and not yet noted, recording them as noted."""
+    file = state_file(event)
+    if not file.exists():
+        return ""
+    state = read_state(file)
+    notes = []
+    for name, load in state.items():
+        try:
+            mtime = Path(load["path"]).stat().st_mtime_ns
+            if mtime <= max(load["loaded"], load["warned"]):
+                continue
+        except (OSError, KeyError, TypeError):
+            continue
+        load["warned"] = mtime
+        notes.append(
+            f"skill `{name}` changed at {when(mtime)} since you loaded it "
+            f"({load['path']}); read it again before its next step."
+        )
+    if notes:
+        write_state(file, state)
+    return "\n".join(notes)
+
+
+def main() -> int:
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print(__doc__)
+        return 0
+    try:
+        event = json.load(sys.stdin)
+        if event.get("hook_event_name") == "PreToolUse":
+            note = check(event)
+            if note:
+                output = {"hookEventName": "PreToolUse", "additionalContext": note}
+                print(json.dumps({"hookSpecificOutput": output}))
+        else:
+            name = loaded_name(event)
+            if isinstance(name, str):
+                record(event, name)
+    except Exception:  # noqa: BLE001, S110 - a hint must never fail the tool call it rides on
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

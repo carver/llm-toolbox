@@ -223,6 +223,27 @@ def test_hooks_register_once_beside_existing_settings(settings):
         str(install.BIN_DST / "heavy-gate"),
         str(install.BIN_DST / "pipe-status-gate"),
         str(install.BIN_DST / "gh-body-gate"),
+        str(install.BIN_DST / "skill-change-hint"),
+    ]
+    assert groups[-1]["matcher"] == "Bash|Agent"
+
+
+def test_the_skill_change_hint_registers_for_loads_and_for_the_check(settings):
+    assert install.register_hooks() == 0
+    assert install.register_hooks() == 0
+    hooks = json.loads(settings.read_text())["hooks"]
+    command = str(install.BIN_DST / "skill-change-hint")
+    registered = sorted(
+        (event, group["matcher"])
+        for event, groups in hooks.items()
+        for group in groups
+        for hook in group["hooks"]
+        if hook["command"] == command
+    )
+    assert registered == [
+        ("PostToolUse", "Skill"),
+        ("PreToolUse", "Bash|Agent"),
+        ("UserPromptSubmit", "*"),
     ]
 
 

@@ -579,6 +579,17 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   adds a note for the agent: the body and the comments come out separately, and
   `issue-todo show N` lists both. It never blocks, and other commands get no
   note.
+- **skill-change-hint**: a Claude Code hook, which `install.py` registers. It
+  records each skill an agent loads, by the Skill tool or a slash command, and
+  before the agent's next Bash or Agent call adds a note for each one whose
+  SKILL.md changed on disk since: ``skill `build` changed at 01:04 since you
+  loaded it (PATH); read it again before its next step``. Once per change; it
+  never blocks, and any error inside it says nothing. It finds SKILL.md as
+  Claude Code does: the user's skills (under `$CLAUDE_CONFIG_DIR`, else
+  `~/.claude`), then the project's (`$CLAUDE_PROJECT_DIR`, then the working
+  folder and those above it), and a plugin's. Loads are kept per session and
+  subagent under `${XDG_STATE_HOME:-~/.local/state}/skill-change-hint/`, for a
+  week.
 
 - **build-state**: `/build`'s bookkeeping. `start` records the base commit
   (HEAD, or `--base REV`) and the repo's fingerprint (every other ref but the

@@ -666,6 +666,29 @@ missing and nothing goes: a working directory inside a git repository (checked:
 the memory folder is the repository's), `CLAUDE_CODE_PROJECT_DIR_NAME`,
 `autoMemoryDirectory` or `CLAUDE_CODE_REMOTE_MEMORY_DIR`.
 
+## skill-change-hint
+
+### A loaded skill that changed on disk gets one note, never a refusal (2026-11-10)
+
+An agent follows the copy of a skill it loaded. On 2026-11-10 the build skill's
+SKILL.md changed at 01:04, mid-session, dropping a step; the session kept to its
+loaded copy, ran two long mutate-check jobs the skill no longer asked for, and the
+owner had to point it out. The owner settled the hook's shape: before the agent's
+next Bash or Agent call it adds context naming the skill, when it changed and its
+path, once per change, and it never blocks. Loading the skill again takes the new
+copy as read.
+
+What the hook sees, from Claude Code 2.1.322 run with hooks that saved their input
+(`claude -p` in a scratch project): PostToolUse on Skill gives `tool_input.skill`
+and `tool_response: {"success": true, "commandName": NAME}`, no path, so the hook
+finds SKILL.md itself, user skills before project skills, as Claude Code ranks
+them. A slash command reaches UserPromptSubmit as the raw prompt (`/name args`),
+not in the `<command-name>` tags the transcript holds; the hook reads both. A
+subagent's events carry its parent's `session_id` and an `agent_id` of their own,
+so loads are kept per agent, or a subagent's load would send its parent a note
+about a skill the parent never read. PreToolUse `additionalContext` reached the
+model on both Bash and Agent calls.
+
 ## path-refs
 
 ### rg runs in the workspace root (2026-11-09)

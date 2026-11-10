@@ -96,6 +96,11 @@ HOOKS = [
         },  # starts the script only for gh issue
     ),
     ("SessionStart", "*", "scratch-usage --warn-if-full", {"timeout": 10}),
+    # Records each skill loaded (by the Skill tool or a slash command), then notes the
+    # ones changed on disk since, before the agent's next Bash or Agent call.
+    ("PostToolUse", "Skill", "skill-change-hint", {"timeout": 10}),
+    ("UserPromptSubmit", "*", "skill-change-hint", {"timeout": 10}),
+    ("PreToolUse", "Bash|Agent", "skill-change-hint", {"timeout": 10}),
 ]
 # (key path, value, why). Claude Code reads these only at user scope.
 SETTINGS_VALUES = [

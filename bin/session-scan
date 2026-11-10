@@ -231,7 +231,10 @@ what I told you", "my reasoning didn't hold"); the user renaming or redefining \
 what the agent built. A design built on a premise nobody \
 checked, which the user or a test then showed false; a bug or problem the agent \
 noticed and set aside ("left for later", "out of scope", a TODO), which still \
-needs a fix.
+needs a fix. A flaw in a brief or plan that cost a fix cycle: a review finding, \
+a test rewritten after review, or a side agent's note that traces back to a \
+choice the brief made, above all one the issue's own text or a design doc \
+argued against.
 - Waste: dead ends, oversized reads or outputs, searches that took several \
 tries, work thrown away, slow paths: a LONG call, or a cache rebuild not after a \
 user turn; the same command taking a minute or more several times; polling \
@@ -239,7 +242,10 @@ user turn; the same command taking a minute or more several times; polling \
 or `until` loop around sleeps, or a stand-in for a sleep) where `bgrun --wait`, \
 `waitone` or a notification would do; a status question answered by many \
 one-at-a-time lookups, such as checking a list of issues or files one call each, \
-when one listing or one tool call could have answered it. Waste can land outside the session: \
+when one listing or one tool call could have answered it. A one-off script the \
+agent wrote to get around a tool's limit, such as cropping a screenshot with \
+PIL or parsing a tool's output in a heredoc, which the tool could do itself. \
+Waste can land outside the session: \
 a change to a shared tool that slowed or broke other sessions' runs, or a queue \
 held so that others waited.
 - Repetition: the same command sequence, lookup or explanation done more than \

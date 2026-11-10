@@ -661,7 +661,10 @@ A Python started with `-E` or `-I` ignores the variable, and so does one the
 user starts in the same tree while a mutant is in place. So the file put back
 also gets an mtime at least a second past the mutant's: no `.pyc` written for
 the mutant matches it, and cargo and make, which compare mtimes, still rebuild.
-It can sit up to a second in the future.
+It can sit up to a second in the future. In `--diff` mode each Python mutant
+also gets an mtime a second past the last one's, since two mutants of a file can
+be the same size: with a command faster than a second, the file's mtime runs
+about a second ahead of the clock per mutant.
 
 Dropped: putting back the file's old mtime, which makes cargo and make take
 their mutant build for current and skip the rebuild; and deleting the restored

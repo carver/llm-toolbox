@@ -1053,19 +1053,36 @@ def test_a_command_that_passes_unmutated_with_no_test_run_runs_no_mutant(
     assert (project / "runs.log").read_text() == "run\n"
 
 
-def test_three_inconclusive_mutants_in_a_row_stop_the_run(project: Path) -> None:
-    (project / "calc.py").write_text(LABEL)
-    fake = project.parent / "fakebin"
+def fake_pytest(root: Path, unmutated: str, mutated: str, status: int) -> Path:
+    """A `pytest` that logs each run to runs.log, prints `unmutated` and passes on
+    the first, then prints `mutated` and exits with `status`."""
+    fake = root / "fakebin"
     fake.mkdir()
-    # Passes unmutated, then each run stops at collection, as a broken import does.
     (fake / "pytest").write_text(
         "#!/bin/sh\necho run >> runs.log\n"
-        '[ "$(wc -l < runs.log)" -eq 1 ] && { echo "1 passed in 0.01s"; exit 0; }\n'
-        "echo 'Interrupted: 1 error during collection'; echo '1 error in 0.05s'; exit 2\n"
+        f"[ \"$(wc -l < runs.log)\" -eq 1 ] && {{ printf '{unmutated}'; exit 0; }}\n"
+        f"printf '{mutated}'; exit {status}\n"
     )
     (fake / "pytest").chmod(0o755)
+    return fake / "pytest"
 
-    result = diff_check(project, str(fake / "pytest"))
+
+# Each mutated run stops at collection, as a broken import does.
+COLLECTION_ERROR = "Interrupted: 1 error during collection\\n1 error in 0.05s\\n"
+
+
+@pytest.mark.parametrize(
+    ("options", "counts"),
+    [((), "; 3 not run"), (("--max", "4"), "; 2 left out by --max 4; 1 not run")],
+    ids=["no cap", "a cap of 4"],
+)
+def test_three_inconclusive_mutants_in_a_row_stop_the_run(
+    project: Path, options: tuple[str, ...], counts: str
+) -> None:
+    (project / "calc.py").write_text(LABEL)
+    fake = fake_pytest(project.parent, "1 passed in 0.01s\\n", COLLECTION_ERROR, 2)
+
+    result = diff_check(project, str(fake), options=options)
 
     assert result.returncode == 3, result.stdout + result.stderr
     assert (project / "runs.log").read_text() == "run\n" * 4
@@ -1074,8 +1091,19 @@ def test_three_inconclusive_mutants_in_a_row_stop_the_run(project: Path) -> None
         f"mutate-check: stopped: {stopped}",
         "  inconclusive: the command exited 2 before any test judged the mutation",
         "    1 error in 0.05s",
-        SUMMARY.format(0, 0, 3, 0) + "; 3 not run",
+        SUMMARY.format(0, 0, 3, 0) + counts,
     ]
+
+
+def test_a_pytest_run_that_skips_every_test_runs_no_mutant(project: Path) -> None:
+    (project / "calc.py").write_text(LABEL)
+    fake = fake_pytest(project.parent, "2 skipped in 0.01s\\n", "", 1)
+
+    result = diff_check(project, str(fake))
+
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert result.stdout.splitlines() == [f"{NO_MUTANT_RAN} it passed, but no test ran"]
+    assert (project / "runs.log").read_text() == "run\n"
 
 
 WAIT = BASE_CALC + "\n\ndef wait(n):\n    while n > 0:\n        n -= 1\n    return n\n"
@@ -1317,6 +1345,29 @@ def test_a_shift_or_a_heredoc_in_a_comment_starts_no_heredoc(project: Path) -> N
         "run.sh:4: deleted: echo one",
         "run.sh:8: deleted: echo two",
     ], result.stdout + result.stderr
+
+
+def test_a_hash_in_quotes_doesnt_hide_a_heredoc(project: Path) -> None:
+    add(
+        project,
+        {"run.sh": '#!/bin/sh\nsed "s/ #.*//" <<EOF\nbody line\nEOF\necho after\n'},
+    )
+
+    result = diff_check(project, "true")
+
+    assert result.stdout.splitlines()[:-1] == ["run.sh:5: deleted: echo after"]
+
+
+def test_a_long_list_of_files_left_alone_is_cut_short(project: Path) -> None:
+    (project / "calc.py").write_text(LABEL)
+    for n in range(7):
+        (project / f"new{n}.py").write_text("print(1)\n")
+
+    result = diff_check(project, "true")
+
+    names = "new0.py, new1.py, new2.py, new3.py, new4.py and 2 more"
+    hint = "untracked, so not mutated (git add -N brings one in)"
+    assert result.stdout.splitlines()[0] == f"mutate-check: {hint}: {names}"
 
 
 def test_lines_are_counted_whatever_gits_diff_config(project: Path) -> None:

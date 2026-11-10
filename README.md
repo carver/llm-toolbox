@@ -172,8 +172,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   error, such as unused code under `-D warnings`), pytest collected nothing (not
   pytest-xdist's exit 2 for `-x` after a failure, which is a catch), a
   `cargo test` or `cargo nextest` run failed without running a test (a filter
-  nextest refused or that matched nothing, or a `cargo test` that passed without
-  running one), or CMD ran past `--timeout` (600 seconds by default). Stopping CMD stops its process group: SIGTERM, then
+  nextest refused or that matched nothing), a `cargo test` passed without running
+  one or pytest passed with every test skipped, or CMD ran past `--timeout` (600
+  seconds by default). Stopping CMD stops its process group: SIGTERM, then
   SIGKILL after `$MUTATE_CHECK_GRACE` seconds. CMD runs with
   `PYTHONDONTWRITEBYTECODE=1`, so a same-size mutation put back within the second
   leaves no `.pyc` that a later import takes for current, and a file put back gets

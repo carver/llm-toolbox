@@ -31,7 +31,8 @@ its summary (under pytest-xdist, -x exits 2 after a failure), or a `cargo test` 
 `cargo nextest` run that fails with no line saying a test ran, is inconclusive: no test
 judged it. So is a command that runs past --timeout (default 600 seconds), which is
 stopped: a hang isn't a catch. A cargo test run that passes with no test run (a
-filter that matched none) is inconclusive too.
+filter that matched none), or a pytest run whose summary counts no test passed (all
+skipped), is inconclusive too.
 
 The cargo case covers nextest refusing a filter (exit 94) or finding no test to run
 (exit 4). A test ran when the output, colour codes aside, has libtest's `test result:`,
@@ -86,15 +87,16 @@ bash -n) is skipped, and two that read the same run once.
 
 CMD runs unmutated first, and unless that run reads as a pass with tests run, so
 that a mutant could be judged, no mutant runs: it prints what the run did, such as
-failing, hanging, or a cargo test run that ran no test. If it rewrites a code file,
-mutate-check puts the file back and stops. Then CMD runs once per mutant, judged as
-above, up to --max N (default 40), and if the first 3 are all inconclusive, it stops
-there and prints the last one's verdict: each statement's first mutant
-before any statement's second, and last, deleting a message (a call whose arguments
-are all f-strings or strings with spaces, an echo to stderr) or a shell setting
-(set, shopt). Each run stops after --timeout, or else ten times the unmutated run
-and at least 30 seconds ($MUTATE_CHECK_MIN_TIMEOUT; the tests shorten it). CMD's
-stdin is /dev/null, here as in the other mode.
+failing, hanging, or a cargo test or pytest run that passed with no test run (all
+skipped). If it rewrites a code file, mutate-check puts the file back and stops.
+Then CMD runs once per mutant, judged as above, up to --max N (default 40): each
+statement's first mutant before any statement's second, and last, deleting a
+message (a call whose arguments are all f-strings or strings with spaces, an echo
+to stderr) or a shell setting (set, shopt). If the first 3 mutants are all
+inconclusive, it stops there and prints the last one's verdict. Each run stops
+after --timeout, or else ten times the unmutated run and at least 30 seconds
+($MUTATE_CHECK_MIN_TIMEOUT; the tests shorten it). CMD's stdin is /dev/null, here as
+in the other mode.
 
 It prints a line for each mutant that survived, `FILE:LINE: what changed`, then
 `mutate-check: N caught, N survived, N inconclusive, N skipped (didn't parse)`, and
@@ -139,6 +141,9 @@ DEFAULT_TIMEOUT = 600.0
 PYTEST_NOTHING_RAN = {2, 4, 5}
 # pytest's summary line when a test failed: under pytest-xdist, -x then exits 2.
 PYTEST_FAILED = re.compile(r"\b[1-9]\d* failed\b.* in \d+(\.\d+)?s\b")
+# pytest's summary line, and the count in it that says a test passed.
+PYTEST_SUMMARY = re.compile(r"\b\d+ (passed|failed|skipped|deselected)\b.* in \d+")
+PYTEST_PASSED = re.compile(r"\b[1-9]\d* passed\b")
 BIN = Path(__file__).resolve().parent
 SHOWN_ERRORS = 3
 STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
@@ -353,11 +358,7 @@ def judge(code: int, output: str, command: list[str]) -> Verdict:
     """The verdict on the command's run with a mutation in place: a failure is a catch
     only when tests ran, and a pass is a miss only when one could have."""
     lines = output.splitlines()
-    if (
-        code == 0
-        and runs_cargo_tests(command)
-        and not any(map(TESTS_PASSED.search, lines))
-    ):
+    if code == 0 and passed_with_no_test(lines, command):
         report = ["mutate-check: inconclusive: the command passed, but no test ran"]
         return Verdict(INCONCLUSIVE, report, "it passed, but no test ran")
     if code == 0:
@@ -392,6 +393,17 @@ def judge(code: int, output: str, command: list[str]) -> Verdict:
         ],
         f"it exited {code}",
     )
+
+
+def passed_with_no_test(lines: list[str], command: list[str]) -> bool:
+    """A passing cargo test run with no line saying a test passed, or a pytest run
+    whose summary counts none passed, as when every test was skipped."""
+    if runs_cargo_tests(command):
+        return not any(map(TESTS_PASSED.search, lines))
+    if runs_pytest(command):
+        summaries = [line for line in lines if PYTEST_SUMMARY.search(line)]
+        return bool(summaries) and not any(map(PYTEST_PASSED.search, summaries))
+    return False
 
 
 def stop(signum: int, _frame: FrameType | None) -> None:
@@ -837,7 +849,11 @@ SHELL_OPENERS = {"{", "(", "then", "do", "else", "in"}
 CASE_PATTERN = re.compile(r"\s*\(?[^\s()|;]+(\s*\|\s*[^\s()|;]+)*\)")
 HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
 # Where `<<` starts no heredoc: a comment, and $(( )) or (( )) arithmetic.
-NOT_HEREDOC = re.compile(r"(^|\s)#.*$|\(\(.*?\)\)", re.MULTILINE)
+# Where `<<` starts no heredoc: a quoted string, a comment, and $(( )) or (( ))
+# arithmetic. A heredoc's own quoted word, as in <<'EOF', is matched before this.
+NOT_HEREDOC = re.compile(
+    r"'[^']*'|\"(?:\\.|[^\"\\])*\"|(?:^|(?<=\s))#.*$|\(\(.*?\)\)", re.MULTILINE
+)
 GUARD_GROUP = re.compile(r"(\|\||&&)\s*\{$")
 SHELL_TEST = re.compile(r"\[\[?\s.*?\s\]\]?")
 SHELL_COMPARISON = re.compile(r"(?<=\s)(==|!=|=|-eq|-ne)(?=\s)")
@@ -895,9 +911,12 @@ class ShellFile:
     def heredoc_end(self, first: int, last: int) -> int | None:
         """The last line of the heredocs the command on lines `first` to `last` starts,
         or None when it starts none: a `<<WORD` with no line WORD after it is none."""
-        code = NOT_HEREDOC.sub("", "\n".join(self.lines[first : last + 1]))
+        code = "\n".join(self.lines[first : last + 1])
+        hidden = NOT_HEREDOC.sub(lambda part: " " * len(part[0]), code)
+        starts = (match.start() for match in re.finditer("<<", hidden))
+        heredocs = [HEREDOC.match(code, start) for start in starts]
         end = None
-        for _, word in HEREDOC.findall(code):
+        for word in (heredoc[2] for heredoc in heredocs if heredoc):
             start = last + 1 if end is None else end + 1
             lines = range(start, len(self.lines))
             end = next((i for i in lines if self.lines[i].strip() == word), None)
@@ -1378,7 +1397,10 @@ def run_mutants(
                 )
                 for line in verdict.report:
                     print(f"  {line.removeprefix('mutate-check: ')}")
-                tally.not_run = len(queue) - place - 1
+                # What --max would have let run is "not run", the rest "left out".
+                rest = len(queue) - place - 1
+                tally.not_run = min(rest, limit - tally.judged())
+                tally.left_out = rest - tally.not_run
                 return
 
 

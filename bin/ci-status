@@ -44,6 +44,9 @@ Options:
                    registers: read the event on stdin, look in its cwd, and print
                    the lines as the session's added context, as hook JSON
 
+wt-ship runs `ci-status --remote REMOTE --branch BRANCH` before it lands, and prints
+what it says.
+
 Environment:
   CI_STATUS_TIMEOUT        seconds all the gh calls of one lookup may take (default 5)
   CI_STATUS_CACHE_SECONDS  seconds an answer stays fresh (default 300); a failed

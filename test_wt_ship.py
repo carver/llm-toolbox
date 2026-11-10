@@ -29,6 +29,78 @@ def commit(cwd, path, text, message):
     return git(cwd, "rev-parse", "HEAD")
 
 
+def fake_ci_status(folder, says="", sleep=0):
+    """Make `folder` hold a `ci-status` that logs its arguments to calls.log, waits
+    `sleep` seconds, then prints `says`; returns the env that puts it first on PATH."""
+    folder.mkdir(exist_ok=True)
+    script = folder / "ci-status"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, time\n"
+        f"open({str(folder / 'calls.log')!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        f"time.sleep({sleep})\n"
+        f"sys.stdout.write({says!r})\n"
+    )
+    script.chmod(0o755)
+    return {"PATH": f"{folder}:{os.environ['PATH']}"}
+
+
+@pytest.fixture(autouse=True)
+def quiet_ci(tmp_path, monkeypatch):
+    """A silent ci-status first on PATH for every test, so none asks the real GitHub
+    (one sets origin to a github.com URL); a test that wants one to speak puts its own
+    in front. Returns its folder."""
+    monkeypatch.setenv("PATH", fake_ci_status(tmp_path / "quiet-ci")["PATH"])
+    return tmp_path / "quiet-ci"
+
+
+RED = "CI is failing on main: ci.yml (check) at b227171, 2 h ago: https://example/1\n"
+
+
+@pytest.mark.parametrize("mode", [[], ["--local"]], ids=["push", "local"])
+def test_failing_ci_on_the_branch_is_named_before_the_landing(setup, tmp_path, mode):
+    origin, main, wt, _ = setup
+    env = fake_ci_status(tmp_path / "red-ci", RED)
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, *mode, env=env)
+
+    assert done.returncode == 0, done.stderr  # a warning, never a refusal
+    landed = git(main, "rev-parse", "main") if mode else remote_main(origin)
+    assert landed == new
+    assert done.stdout.startswith(RED)
+    calls = (tmp_path / "red-ci/calls.log").read_text()
+    assert calls == "--remote origin --branch main\n"
+
+
+def test_nothing_to_land_asks_nothing_of_ci(setup, quiet_ci):
+    _, _, wt, _ = setup
+    assert ship(wt, "--local").returncode == 0
+    assert ship(wt).returncode == 0
+    assert not (quiet_ci / "calls.log").exists()
+
+
+def test_a_bad_ci_timeout_still_lands(setup, tmp_path):
+    origin, _, wt, _ = setup
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+    done = ship(wt, env={"WT_SHIP_CI_TIMEOUT": "soon"})
+    assert done.returncode == 0, done.stderr
+    assert remote_main(origin) == new
+
+
+def test_a_ci_status_with_no_answer_in_time_is_left_behind(setup, tmp_path):
+    origin, _, wt, _ = setup
+    env = fake_ci_status(tmp_path / "slow-ci", RED, sleep=30)
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, env=env | {"WT_SHIP_CI_TIMEOUT": "0.5"})
+
+    assert done.returncode == 0, done.stderr
+    assert remote_main(origin) == new
+    assert "CI is failing" not in done.stdout
+    # The leftover-process fixture fails the test if the sleeping ci-status outlived it.
+
+
 def ship_env(session="s-mine", wait="10", **extra):
     """wt-ship's environment: short waits, so a test that waits by mistake ends."""
     return os.environ | {

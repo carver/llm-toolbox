@@ -12,7 +12,11 @@ the main tree's branch.
 In order, it:
 
 1. refuses uncommitted changes to tracked files, and a worktree whose earlier commits
-   another run is checking, or where one was killed before it put the tip back (step 4);
+   another run is checking, or where one was killed before it put the tip back (step 4).
+   Then, unless there's nothing to push, it prints the line `ci-status` (`-h`) gives
+   for each workflow failing on REMOTE/BRANCH on GitHub, so a landing on a red
+   branch is a choice made knowingly. Only a warning: no ci-status, no answer within
+   WT_SHIP_CI_TIMEOUT seconds, or anything else going wrong, and it says nothing;
 2. fetches the remote, and when HEAD lacks REMOTE/BRANCH or holds fixup! commits,
    rebases onto it, folding them (autosquash). A conflict stops it with the rebase in
    progress: resolve the hunks (`conflicts -h`), finish with `conflicts --continue`,
@@ -124,6 +128,8 @@ Environment:
                      the tests shorten both)
   FIFO_LOCK_SECONDS  seconds of waiting for the queue folder's lock before naming its
                      holder (default 5; the tests shorten it)
+  WT_SHIP_CI_TIMEOUT seconds ci-status may take to say whether CI is failing on the
+                     branch (default 15)
   WT_SHIP_UNTICKED_TIMEOUT
                      seconds all the unticked-item lookups of one report may take
                      together (default 30; the tests shorten it)
@@ -636,6 +642,7 @@ def ship(args):
     if is_ancestor("HEAD", upstream):
         print(f"HEAD is already in {upstream}: nothing to push.")
         return 0
+    warn_of_red_ci(remote, branch)
     rebase_onto(upstream, PUSH)
     # Once, before any check: a verdict that changed after a retry's rebase would come
     # too late to act on.
@@ -741,6 +748,20 @@ def run_within(argv, seconds):
         process.communicate()
         return None
     return process.returncode, stdout, stderr
+
+
+def warn_of_red_ci(remote, branch):
+    """Print ci-status's line for each workflow failing on `remote`'s `branch` on
+    GitHub, so a landing on a red branch is a choice made knowingly. Only a warning:
+    no ci-status, no answer within WT_SHIP_CI_TIMEOUT seconds, or an error, and it
+    says nothing."""
+    try:
+        seconds = float(os.environ.get("WT_SHIP_CI_TIMEOUT", "15"))
+        got = run_within(["ci-status", "--remote", remote, "--branch", branch], seconds)
+    except (OSError, ValueError):
+        return
+    if got and got[1].strip():
+        print(got[1].rstrip("\n"), flush=True)
 
 
 def closed_issues(old, new):
@@ -1012,6 +1033,7 @@ def land(args):
     if is_ancestor("HEAD", ref):
         print(f"HEAD is already in {branch}: nothing to land.")
         return 0
+    warn_of_red_ci("origin", branch)
     # Before the wait, so a conflict shows without holding the main tree; no check
     # yet, since another landing may move the branch meanwhile.
     rebase_onto(ref, LAND)

@@ -237,7 +237,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   conflicts. An agent had chained `git add` and
   `git rebase --continue` after a resolve that failed, and committed the
   markers.
-- **wt-ship**: ships a worktree's commits. In a repo that pushes, it rebases
+- **wt-ship**: ships a worktree's commits. First, with something to ship, it
+  prints `ci-status`'s line for each workflow failing on the target branch on
+  GitHub (origin's, with `--local`), only a warning, given
+  `$WT_SHIP_CI_TIMEOUT` seconds (default 15). In a repo that pushes, it rebases
   onto the remote branch (the main tree's, by default), refuses leftover
   conflict markers, refuses a commit message that names, by its ID, a commit
   the branch doesn't hold (7 to 64 hex digits that resolve to a commit here,
@@ -604,7 +607,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   and branch for `CI_STATUS_CACHE_SECONDS` (300; a failed lookup 60) under
   `${XDG_CACHE_HOME:-~/.cache}/ci-status/`, behind a lock, so sessions starting
   together ask GitHub once. `install.py` registers `ci-status --session-start`
-  as a SessionStart hook, which adds the lines to the session's context.
+  as a SessionStart hook, which adds the lines to the session's context, and
+  `wt-ship` prints them before it lands.
 
 - **build-state**: `/build`'s bookkeeping. `start` records the base commit
   (HEAD, or `--base REV`) and the repo's fingerprint (every other ref but the

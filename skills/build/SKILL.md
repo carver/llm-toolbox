@@ -27,7 +27,9 @@ When the change adds a **gate** (a rule that refuses, flags, rate-limits or veri
 
 Run `build-state start` in the repo. It records the **base** (HEAD, or `--base REV` when your commits for this change already started) and the **repo fingerprint** in the git dir; `build-state show` prints them again after a context reset.
 
-Done when every design fork is answered, the brief names the seams and accounts for every item of the issue or spec the change comes from, the brief review's findings are answered when the change adds a gate, and the brief would let a reviewer who never saw this chat judge the change.
+When the change writes or rewrites text that agents or people read and act on (an installer, a skill, a help page, a reply's wording), review the brief the same way, with this ask: "Read the brief. Check each decision it makes against the text of the issue or spec it comes from, body and every comment, and against the design docs the repo points to. Report each decision one of them argues against, with the line that does; edit nothing." When the change also adds a gate, one subagent takes both asks. Reason: a brief chose to show agents a link to public GitHub issues, which the issue's own text and the design doc ruled out; only the review of the finished code caught it, and a fix cycle followed.
+
+Done when every design fork is answered, the brief names the seams and accounts for every item of the issue or spec the change comes from, the brief review's findings are answered when the change adds a gate or writes text people or agents act on, and the brief would let a reviewer who never saw this chat judge the change.
 
 ## 2. Implement
 

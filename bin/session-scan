@@ -264,7 +264,10 @@ together with nothing pointing from one to the other.
 - Skipped checks: `--no-verify` or `git commit -n`; and a step of a skill the \
 agent loaded (its text shows in the digest, as after `/build` or a Skill call) \
 skipped or run out of order, such as a review run after the next commit's work \
-had started, or a sweep or bookkeeping command the skill names never run.
+had started, or a sweep or bookkeeping command the skill names never run. When \
+a skill names steps to run once per commit, as `/build` does for each commit of \
+a build, check each commit separately: a step run for the last commit but not \
+the first is skipped for the first.
 
 Report every `HOOK ERROR` as a candidate, even one followed by a correct retry: \
 the checker dismisses those, and the retrospective must account for each \

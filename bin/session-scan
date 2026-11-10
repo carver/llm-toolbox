@@ -235,7 +235,11 @@ needs a fix.
 - Waste: dead ends, oversized reads or outputs, searches that took several \
 tries, work thrown away, slow paths: a LONG call, or a cache rebuild not after a \
 user turn; the same command taking a minute or more several times; polling \
-(repeated sleeps, waits or status checks). Waste can land outside the session: \
+(repeated sleeps, waits or status checks), and a hand-rolled wait loop (a `for` \
+or `until` loop around sleeps, or a stand-in for a sleep) where `bgrun --wait`, \
+`waitone` or a notification would do; a status question answered by many \
+one-at-a-time lookups, such as checking a list of issues or files one call each, \
+when one listing or one tool call could have answered it. Waste can land outside the session: \
 a change to a shared tool that slowed or broke other sessions' runs, or a queue \
 held so that others waited.
 - Repetition: the same command sequence, lookup or explanation done more than \

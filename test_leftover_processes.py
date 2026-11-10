@@ -325,6 +325,9 @@ JOB = """
 while [ ! -s "$1" ]; do sleep 0.01; done
 cd "$(cat "$1")" || exit
 (env -u LEFTOVER_PROCESSES_TAG sleep 300 >/dev/null 2>&1 & echo $! > "$2.tmp")
+# Until it execs, the fork still has this job's environment, the outer run's tag
+# included, which the guard reads as another watch's process.
+while [ "$(tr '\\0' ' ' < /proc/"$(cat "$2.tmp")"/cmdline)" != "sleep 300 " ]; do sleep 0.01; done
 mv "$2.tmp" "$2"
 exec sleep 300
 """

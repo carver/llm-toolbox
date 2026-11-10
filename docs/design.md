@@ -646,3 +646,24 @@ skip git-ignored folders, where a link such as `data -> ../cache/X` is most like
 live. It walks the rest of the workspace, git-ignored venvs included, in about 2 s
 warm (13 s once, with the host mount's cache cold), as long as `find` takes over
 the same folders.
+## mutate-check
+
+### The command writes no .pyc (2026-11-09)
+
+Python takes a `.pyc` as current when the size and the mtime, in whole seconds,
+that it recorded match its source's. A same-size mutation (`n * 2` to `n + 2`,
+`==` to `!=`) that the command imported, put back within the second, left the
+mutant's bytecode looking current: in 9 of 10 runs, a plain import afterwards
+ran the mutant, until the next edit of that file. So the command runs with
+`PYTHONDONTWRITEBYTECODE=1`, and no mutant's bytecode is written at all.
+
+A Python started with `-E` or `-I` ignores the variable, and so does one the
+user starts in the same tree while a mutant is in place. So the file put back
+also gets an mtime at least a second past the mutant's: no `.pyc` written for
+the mutant matches it, and cargo and make, which compare mtimes, still rebuild.
+It can sit up to a second in the future.
+
+Dropped: putting back the file's old mtime, which makes cargo and make take
+their mutant build for current and skip the rebuild; and deleting the restored
+file's `__pycache__` entries, which also removes the bytecode of the user's own
+runs and misses a `PYTHONPYCACHEPREFIX`.

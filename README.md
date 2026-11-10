@@ -173,8 +173,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `cargo test` or `cargo nextest` run failed without running a test (a filter
   nextest refused or that matched nothing), or CMD ran past `--timeout` (600
   seconds by default). Stopping CMD stops its process group: SIGTERM, then
-  SIGKILL after `$MUTATE_CHECK_GRACE` seconds. For checking that a test which
-  passed on its first run guards what it's meant to.
+  SIGKILL after `$MUTATE_CHECK_GRACE` seconds. CMD runs with
+  `PYTHONDONTWRITEBYTECODE=1`, so a same-size mutation put back within the second
+  leaves no `.pyc` that a later import takes for current, and a file put back gets
+  an mtime a second past the mutant's, for a Python run with `-E` or `-I`. For
+  checking that a test which passed on its first run guards what it's meant to.
 - **conflicts**: `conflicts FILE` lists a file's conflict hunks, numbered, with
   each side and its marker label; `conflicts FILE N SIDE` (or `all SIDE`)
   resolves them as `ours`, `theirs`, `both` or `base`, and the triples repeat,

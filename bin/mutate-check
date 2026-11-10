@@ -42,6 +42,12 @@ when it failed, or its last line of output when there are none; never the whole 
 Stopped, or past --timeout, it stops the command's process group: SIGTERM, then
 SIGKILL after $MUTATE_CHECK_GRACE seconds (default 5; the tests shorten it).
 
+The command runs with PYTHONDONTWRITEBYTECODE=1. Python takes a .pyc as current when
+its source's size and mtime in whole seconds match, so a same-size mutation put back
+within the second would leave its bytecode for the next import. A Python started with
+-E or -I ignores the variable, so each file put back also gets an mtime at least a
+second past the mutant's.
+
 Exit status: 0 the command failed, so the mutation was caught; 1 it passed, so the
 tests miss it; 2 usage error, an --edits FILE that can't be read, or blocks that didn't
 apply (the command didn't run);
@@ -58,6 +64,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType, ModuleType
@@ -113,17 +120,21 @@ def snapshot(paths: list[Path]) -> dict[Path, Original]:
 
 def restore(originals: dict[Path, Original]) -> list[str]:
     """Put each file back as it was, through a temp file beside it so a crash can't leave
-    half of one, also when the command deleted it. Signals wait until it's done. Returns
-    what couldn't be put back."""
+    half of one, also when the command deleted it. Its mtime moves on by at least a
+    second, so no .pyc written for the mutant passes for its own. Signals wait until
+    it's done. Returns what couldn't be put back."""
     signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
     failed = []
     for target, original in originals.items():
         try:
+            mutated = target.stat().st_mtime_ns if target.exists() else 0
             fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
             with os.fdopen(fd, "wb") as f:
                 f.write(original.content)
             os.chmod(temp, original.mode)
             os.replace(temp, target)
+            later = max(time.time_ns(), mutated + 1_000_000_000)
+            os.utime(target, ns=(later, later))
         except OSError as e:
             failed.append(f"mutate-check: couldn't put back {target}: {e}")
     return failed
@@ -140,12 +151,13 @@ def run(command: list[str], timeout: float) -> tuple[int, str]:
     # Read before the command starts, so a bad value stops here rather than mid-stop
     grace = float(os.environ.get("MUTATE_CHECK_GRACE", "5"))
     # Its own process group, so stopping it stops what it started, such as the test
-    # binaries cargo runs, too.
+    # binaries cargo runs, too. PYTHONDONTWRITEBYTECODE: the docstring says why.
     child = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"},
     )
     try:
         output, _ = child.communicate(timeout=timeout)

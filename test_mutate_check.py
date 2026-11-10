@@ -21,6 +21,8 @@ BREAK = """--- calc.py
     return n + 3
 >>>>>>>
 """
+# The same size as CODE, like BREAK, but double(3) is 5 here, not 6.
+SAME_SIZE = BREAK.replace("return n + 3", "return n + 2")
 HARMLESS = """--- calc.py
 <<<<<<<
     return n * 2
@@ -174,6 +176,28 @@ def test_a_file_the_command_deletes_is_put_back(repo: Path) -> None:
     assert (repo / "calc.py").read_text() == CODE
     assert (repo / "calc.py").stat().st_mode & 0o777 == 0o640
     assert [p.name for p in repo.iterdir() if p.name.startswith(".")] == []
+
+
+# -E: a Python that ignores PYTHON* variables writes the mutant's .pyc anyway.
+@pytest.mark.parametrize("flags", [(), ("-E",)], ids=["plain", "-E"])
+def test_a_same_size_mutants_bytecode_is_not_left_for_later_runs(
+    repo: Path, flags: tuple[str, ...]
+) -> None:
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+    imports = (sys.executable, *flags, "-c", "import calc; assert calc.double(3) == 6")
+
+    result = check(repo, SAME_SIZE, *imports, env=env)
+    after = subprocess.run(
+        [sys.executable, "-c", "import calc; print(calc.double(3))"],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert after.stdout.strip() == "6", after.stdout + after.stderr
 
 
 def test_a_child_ignoring_term_is_killed_once_the_grace_ends(repo: Path) -> None:

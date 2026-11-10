@@ -1256,3 +1256,125 @@ def test_help_shows_the_diff_mode_with_an_example() -> None:
 
     assert "--diff BASE" in result.stdout
     assert "  mutate-check --diff " in result.stdout
+
+
+def test_the_command_gets_no_stdin_to_wait_on(project: Path) -> None:
+    (project / "calc.py").write_text(LABEL)
+    # stdin stays open: a command that read it would wait past the timeout.
+    proc = subprocess.Popen(
+        [str(SCRIPT), "--diff", "HEAD", "--timeout", "5", "--", "sh", "-c", "read x"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        cwd=project,
+        text=True,
+    )
+    assert proc.stdout is not None
+    try:
+        out = proc.stdout.read()  # stdin still open, unlike with communicate()
+        proc.wait(timeout=60)
+    finally:
+        proc.kill()
+
+    # `read` fails at once on /dev/null, so every run fails: the baseline too.
+    assert proc.returncode == 3, out
+    assert "it exited 1" in out
+
+
+SAME_SIZES = BASE_CALC + (
+    "\n\ndef f(a, b):\n    return a == b\n\n\ndef g(a, b):\n    return a != b\n"
+)
+
+
+def test_a_mutants_bytecode_never_serves_the_next_one(project: Path) -> None:
+    # -E: Python writes each mutant's .pyc. The deletions are the same size, and so
+    # are the swaps; a .pyc taken for the next mutant's would catch g's two mutants.
+    (project / "calc.py").write_text(SAME_SIZES)
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+    check_f = (sys.executable, "-E", "-c", "import calc; assert calc.f(1, 1)")
+
+    result = diff_check(project, *check_f, env=env)
+
+    assert result.stdout.splitlines() == [
+        "calc.py:10: deleted: return a != b",
+        "calc.py:10: != -> ==: a != b",
+        SUMMARY.format(2, 2, 0, 0),
+    ], result.stdout + result.stderr
+
+
+def test_a_shift_or_a_heredoc_in_a_comment_starts_no_heredoc(project: Path) -> None:
+    add(
+        project,
+        {
+            "run.sh": "#!/bin/sh\n# cat <<EOF\nn=$(( 1 << n ))\n"
+            "echo one\ncat <<END\nbody\nEND\necho two\n"
+        },
+    )
+
+    result = diff_check(project, "true")
+
+    assert sorted(result.stdout.splitlines()[:-1]) == [
+        "run.sh:3: deleted: n=$(( 1 << n ))",
+        "run.sh:4: deleted: echo one",
+        "run.sh:8: deleted: echo two",
+    ], result.stdout + result.stderr
+
+
+def test_lines_are_counted_whatever_gits_diff_config(project: Path) -> None:
+    add(project, {"tool.py": "a = 1\n\nb = 2\n"})
+    git(project, "commit", "-q", "-m", "tool")
+    git(project, "config", "diff.interHunkContext", "5")
+    git(project, "config", "diff.suppressBlankEmpty", "true")
+    (project / "tool.py").write_text("a = 'x'\n\nb = 2\nc = 3\n")
+
+    result = diff_check(project, "true")
+
+    assert sorted(result.stdout.splitlines()[:-1]) == [
+        "tool.py:1: 'x' -> 'XXxXX'",
+        "tool.py:1: deleted: a = 'x'",
+        "tool.py:4: deleted: c = 3",
+    ], result.stdout + result.stderr
+
+
+def test_a_byte_order_mark_doesnt_move_the_mutants(project: Path) -> None:
+    add(project, {"bom.py": ""})
+    (project / "bom.py").write_bytes("\ufeffNAME = 'a'\n".encode())
+
+    result = diff_check(project, *python("import bom; assert bom.NAME == 'a'"))
+
+    assert result.stdout.splitlines() == [SUMMARY.format(2, 0, 0, 0)], result.stdout
+
+
+def test_a_string_of_whitespace_alone_is_a_value(project: Path) -> None:
+    add(project, {"tool.py": 'print("\\n".join(names))\n'})
+
+    result = diff_check(project, "true")
+
+    assert sorted(result.stdout.splitlines()[:-1]) == [
+        "tool.py:1: \"\\n\" -> 'XX\\nXX'",
+        'tool.py:1: deleted: print("\\n".join(names))',
+    ], result.stdout + result.stderr
+
+
+def test_a_bad_min_timeout_is_a_usage_error(project: Path) -> None:
+    (project / "calc.py").write_text(LABEL)
+
+    result = diff_check(
+        project, "touch", "ran", env=os.environ | {"MUTATE_CHECK_MIN_TIMEOUT": "abc"}
+    )
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "MUTATE_CHECK_MIN_TIMEOUT" in result.stderr
+    assert not (project / "ran").exists()
+
+
+def test_a_base_with_no_history_in_common_says_so(project: Path) -> None:
+    git(project, "switch", "-q", "--orphan", "other")
+    add(project, {"other.py": "print(1)\n"})
+    git(project, "commit", "-q", "-m", "other")
+    git(project, "switch", "-q", "main")
+
+    result = diff_check(project, "touch", "ran", base="other")
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "no history in common with HEAD" in result.stderr
+    assert not (project / "ran").exists()

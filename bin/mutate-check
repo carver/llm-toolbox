@@ -73,10 +73,10 @@ file stem such as tests, test_x, x_test, x_testing or test-x. On those lines:
           'XX<string>XX', unless it holds whitespace (a message), a URL or a digest,
           or sits in a docstring, an annotation, an f-string or a list, tuple, set
           or dict at a module's top level (a data table).
-  shell   a command becomes `:`, and a `cmd || {` group up to its `}` too; an if,
-          elif, while or until condition is negated; = or == and !=, -eq and -ne
-          swap inside [ ] or [[ ]]; W in ${N:-W}, ${N-W}, ${N:=W} or ${N=W} becomes
-          XXWXX.
+  shell   a command becomes `:`, and a `cmd || {` group up to its `}` too; a
+          one-line if, elif, while or until condition is negated; = or == and !=,
+          -eq and -ne swap inside [ ] or [[ ]]; W in ${N:-W}, ${N-W}, ${N:=W} or
+          ${N=W} becomes XXWXX.
 
 Left out as changing nothing a test sees: a return of nothing that ends a function, a
 continue that ends a loop, a final `exit 0`, True and False in a decorator (as
@@ -99,8 +99,10 @@ stdin is /dev/null, here as in the other mode.
 It prints a line for each mutant that survived, `FILE:LINE: what changed`, then
 `mutate-check: N caught, N survived, N inconclusive, N skipped (didn't parse)`, and
 how many --max left out; run again with a higher --max to try those. CMD runs up to
-N+1 times, so run it as a background call under heavy, with the edits to the tree
-done: `bgrun --wait -o LOG -- heavy -- mutate-check --diff BASE -- CMD`.
+N+1 times, so run it as a background call in heavy's long lane, with the edits to
+the tree done: `bgrun --wait -o LOG -- heavy --long -- mutate-check --diff BASE --
+CMD`. Each Python mutant gets an mtime a second past the last one's, so a .pyc that
+a Python ignoring PYTHONDONTWRITEBYTECODE wrote for one never passes for the next.
 
 Exit status with --diff: 0 no mutant survived; 1 one did; 2 usage error, BASE isn't
 a commit, CMD rewrote a code file, or a file couldn't be put back; 3 no mutant was
@@ -110,6 +112,7 @@ rest had no mutants; 128+N stopped by signal N, after putting the file back.
 """
 
 import ast
+import codecs
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -521,6 +524,9 @@ class PythonFile:
             raise NotMutated("doesn't parse") from e
         self.path, self.text, self.changed = path, text, changed
         self.starts = line_starts(text)
+        # ast counts line 1's columns from after a byte order mark.
+        if text.startswith(codecs.BOM_UTF8):
+            self.starts[0] = len(codecs.BOM_UTF8)
         self.parents = {
             id(child): node
             for node in ast.walk(self.tree)
@@ -650,12 +656,17 @@ def is_none(node: ast.expr | None) -> bool:
 
 
 def is_prose(node: ast.expr) -> bool:
-    """An f-string, or a string with whitespace in it: a message, not a value."""
+    """An f-string, or a string of words: a message, not a value."""
     return isinstance(node, ast.JoinedStr) or (
         isinstance(node, ast.Constant)
         and isinstance(node.value, str)
-        and any(c.isspace() for c in node.value)
+        and has_words(node.value)
     )
+
+
+def has_words(text: str) -> bool:
+    """Whitespace between other characters, as a message has, and `"\\n"` hasn't."""
+    return any(c.isspace() for c in text.strip())
 
 
 def says_a_message(node: ast.stmt) -> bool:
@@ -788,7 +799,7 @@ def changed_string(f: PythonFile, node: ast.AST) -> Iterator[Mutant]:
     value = node.value
     if not f.touched(node) or id(node) in f.table_strings:
         return
-    if any(c.isspace() for c in value) or "://" in value or HEX_DIGEST.search(value):
+    if has_words(value) or "://" in value or HEX_DIGEST.search(value):
         return
     new = repr(f"XX{value}XX")
     yield f.mutant(node, STRING, new, f"{short(f.source(node))} -> {new}")
@@ -825,6 +836,8 @@ SHELL_KEYWORDS |= {"do", "done", "case", "in", "esac", "function", "{", "}", "("
 SHELL_OPENERS = {"{", "(", "then", "do", "else", "in"}
 CASE_PATTERN = re.compile(r"\s*\(?[^\s()|;]+(\s*\|\s*[^\s()|;]+)*\)")
 HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
+# Where `<<` starts no heredoc: a comment, and $(( )) or (( )) arithmetic.
+NOT_HEREDOC = re.compile(r"(^|\s)#.*$|\(\(.*?\)\)", re.MULTILINE)
 GUARD_GROUP = re.compile(r"(\|\||&&)\s*\{$")
 SHELL_TEST = re.compile(r"\[\[?\s.*?\s\]\]?")
 SHELL_COMPARISON = re.compile(r"(?<=\s)(==|!=|=|-eq|-ne)(?=\s)")
@@ -863,16 +876,25 @@ class ShellFile:
             first = index
             while index + 1 < len(self.lines) and continues(self.lines[index]):
                 index += 1
-            heredocs = HEREDOC.findall("\n".join(self.lines[first : index + 1]))
+            body_end = self.heredoc_end(first, index)
             text = self.lines[first].strip()
-            if text and not text.startswith("#") and not heredocs:
+            if text and not text.startswith("#") and body_end is None:
                 found.append((first, index))
-            index += 1
-            for _, word in heredocs:
-                while index < len(self.lines) and self.lines[index].strip() != word:
-                    index += 1
-                index += 1
+            index = (index if body_end is None else body_end) + 1
         return found
+
+    def heredoc_end(self, first: int, last: int) -> int | None:
+        """The last line of the heredocs the command on lines `first` to `last` starts,
+        or None when it starts none: a `<<WORD` with no line WORD after it is none."""
+        code = NOT_HEREDOC.sub("", "\n".join(self.lines[first : last + 1]))
+        end = None
+        for _, word in HEREDOC.findall(code):
+            start = last + 1 if end is None else end + 1
+            lines = range(start, len(self.lines))
+            end = next((i for i in lines if self.lines[i].strip() == word), None)
+            if end is None:
+                return None
+        return end
 
     def mutants(self) -> list[Mutant]:
         commands = self.commands()
@@ -1114,7 +1136,11 @@ def read_diff(base: str) -> Diff:
         )
     except UsageError:
         raise UsageError(f"mutate-check: --diff {base}: not a commit") from None
-    start = git("merge-base", commit.strip(), "HEAD").strip()
+    try:
+        start = git("merge-base", commit.strip(), "HEAD").strip()
+    except UsageError:
+        message = f"mutate-check: --diff {base}: no history in common with HEAD"
+        raise UsageError(message) from None
     listed = git("diff", "--name-status", "-z", "-M", "--no-relative", start, "--")
     fields = iter(listed.split("\0"))
     files: dict[Path, CodeFile] = {}
@@ -1130,7 +1156,8 @@ def read_diff(base: str) -> Diff:
             continue
         patch = git(
             *("diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "-M"),
-            *("--no-relative", start, "--", *(str(top / p) for p in paths)),
+            *("--inter-hunk-context=0", "--no-relative", start, "--"),
+            *(str(top / p) for p in paths),
         )
         changed = added_lines(patch)
         if not changed:
@@ -1245,15 +1272,25 @@ def holds_original(file: CodeFile) -> bool:
 
 
 def mutant_run(
-    file: CodeFile, text: bytes, command: list[str], timeout: float
+    file: CodeFile,
+    text: bytes,
+    command: list[str],
+    timeout: float,
+    stamps: dict[Path, int],
 ) -> Verdict:
     """Run the command with the file holding `text`, put the file back, and give the
-    verdict, inconclusive for a hang. Raises Stopped, and UsageError when the file
-    can't be written or put back, or the command won't start."""
+    verdict, inconclusive for a hang. A Python file's mutant gets an mtime a second
+    past the one `stamps` holds for its last, so a .pyc written for one never passes
+    for the next, which may be the same size. Raises Stopped, and UsageError when the
+    file can't be written or put back, or the command won't start."""
     signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
     try:
         try:
             put(file.path, Original(text, file.original.mode))
+            if file.kind == PYTHON:
+                stamp = max(time.time_ns(), stamps.get(file.path, 0) + 1_000_000_000)
+                os.utime(file.path, ns=(stamp, stamp))
+                stamps[file.path] = stamp
         except OSError as e:
             raise UsageError(
                 f"mutate-check: couldn't write a mutant to {file.path}: {e}"
@@ -1282,6 +1319,7 @@ def run_mutants(
     inconclusive, the rest would most likely be too: it stops, and prints the last
     one's verdict."""
     seen = set()
+    stamps: dict[Path, int] = {}
     queue = in_turn(diff)
     for place, mutant in enumerate(queue):
         file = diff.files[mutant.path]
@@ -1295,7 +1333,7 @@ def run_mutants(
         elif not PARSES[file.kind](text):
             tally.skipped += 1
         else:
-            verdict = mutant_run(file, text, command, timeout)
+            verdict = mutant_run(file, text, command, timeout, stamps)
             if verdict.status == MISSED:
                 tally.survived += 1
                 where = f"{os.path.relpath(mutant.path)}:{mutant.line}"
@@ -1322,7 +1360,13 @@ def diff_main(options: Options) -> int:
     for signum in STOP_SIGNALS:
         signal.signal(signum, stop)
     try:
-        least = seconds(os.environ.get("MUTATE_CHECK_MIN_TIMEOUT"), MIN_TIMEOUT)
+        try:
+            least = seconds(os.environ.get("MUTATE_CHECK_MIN_TIMEOUT"), MIN_TIMEOUT)
+        except ValueError:
+            message = (
+                "mutate-check: $MUTATE_CHECK_MIN_TIMEOUT takes a number of seconds"
+            )
+            raise UsageError(message) from None
         diff = read_diff(options.base)
         if not diff.mutants and diff.not_mutated:
             print("mutate-check: nothing to mutate in the changed code it could read")

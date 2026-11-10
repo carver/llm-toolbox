@@ -31,6 +31,7 @@ bin/skills-news, which emails what changed upstream, so you know when an
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -141,13 +142,40 @@ THIRD_PARTY_SKILLS = {
     "vercel-labs/skills": ["find-skills"],
 }
 CRON_MARKER = "# llm-toolbox"
-CRON_LINES = [
-    (
-        "17 8 * * 1 bash -lc 'mkdir -p ~/.cache/skills-news && skills-news"
-        " --email ADDRESS-REMOVED >> ~/.cache/skills-news/cron.log 2>&1'"
-        f" {CRON_MARKER} weekly skills-news"
-    ),
-]
+# The global git config key holding the address the weekly skills-news email goes
+# to; this repo names no one's address (sandbox-setup sets the owner's).
+NEWS_EMAIL_KEY = "llm-toolbox.newsEmail"
+
+
+def cron_lines(address: str | None) -> list[str]:
+    """This repo's cron lines: the weekly skills-news job, when there's an address
+    to mail it to."""
+    if not address:
+        return []
+    return [
+        (
+            "17 8 * * 1 bash -lc 'mkdir -p ~/.cache/skills-news && skills-news"
+            f" --email {address} >> ~/.cache/skills-news/cron.log 2>&1'"
+            f" {CRON_MARKER} weekly skills-news"
+        )
+    ]
+
+
+def news_email() -> str | None:
+    """The skills-news address from the global git config, or None. One with
+    anything but an address's plain characters is refused, since the cron line puts
+    it inside a quoted shell command."""
+    found = subprocess.run(
+        ["git", "config", "--global", "--get", NEWS_EMAIL_KEY],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    address = found.stdout.strip()
+    if address and not re.fullmatch(r"[\w.+][\w.+-]*@[\w.-]+", address):
+        say(f"ignoring {NEWS_EMAIL_KEY} {address!r}: not a plain email address")
+        return None
+    return address or None
 
 
 def say(msg):
@@ -377,10 +405,11 @@ def update_third_party_skills() -> int:
         return conflicts
 
 
-def merged_crontab(current: str) -> str:
-    """`current` with this repo's lines replaced by CRON_LINES, others kept."""
-    kept = [line for line in current.splitlines() if CRON_MARKER not in line]
-    return "\n".join([*kept, *CRON_LINES]) + "\n"
+def merged_crontab(current: str, ours: list[str]) -> str:
+    """`current` with this repo's lines replaced by `ours`, others kept."""
+    lines = [line for line in current.splitlines() if CRON_MARKER not in line]
+    lines += ours
+    return "\n".join(lines) + "\n" if lines else ""
 
 
 def install_cron() -> int:
@@ -393,7 +422,13 @@ def install_cron() -> int:
         say("FAILED cron: no crontab command")
         return 1
     current = listed.stdout if listed.returncode == 0 else ""
-    wanted = merged_crontab(current)
+    address = news_email()
+    if address is None:
+        say(
+            "no weekly skills-news cron job: give it an address with"
+            f" `git config --global {NEWS_EMAIL_KEY} ADDRESS`"
+        )
+    wanted = merged_crontab(current, cron_lines(address))
     if wanted == current:
         return 0
     written = subprocess.run(
@@ -402,7 +437,11 @@ def install_cron() -> int:
     if written.returncode:
         say(f"FAILED cron: {written.stderr.strip()}")
         return 1
-    say("installed the weekly skills-news cron job")
+    say(
+        "installed the weekly skills-news cron job"
+        if address
+        else "removed the weekly skills-news cron job"
+    )
     return 0
 
 

@@ -419,16 +419,43 @@ def test_crontab_keeps_other_jobs_and_replaces_ours():
         "7 * * * * other-job # rental-finder scan\n"
         "1 1 * * 1 old skills-news # llm-toolbox weekly skills-news\n"
     )
-    merged = install.merged_crontab(current)
-    assert merged.splitlines() == [
-        "7 * * * * other-job # rental-finder scan",
-        *install.CRON_LINES,
-    ]
-    assert install.merged_crontab(merged) == merged
+    ours = install.cron_lines("me@example.org")
+    merged = install.merged_crontab(current, ours)
+    assert merged.splitlines() == ["7 * * * * other-job # rental-finder scan", *ours]
+    assert install.merged_crontab(merged, ours) == merged
 
 
 def test_crontab_from_empty():
-    assert install.merged_crontab("") == "\n".join(install.CRON_LINES) + "\n"
+    ours = install.cron_lines("me@example.org")
+    assert install.merged_crontab("", ours) == "\n".join(ours) + "\n"
+
+
+def test_the_skills_news_job_mails_the_configured_address():
+    (line,) = install.cron_lines("me@example.org")
+    assert "skills-news --email me@example.org " in line
+    assert line.endswith(f"{install.CRON_MARKER} weekly skills-news")
+
+
+def test_with_no_address_there_is_no_job_and_ours_go():
+    current = "1 1 * * 1 old skills-news # llm-toolbox weekly skills-news\n"
+    assert install.cron_lines(None) == []
+    assert install.merged_crontab(current, []) == ""
+
+
+def test_with_no_address_and_no_job_the_crontab_stays_empty():
+    assert install.merged_crontab("", []) == ""
+
+
+def test_the_address_comes_from_the_global_git_config(tmp_path, monkeypatch):
+    config = tmp_path / "gitconfig"
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    assert install.news_email() is None
+    config.write_text("[llm-toolbox]\n\tnewsEmail = me@example.org\n")
+    assert install.news_email() == "me@example.org"
+    config.write_text('[llm-toolbox]\n\tnewsEmail = "me\'; rm -rf ~ #@x.org"\n')
+    assert install.news_email() is None
+    config.write_text("[llm-toolbox]\n\tnewsEmail = --help@x.org\n")
+    assert install.news_email() is None
 
 
 def test_update_passes_every_listed_skill(third_party, monkeypatch):

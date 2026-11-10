@@ -48,7 +48,8 @@ skill, it reports the conflict and leaves it alone.
 It also installs other authors' skills, listed in `THIRD_PARTY_SKILLS` in
 `install.py`, with `npx skills add -g`. It installs only the missing ones, and
 updates them only with `--update`. It also installs a weekly cron job (Mondays
-08:17) that runs `skills-news`, which emails what changed upstream; read that,
+08:17) that runs `skills-news`, which emails what changed upstream to the address
+in `git config --global llm-toolbox.newsEmail` (without one, there's no job); read that,
 then run `python3 install.py --update`. An update replaces a skill whose
 upstream changed, along with any hand edits to it, so keep those edits as
 patches in `skill-patches/` (see `skill-patch`): `install.py` puts each one

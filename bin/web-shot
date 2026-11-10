@@ -80,15 +80,26 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# The docstring up to the end of its Actions list, which -h prints before the options,
+# and the rest, which it prints after them.
+HELP_HEAD, HELP_TAIL = re.match(
+    r"(.*?\nActions.*?)\n\n(.*)", __doc__, re.DOTALL
+).groups()
+# Each action's form, such as "shot NAME [SELECTOR]", from the Actions list.
+FORMS = {
+    m.group(1).split()[0]: m.group(1)
+    for m in re.finditer(
+        r"^  (\S.*?)\s{2,}", HELP_HEAD.split("\nActions")[1], re.MULTILINE
+    )
+}
+# Each action's (min, max) arguments, from its form: a word in brackets is optional.
 ARITY = {
-    "click": (1, 1),
-    "wait": (1, 1),
-    "eval": (1, 1),
-    "shot": (1, 2),
-    "text": (0, 1),
-    "links": (0, 1),
-    "scroll-all": (0, 0),
-}  # (min, max) arguments
+    verb: (
+        sum(not w.startswith("[") for w in form.split()[1:]),
+        len(form.split()) - 1,
+    )
+    for verb, form in FORMS.items()
+}
 INSTALL = "uv run --with playwright==1.64.1 playwright install chromium"
 # After a scroll, no request in flight this long means the page has loaded what it asked for; a page
 # that never stops polling is measured after the cap anyway.
@@ -212,7 +223,9 @@ def parse_action(text):
     verb, _, rest = text.strip().partition(" ")
     rest = rest.strip()
     if verb not in ARITY:
-        raise UsageError(f"unknown action {verb!r}; one of {', '.join(ARITY)}")
+        raise UsageError(
+            f"unknown action {verb!r}; the actions: {' | '.join(FORMS.values())}"
+        )
     args = (
         tuple(rest.split(" ", 1))
         if verb == "shot" and rest
@@ -223,7 +236,8 @@ def parse_action(text):
     low, high = ARITY[verb]
     if not low <= len(args) <= high:
         raise UsageError(
-            f"{verb!r} takes {low}{'' if low == high else f' to {high}'} argument(s): {text!r}"
+            f"{verb!r} takes {low}{'' if low == high else f' to {high}'} argument(s): {text!r}; "
+            f"its form: {FORMS[verb]}"
         )
     if verb == "wait" and not args[0].isdigit():
         raise UsageError(f"wait takes milliseconds: {text!r}")
@@ -590,8 +604,10 @@ def context_options(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description=__doc__.split("\n\n")[0],
-        epilog=__doc__.split("\n\n", 1)[1],
+        # The usage, PAGE and the actions come before the options, so the help's first
+        # screen shows how to write an action.
+        description=HELP_HEAD,
+        epilog=HELP_TAIL,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("page", help="a URL or a local file")
@@ -600,7 +616,7 @@ def main(argv=None):
         action="append",
         default=[],
         metavar="ACTION",
-        help="an action; see below",
+        help="an action, as the list above gives",
     )
     parser.add_argument(
         "--out", type=Path, help="output directory (default: a new temp dir)"

@@ -123,6 +123,25 @@ def test_rejects_bad_actions(bad):
         web_shot.parse_action(bad)
 
 
+def test_a_wrong_count_of_arguments_shows_the_actions_form():
+    with pytest.raises(web_shot.UsageError, match=re.escape("shot NAME [SELECTOR]")):
+        web_shot.parse_action("shot")
+
+
+def test_an_unknown_action_shows_every_actions_form():
+    with pytest.raises(web_shot.UsageError) as raised:
+        web_shot.parse_action("shot:full")
+    for form in ("click SELECTOR", "wait MS", "shot NAME [SELECTOR]", "scroll-all"):
+        assert form in str(raised.value)
+
+
+def test_the_first_lines_of_help_list_the_actions(capsys):
+    with pytest.raises(SystemExit):
+        web_shot.main(["-h"])
+    head = "\n".join(capsys.readouterr().out.splitlines()[:25])
+    assert "shot NAME [SELECTOR]" in head and "scroll-all" in head
+
+
 def test_a_local_path_becomes_a_file_url(tmp_path):
     page = tmp_path / "p.html"
     page.write_text("<p>")

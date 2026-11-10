@@ -37,7 +37,12 @@ In order, it:
    It lists each such commit with the IDs it names, newest first, and the fix for
    each, `build-state reword SHA`, to name the commit by its subject instead, run in
    the order listed. This runs after every rebase, so before any check, and with
-   --local before the wait;
+   --local before the wait. After the first rebase only, it then warns of each
+   commit that only refines an earlier commit of the landing (lib/foldable.py: 75%
+   or more of the lines it changes came from one), a full check that folding would
+   save, and names `build-state fold --upstream UPSTREAM`, which folds them, and the
+   trailer `Fold-check: keep`, which keeps a commit out; then it lands them as they
+   are. A judgement that fails says so in a line and the landing goes on;
 4. checks every commit it would push with the repo's agent-pre-commit hook, else none,
    and says so: each commit whose tree has no pass of the check, as its bytes are now,
    on agent-commit-gate's record, HEAD included, oldest first, each checked out in
@@ -143,6 +148,7 @@ from typing import NamedTuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import commitcheck
 import fifo
+import foldable
 from commitcheck import git, named, out
 from fifo import Holder
 
@@ -548,6 +554,40 @@ def rebase_onto(upstream, mode):
     refuse_stale_citations(upstream, mode)
 
 
+def warn_of_folds(upstream):
+    """Warn of the commits that only refine an earlier commit of this landing, each a
+    full check that folding would save; land them as they are."""
+    try:
+        folds = foldable.foldable(upstream)
+    except (commitcheck.GitError, ValueError) as error:
+        # Only a warning: a judgement that fails, git's or a parse of its output,
+        # never stops a landing.
+        print(
+            f"Couldn't judge which commits could fold, so not saying: {error}",
+            flush=True,
+        )
+        return
+    trailer = f"`{foldable.KEEP_TRAILER}: {foldable.KEEP_VALUE}`"
+    if movable := [f for f in folds if not f.relies_on]:
+        print(
+            "These commits only refine an earlier commit of this landing, so each"
+            " costs a full check. Landing them as they are; next time fold them first"
+            f" with `build-state fold --upstream {upstream}`, or give one that stands"
+            f" on its own the trailer {trailer} (`build-state reword SHA`):",
+            *foldable.describe(movable),
+            sep="\n",
+            flush=True,
+        )
+    if left := [f for f in folds if f.relies_on]:
+        print(
+            "These refine an earlier commit too, but folding would leave it using a"
+            f" name defined after it, so fold them by hand or give them {trailer}:",
+            *foldable.describe(left),
+            sep="\n",
+            flush=True,
+        )
+
+
 def rebase_and_check(remote, branch):
     """Fetch, rebase onto the remote branch, refuse markers, check."""
     git("fetch", "-q", remote, branch)
@@ -587,7 +627,11 @@ def ship(args):
     if is_ancestor("HEAD", upstream):
         print(f"HEAD is already in {upstream}: nothing to push.")
         return 0
-    rebase_and_check(remote, branch)
+    rebase_onto(upstream, PUSH)
+    # Once, before any check: a verdict that changed after a retry's rebase would come
+    # too late to act on.
+    warn_of_folds(upstream)
+    run_checks(upstream, PUSH)
     for attempt in range(1, TRIES + 1):
         old = out("rev-parse", upstream)
         pushed = git("push", "-q", remote, f"HEAD:{branch}", check=False)
@@ -962,6 +1006,7 @@ def land(args):
     # Before the wait, so a conflict shows without holding the main tree; no check
     # yet, since another landing may move the branch meanwhile.
     rebase_onto(ref, LAND)
+    warn_of_folds(ref)
     with claim(main_path, wait=not args.no_wait):
         rebase_onto(ref, LAND)
         # Before the checks, which everyone waiting for the claim waits through.

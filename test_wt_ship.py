@@ -2348,3 +2348,92 @@ def test_a_push_lists_unticked_items_too(setup, tmp_path):
 
     assert done.returncode == 0, done.stderr
     assert "#5, which" in done.stdout and "  [ ] Left\n" in done.stdout
+
+
+FEATURE = "".join(f"feature line {n}\n" for n in range(1, 5))
+
+
+def refined_feature(wt, message="Refine the feature"):
+    """A commit that adds a feature, one that changes only its lines, and the latter."""
+    commit(wt, "feature.py", FEATURE, "Add the feature")
+    path = wt / "feature.py"
+    path.write_text(path.read_text().replace("feature line 2\n", "feature line two\n"))
+    git(wt, "commit", "-qam", message)
+    return git(wt, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("local", [True, False])
+def test_a_commit_that_only_refines_an_earlier_one_is_warned_of_and_lands(setup, local):
+    origin, main, wt, _ = setup
+    refined_feature(wt)
+
+    done = ship(wt, *(["--local"] if local else []))
+
+    assert done.returncode == 0, done.stderr
+    warning = done.stdout.index("only refine an earlier commit")
+    assert warning < done.stdout.index("Notice for other sessions:")
+    assert "Refine the feature" in done.stdout[warning:].splitlines()[1]
+    upstream = "refs/heads/main" if local else "origin/main"
+    assert f"build-state fold --upstream {upstream}" in done.stdout
+    landed = main if local else origin
+    assert git(landed, "log", "--format=%s", "-2", "main").splitlines() == [
+        "Refine the feature",
+        "Add the feature",
+    ]
+
+
+def test_the_keep_trailer_silences_the_warning(setup):
+    _, _, wt, _ = setup
+    refined_feature(wt, "A change of its own\n\nFold-check: keep")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert "only refine an earlier commit" not in done.stdout
+
+
+def test_the_warning_comes_once_though_a_lost_race_rebases_again(setup):
+    _, main, wt, other = setup
+    refined_feature(wt)
+    racing_pre_push(main, other, 1)
+
+    done = ship(wt)
+
+    assert done.returncode == 0, done.stderr
+    assert "Another push won the race" in done.stdout
+    assert done.stdout.count("only refine an earlier commit") == 1
+
+
+@pytest.mark.parametrize("local", [True, False])
+def test_the_warning_comes_before_any_check(setup, local):
+    _, main, wt, _ = setup
+    hooks = Path(git(main, "rev-parse", "--absolute-git-dir")) / "hooks"
+    # A check that fails stops the landing, so a warning after it would never show.
+    (hooks / "agent-pre-commit").write_text("#!/bin/sh\nexit 1\n")
+    (hooks / "agent-pre-commit").chmod(0o755)
+    refined_feature(wt)
+
+    done = ship(wt, *(["--local"] if local else []))
+
+    assert done.returncode == 1
+    assert "only refine an earlier commit" in done.stdout
+
+
+def test_the_warning_comes_before_the_wait_for_the_main_tree(setup, holder):
+    _, main, wt, _ = setup
+    flag(main).write_text(holder_flag(holder()))
+    refined_feature(wt)
+
+    done = ship(wt, "--local", "--no-wait")
+
+    assert done.returncode == 3, done.stderr
+    assert "only refine an earlier commit" in done.stdout
+
+
+def test_the_warning_says_how_to_give_a_commit_the_trailer(setup):
+    _, _, wt, _ = setup
+    refined_feature(wt)
+
+    done = ship(wt, "--local")
+
+    assert "`build-state reword SHA`" in done.stdout

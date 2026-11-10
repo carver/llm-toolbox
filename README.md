@@ -222,8 +222,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   but not on the line `git cherry-pick -x` adds when a branch no linked
   worktree has out, a tag or a remote-tracking ref holds the source),
   since a rebase changes an unlanded commit's ID (`build-state reword SHA`
-  rewords it), and checks every commit it would push with the repo's
-  `agent-pre-commit`, through `agent-commit-gate --run`, which hands each the
+  rewords it), warns once, before any check, of each commit that only refines
+  an earlier one of the landing (`build-state fold` folds them; a
+  `Fold-check: keep` trailer silences it), and checks every commit it would
+  push with the repo's `agent-pre-commit`, through `agent-commit-gate --run`,
+  which hands each the
   `CHECK_BASE` of the commit before or the main branch's tip: each commit with
   no pass on record, oldest first, checked out in turn in the worktree, first
   outside `heavy`'s queue (`--no-queue`), so a docs-only commit never waits,

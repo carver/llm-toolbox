@@ -6,7 +6,8 @@
 
 A session log and each of its subagents' logs run to a megabyte of JSONL, mostly
 tool output. This prints a summary of what each agent and each tool cost, then
-every agent's timeline: user turns, the assistant's text, one line per tool call
+every agent's timeline: user turns (a forwarded side agent's note marked
+`USER (side-agent note)`), the assistant's text, one line per tool call
 with the size of its output, and the text of every error. A hook that failed
 or was cancelled (by a timeout, say) gets a line with its error's last line,
 under the tool call it ran for (or where it ran, if it ran for none), and the
@@ -121,6 +122,8 @@ LONG = 40 * 60
 BACKGROUND_STARTS = ("Command running in background", "Async agent launched")
 # These last as long as the user takes to answer: their time is tagged user, never LONG.
 USER_WAITS = ("AskUserQuestion", "ExitPlanMode")
+# How Claude Code starts a user turn that forwards a side agent's note.
+SIDE_NOTE = "Here is a note offered by a side agent:"
 # A request that wrote this many tokens or more to the prompt cache, and read fewer from
 # it, rebuilt the cache: it had expired, or been lost some other way.
 REBUILD_TOKENS = 100_000
@@ -464,7 +467,12 @@ def digest(
     def user_turn(text: str) -> None:
         nonlocal user_since_reply
         user_since_reply = True
-        line = f"USER {view.user(text)}"
+        # A side agent's note the user forwards often names something the agent
+        # missed: labelled, so /upskill's readers take it for the correction it is.
+        label, text = "USER", text.lstrip()
+        if text.startswith(SIDE_NOTE):
+            label, text = "USER (side-agent note)", text.removeprefix(SIDE_NOTE)
+        line = f"{label} {view.user(text)}"
         agent.lines.append(line)
         if agent.name == "main":
             agent.short_form.append([line])

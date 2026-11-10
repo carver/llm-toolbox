@@ -1348,3 +1348,33 @@ def test_whole_text_and_tails_do_not_go_with_errors(config: Path, flag: str) -> 
         env={**os.environ, "CLAUDE_CONFIG_DIR": str(config)},
     )
     assert proc.returncode == 2
+
+
+SIDE_NOTE_TURN = (
+    "Here is a note offered by a side agent:\n\n> Heads up · A force-push keeps the"
+    " old commits on GitHub.\n\nOk, what now?"
+)
+
+
+@pytest.fixture
+def side_note_config(tmp_path: Path) -> Path:
+    project = tmp_path / "claude" / "projects" / "-work-repo"
+    write_jsonl(
+        project / "sess1.jsonl",
+        [
+            user("Fix the flaky test"),
+            assistant("r1"),
+            user(SIDE_NOTE_TURN),
+            assistant("r2"),
+        ],
+    )
+    return tmp_path / "claude"
+
+
+@pytest.mark.parametrize("args", [(), ("--errors",)])
+def test_a_side_agents_note_is_labelled_as_one(side_note_config: Path, args) -> None:
+    out = digest(side_note_config, *args)
+    assert "USER (side-agent note) > Heads up · A force-push keeps" in out
+    assert "USER Fix the flaky test" in out
+    assert "USER (side-agent note) Fix" not in out
+    assert "Here is a note offered" not in out

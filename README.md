@@ -647,7 +647,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   subagents' and workflow agents' logs, for a retrospective. Prints what each
   agent and tool cost (calls, errors, estimated tokens of tool output, API
   tokens in and out), its five biggest tool outputs and its longest calls,
-  then each subagent's timeline: user turns, the assistant's text, one line per
+  then each subagent's timeline: user turns (a forwarded side agent's note
+  marked `USER (side-agent note)`), the assistant's text, one line per
   tool call with its output's size and, for a call of a minute or more, how
   long it took (`LONG` from 40 minutes, when the prompt cache may expire),
   a line where a request rebuilt the expired prompt cache, with the idle

@@ -198,7 +198,8 @@ How the log reads:
 - `== NAME (TYPE: DESCRIPTION)` starts an agent's section; `main` is the session \
 the user talked to. `(continued)` means the section began in an earlier part.
 - `USER ...` is a turn from the user or, in a subagent, the brief its parent \
-wrote. `USER (injected, N chars)` is text a skill or hook added.
+wrote. `USER (injected, N chars)` is text a skill or hook added. \
+`USER (side-agent note)` is a side agent's note the user forwarded.
 - An indented line of plain text is the agent's own words, whole.
 - `> Tool: input` is a tool call; `-> agent-...` names the subagent it started. \
 A long input is cut, ending `…[+N chars]`.
@@ -225,8 +226,9 @@ context: cite the numbered lines, not them.
 The categories, by these exact names:
 - Mistakes: wrong assumptions, retracted answers, reverted edits, user \
 corrections, a fix that had to be redone. Corrections also arrive indirectly: a \
-side agent's note the user forwards ("Here is a note offered by a side agent") \
-that names something the agent missed; a question the user sends back to \
+side agent's note the user forwards (a `USER (side-agent note)` line) that \
+names something the agent missed: take each such line as a candidate unless the \
+agent had already raised what it says; a question the user sends back to \
 clarify, which means it was unclear; the agent correcting itself ("correcting \
 what I told you", "my reasoning didn't hold"); the user renaming or redefining \
 what the agent built. A design built on a premise nobody \

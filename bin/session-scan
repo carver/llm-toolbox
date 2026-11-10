@@ -14,8 +14,8 @@ over-reports, so a second stage checks them, and the retrospective's agent, whos
 context may already be long, reads a short report rather than checking each
 candidate itself.
 
-It runs `session-digest --timelines --whole-text --tails` for the session, which
-defaults to the newest one for --cwd: workflow agents' full timelines, the
+It runs `session-digest --timelines --whole-text --tails` for the session (default:
+the one it runs in, else the newest for --cwd): workflow agents' full timelines, the
 assistant's text whole, and each successful output's last three lines, where a
 misread test summary or exit line would show (--no-tails leaves them out). It
 writes into DIR:
@@ -860,7 +860,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "session",
         nargs="?",
-        help="session id or path to its .jsonl (default: newest for --cwd)",
+        help="session id or path to its .jsonl (default: this session's, else the newest for --cwd)",
     )
     parser.add_argument(
         "--cwd",

@@ -610,8 +610,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `--whole-text` prints the assistant's text whole (user turns up to 10000
   characters) and `--tails` each successful output's last three lines.
   Images count about width × height / 750 tokens, from their header. Defaults to the
-  newest session for the current directory (or its nearest parent with sessions),
-  under `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
+  session it runs in (`$CLAUDE_CODE_SESSION_ID`), else the newest session for the
+  current directory (or its nearest parent with sessions), under
+  `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
 
 - **session-scan**: has a cheaper model read a whole session's digest, every
   agent, for /upskill. Writes `session-digest --timelines --whole-text --tails`

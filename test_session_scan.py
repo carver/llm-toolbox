@@ -153,6 +153,13 @@ class Env(dict):
         return f"Env({sorted(self)})"
 
 
+@pytest.fixture(autouse=True)
+def outside_a_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """session-digest, which session-scan runs, reads $CLAUDE_CODE_SESSION_ID's log when
+    given no session, so no test inherits the id of the session that runs the suite."""
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+
+
 @pytest.fixture
 def env(tmp_path: Path) -> dict[str, str]:
     fake_bin = tmp_path / "fake-bin"

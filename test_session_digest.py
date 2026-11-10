@@ -97,6 +97,13 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
 
 
+@pytest.fixture(autouse=True)
+def outside_a_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no session argument, session-digest reads $CLAUDE_CODE_SESSION_ID's log, so
+    no test inherits the id of the session that runs the suite."""
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+
+
 @pytest.fixture
 def config(tmp_path: Path) -> Path:
     project = tmp_path / "claude" / "projects" / "-work-repo"
@@ -115,8 +122,12 @@ def config(tmp_path: Path) -> Path:
     return tmp_path / "claude"
 
 
-def digest(config: Path, *args: str, cwd: str = "/work/repo") -> str:
+def digest(
+    config: Path, *args: str, cwd: str = "/work/repo", session_env: str | None = None
+) -> str:
     env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config)}
+    if session_env is not None:
+        env["CLAUDE_CODE_SESSION_ID"] = session_env
     proc = subprocess.run(
         [str(SCRIPT), "--cwd", cwd, *args],
         text=True,
@@ -198,6 +209,37 @@ def test_session_by_id(config: Path) -> None:
 
 def test_newest_session_found_from_a_subdirectory(config: Path) -> None:
     assert "USER Fix the flaky test" in digest(config, cwd="/work/repo/research/notes")
+
+
+def other_session_written_last(config: Path) -> None:
+    """A second session in the project, its log the newest, as one still running."""
+    path = config / "projects" / "-work-repo" / "sess2.jsonl"
+    write_jsonl(path, [user("Another session's turn")])
+    later = (config / "projects" / "-work-repo" / "sess1.jsonl").stat().st_mtime + 60
+    os.utime(path, (later, later))
+
+
+def test_no_argument_reads_the_session_it_runs_in(config: Path) -> None:
+    other_session_written_last(config)
+    out = digest(config, session_env="sess1")
+    assert "USER Fix the flaky test" in out
+    assert "Another session's turn" not in out
+
+
+def test_no_argument_reads_the_newest_session_outside_one(config: Path) -> None:
+    other_session_written_last(config)
+    assert "Another session's turn" in digest(config)
+
+
+def test_no_argument_reads_the_newest_when_its_own_session_is_another_projects(
+    config: Path,
+) -> None:
+    other_session_written_last(config)
+    write_jsonl(
+        config / "projects" / "-work-other" / "elsewhere.jsonl",
+        [user("A session of another project")],
+    )
+    assert "Another session's turn" in digest(config, session_env="elsewhere")
 
 
 def test_unknown_session_fails(config: Path) -> None:

@@ -45,7 +45,7 @@ To start a new Rust desktop app, run `new-egui-app DIR` (`-h` for options) rathe
 
 To read what a YouTube video says, around a timestamp or in full, use `yt-transcript`.
 
-A new user-level skill or tool goes in llm-toolbox (`skills/` or `bin/`), then run its `install.py` to link it. Anything written straight into `~/.claude` or `~/.agents` is lost when the sandbox is recreated. To change another author's skill, edit it in `~/.agents/skills`, then run `skill-patch save NAME --why "..."`; an edit without a patch is lost at the next update.
+A new user-level skill or tool goes in llm-toolbox (`skills/` or `bin/`), then run its `install.py` to link it. Anything written straight into `~/.claude` or `~/.agents` is lost when the sandbox is recreated. To change another author's skill, edit it in `~/.agents/skills`, then run `skill-patch save NAME --why "..."`; an edit without a patch is lost at the next update. When an llm-toolbox commit renames or removes a tool, skill or option, or changes behaviour another repo relies on, give its message a `Breaks:` trailer saying what changed and how to adapt: a repo brought back after a freeze finds it there (sandbox-setup's `CHANGES.md`).
 
 Before scraping a site, look for its data source: an official API or MCP endpoint (often linked as "use with your AI assistant"), an applicant-tracking-system API such as Greenhouse's `boards-api`, or JSON embedded in the page. These return complete, structured data and usually skip the bot checks that block scripted page fetches.
 

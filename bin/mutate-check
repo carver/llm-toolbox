@@ -207,11 +207,19 @@ def restore(originals: dict[Path, Original]) -> list[str]:
         try:
             mutated = target.stat().st_mtime_ns if target.exists() else 0
             put(target, original)
-            later = max(time.time_ns(), mutated + 1_000_000_000)
-            os.utime(target, ns=(later, later))
+            stamp_past(target, mutated)
         except OSError as e:
             failed.append(f"mutate-check: couldn't put back {target}: {e}")
     return failed
+
+
+def stamp_past(target: Path, earlier: int) -> int:
+    """Give the file an mtime a whole second past `earlier` (in ns), or now if that's
+    later, so a .pyc that Python wrote for its text at `earlier` doesn't match it.
+    Returns the mtime."""
+    stamp = max(time.time_ns(), earlier + 1_000_000_000)
+    os.utime(target, ns=(stamp, stamp))
+    return stamp
 
 
 class TimedOut(Exception):
@@ -438,6 +446,7 @@ class Options:
 
 DEFAULT_MAX = 40
 EARLY_STOP = 3
+SHOWN_NAMES = 5
 TIMEOUT_FACTOR = 10
 MIN_TIMEOUT = 30.0
 SHOWN_SOURCE = 72
@@ -522,6 +531,9 @@ HEX_DIGEST = re.compile(r"[0-9a-fA-F]{32}")
 
 class PythonFile:
     """A Python file's text and syntax tree, and the mutants of its changed lines."""
+
+    # Python caches the file's bytecode, by mtime in whole seconds and size.
+    has_bytecode = True
 
     def __init__(self, path: Path, text: bytes, changed: set[int]) -> None:
         try:
@@ -867,6 +879,8 @@ CONTINUED = ("\\", "|", "&&")
 class ShellFile:
     """A shell script's lines, and the mutants of its changed ones."""
 
+    has_bytecode = False
+
     def __init__(self, path: Path, text: bytes, changed: set[int]) -> None:
         if BASH is None:
             raise NotMutated("no bash to check shell mutants")
@@ -1130,7 +1144,7 @@ def added_lines(patch: str) -> set[int]:
 
 
 @dataclass(frozen=True)
-class Snapshot:
+class Target:
     """A code file with mutants: its kind, and what to put back after each."""
 
     path: Path
@@ -1143,16 +1157,13 @@ class Diff:
     """The code a diff changed: each file and its mutants, the commit the diff starts
     from, and how many code files it changed but has no mutants for."""
 
-    files: dict[Path, Snapshot]
+    files: dict[Path, Target]
     mutants: list[Mutant]
     base_commit: str
     not_mutated: int
 
 
-SHOWN_NAMES = 5
-
-
-def named(names: list[str]) -> str:
+def first_names(names: list[str]) -> str:
     """The names, cut to SHOWN_NAMES and how many more."""
     shown = ", ".join(names[:SHOWN_NAMES])
     more = len(names) - SHOWN_NAMES
@@ -1165,7 +1176,7 @@ def read_diff(base: str) -> Diff:
     UsageError when git can't make the diff."""
     top = Path(git("rev-parse", "--show-toplevel").strip())
     base_commit = merge_base(base)
-    files: dict[Path, Snapshot] = {}
+    files: dict[Path, Target] = {}
     mutants: list[Mutant] = []
     reasons: dict[str, list[str]] = {}
     for path, kind, changed in changed_code(top, base_commit):
@@ -1175,14 +1186,14 @@ def read_diff(base: str) -> Diff:
         except NotMutated as e:
             reasons.setdefault(str(e), []).append(os.path.relpath(path))
             continue
-        files[path] = Snapshot(path, kind, Original(text, path.stat().st_mode))
+        files[path] = Target(path, kind, Original(text, path.stat().st_mode))
         mutants += found
     untracked = untracked_code(top)
     if untracked:
         hint = "untracked, so not mutated (git add -N brings one in)"
-        print(f"mutate-check: {hint}: {named(untracked)}")
+        print(f"mutate-check: {hint}: {first_names(untracked)}")
     for reason, names in reasons.items():
-        print(f"mutate-check: {reason}, so not mutated: {named(names)}")
+        print(f"mutate-check: {reason}, so not mutated: {first_names(names)}")
     not_mutated = sum(map(len, reasons.values()))
     return Diff(files, mutants, base_commit, not_mutated)
 
@@ -1314,7 +1325,7 @@ def baseline(
     return timeout or max(least, TIMEOUT_FACTOR * took)
 
 
-def holds_original(file: Snapshot) -> bool:
+def holds_original(file: Target) -> bool:
     try:
         return file.path.read_bytes() == file.original.content
     except OSError:
@@ -1322,7 +1333,7 @@ def holds_original(file: Snapshot) -> bool:
 
 
 def mutant_run(
-    file: Snapshot,
+    file: Target,
     text: bytes,
     command: list[str],
     timeout: float,
@@ -1337,10 +1348,8 @@ def mutant_run(
     try:
         try:
             put(file.path, Original(text, file.original.mode))
-            if file.kind is PythonFile:
-                stamp = max(time.time_ns(), stamps.get(file.path, 0) + 1_000_000_000)
-                os.utime(file.path, ns=(stamp, stamp))
-                stamps[file.path] = stamp
+            if file.kind.has_bytecode:
+                stamps[file.path] = stamp_past(file.path, stamps.get(file.path, 0))
         except OSError as e:
             raise UsageError(
                 f"mutate-check: couldn't write a mutant to {file.path}: {e}"

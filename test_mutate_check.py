@@ -298,6 +298,30 @@ def test_pytest_that_collects_nothing_is_inconclusive(repo: Path) -> None:
     assert (repo / "calc.py").read_text() == CODE
 
 
+# pytest 9.1.1 with pytest-xdist 3.8.0 and -x, when a test fails: it exits 2, the
+# status of an interrupted run, though a test ran and failed.
+XDIST_STOPPED_AFTER_A_FAILURE = (
+    "FAILED test_calc.py::test_double - assert 5 == 4\n"
+    "!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+    "!!!!!!!!!!!! xdist.dsession.Interrupted: stopping after 1 failures !!!!!!!!!!!!!\n"
+    "1 failed, 1 passed in 0.91s\n"
+)
+
+
+def test_pytest_stopped_by_x_after_a_failure_is_caught(repo: Path) -> None:
+    fake = repo / "fakebin"
+    fake.mkdir()
+    (fake / "pytest").write_text("#!/bin/sh\ncat pytest.out\nexit 2\n")
+    (fake / "pytest").chmod(0o755)
+    (repo / "pytest.out").write_text(XDIST_STOPPED_AFTER_A_FAILURE)
+    env = os.environ | {"PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
+
+    result = check(repo, BREAK, "pytest", "-x", "-n", "2", env=env)
+
+    assert result.returncode == 0, result.stdout
+    assert "caught: the command exited 2" in result.stdout
+
+
 def test_a_command_that_runs_past_the_timeout_is_inconclusive(repo: Path) -> None:
     started = time.monotonic()
     result = check(

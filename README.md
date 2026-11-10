@@ -169,7 +169,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   when stopped. It exits 0 when CMD failed (the tests catch the break) and 1 when it
   passed, printing one line and at most 3 of pytest's `E ` lines. It exits 3,
   inconclusive, when no test judged the break: the build failed (a Rust compile
-  error, such as unused code under `-D warnings`), pytest collected nothing, a
+  error, such as unused code under `-D warnings`), pytest collected nothing (not
+  pytest-xdist's exit 2 for `-x` after a failure, which is a catch), a
   `cargo test` or `cargo nextest` run failed without running a test (a filter
   nextest refused or that matched nothing), or CMD ran past `--timeout` (600
   seconds by default). Stopping CMD stops its process group: SIGTERM, then

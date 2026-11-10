@@ -26,7 +26,8 @@ stopped by Ctrl-C, SIGTERM or SIGHUP.
 
 A failure counts as a catch only when tests ran. A mutation that stops the build (a Rust
 `error: could not compile` or `error[E...]`, as unused code under `-D warnings` does),
-pytest exiting 2, 4 or 5 (collection errors, usage, no tests), or a `cargo test` or
+pytest exiting 2, 4 or 5 (collection errors, usage, no tests) with no `N failed` in
+its summary (under pytest-xdist, -x exits 2 after a failure), or a `cargo test` or
 `cargo nextest` run that fails with no line saying a test ran, is inconclusive: no test
 judged it. So is a command that runs past --timeout (default 600 seconds), which is
 stopped: a hang isn't a catch.
@@ -129,6 +130,8 @@ DEFAULT_TIMEOUT = 600.0
 # pytest's statuses when no test judged anything: interrupted or collection errors,
 # a usage error, no tests collected.
 PYTEST_NOTHING_RAN = {2, 4, 5}
+# pytest's summary line when a test failed: under pytest-xdist, -x then exits 2.
+PYTEST_FAILED = re.compile(r"\b[1-9]\d* failed\b.* in \d+(\.\d+)?s\b")
 BIN = Path(__file__).resolve().parent
 SHOWN_ERRORS = 3
 STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
@@ -343,7 +346,12 @@ def judge(code: int, output: str, command: list[str]) -> Verdict:
         runs_cargo_tests(command) or rust_build_failed(lines)
     )
     errors = rust_errors(lines) if no_rust_test else []
-    if no_rust_test or (runs_pytest(command) and code in PYTEST_NOTHING_RAN):
+    pytest_ran_none = (
+        runs_pytest(command)
+        and code in PYTEST_NOTHING_RAN
+        and not any(map(PYTEST_FAILED.search, lines))
+    )
+    if no_rust_test or pytest_ran_none:
         report = [
             (
                 f"mutate-check: inconclusive: the command exited {code} before any"

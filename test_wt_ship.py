@@ -2205,3 +2205,146 @@ def test_a_cited_id_counts_only_from_7_digits_and_standing_alone(setup, words):
     done = ship(wt, "--local")
 
     assert done.returncode == 0, done.stderr
+
+
+def fake_issue_todo(folder, unticked):
+    """A folder holding an `issue-todo` whose `unticked N...` prints `unticked[N]`, each
+    item as `#N TEXT`, and fails for a number it lacks; it logs each call to calls.log."""
+    folder.mkdir(exist_ok=True)
+    script = folder / "issue-todo"
+    items = {
+        n: "".join(f"#{n} {text}\n" for text in texts) for n, texts in unticked.items()
+    }
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"open({str(folder / 'calls.log')!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        f"items = {items!r}\n"
+        "args = sys.argv[2:]\n"
+        "if args[0] == '--repo':\n"
+        "    args = args[2:]\n"
+        "for n in args:\n"
+        "    if int(n) not in items:\n"
+        "        sys.exit('gh: Could not resolve to an issue')\n"
+        "    sys.stdout.write(items[int(n)])\n"
+    )
+    script.chmod(0o755)
+    return {"PATH": f"{folder}:{os.environ['PATH']}"}
+
+
+def test_a_landing_that_closes_an_issue_lists_its_unticked_items(setup, tmp_path):
+    _, main, wt, _ = setup
+    env = fake_issue_todo(tmp_path / "fakes", {46: ["The stamp", "The page"], 43: []})
+    commit(wt, "a.py", "x = 1\n", "Add a\n\nCloses #46")
+    commit(wt, "b.py", "y = 2\n", "Add b\n\nfixes: #43, and owner/other#9")
+
+    done = ship(wt, "--local", env=env)
+
+    assert done.returncode == 0, done.stderr
+    closer = git(main, "log", "--format=%h", "-1", "--grep=Closes #46")
+    assert (
+        f"#46, which {closer} closes, has 2 unticked items:\n"
+        "  [ ] The stamp\n"
+        "  [ ] The page\n"
+        f"Tick each that this landing did, with `issue-todo tick 46 MATCH --note {closer}`,"
+        " and leave the rest.\n"
+    ) in done.stdout
+    assert "#43" not in done.stdout.split("Notice for other sessions:")[0]
+    assert (tmp_path / "fakes/calls.log").read_text() == "unticked 46\nunticked 43\n"
+
+
+def test_a_landing_that_closes_nothing_asks_nothing(setup, tmp_path):
+    _, _, wt, _ = setup
+    env = fake_issue_todo(tmp_path / "fakes", {})
+    commit(wt, "a.py", "x = 1\n", "Add a, as in #46")
+
+    done = ship(wt, "--local", env=env)
+
+    assert done.returncode == 0, done.stderr
+    assert not (tmp_path / "fakes/calls.log").exists()
+
+
+def test_a_failed_lookup_says_so_and_still_lands(setup, tmp_path):
+    _, main, wt, _ = setup
+    env = fake_issue_todo(tmp_path / "fakes", {})
+    commit(wt, "a.py", "x = 1\n", "Add a\n\nResolves #99")
+
+    done = ship(wt, "--local", env=env)
+
+    assert done.returncode == 0, done.stderr
+    assert git(main, "rev-parse", "HEAD") == git(wt, "rev-parse", "HEAD")
+    assert (
+        "Couldn't check #99's task-list items: gh: Could not resolve to an issue"
+        in done.stdout
+    )
+
+
+def test_the_lookup_names_the_github_repo_of_the_remote(setup, tmp_path):
+    _, main, wt, _ = setup
+    env = fake_issue_todo(tmp_path / "fakes", {46: []})
+    git(main, "remote", "set-url", "origin", "git@github.com:acme/widgets.git")
+    commit(wt, "a.py", "x = 1\n", "Add a\n\nCloses #46")
+
+    done = ship(wt, "--local", env=env)
+
+    assert done.returncode == 0, done.stderr
+    assert (tmp_path / "fakes/calls.log").read_text() == (
+        "unticked --repo acme/widgets 46\n"
+    )
+
+
+def test_no_issue_todo_on_path_says_so_and_still_lands(setup):
+    _, main, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a\n\nCloses #5")
+
+    done = ship(wt, "--local", env={"PATH": path_without("issue-todo")})
+
+    assert done.returncode == 0, done.stderr
+    assert git(main, "rev-parse", "HEAD") == git(wt, "rev-parse", "HEAD")
+    assert "Couldn't check #5's task-list items: no issue-todo on PATH" in done.stdout
+
+
+def test_a_slow_lookup_is_stopped_with_its_children_within_one_deadline(
+    setup, tmp_path
+):
+    _, _, wt, _ = setup
+    fakes = tmp_path / "fakes"
+    fakes.mkdir()
+    pid_file = fakes / "child.pid"
+    script = fakes / "issue-todo"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess, sys, time\n"
+        f"open({str(fakes / 'calls.log')!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "child = subprocess.Popen(['sleep', '60'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(60)\n"
+    )
+    script.chmod(0o755)
+    commit(wt, "a.py", "x = 1\n", "Add a\n\nCloses #1, closes #2")
+    env = {
+        "PATH": f"{fakes}:{os.environ['PATH']}",
+        "WT_SHIP_UNTICKED_TIMEOUT": "1",
+    }
+
+    done = ship(wt, "--local", env=env)
+
+    assert done.returncode == 0, done.stderr
+    assert "Couldn't check #1's task-list items: no answer within 1 s" in done.stdout
+    assert "Couldn't check #2's task-list items: no answer within 1 s" in done.stdout
+    assert (fakes / "calls.log").read_text() == "unticked 1\n"  # #2 had no time left
+    child = int(pid_file.read_text())
+    wait_until(
+        lambda: not Path(f"/proc/{child}").exists(), "the lookup's child to end", 5
+    )
+
+
+def test_a_push_lists_unticked_items_too(setup, tmp_path):
+    _, _, wt, _ = setup
+    env = fake_issue_todo(tmp_path / "fakes", {5: ["Left"]})
+    commit(wt, "a.py", "x = 1\n", "Add a\n\nCloses #5")
+
+    done = ship(wt, env=env)
+
+    assert done.returncode == 0, done.stderr
+    assert "#5, which" in done.stdout and "  [ ] Left\n" in done.stdout

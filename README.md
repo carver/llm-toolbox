@@ -217,10 +217,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   repo that keeps the check in its tree fails a commit that drops it, or keeps a
   link to it that leads to no executable file in that commit. Then it
   pushes with one retry when another push wins the race, and confirms the
-  remote holds HEAD. Then it prints the range, a notice for other sessions and
-  whether the main tree is behind; `--remove` removes the worktree, and `-C DIR`
-  runs it on the worktree DIR from outside, so the call's shell isn't left in
-  the folder it removed. In a repo
+  remote holds HEAD. Then it prints the range, a notice for other sessions,
+  whether the main tree is behind, and the unticked task-list items of each
+  issue a commit closes ("Closes #46"), to tick before the issue closes, all
+  looked up within `$WT_SHIP_UNTICKED_TIMEOUT` seconds (default 30);
+  `--remove` removes the worktree, and `-C DIR` runs it on the worktree DIR from
+  outside, so the call's shell isn't left in the folder it removed. In a repo
   that doesn't push, `--local` lands the commits on the main tree's branch
   instead: it rebases before it waits, checking nothing, then claims the main
   tree with the `CLAUDE_WORKING` flag, recording `CLAUDE_CODE_SESSION_ID`, the

@@ -62,7 +62,15 @@ In order, it:
    10 tries in all, then stops saying to run it again;
 6. fetches again and confirms the remote branch holds HEAD;
 7. prints the range it pushed, a notice for other sessions (which it doesn't send),
-   and whether the main tree's branch is now behind the remote.
+   and whether the main tree's branch is now behind the remote. For each issue a
+   commit's message closes with one of GitHub's keywords ("Closes #46", "fixes:
+   #43"), it lists the issue's task-list items still unticked, from `issue-todo
+   unticked`, with the `issue-todo tick` command and the landed commit's ID to note,
+   so the session ticks what it did before the issue closes. It asks about the
+   GitHub repo of the remote it pushed to (origin for --local), else the one gh
+   picks. It only warns: a lookup that fails says so in a line, all of them share
+   one deadline (WT_SHIP_UNTICKED_TIMEOUT), and no closing keyword means no lookup.
+   --local's landing prints the same.
 
 BRANCH defaults to the branch the main worktree has checked out. Nothing to push is a
 clean exit. --remove runs `git worktree remove` from the main tree once the push is
@@ -108,6 +116,9 @@ Environment:
                      the tests shorten both)
   FIFO_LOCK_SECONDS  seconds of waiting for the queue folder's lock before naming its
                      holder (default 5; the tests shorten it)
+  WT_SHIP_UNTICKED_TIMEOUT
+                     seconds all the unticked-item lookups of one report may take
+                     together (default 30; the tests shorten it)
 
 Exit status: 0 shipped, landed or nothing to do; 1 a step failed (the message says
 what to do); 2 a usage error; with --local, 3 another session held the main tree's
@@ -125,7 +136,7 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import NamedTuple
 
@@ -600,7 +611,7 @@ def ship(args):
     new = out("rev-parse", "HEAD")
     if not is_ancestor(new, upstream):
         raise Stop(f"{upstream} doesn't hold {new[:12]} after the push.")
-    report(old, new, PUSH.done, branch, f"to {upstream}")
+    report(old, new, PUSH.done, branch, f"to {upstream}", remote)
     if main_branch == branch:
         local = out("rev-parse", f"refs/heads/{branch}")
         if local != new and is_ancestor(local, upstream):
@@ -638,10 +649,113 @@ def changed_places(files):
     )
 
 
-def report(old, new, verb, branch, where):
+# GitHub's closing keywords before an issue of this repo: "Closes #46", "fixes: #43".
+CLOSES = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+#(\d+)\b", re.IGNORECASE
+)
+# A GitHub remote's URL, by HTTPS or SSH, and the OWNER/REPO in it.
+GITHUB_URL = re.compile(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$")
+
+
+def unticked_timeout():
+    """Seconds the whole unticked lookup may take, so a slow GitHub can't hold up the
+    report: WT_SHIP_UNTICKED_TIMEOUT, else 30."""
+    return float(os.environ.get("WT_SHIP_UNTICKED_TIMEOUT", "30"))
+
+
+def github_repo(remote):
+    """OWNER/REPO of `remote` when its URL is on GitHub, else None."""
+    url = git("remote", "get-url", remote, check=False).stdout.strip()
+    match = GITHUB_URL.search(url)
+    return match.group(1) if match else None
+
+
+def run_within(argv, seconds):
+    """argv's (exit status, stdout, stderr), in a process group of its own, which is
+    stopped whole once `seconds` pass, so nothing it started outlives it; None then."""
+    process = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        return None
+    return process.returncode, stdout, stderr
+
+
+def closed_issues(old, new):
+    """Each issue a commit in old..new closes, as (number, the commit's short ID), in
+    the order the commits landed, each issue once."""
+    found = {}
+    log = out("log", "--reverse", "--format=%h%x00%B%x01", f"{old}..{new}")
+    for entry in log.split("\x01"):
+        sha, _, message = entry.strip().partition("\x00")
+        for number in CLOSES.findall(message):
+            found.setdefault(int(number), sha)
+    return list(found.items())
+
+
+def warn_unticked(old, new, remote):
+    """For each issue the landing closes, its task-list items still unticked, through
+    `issue-todo unticked` on `remote`'s GitHub repo, so the session ticks what it did
+    before the issue closes with boxes open. A failed lookup says so; nothing here
+    stops the run, and all of it shares one deadline."""
+    closed = closed_issues(old, new)
+    if not closed:
+        return
+    repo = github_repo(remote)
+    where = ["--repo", repo] if repo else []
+    timeout = unticked_timeout()
+    deadline = time.monotonic() + timeout
+    for number, sha in closed:
+        couldnt = f"Couldn't check #{number}'s task-list items:"
+        left = deadline - time.monotonic()
+        if left <= 0:
+            print(f"{couldnt} no answer within {timeout:g} s")
+            continue
+        try:
+            got = run_within(["issue-todo", "unticked", *where, str(number)], left)
+        except FileNotFoundError:
+            print(f"{couldnt} no issue-todo on PATH")
+            continue
+        if got is None:
+            print(f"{couldnt} no answer within {timeout:g} s")
+            continue
+        status, stdout, stderr = got
+        if status != 0:
+            print(
+                f"{couldnt} {(stderr.strip().splitlines() or ['issue-todo failed'])[-1]}"
+            )
+            continue
+        items = [
+            line.removeprefix(f"#{number} ") for line in stdout.splitlines() if line
+        ]
+        if not items:
+            continue
+        plural = "s" if len(items) > 1 else ""
+        print(
+            f"\n#{number}, which {sha} closes, has {len(items)} unticked item{plural}:"
+        )
+        for item in items:
+            print(f"  [ ] {item}")
+        print(
+            f"Tick each that this landing did, with `issue-todo tick {number} MATCH"
+            f" --note {sha}`, and leave the rest."
+        )
+
+
+def report(old, new, verb, branch, where, remote="origin"):
     subjects = out("log", "--format=%s", "--reverse", f"{old}..{new}").splitlines()
     files = out("diff", "--name-only", old, new).splitlines()
     print(f"{verb.capitalize()} {old[:7]}..{new[:7]} {where}.")
+    warn_unticked(old, new, remote)
     print("\nNotice for other sessions:")
     print(
         f"FYI: {verb} {old[:7]}..{new[:7]} to {branch}: {'; '.join(subjects)}. Files: {changed_places(files)}."

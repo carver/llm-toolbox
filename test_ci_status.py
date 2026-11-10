@@ -228,6 +228,50 @@ def test_a_scheduled_run_says_so_beside_its_jobs(gh):
     assert "nightly.yml (crawl; scheduled) at" in gh.ci_status().stdout
 
 
+def test_a_workflow_the_repo_ignores_is_left_out_and_v_names_it(gh):
+    for name in ("mutants.yml", "nightly.yml"):
+        subprocess.run(
+            ["git", "-C", str(gh.repo), "config", "--add", "ci-status.ignore", name],
+            check=True,
+        )
+    gh.runs(
+        run(9, "mutants.yml", "failure", event="schedule"),
+        run(8, "nightly.yml", "failure"),
+        run(7, "ci.yml", "failure"),
+    )
+    done = gh.ci_status("-v")
+    assert done.stdout.startswith("CI is failing on main: ci.yml at")
+    assert done.stdout.count("\n") == 1
+    assert done.stderr == (
+        "ci-status: ignored by ci-status.ignore: mutants.yml, nightly.yml\n"
+    )
+    assert gh.ci_status().stderr == ""
+
+
+def test_when_every_failing_workflow_is_ignored_it_says_nothing(gh):
+    subprocess.run(
+        ["git", "-C", str(gh.repo), "config", "ci-status.ignore", "mutants.yml"],
+        check=True,
+    )
+    gh.runs(run(9, "mutants.yml", "failure", event="schedule"))
+    done = gh.ci_status("-v")
+    assert done.stdout == ""
+    assert done.stderr.splitlines() == [
+        "ci-status: ignored by ci-status.ignore: mutants.yml",
+        "ci-status: nothing to say: every workflow on main is passing or ignored",
+    ]
+
+
+def test_the_ignore_list_applies_to_a_cached_answer_at_once(gh):
+    gh.runs(run(9, "mutants.yml", "failure"))
+    assert "mutants.yml" in gh.ci_status().stdout
+    subprocess.run(
+        ["git", "-C", str(gh.repo), "config", "ci-status.ignore", "mutants.yml"],
+        check=True,
+    )
+    assert gh.ci_status().stdout == ""
+
+
 def test_a_workflow_no_longer_active_is_left_out(gh):
     gh.workflows("ci.yml", disabled=["nightly.yml"])  # old.yml was deleted
     gh.runs(run(9, "nightly.yml", "failure"), run(8, "old.yml", "failure"))
@@ -337,7 +381,9 @@ def test_bad_json_says_nothing(gh):
 
 def test_verbose_says_why_it_said_nothing(gh):
     gh.runs(run(9, "ci.yml", "success"))
-    assert "passing" in gh.ci_status("-v").stderr
+    assert gh.ci_status("-v").stderr == (
+        "ci-status: nothing to say: every workflow on main is passing\n"
+    )
     gh.origin("/srv/git/widgets.git")
     assert "GitHub" in gh.ci_status("-v").stderr
 

@@ -21,6 +21,10 @@ workflow whose latest verdict failed:
 - A run of the same workflow still going, newer than the failure, is noted at the
   end of the line: `(a run for d00d1e5 is in progress)`.
 - The age is when the failing run finished.
+- A workflow the repo names in `git config ci-status.ignore` is left out, matched by
+  its file name, one value each, for one whose failures say nothing about the code
+  (a nightly link check, a long mutation run):
+      git config --add ci-status.ignore mutants.yml
 
 It says nothing when every workflow passes, the remote isn't on GitHub, there's no
 gh, gh can't reach GitHub or isn't logged in, or anything else goes wrong, and it
@@ -39,7 +43,8 @@ Options:
   -C DIR           look at the repo in DIR (default: the current folder)
   --remote NAME    the remote whose GitHub repo to ask about (default: origin)
   --branch BRANCH  the branch (default: the repo's default branch on GitHub)
-  -v               say on stderr why nothing was printed
+  -v               say on stderr why nothing was printed, and which failing
+                   workflows ci-status.ignore left out
   --session-start  run as Claude Code's SessionStart hook, which install.py
                    registers: read the event on stdin, look in its cwd, and print
                    the lines as the session's added context, as hook JSON
@@ -78,10 +83,16 @@ RUNS = 50
 FAILED_LOOKUP_SECONDS = 60
 UNSAFE = re.compile(r"[^\w .:/-]")
 NAME_LENGTH = 40
+IGNORE_KEY = "ci-status.ignore"
 
 
 class Quiet(Exception):
-    """Nothing to say, with the reason -v gives."""
+    """Nothing to say, with the reason -v gives, and the failing workflows the
+    repo's ci-status.ignore left out."""
+
+    def __init__(self, reason: str, left_out: list[str] | None = None):
+        super().__init__(reason)
+        self.left_out = left_out or []
 
 
 class Gh:
@@ -338,14 +349,43 @@ def status(repo: str, branch: str | None, gh: Gh) -> dict:
     return cached["answer"]
 
 
-def lines(folder: str, remote: str, branch: str | None, seconds: float) -> list[str]:
+def ignored(folder: str) -> set[str]:
+    """The workflow file names `git config ci-status.ignore` lists, one per value."""
+    got = subprocess.run(
+        ["git", "-C", folder, "config", "--get-all", IGNORE_KEY],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return set(got.stdout.splitlines()) if got.returncode == 0 else set()
+
+
+def lines(
+    folder: str, remote: str, branch: str | None, seconds: float
+) -> tuple[list[str], list[str]]:
+    """The lines to print, and the failing workflows ci-status.ignore left out."""
     repo = github_repo(folder, remote)
     gh = Gh(seconds)
     signal.signal(signal.SIGTERM, lambda *_: (gh.stop(), sys.exit(0)))
     answer = status(repo, branch, gh)
-    if not answer["failing"]:
-        raise Quiet(f"every workflow on {answer['branch']} is passing")
-    return [line(answer["branch"], run) for run in answer["failing"]]
+    # After the cache, so a change to the setting counts at once.
+    skip = ignored(folder)
+    left_out = [run["file"] for run in answer["failing"] if run["file"] in skip]
+    failing = [run for run in answer["failing"] if run["file"] not in skip]
+    if not failing:
+        either = " or ignored" if left_out else ""
+        raise Quiet(
+            f"every workflow on {answer['branch']} is passing{either}", left_out
+        )
+    return [line(answer["branch"], run) for run in failing], left_out
+
+
+def say_ignored(left_out: list[str]) -> None:
+    if left_out:
+        print(
+            f"ci-status: ignored by {IGNORE_KEY}: {', '.join(left_out)}",
+            file=sys.stderr,
+        )
 
 
 def parse(argv):
@@ -369,15 +409,18 @@ def main(argv=None) -> int:
         if args.session_start:
             folder = json.loads(sys.stdin.read())["cwd"]
         seconds = float(os.environ.get("CI_STATUS_TIMEOUT", "5"))
-        found = lines(folder, args.remote, args.branch, seconds)
+        found, left_out = lines(folder, args.remote, args.branch, seconds)
     except Quiet as quiet:
         if args.verbose:
+            say_ignored(quiet.left_out)
             print(f"ci-status: nothing to say: {quiet}", file=sys.stderr)
         return 0
     except Exception as error:  # noqa: BLE001 - a session's start must never fail on it
         if args.verbose:
             print(f"ci-status: nothing to say: {error!r}", file=sys.stderr)
         return 0
+    if args.verbose:
+        say_ignored(left_out)
     if args.session_start:
         context = {
             "hookEventName": "SessionStart",

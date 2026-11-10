@@ -600,7 +600,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   failing on main: ci.yml (check) at b227171, 2 h ago: URL``. Only push and
   schedule runs count (a scheduled one says so), a cancelled or skipped run is
   no verdict, only active workflows count, and the failed jobs are named, their
-  names cut to plain characters. A newer run still going is noted. It asks
+  names cut to plain characters. A newer run still going is noted. A workflow a
+  repo names in `git config ci-status.ignore` (one `--add` per file name, as
+  `mutants.yml`) is left out, and `-v` names the failing ones it left out. It asks
   through `gh api`, within `CI_STATUS_TIMEOUT` seconds (5) for all its calls,
   and says nothing, exit 0, when all pass, the remote (origin, or `--remote`)
   isn't on GitHub, or anything fails; `-v` says why. Answers are cached per repo

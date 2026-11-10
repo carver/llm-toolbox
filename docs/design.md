@@ -752,6 +752,14 @@ filedrawer-dev/filedrawer from the sandbox: the runs call takes about 1.8 s, a j
 call 0.4 s; `gh auth status` says not logged in there, yet the calls work through
 the proxy, so the tool tries the call rather than checking auth.
 
+### A repo may ignore workflows by file name (2026-11-10)
+
+Scheduled runs count, so a scheduled job that fails for reasons outside the code (a
+nightly link check, a long mutation run) would read as "CI is failing on main". The
+owner chose a per-repo opt-out, `git config --add ci-status.ignore FILE.yml`, matched
+against the workflow's file name. It applies after the cache, so a change counts at
+once, and `-v` names the failing workflows it left out.
+
 ## path-refs
 
 ### rg runs in the workspace root (2026-11-09)

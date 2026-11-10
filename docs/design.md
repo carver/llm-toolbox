@@ -56,7 +56,7 @@ half busy may be using most of what the host gives this VM. The levers for faste
 landings are fewer full checks per landing and cheaper ones, not more at once.
 
 The script and its raw results (hyperfine JSON, vmstat logs) are in
-`/home/carver/code/claudedev/cache/heavy-lane-exp/` on the host disk, outside git.
+`/home/carver/code/claudedev/keep/heavy-lane-exp/` on the host disk, outside git.
 
 ### `heavy --quick`: seconds of work runs at once on quiet cores, else next (2026-11-09)
 

@@ -1738,3 +1738,217 @@ def test_a_push_u_over_a_remote_branch_there_at_start_still_stops_finish(repo, o
     assert_the_upstream_keys_stop(
         done, "its upstream, refs/remotes/origin/work, was there at start"
     )
+
+
+def write_commit(repo, message, files):
+    for path, text in files.items():
+        (repo / path).write_text(text)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", message)
+    return git(repo, "rev-parse", "HEAD").strip()
+
+
+def test_fold_folds_a_refinement_into_its_target_and_keeps_the_rest(worktree):
+    commit(worktree, "a.py", "Add a")
+    commit(worktree, "b.py", "Add b")
+    tree = git(worktree, "rev-parse", "HEAD^{tree}")
+    commit(worktree, "a.py", "Refine a\n\nThe second line of a was wrong.")
+
+    done = build_state(worktree, "fold")
+
+    assert done.returncode == 0, done.stderr
+    assert subjects(worktree, "main") == ["Add a", "Add b"]
+    assert git(worktree, "rev-parse", "HEAD^{tree}") != tree
+    assert git(worktree, "show", "HEAD~1:a.py").startswith("Add a\nRefine a\n")
+    assert "The second line of a was wrong." in done.stdout
+    assert "build-state reword" in done.stdout
+
+
+def test_fold_with_nothing_to_fold_says_so(worktree):
+    commit(worktree, "a.py", "Add a")
+    commit(worktree, "b.py", "Add b")
+
+    done = build_state(worktree, "fold")
+
+    assert done.returncode == 0, done.stderr
+    assert "Nothing to fold" in done.stdout and "Folded" not in done.stdout
+    assert subjects(worktree, "main") == ["Add a", "Add b"]
+
+
+def test_fold_takes_the_upstream_it_is_given(repo, worktree):
+    commit(worktree, "a.py", "Add a")
+    other = git(worktree, "rev-parse", "HEAD").strip()
+    commit(worktree, "a.py", "Refine a")
+
+    done = build_state(worktree, "fold", "--upstream", other)
+
+    assert done.returncode == 0, done.stderr
+    assert "Nothing to fold" in done.stdout
+
+
+def test_fold_refuses_uncommitted_changes(worktree):
+    commit(worktree, "a.py", "Add a")
+    commit(worktree, "a.py", "Refine a")
+    (worktree / "a.py").write_text("half done\n")
+
+    done = build_state(worktree, "fold")
+
+    assert done.returncode == 1 and "uncommitted" in done.stderr
+    assert (worktree / "a.py").read_text() == "half done\n"
+
+
+def test_fold_leaves_a_commit_that_uses_a_name_defined_since_its_target(worktree):
+    commit(worktree, "a.py", "Add a")
+    write_commit(worktree, "Add a helper", {"helper.py": "def shiny_helper():\n"})
+    commit(worktree, "a.py", "shiny_helper()")
+
+    done = build_state(worktree, "fold")
+
+    assert done.returncode == 0, done.stderr
+    assert subjects(worktree, "main") == ["Add a", "Add a helper", "shiny_helper()"]
+    assert "shiny_helper" in done.stdout and "Left in place" in done.stdout
+
+
+def test_a_fold_that_conflicts_changes_nothing_and_names_the_commits(worktree):
+    main_lines = "".join(f"main {n}\n" for n in range(8))
+    upstream = write_commit(worktree, "On main", {"a.py": main_lines})
+    write_commit(worktree, "Add a", {"a.py": main_lines + "a1\na2\na3\na4\n"})
+    # Mostly main's lines, so it stays, and it changes a3, next to a2.
+    text = (worktree / "a.py").read_text()
+    for n in range(8):
+        text = text.replace(f"main {n}\n", f"main {n}!\n")
+    write_commit(worktree, "Rework main", {"a.py": text.replace("a3\n", "a3!\n")})
+    write_commit(
+        worktree,
+        "Fix a2",
+        {"a.py": (worktree / "a.py").read_text().replace("a2\n", "a2!\n")},
+    )
+    before = git(worktree, "rev-parse", "HEAD")
+
+    done = build_state(worktree, "fold", "--upstream", upstream)
+
+    assert done.returncode == 1
+    assert "Fix a2" in done.stderr and "Rework main" in done.stderr
+    assert git(worktree, "rev-parse", "HEAD") == before
+    assert git(worktree, "status", "--porcelain") == ""
+    git_dir = Path(git(worktree, "rev-parse", "--absolute-git-dir").strip())
+    assert not (git_dir / "rebase-merge").exists()
+
+
+def test_finish_warns_of_commits_that_only_refine_and_keeps_them(worktree):
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Add a")
+    commit(worktree, "b.py", "Add b")
+    commit(worktree, "a.py", "Refine a")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "Refine a" in done.stdout and "build-state fold" in done.stdout
+    assert "wt-ship" in done.stdout
+    assert subjects(worktree, "main") == ["Add a", "Add b", "Refine a"]
+
+
+def test_finish_says_nothing_of_folds_when_none_are_due(worktree):
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Add a")
+    commit(worktree, "b.py", "Add b")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "build-state fold" not in done.stdout
+
+
+def test_fold_refuses_while_a_rebase_is_in_progress(worktree):
+    commit(worktree, "a.py", "Add a")
+    commit(worktree, "a.py", "Refine a")
+    git_dir = Path(git(worktree, "rev-parse", "--absolute-git-dir").strip())
+    (git_dir / "rebase-merge").mkdir()
+
+    done = build_state(worktree, "fold")
+
+    assert done.returncode == 1 and "rebase is in progress" in done.stderr
+
+
+def test_fold_refuses_a_merge_among_the_commits(worktree):
+    commit(worktree, "a.py", "Add a")
+    side = git(worktree, "rev-parse", "HEAD").strip()
+    commit(worktree, "a.py", "Refine a")
+    git(worktree, "checkout", "-q", "--detach", side)
+    commit(worktree, "b.py", "Add b")
+    git(worktree, "merge", "-q", "--no-ff", "-m", "Merge", "HEAD@{2}")
+    before = git(worktree, "rev-parse", "HEAD")
+
+    done = build_state(worktree, "fold")
+
+    assert done.returncode == 1 and "merge" in done.stderr
+    assert git(worktree, "rev-parse", "HEAD") == before
+
+
+def test_fold_with_the_main_tree_detached_asks_for_the_upstream(repo, worktree):
+    git(repo, "checkout", "-q", "--detach")
+    commit(worktree, "a.py", "Add a")
+    commit(worktree, "a.py", "Refine a")
+
+    done = build_state(worktree, "fold")
+
+    assert done.returncode == 1 and "--upstream" in done.stderr
+
+
+@pytest.mark.parametrize("origin_ahead", [True, False])
+def test_fold_lands_on_origins_copy_of_the_branch_only_when_it_is_ahead(
+    repo, worktree, origin_ahead
+):
+    added = commit(worktree, "a.py", "Add a")
+    commit(worktree, "a.py", "Refine a")
+    if origin_ahead:
+        # origin's main already holds "Add a", so "Refine a" is all that lands.
+        git(repo, "update-ref", "refs/remotes/origin/main", added)
+    else:
+        side = git(repo, "commit-tree", "-m", "elsewhere", "HEAD^{tree}").strip()
+        git(repo, "update-ref", "refs/remotes/origin/main", side)
+
+    done = build_state(worktree, "fold")
+
+    assert done.returncode == 0, done.stderr
+    assert ("Nothing to fold" in done.stdout) is origin_ahead
+
+
+def test_finish_warns_that_wt_ship_lands_a_commit_using_a_name_defined_since(
+    worktree,
+):
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Add a")
+    write_commit(worktree, "Add a helper", {"helper.py": "def shiny_helper():\n"})
+    commit(worktree, "a.py", "shiny_helper()")
+
+    done = build_state(worktree, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "`build-state fold` leaves them" in done.stdout
+    assert "shiny_helper" in done.stdout
+    assert "full check on each" not in done.stdout
+
+
+def test_finish_with_the_main_tree_detached_judges_no_folds(repo, worktree):
+    git(repo, "checkout", "-q", "--detach")
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Add a")
+    commit(worktree, "a.py", "Refine a")
+
+    done = build_state(worktree, "finish")
+
+    assert "build-state fold" not in done.stdout
+    assert "Traceback" not in done.stderr
+
+
+def test_fold_refuses_fixups_it_would_need_folded_first(worktree):
+    added = commit(worktree, "a.py", "Add a")
+    commit(worktree, "a.py", "fix a", f"--fixup={added}")
+    commit(worktree, "a.py", "Refine a")
+
+    done = build_state(worktree, "fold")
+
+    assert done.returncode == 1 and "fixup!" in done.stderr
+    assert "build-state finish" in done.stderr

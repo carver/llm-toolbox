@@ -183,6 +183,44 @@ the queue does.
 wt-ship checks a fold's new trees when it lands them, so finish's own run of the
 full check on each rewritten commit was a second one.
 
+### Commits that only refine an earlier one of the landing get folded (2026-11-09)
+
+The owner's rule: every commit gets the full suite before it lands, and none after,
+so the give is in commit isolation. The mutate-check landing of 2026-11-09 checked 8
+commits, 96 to 160 seconds each, of which 5 only refined the `--diff` code an earlier
+one added: review fixes, the owner's asks after a first run, two refactors. /build
+now makes its refactor and those asks `fixup!`s, and `lib/foldable.py` finds the rest.
+
+A commit is foldable when 75% or more of the non-blank lines its hunks replace, or,
+for an insertion, sit either side of, were last changed (git blame, from the merge
+base) by an earlier commit of the landing. The owner chose hunk blame, then the
+threshold over "every line" on data: every line flagged 1 of the 5, since refactors
+touch a few of main's lines and new helpers sit beside main's code. The shares were
+0%, 9%, 17% for the three commits that stand alone and 88% to 100% for the five;
+over 50 earlier commits taken as one batch, harsher than any landing, one scored
+over 50%, a session-scan feature built on the commit before it. A refinement that
+also fixes a line of main's folds with it, which the owner accepted: it lands
+checked either way.
+
+A fold moves a commit back past those between it and its target. A conflict there
+shows in the rebase, which `build-state fold` aborts; a use of a name a commit in
+between defines doesn't, and would fail only the folded commit's full check. So a
+commit whose added lines use a name a line added since its target defines (def,
+class, const, `NAME =` and the like), which the target's tree lacks, is left in
+place, and wt-ship lands it with a warning (the owner's call, after a side agent
+raised it). Tried first: any word the parent's tree has and the target's lacks,
+which flagged `Interrupted` in eb8faa1, a word that only prose and a test string
+named.
+
+wt-ship and finish warn; neither refuses. The owner first chose a refusal, then
+weighed it against real landings: of the last 149 landings to llm-toolbox's main, 44
+had several commits, 248 in all, and 18 were foldable; of filedrawer's last 199, 49
+had several, 291 in all, and 16 were foldable, 12 of them /build's "tidy after review"
+refactors, which its fixup rule above already folds. About 6% of commits, a step
+too small for a stop every other session meets. A `Fold-check: keep` trailer on the
+commit silences the warning for it, rather than a flag for the whole landing (the
+owner's choice): it lasts through rebases and says which split is on purpose.
+
 ### A repo may run a lighter check at each commit (2d50a0e, 2026-11-08)
 
 A repo's `agent-commit-check` runs at each commit in the full check's place, with
@@ -314,7 +352,8 @@ refactor base was recorded after it, and when a commit between the two isn't a f
 rewritten since into a new tree, as by a rebase, which takes a new review. A reword
 keeps every tree, so finish finds the reviewed commit and the refactor base by their
 trees after one, as after the reword a conflicting fold's hint gives. Commits after the
-refactor base are the refactor's own, so a new commit made there still finishes
+refactor base are the refactor's own (since 2026-11-09 /build makes them `fixup!`s,
+which fold away), so a new commit made there still finishes
 unreviewed: an accepted gap (the owner's call, 2026-11-09), since a rule on the
 files those commits touch would also refuse honest refactors, such as a helper
 moved to a new file. Rejected: a warning at finish, which comes after the next
@@ -380,7 +419,8 @@ In a /build, `git commit -a --fixup=A` swept in test edits meant for commit B;
 `build-state finish`'s fold then conflicted in the test file, and the agent reset and
 split both fixups again. The owner's rules: warn, never refuse, since a fix may add a
 file its target forgot; find the target as `git rebase --autosquash` does; say nothing
-when there's none.
+when there's none. Since /build's refactor became `fixup!`s (2026-11-09), a refactor
+that moves a helper into a new file warns too: expected, and fine to go on.
 
 - It runs from a post-commit line that `--install` writes. The pre-commit gate already
   reads the running `git commit`'s arguments, so it could have warned with no

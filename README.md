@@ -565,7 +565,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   runs no check: a fold's new tree has no pass on the gate's record, so
   `wt-ship` checks it when it lands, and a fix folded into a commit before the
   code it needs fails there, naming that commit. Then it lists the commits since the
-  base and the test files changed since the refactor base, and fails naming
+  base and the test files changed since the refactor base, warns of the
+  commits that only refine an earlier one of the landing, each a full check
+  for `wt-ship` (`fold` folds them), and fails naming
   any ref or config key that moved (a tag only when it points at a commit the
   fold may rewrite); `core.hooksPath`, another branch's settings, the work
   branch's remote and merge, each when it wasn't set at start and the upstream
@@ -584,6 +586,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   the repo has an `agent-pre-commit`, which `wt-ship` runs on every commit
   when it lands, the prompt tells the reviewer to run only the tests a finding
   needs rather than the whole suite.
+  `fold` folds each commit whose changed lines came mostly (75%) from an
+  earlier commit since the branch it lands on into that commit, in one rebase,
+  leaving a commit that uses a name defined after its target, one with a
+  `Fold-check: keep` trailer, and the tree as they were; on a conflict it
+  aborts and names the commits it would have moved past.
   `reword SHA [FILE]` replaces a commit's message (FILE, or stdin), keeping
   every tree; it refuses during a rebase, with uncommitted changes, with merges
   after the commit, a later `fixup!` naming it, or the commit already pushed.

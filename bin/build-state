@@ -28,6 +28,9 @@
                             on every commit when it lands, the file tells the
                             reviewer to run only the tests a finding needs, not the
                             whole suite
+    build-state fold [--upstream REV]
+                            fold each commit that only refines an earlier commit
+                            of the landing into it, in one rebase (see below)
     build-state reword SHA [FILE]
                             replace commit SHA's message with FILE's text (stdin
                             without FILE), keeping every tree; refuses with
@@ -44,7 +47,7 @@ after it; one that names shared history, or no commit, stops finish and says why
 build on a branch holds its own commits, so there only fixes after the base fold. After
 a wider fold, the commits finish lists from the base include the rewritten earlier
 ones. Every other commit
-stays as it is, in order, so logically separate commits stay separate. It refuses
+stays as it is, in order. It refuses
 uncommitted changes and leftover conflict markers since the base. On a conflict it aborts
 the rebase, and when the folded tree differs from the tree before, it resets to that;
 either way the branch is as it was. A fix conflicts when a commit after the one it
@@ -89,6 +92,24 @@ start or now, or is a symbolic ref repointed; the rest, as a fetch in any worktr
 moves them, are counted. A fix commit left unfolded (its target is older than the
 base) also fails finish. It does not push.
 
+After its fold, finish warns of the commits that only refine an earlier commit of the
+landing (lib/foldable.py: 75% or more of the lines they change came from one), since
+the merge base with the branch it lands on, each a full check wt-ship would run, and
+says which of them fold leaves in place, as each uses a name defined after its target.
+The branch it lands on is the main tree's, or origin's copy when that is ahead.
+
+fold folds those commits, since the merge base with that branch or --upstream REV,
+into their targets in one rebase, leaving the rest in order and the tree as it was,
+then prints the messages the fold dropped, to carry into the commits they went into
+with reword. It leaves each commit that uses a name defined after its target in
+place, and says so. It refuses uncommitted changes, a rebase in progress, merges in
+the commits, and fixup!, squash! or amend! commits, which finish folds first. On a
+conflict it aborts, puts the branch back, and names the commits the folds moved back
+past. A commit that stands on its own keeps out of every fold with the trailer
+`Fold-check: keep` in its message. It exits 0 when it folded or found nothing to
+fold, and 1, having changed nothing, when it refused, its rebase conflicted or
+wouldn't start, or the folded tree differed.
+
 On a detached HEAD, as in a worktree that will land on main, there is no work branch.
 There the build's target is the branch the main worktree has checked out, when HEAD
 shares history with it: it forked from it, as a worktree holding a commit of its own
@@ -113,6 +134,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import commitcheck
+import foldable
 
 # tests/x.py, test/x.py, spec/x.rb, test_x.py, x_test.go, x.test.ts, x.spec.js
 TEST_FILE = re.compile(
@@ -802,6 +824,7 @@ def finish(args: argparse.Namespace) -> int:
         )
     if "refactor_base" in state:
         report_tests(state["refactor_base"])
+    warn_of_folds()
     for branch in sorted(changed.targets):
         rebase = ": rebase onto it" if behind(branch) else ""
         print(f"{branch} moved since start{rebase}")
@@ -972,6 +995,178 @@ todo.write_text("".join(lines))
 """
 
 
+def warn_of_folds() -> None:
+    """Say which commits only refine an earlier commit of the landing, each a full
+    check wt-ship would run for nothing, and which of them fold leaves in place."""
+    if (upstream := landing_upstream()) is None:
+        return
+    try:
+        folds = foldable.foldable(upstream)
+    except commitcheck.GitError as error:
+        print(f"\nCouldn't judge which commits could fold: {error}")
+        return
+    if movable := [f for f in folds if not f.relies_on]:
+        print(
+            "\nThese only refine an earlier commit of the landing, and wt-ship runs the"
+            " full check on each: run `build-state fold`, or give one that stands on"
+            f" its own the trailer `{foldable.KEEP_TRAILER}: {foldable.KEEP_VALUE}`.",
+            *foldable.describe(movable),
+            sep="\n",
+        )
+    if left := [f for f in folds if f.relies_on]:
+        print(
+            "\nThese refine an earlier commit too, but `build-state fold` leaves them,"
+            " since each uses a name defined after its target:",
+            *foldable.describe(left),
+            sep="\n",
+        )
+
+
+def landing_upstream() -> str | None:
+    """The branch the work lands on: the main tree's, or origin's copy of it when that
+    is ahead, as a pushing wt-ship rebases onto; None when the main tree is detached."""
+    branch = main_tree_branch()
+    if branch is None:
+        return None
+    remote = f"refs/remotes/origin/{branch}"
+    held = git("rev-parse", "--verify", "--quiet", remote, check=False).returncode == 0
+    if held and ancestor(f"refs/heads/{branch}", remote):
+        return remote
+    return f"refs/heads/{branch}"
+
+
+def fold(args: argparse.Namespace) -> int:
+    upstream = args.upstream or landing_upstream()
+    if upstream is None:
+        return fail("The main tree is detached: give the branch with --upstream REV.")
+    git_dir = Path(git("rev-parse", "--absolute-git-dir").stdout.strip())
+    base = git("merge-base", upstream, "HEAD").stdout.strip()
+    if refusal := fold_refusal(git_dir, base):
+        return fail(refusal)
+    try:
+        folds = foldable.foldable(upstream)
+    except commitcheck.GitError as error:
+        return fail(f"Couldn't judge which commits fold: {error}")
+    for line in foldable.describe([f for f in folds if f.relies_on]):
+        print(f"Left in place: {line.strip()}")
+    moving = [f for f in folds if not f.relies_on]
+    if not moving:
+        print(f"Nothing to fold since {short_ref(upstream)}.")
+        return 0
+    before = head()
+    rebase = rebase_by_plan(base, fold_plan(base, moving))
+    if rebase.returncode != 0:
+        stopped = stopped_at(git_dir)
+        git("rebase", "--abort", check=False)
+        git("reset", "-q", "--keep", before, check=False)
+        return fail(*conflict_report(base, moving, stopped, rebase.stderr))
+    if (
+        git("rev-parse", "HEAD^{tree}").stdout
+        != git("rev-parse", f"{before}^{{tree}}").stdout
+    ):
+        git("reset", "-q", "--hard", before)
+        return fail(
+            "Folding changed the tree, so the branch is back as it was:",
+            f"  {before}. Fold by hand and compare with `git diff {before[:12]}`.",
+        )
+    report_folded(base, moving)
+    return 0
+
+
+def fold_refusal(git_dir: Path, base: str) -> str | None:
+    """Why fold can't start, or None."""
+    if any((git_dir / name).exists() for name in ("rebase-merge", "rebase-apply")):
+        return "A rebase is in progress: finish or abort it before folding."
+    if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        return "There are uncommitted changes: commit or stash them first."
+    if git("rev-list", "--merges", f"{base}..HEAD").stdout.strip():
+        return "The commits hold a merge, which a rebase would flatten: fold by hand."
+    if any(subject.startswith(FIXES) for _, subject in commits(f"{base}..HEAD")):
+        return (
+            "The commits hold fixup!, squash! or amend! commits: fold those first, with"
+            " `build-state finish` in a build, else"
+            " `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash BASE`."
+        )
+    return None
+
+
+def fold_plan(base: str, moving: list[foldable.Fold]) -> list[str]:
+    """The rebase's todo: every commit in order, each moving one right after its
+    target as a fixup, those for one target in their own order."""
+    into: dict[str, list[str]] = {}
+    for f in moving:
+        into.setdefault(f.target, []).append(f.sha)
+    moved = {f.sha for f in moving}
+    plan = []
+    for sha in git("rev-list", "--reverse", f"{base}..HEAD").stdout.split():
+        if sha not in moved:
+            plan += [f"pick {sha}", *(f"fixup {fix}" for fix in into.get(sha, []))]
+    return plan
+
+
+def rebase_by_plan(base: str, plan: list[str]) -> subprocess.CompletedProcess:
+    with tempfile.TemporaryDirectory() as scratch:
+        todo = Path(scratch, "todo")
+        todo.write_text("\n".join(plan) + "\n")
+        return subprocess.run(
+            [
+                *("git", "-c", "rebase.updateRefs=false"),
+                *("-c", "advice.mergeConflict=false"),
+                *("rebase", "-q", "-i", "--no-autosquash", base),
+            ],
+            env=os.environ | {"GIT_SEQUENCE_EDITOR": f'cp "{todo}"', "GIT_EDITOR": ":"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+def conflict_report(
+    base: str, moving: list[foldable.Fold], stopped: str | None, said: str
+) -> list[str]:
+    """What to say when the fold's rebase failed, the branch now back as it was."""
+    if stopped is None:
+        return ["The fold's rebase didn't start, and nothing changed:", said.strip()]
+    order = git("rev-list", "--reverse", f"{base}..HEAD").stdout.split()
+    moved = {f.sha for f in moving}
+    passed: list[str] = []
+    for f in moving:
+        between = order[order.index(f.target) + 1 : order.index(f.sha)]
+        passed += [sha for sha in between if sha not in moved and sha not in passed]
+    return [
+        f"The fold conflicted at {stopped}, and nothing changed. These folds:",
+        *foldable.describe(moving),
+        "move back past these commits, and one of them changes lines a fold does:",
+        *(f"  {foldable.named(sha)}" for sha in passed),
+        "Fold them by hand, or give one that stands on its own the trailer",
+        f"`{foldable.KEEP_TRAILER}: {foldable.KEEP_VALUE}` (`build-state reword SHA`).",
+    ]
+
+
+def report_folded(base: str, moving: list[foldable.Fold]) -> None:
+    print("Folded:", *foldable.describe(moving), sep="\n")
+    print("\nTheir messages, which the fold dropped:")
+    for f in moving:
+        message = git("log", "-1", "--format=%B", f.sha).stdout.strip()
+        print("\n".join(f"    {line}".rstrip() for line in message.splitlines()), "\n")
+    print(
+        "Carry what matters from them into the commit each went into"
+        " (`build-state reword SHA`). The commits now:"
+    )
+    print(git("log", "--oneline", "--reverse", f"{base}..HEAD").stdout, end="")
+
+
+def stopped_at(git_dir: Path) -> str | None:
+    """The commit a stopped rebase was replaying, with its subject."""
+    done = git_dir / "rebase-merge" / "done"
+    if not done.is_file():
+        return None
+    words = [line.split() for line in done.read_text().splitlines() if line.strip()]
+    if not words or len(words[-1]) < 2:
+        return None
+    return foldable.named(words[-1][1])
+
+
 def reword(args: argparse.Namespace) -> int:
     message = args.file.read_text() if args.file else sys.stdin.read()
     if not message.strip():
@@ -1082,6 +1277,16 @@ def main(argv: list[str] | None = None) -> int:
         help=f"code-review's SKILL.md, for its two briefs (default {CODE_REVIEW})",
     )
     prompt_command.set_defaults(run=review_prompt)
+    fold_command = commands.add_parser(
+        "fold", help="fold each commit that only refines an earlier one into it"
+    )
+    fold_command.add_argument(
+        "--upstream",
+        metavar="REV",
+        help="the branch the commits land on (default: the main tree's branch, or"
+        " origin's copy of it when that is ahead)",
+    )
+    fold_command.set_defaults(run=fold)
     reword_command = commands.add_parser("reword", help="replace a commit's message")
     reword_command.add_argument("sha", metavar="SHA")
     reword_command.add_argument("file", nargs="?", type=Path, metavar="FILE")

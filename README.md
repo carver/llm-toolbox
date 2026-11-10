@@ -420,7 +420,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   by its subject. `issue-todo read N...` prints each issue's body and every
   comment, with author and date. `show` and `read` end with the issues and pull
   requests each issue mentions as `#N`, with their state, open items and title,
-  so a plan issue tells which of its steps are done. `issue-todo claim N` claims
+  so a plan issue tells which of its steps are done. `issue-todo unticked N...`
+  prints each unticked item as `#N TEXT`, one a line, for a script such as
+  wt-ship. `issue-todo claim N` claims
   an issue for this session (`--as NAME`, else `CLAUDE_CODE_SESSION_ID`'s first 8
   characters) in a marked comment, and refuses while another session's claim stands; `release N`
   frees it. It writes through `gh api`.

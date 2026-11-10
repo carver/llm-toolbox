@@ -473,3 +473,24 @@ def test_a_name_with_a_space_is_refused(fake, capsys):
         tool.main(["claim", "7", "--as", "jc laptop"])
 
     assert fake.patched == []
+
+
+def test_unticked_prints_each_open_item_of_the_body_and_comments(fake, capsys):
+    fake.issue["body"] += "\nSee #25."  # a mention, which unticked doesn't look up
+
+    assert tool.main(["unticked", "7"]) == 0
+
+    assert capsys.readouterr().out == (
+        "#7 The forecast question\n"
+        "#7 a nested step\n"
+        "#7 Replace the forecast measure\n"
+        "#7 Add hub\n"
+    )
+    assert not [a for a in fake.calls if a[:2] == ("api", "graphql")]
+
+
+def test_unticked_prints_nothing_for_an_issue_with_every_item_ticked(fake, capsys):
+    fake.issue["body"] = "- [x] done"
+    fake.comments[1]["body"] = "- [x] also done"
+    assert tool.main(["unticked", "7"]) == 0
+    assert capsys.readouterr().out == ""

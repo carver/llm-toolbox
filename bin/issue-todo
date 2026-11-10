@@ -10,11 +10,14 @@ without the body, so a to-do list split between them reads as two partial lists.
 prints every open issue's open items, leaving out pull requests and ticked items.
 `open --titles` prints one line per open issue instead: its number, its title, and how
 many open items it has, if any. That is enough to find an issue by its subject.
+`unticked N...` prints each unticked item as `#N TEXT`, one a line, for a script:
+wt-ship lists them for each issue a landing closes.
 
     issue-todo open
     issue-todo open --titles          # a line like "#16 Site design (3 open items)"
     issue-todo show 42
     issue-todo read 42 43             # body and every comment, which gh splits in two
+    issue-todo unticked 42 43         # each unticked item, as "#42 TEXT", one a line
     issue-todo claim 42               # refuses while another session holds a claim
     issue-todo release 42
     issue-todo tick 42 "forecast measure" --note "built in 8d5068e"
@@ -253,6 +256,16 @@ def read(repo: str, numbers: list[int]) -> int:
     return 0
 
 
+def unticked(repo: str, numbers: list[int]) -> int:
+    """Each unticked item of each issue, as `#N TEXT`."""
+    for number in numbers:
+        for part in parts(repo, number)[1]:
+            for item in items(part.markdown):
+                if not item.done:
+                    print(f"#{number} {item.text}")
+    return 0
+
+
 CLAIM = re.compile(r"<!-- issue-todo (claim|release) (\S+) -->")
 NAME = re.compile(r"\S+")  # what CLAIM reads back
 
@@ -450,6 +463,9 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument(
         "--dry-run", action="store_true", help="print the new line, write nothing"
     )
+    what = "each unticked item of each issue, as `#N TEXT`, one a line"
+    u = sub.add_parser("unticked", parents=[where], help=what, description=what)
+    u.add_argument("numbers", type=int, nargs="+", metavar="number")
     what = "each issue's title, state, body and every comment, with author and date"
     r = sub.add_parser("read", parents=[where], help=what, description=what)
     r.add_argument("numbers", type=int, nargs="+", metavar="number")
@@ -478,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
     commands = {
         "open": lambda: show_titles(repo) if args.titles else show_open(repo),
         "show": lambda: show(repo, args.number),
+        "unticked": lambda: unticked(repo, args.numbers),
         "read": lambda: read(repo, args.numbers),
         "claim": lambda: claim(repo, args.number, session),
         "release": lambda: release(repo, args.number, session),

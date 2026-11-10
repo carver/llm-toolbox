@@ -9,6 +9,10 @@ import pytest
 SCRIPT = Path(__file__).resolve().parent / "bin" / "heavy-gate"
 
 
+# What every gate's refusal ends with: a refused call runs none of its parts.
+NOTHING_RAN = "Nothing in this command ran, the parts before the refused one included."
+
+
 def run_hook(command, background=None, tool="Bash", timeout=None):
     """The hook's exit status and stderr for one call, its input shaped as Claude Code sends it.
     ``timeout`` is the Bash call's own, in ms."""
@@ -87,6 +91,7 @@ def test_a_foreground_call_that_waits_on_heavy_is_refused(command):
     assert "bgrun --wait -o" in err and "run_in_background: true" in err
     assert "heavy --quick -- CMD" in err
     assert len(err.splitlines()) <= 2
+    assert err.rstrip().endswith(NOTHING_RAN)
 
 
 WAITS_ON_QUICK = [

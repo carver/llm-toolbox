@@ -28,7 +28,8 @@ regard to quotes, which errs toward refusing.
 
     heavy-gate < hook-input.json    # as Claude Code calls it
 
-Exit status: 0 allowed, 2 refused (the reason on stderr), 1 input that isn't JSON.
+Exit status: 0 allowed, 2 refused (the reason on stderr, ending with a sentence saying
+nothing in the command ran), 1 input that isn't JSON.
 """
 
 import json
@@ -37,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from shellparse import (
+    NOTHING_RAN,
     SHELLS,
     bgrun_command,
     command_of,
@@ -176,7 +178,7 @@ def main(argv=None) -> int:
         found.discard(QUICK_TIMEOUT)
     for refusal in REFUSALS:
         if refusal in found:
-            print(refusal, file=sys.stderr)
+            print(f"{refusal} {NOTHING_RAN}", file=sys.stderr)
             return 2
     return 0
 

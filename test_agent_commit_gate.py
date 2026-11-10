@@ -51,6 +51,9 @@ def run_hook(monkeypatch, capsys, command, tool="Bash"):
 def test_skipping_the_hook_is_refused(monkeypatch, capsys, command):
     code, err = run_hook(monkeypatch, capsys, command)
     assert code == 2 and "--no-verify" in err
+    assert err.rstrip().endswith(
+        "Nothing in this command ran, the parts before the refused one included."
+    )
 
 
 @pytest.mark.parametrize(

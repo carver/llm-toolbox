@@ -24,6 +24,11 @@ import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# What every gate's refusal ends with. A refused Bash call runs none of its parts, and
+# an agent once took a refusal of an inline edit to cover only that part, so a heredoc
+# before it that wrote a file was never redone.
+NOTHING_RAN = "Nothing in this command ran, the parts before the refused one included."
+
 # Characters shlex returns as operator tokens: separators and redirections.
 OPERATORS = ";&|()<>\n`"
 # Where a `#` starts a comment: at a word's start.

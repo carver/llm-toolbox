@@ -51,7 +51,8 @@ $GH_BODY_GATE_DEADLINE another deadline in seconds.
 
     gh-body-gate < hook-input.json    # as Claude Code calls it
 
-Exit status: 0 allowed, 2 refused (the reason on stderr), 1 input that isn't JSON.
+Exit status: 0 allowed, 2 refused (the reason on stderr, ending with a sentence saying
+nothing in the command ran), 1 input that isn't JSON.
 """
 
 import json
@@ -69,6 +70,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from shellparse import (
     MARK,
+    NOTHING_RAN,
     SHELLS,
     Command,
     bgrun_command,
@@ -592,7 +594,7 @@ def main(argv=None) -> int:
     command = (event.get("tool_input") or {}).get("command") or ""
     reason = refusal(command, event.get("cwd"))
     if reason:
-        print(reason, file=sys.stderr)
+        print(f"{reason} {NOTHING_RAN}", file=sys.stderr)
         return 2
     return 0
 

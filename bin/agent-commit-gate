@@ -1221,7 +1221,7 @@ def main(argv=None):
             "Commit blocked: --no-verify (-n) skips the pre-commit hook, which runs "
             f"this repo's checks, {HOOK_NAME} included. Fix what they report and "
             "commit without it. An amend that changes only the message already skips "
-            "the agent check, since its tree passed it.",
+            f"the agent check, since its tree passed it. {shellparse.NOTHING_RAN}",
             file=sys.stderr,
         )
         return 2

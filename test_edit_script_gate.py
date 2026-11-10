@@ -19,6 +19,10 @@ READ_REPLACE_WRITE = (
 )
 
 
+# What every gate's refusal ends with: a refused call runs none of its parts.
+NOTHING_RAN = "Nothing in this command ran, the parts before the refused one included."
+
+
 def run_hook(monkeypatch, capsys, command, tool="Bash"):
     event = {"tool_name": tool, "tool_input": {"command": command}, "cwd": "/r"}
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
@@ -45,6 +49,7 @@ def test_an_inline_read_replace_write_script_is_refused(monkeypatch, capsys, com
 
     assert code == 2
     assert "apply-edits" in err
+    assert err.rstrip().endswith(NOTHING_RAN)
 
 
 @pytest.mark.parametrize(

@@ -10,6 +10,10 @@ import pytest
 SCRIPT = Path(__file__).resolve().parent / "bin" / "pipe-status-gate"
 
 
+# What every gate's refusal ends with: a refused call runs none of its parts.
+NOTHING_RAN = "Nothing in this command ran, the parts before the refused one included."
+
+
 def run_hook(command, tool="Bash"):
     """The hook's exit status and stderr for one call, its input shaped as Claude Code sends it."""
     event = {
@@ -92,6 +96,7 @@ def test_a_piped_commit_landing_or_wait_is_refused_naming_it(command, name):
 
     assert code == 2
     assert name in err.splitlines()[0]
+    assert err.rstrip().endswith(NOTHING_RAN)
 
 
 def test_the_refusal_says_why_and_what_to_do_in_two_lines():

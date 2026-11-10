@@ -24,6 +24,10 @@ exit 1
 """
 
 
+# What every gate's refusal ends with: a refused call runs none of its parts.
+NOTHING_RAN = "Nothing in this command ran, the parts before the refused one included."
+
+
 class Gate:
     """Runs the hook from a folder of its own, with the event's cwd at ``work``."""
 
@@ -133,6 +137,7 @@ def test_a_body_file_slop_lint_flags_is_refused(gate, command):
     assert "gh " in lines[0] and "slop-lint" in lines[0]
     assert f"{path}:3:10: dash: {DASH}" in lines[1]
     assert WAY_OUT in lines[-1] and "Fix the text" in lines[-1]
+    assert lines[-1].endswith(NOTHING_RAN)
     assert len(lines) == 3
 
 

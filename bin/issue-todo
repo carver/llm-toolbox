@@ -21,6 +21,7 @@ wt-ship lists them for each issue a landing closes.
     issue-todo unticked 42 43         # each unticked item, as "#42 TEXT", one a line
     issue-todo claim 42               # refuses while another session holds a claim
     issue-todo release 42
+    issue-todo claims                 # "#41  5c618940  3h  Beta backups", one a claim
     issue-todo tick 42 "forecast measure" --note "built in 8d5068e"
     issue-todo tick 42 "Add hub" --undo
     issue-todo tick 42 "Add hub" --dry-run
@@ -41,6 +42,10 @@ GraphQL call fetches them all, so a plan issue tells which of its steps are done
 `<!-- issue-todo claim ID -->` (or `release`), so two sessions don't both take one
 issue. ID is the session's name: --as NAME, else $CLAUDE_CODE_SESSION_ID's first 8
 characters. `claim` refuses while a claim by another ID stands unreleased.
+`claims` lists the claims standing on open issues, one a line, as
+`#N  ID  AGE  TITLE`, AGE floored to `45m`, `3h` or `2d`, and prints nothing when
+none stands. It costs one GraphQL call per 100 open issues, plus a REST listing for
+each issue with over 100 comments.
 """
 
 import argparse
@@ -51,6 +56,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 BOX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+\[)([ xX])(\]\s+)(.*)$")
 FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
@@ -272,8 +278,8 @@ NAME = re.compile(r"\S+")  # what CLAIM reads back
 
 
 def claims(comments: list[tuple[str, str]]) -> dict[str, str]:
-    """The sessions holding a claim, with each claim's date, from `comments` in order,
-    each as (body, date): a claim stands until a later release by the same ID."""
+    """The sessions holding a claim, with each claim's time, from `comments` in order,
+    each as (body, time): a claim stands until a later release by the same ID."""
     held = {}
     for body, date in comments:
         for kind, session in CLAIM.findall(body):
@@ -285,16 +291,29 @@ def claims(comments: list[tuple[str, str]]) -> dict[str, str]:
 
 
 def holders(repo: str, number: int) -> dict[str, str]:
-    """The sessions holding a claim on the issue, with each claim's date."""
+    """The sessions holding a claim on the issue, with each claim's time, as GitHub
+    gives it (`2026-10-25T08:04:00Z`)."""
     comments = json.loads(
         gh("api", "--paginate", f"repos/{repo}/issues/{number}/comments")
     )
-    return claims(
-        [
-            (c.get("body") or "", c["created_at"][:16].replace("T", " "))
-            for c in comments
-        ]
-    )
+    return claims([(c.get("body") or "", c["created_at"]) for c in comments])
+
+
+def minute(time: str) -> str:
+    """GitHub's `2026-10-25T08:04:00Z` as `2026-10-25 08:04`."""
+    return time[:16].replace("T", " ")
+
+
+def age(time: str) -> str:
+    """How long ago GitHub's `time` was, floored: `45m` under an hour, `3h` under a
+    day, else `2d`."""
+    then = datetime.strptime(time, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    minutes = max(0, int((datetime.now(UTC) - then).total_seconds() // 60))
+    if minutes < 60:
+        return f"{minutes}m"
+    if minutes < 24 * 60:
+        return f"{minutes // 60}h"
+    return f"{minutes // (24 * 60)}d"
 
 
 def claimed_by(bodies: list[str]) -> str:
@@ -318,12 +337,15 @@ def post_comment(repo: str, number: int, body: str) -> None:
 def claim(repo: str, number: int, session: str) -> int:
     held = holders(repo, number)
     if session in held:
-        print(f"#{number} is already claimed by {session}, since {held[session]}")
+        print(
+            f"#{number} is already claimed by {session}, since {minute(held[session])}"
+        )
         return 0
     if held:
         for other, since in held.items():
             print(
-                f"issue-todo: #{number} is claimed by session {other} since {since}, "
+                f"issue-todo: #{number} is claimed by session {other} "
+                f"since {minute(since)}, "
                 "and not released",
                 file=sys.stderr,
             )
@@ -382,6 +404,46 @@ def show_open(repo: str) -> int:
     if done:
         print(f"no open items: {' '.join(done)}")
     return 0
+
+
+COMMENTS_PER_ISSUE = 100  # the most GraphQL serves in one connection
+
+
+def list_claims(repo: str) -> int:
+    """Each open issue's standing claims, as `#N  ID  AGE  TITLE`. One GraphQL call
+    per 100 open issues; an issue with more comments than it served gets them all
+    through REST."""
+    owner, name = repo.split("/", 1)
+    after = "null"
+    while True:
+        query = (
+            f"query {{ repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) "
+            f"{{ issues(states: OPEN, first: 100, after: {after}) "
+            "{ pageInfo { hasNextPage endCursor } nodes { number title "
+            f"comments(first: {COMMENTS_PER_ISSUE}) "
+            "{ totalCount nodes { body createdAt } } } } } }"
+        )
+        out = gh("api", "graphql", "-f", f"query={query}")
+        try:
+            issues = json.loads(out)["data"]["repository"]["issues"]
+        except (ValueError, KeyError, TypeError):
+            sys.exit(
+                f"issue-todo: gh api graphql gave no open issues for {repo}; "
+                "`gh auth status` checks gh's login"
+            )
+        for issue in issues["nodes"]:
+            comments = issue["comments"]
+            if comments["totalCount"] > len(comments["nodes"]):
+                held = holders(repo, issue["number"])
+            else:
+                held = claims(
+                    [(c.get("body") or "", c["createdAt"]) for c in comments["nodes"]]
+                )
+            for session, since in held.items():
+                print(f"#{issue['number']}  {session}  {age(since)}  {issue['title']}")
+        if not issues["pageInfo"]["hasNextPage"]:
+            return 0
+        after = json.dumps(issues["pageInfo"]["endCursor"])
 
 
 def show_titles(repo: str) -> int:
@@ -496,6 +558,11 @@ def main(argv: list[str] | None = None) -> int:
             dest="name",
             help="the claimant's name (default: $CLAUDE_CODE_SESSION_ID's first 8 characters)",
         )
+    what = (
+        "each claim standing on an open issue, one a line, with its issue's number "
+        "and title, the session and its age; one GraphQL call per 100 open issues"
+    )
+    sub.add_parser("claims", parents=[where], help=what, description=what)
     args = p.parse_args(argv)
     session = ""
     if args.cmd in ("claim", "release"):
@@ -515,6 +582,7 @@ def main(argv: list[str] | None = None) -> int:
         "read": lambda: read(repo, args.numbers),
         "claim": lambda: claim(repo, args.number, session),
         "release": lambda: release(repo, args.number, session),
+        "claims": lambda: list_claims(repo),
         "tick": lambda: tick_one(
             repo, args.number, args.match, args.note, args.undo, args.dry_run
         ),

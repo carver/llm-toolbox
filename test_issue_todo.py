@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -98,6 +99,8 @@ class FakeGh:
                 "comments": {"nodes": []},
             },
         }
+        # The open issues as GraphQL's `issues(states: OPEN)` serves them, page by page.
+        self.open_pages = [[]]
         self.graphql_fails = False
         self.patched = []
         self.calls = []
@@ -106,6 +109,15 @@ class FakeGh:
         if self.graphql_fails:
             return ""
         query = next(a for a in args if a.startswith("query="))
+        if "issues(states: OPEN" in query:
+            after = re.search(r'after: (null|"(\d+)")', query).group(2)
+            page = int(after or 0)
+            more = page + 1 < len(self.open_pages)
+            issues = {
+                "pageInfo": {"hasNextPage": more, "endCursor": str(page + 1)},
+                "nodes": self.open_pages[page],
+            }
+            return json.dumps({"data": {"repository": {"issues": issues}}})
         data, errors = {}, []
         for alias, number in re.findall(
             r"(m\d+): issueOrPullRequest\(number: (\d+)\)", query
@@ -515,3 +527,99 @@ def test_open_titles_names_each_issues_unreleased_claimants(fake, capsys):
         "#8 Unclaimed",
     ]
     assert len(fake.calls) == 3  # the repo, the listing and #7's comments
+
+
+def ago(**delta):
+    """GitHub's form of a time `delta` before now."""
+    return (datetime.now(UTC) - timedelta(**delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def marker(session, kind="claim", **delta):
+    """A comment, as GraphQL serves it, carrying a claim or release marker."""
+    return {
+        "body": f"Taking this.\n<!-- issue-todo {kind} {session} -->",
+        "createdAt": ago(**delta),
+    }
+
+
+def open_issue(number, title, comments):
+    return {
+        "number": number,
+        "title": title,
+        "comments": {"totalCount": len(comments), "nodes": comments},
+    }
+
+
+def test_claims_lists_each_standing_claim_with_its_age_and_issue(fake, capsys):
+    fake.open_pages = [
+        [
+            open_issue(
+                3, "Unclaimed", [{"body": "a remark", "createdAt": ago(hours=1)}]
+            ),
+            open_issue(
+                7,
+                "Criterion: consistent",
+                [
+                    marker("held0001", days=2, hours=1),
+                    marker("held0002", hours=3, minutes=5),
+                ],
+            ),
+            open_issue(
+                9,
+                "Released again",
+                [marker("gone0001", days=1), marker("gone0001", "release", hours=2)],
+            ),
+            open_issue(12, "Fresh", [marker("new00001", minutes=45, seconds=30)]),
+        ]
+    ]
+
+    assert tool.main(["claims", "--repo", "owner/repo"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "#7  held0001  2d  Criterion: consistent",
+        "#7  held0002  3h  Criterion: consistent",
+        "#12  new00001  45m  Fresh",
+    ]
+    assert len(fake.calls) == 1  # one GraphQL call for every issue
+
+
+def test_claims_prints_nothing_when_no_claim_stands(fake, capsys):
+    fake.open_pages = [[open_issue(3, "Unclaimed", [])]]
+
+    assert tool.main(["claims", "--repo", "owner/repo"]) == 0
+
+    assert capsys.readouterr().out == ""
+    assert len(fake.calls) == 1  # it did look
+
+
+def test_claims_reads_every_page_of_open_issues(fake, capsys):
+    fake.open_pages = [
+        [open_issue(3, "First page", [marker("one00001", hours=1)])],
+        [open_issue(150, "Second page", [marker("two00001", hours=5)])],
+    ]
+
+    assert tool.main(["claims", "--repo", "owner/repo"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "#3  one00001  1h  First page",
+        "#150  two00001  5h  Second page",
+    ]
+    assert len(fake.calls) == 2
+
+
+def test_claims_reads_all_comments_of_an_issue_with_more_than_graphql_served(
+    fake, capsys
+):
+    # GraphQL served the first comments; the release came later, past them.
+    fake.open_pages = [[open_issue(7, "Long thread", [marker("held0001", days=3)])]]
+    fake.open_pages[0][0]["comments"]["totalCount"] = 150
+    fake.comments = [
+        claim_comment("held0001"),
+        claim_comment("held0001", "release"),
+        claim_comment("late0001") | {"created_at": ago(hours=4)},
+    ]
+
+    assert tool.main(["claims", "--repo", "owner/repo"]) == 0
+
+    assert capsys.readouterr().out == "#7  late0001  4h  Long thread\n"
+    assert fake.calls[-1][-1] == "repos/owner/repo/issues/7/comments"

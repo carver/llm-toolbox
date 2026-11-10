@@ -475,7 +475,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   wt-ship. `issue-todo claim N` claims
   an issue for this session (`--as NAME`, else `CLAUDE_CODE_SESSION_ID`'s first 8
   characters) in a marked comment, and refuses while another session's claim stands; `release N`
-  frees it. It writes through `gh api`.
+  frees it, both writing through `gh api`. `issue-todo claims` lists the claims
+  standing on open issues, as `#N ID AGE TITLE`, in one GraphQL call per 100 open
+  issues.
 - **openrouter-credits**: prints an OpenRouter account's credits, bought, used
   and left. The key comes from `OPENROUTER_API_KEY`, else from `./.env` (or
   `--env-file`); it is never printed.

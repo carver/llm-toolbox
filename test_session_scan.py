@@ -1115,6 +1115,38 @@ def test_the_verifier_and_merger_default_to_opus(env: dict, tmp_path: Path) -> N
             assert argv[argv.index("-m") + 1] == "opus", role
 
 
+def test_a_promise_to_do_something_once_work_lands_is_set_aside(
+    env: dict, tmp_path: Path
+) -> None:
+    """An agent said "I'll note it in #28 when this lands" and never did; the scan's
+    readers missed it, so the list must hold it. Plain narration of the next step
+    isn't a promise."""
+    # Each promise matches one phrasing alone.
+    promises = [
+        "The note is right; I'll note it in #28.",
+        "I’ll file an issue for the gate.",
+        "The numbers go on the PR when this lands.",
+        "The docs follow once this is merged.",
+    ]
+    narration = [
+        "I'll fold it now.",
+        "Committing; it lands next.",
+        "wt-ship will rebase when it lands.",
+    ]
+    main = [user("Go")] + [
+        assistant(f"r{n}", {"type": "text", "text": text})
+        for n, text in enumerate(promises + narration)
+    ]
+    session(Path(env["CLAUDE_CONFIG_DIR"]), main)
+    out = tmp_path / "scan"
+    proc = scan(env, out, FAKE_REPLY="[]")
+    aside = ("\n" + proc.stdout).split("\nset aside\n")[1].split("\n\n")[0]
+    for text in promises:
+        assert text in aside, aside
+    for text in narration:
+        assert text not in aside, aside
+
+
 def test_what_an_agent_set_aside_is_listed(env: dict, tmp_path: Path) -> None:
     main = [
         user("Go"),

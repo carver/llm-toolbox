@@ -63,7 +63,8 @@ It prints the findings, numbered, each with its candidates under it, as
 the unverified ones and the dismissed ones (trivial and false), each with its
 reason; then "set aside": each line of an agent's own words that leaves
 something for later ("left for later", "out of scope", "TODO", "follow-up",
-"deferred"), which a reader passes over easily; then the ten most repeated
+"deferred"), or promises to do so once work lands ("I'll note it in #28 when this
+lands"), which a reader passes over easily; then the ten most repeated
 calls; then one line per chunk with its line
 range and candidate count, and one per verify batch with its verdict counts, so a
 chunk with none or a batch that judged everything alike stands out; then a
@@ -231,7 +232,8 @@ what I told you", "my reasoning didn't hold"); the user renaming or redefining \
 what the agent built. A design built on a premise nobody \
 checked, which the user or a test then showed false; a bug or problem the agent \
 noticed and set aside ("left for later", "out of scope", a TODO), which still \
-needs a fix. A flaw in a brief or plan that cost a fix cycle: a review finding, \
+needs a fix; a promise to note, file or post something once work lands that \
+the session never kept. A flaw in a brief or plan that cost a fix cycle: a review finding, \
 a test rewritten after review, or a side agent's note that traces back to a \
 choice the brief made, above all one the issue's own text or a design doc \
 argued against. A tool that answered about the wrong target: another session, \
@@ -480,9 +482,13 @@ def repeated_calls(digest: Digest) -> list[tuple[str, int, list[int]]]:
 
 
 # An agent's words that set something aside, for the "set aside" list: a problem
-# noticed and left, which a reader skips easily (one on a held-out session did).
+# noticed and left, which a reader skips easily (one on a held-out session did), or a
+# promise to note, file or post something once work lands, which the readers missed
+# on a session that never kept it.
 SET_ASIDE = re.compile(
-    r"left for later|for later\b|out of scope|\bTODO\b|follow-?up\b|deferred",
+    r"left for later|for later\b|out of scope|\bTODO\b|follow-?up\b|deferred"
+    r"|\bI['’]ll (?:note|file|post|mention|record|write up)\b"
+    r"|\b(?:when|after|once) this (?:lands|is merged)\b",
     re.IGNORECASE,
 )
 SET_ASIDE_SHOWN = 300

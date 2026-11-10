@@ -192,8 +192,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   seconds (`$MUTATE_CHECK_MIN_TIMEOUT`), and stops if the first 3 are all
   inconclusive. It prints `FILE:LINE: what changed`
   for each mutant that survived and a summary line, and exits 0 when none
-  survived, 1 when one did, and 3 when no mutant was judged. For a builder to find
-  what the tests let through before a review does.
+  survived, 1 when one did, and 3 when no mutant was judged. The daily mutants
+  workflow runs it over the lines landed since its last complete run; run it by
+  hand to check a diff's tests before a review does.
 - **conflicts**: `conflicts FILE` lists a file's conflict hunks, numbered, with
   each side and its marker label; `conflicts FILE N SIDE` (or `all SIDE`)
   resolves them as `ours`, `theirs`, `both` or `base`, and the triples repeat,

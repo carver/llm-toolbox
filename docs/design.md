@@ -761,3 +761,18 @@ passing baseline (a mutant that breaks the import) stays inconclusive, not caugh
 and a test pytest-timeout fails stays caught. Suggested, not built: one run per file
 with an exit at its top, to name in one line a file the command never runs, instead
 of a survivor for each of its mutants.
+
+### /build no longer runs --diff; a daily CI run does (2026-11-10)
+
+/build's step 2 had the builder run `mutate-check --diff` after every change to Python
+or shell, under `heavy --long`, and leave the tree alone until it ended. The owner
+dropped it: it blocks the builder for the run (8 minutes for 40 mutants in the
+fold-check build), and its 4-core lane is half of this VM's 6 to 8 cores of real
+compute, while the landing checks wait behind it. Each repo's `mutants.yml` workflow
+now runs daily on the lines changed since the last run that judged every mutant (a
+run cut off keeps that base; filedrawer keeps its full run started by hand too), on
+GitHub's runners, and `/upskill` pitches triage of the runs no one has triaged
+(`mutants-pending`). The cost, accepted by name: the --diff entry above exists because
+reviews found survivors the builder hadn't, each a fix round, and those rounds can
+come back, a day later. A builder or reviewer still runs `mutate-check` on one mutant
+to show a test catches what it's meant to (/build step 2, /tdd).

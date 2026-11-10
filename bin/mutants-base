@@ -20,6 +20,10 @@ GH_TOKEN with `actions: read`; any error from gh, or one that takes past
 MUTANTS_BASE_GH_SECONDS (default 60) per call, fails it: a guessed base would skip
 lines or test old ones again without saying so.
 
+filedrawer's bin/mutants-base answers the same question for its cargo-mutants workflow,
+with its own rules (a full run counts, the artifacts last 30 days); a change to how a
+run's base is found here may belong there too.
+
 Exit status: 0 found; 1 gh or git failed (the message says which); 2 usage error.
 """
 

@@ -1,4 +1,6 @@
 #!/bin/sh
+# After an agent's commit, warn when a fix commit changes a file its target didn't (llm-toolbox agent-commit-gate).
+if [ -n "${AI_AGENT:-}" ] && command -v agent-commit-gate >/dev/null; then agent-commit-gate --post-commit; fi
 # Link a tool or skill as soon as it's committed or pulled, so it's on PATH without a
 # hand-run install.py (install.py --links prints only what it changed). Also run as
 # post-merge, through the link beside this file.

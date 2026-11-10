@@ -172,11 +172,17 @@ def test_install_refuses_a_pre_commit_that_is_not_a_shell_script(repo):
 
 
 @pytest.mark.parametrize(
-    "path",
-    [".githooks/pre-commit", "templates/egui-app/.githooks/pre-commit"],
+    "path, line",
+    [
+        (".githooks/pre-commit", gate.LINE),
+        ("templates/egui-app/.githooks/pre-commit", gate.LINE),
+        (".githooks/post-commit", gate.POST_LINE),
+        ("templates/egui-app/.githooks/post-commit", gate.POST_LINE),
+    ],
+    ids=["pre-commit", "egui pre-commit", "post-commit", "egui post-commit"],
 )
-def test_checked_in_hooks_carry_the_current_line(path):
-    assert gate.LINE in (SCRIPT.parent.parent / path).read_text()
+def test_checked_in_hooks_carry_the_current_line(path, line):
+    assert line in (SCRIPT.parent.parent / path).read_text()
 
 
 # The comment --install wrote above its line before this one, and those lines, oldest
@@ -277,6 +283,71 @@ def test_install_refuses_a_repo_without_an_agent_check(repo):
     run = install(repo)
     assert run.returncode == 1 and "agent-pre-commit" in run.stderr
     assert not (repo / ".githooks" / "pre-commit").exists()
+
+
+def test_install_puts_the_post_commit_line_first_once(repo):
+    """First, so a post-commit that exits early, as llm-toolbox's does in a linked
+    worktree, still runs it."""
+    hook(repo, "agent-pre-commit", "exit 0")
+    post = hook(repo, "post-commit", "exit 0")
+
+    assert install(repo).returncode == 0
+    run = install(repo)
+
+    assert run.returncode == 0, run.stderr
+    assert post.read_text().splitlines() == [
+        "#!/bin/sh",
+        gate.POST_COMMENT,
+        gate.POST_LINE,
+        "exit 0",
+    ]
+
+
+def test_install_creates_a_missing_post_commit(repo):
+    hook(repo, "agent-pre-commit", "exit 0")
+
+    assert install(repo).returncode == 0
+
+    post = repo / ".githooks" / "post-commit"
+    assert os.access(post, os.X_OK) and gate.POST_LINE in post.read_text()
+
+
+def test_install_leaves_a_pre_commit_with_the_line_first_as_it_is(repo):
+    """Whatever its shebang: `env -S` reads as no shell the installer knows."""
+    hook(repo, "agent-pre-commit", "exit 0")
+    pre = repo / ".githooks" / "pre-commit"
+    text = f"#!/usr/bin/env -S bash -e\n{gate.COMMENT}\n{gate.LINE}\necho fast\n"
+    pre.write_text(text)
+    pre.chmod(0o755)
+
+    run = install(repo)
+
+    assert run.returncode == 0, run.stderr
+    assert "already installed" in run.stdout and pre.read_text() == text
+
+
+def test_a_pre_commit_that_is_not_a_shell_script_still_gets_the_post_commit_line(
+    repo,
+):
+    hook(repo, "agent-pre-commit", "exit 0")
+    (repo / ".githooks" / "pre-commit").write_text("#!/usr/bin/env python3\n")
+
+    run = install(repo)
+
+    assert run.returncode == 1 and "pre-commit" in run.stderr
+    assert gate.POST_LINE in (repo / ".githooks" / "post-commit").read_text()
+
+
+def test_install_refuses_a_post_commit_that_is_not_a_shell_script(repo):
+    hook(repo, "agent-pre-commit", "exit 0")
+    post = repo / ".githooks" / "post-commit"
+    post.write_text("#!/usr/bin/env python3\nprint('hi')\n")
+
+    run = install(repo)
+
+    assert run.returncode == 1 and "post-commit" in run.stderr
+    assert "AI_AGENT" not in post.read_text()
+    assert gate.LINE in (repo / ".githooks" / "pre-commit").read_text()
 
 
 @pytest.fixture(scope="module")
@@ -835,6 +906,344 @@ def test_a_message_on_stdin_is_not_a_fix(tmp_path, monkeypatch):
     (tmp_path / "-").write_text("fixup! x\n")
 
     assert not gate.is_fix_commit(["-F", "-"])
+
+
+def person_commit(repo, subject, files):
+    """Write `files` ({name: text}) and commit all that's changed as a person would,
+    with no agent check or warning; returns the commit's ID."""
+    for name, text in files.items():
+        write(repo / name, text)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", subject)
+    return head(repo)
+
+
+def agent_git(repo, *args, stdin=None, agent=True, env=None):
+    """`git ARGS` in `repo` as an agent runs it, with this checkout's gate on PATH, an
+    editor that keeps the message git proposes, and `env` added; the run, after
+    checking it passed."""
+    env = without_repo_vars(os.environ) | {"GIT_EDITOR": "true"} | (env or {})
+    env["PATH"] = os.pathsep.join(
+        [str(SCRIPT.parent), path_without(SCRIPT.name, env["PATH"])]
+    )
+    if agent:
+        env["AI_AGENT"] = "test-agent"
+    run = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    return run
+
+
+def warnings(run):
+    return [
+        line
+        for line in run.stderr.splitlines()
+        if line.startswith("agent-commit-gate:")
+    ]
+
+
+def stray(path, target, kind="fixup!"):
+    return (
+        f"agent-commit-gate: this {kind} changes {path}, which its target"
+        f' "{target}" didn\'t touch'
+    )
+
+
+def split_off(repo, *paths):
+    """The advice for `paths`, each named from the top of the work tree (`:/`)."""
+    return (
+        "agent-commit-gate: to split off what belongs to another commit, while HEAD is"
+        f" {head(repo)[:12]}: git reset -q HEAD^ --"
+        f" {' '.join(f':/{path}' for path in paths)} && git commit -q --amend"
+        " --no-edit, then commit it with that commit"
+    )
+
+
+# What the advice adds when more is staged than the commit took in.
+UNSTAGE_FIRST = "; unstage the rest of what's staged first, or it goes in too"
+
+
+def a_then_b(repo):
+    """Commit a.txt as "Add a", then b.txt as "Add b"; returns Add a's ID."""
+    a = person_commit(repo, "Add a", {"a.txt": "a\n"})
+    person_commit(repo, "Add b", {"b.txt": "b\n"})
+    return a
+
+
+def test_a_fixup_that_sweeps_in_another_commits_file_names_only_that_file(installed):
+    """The case that asked for the warning: `commit -a --fixup=A` swept in edits that
+    were meant for B."""
+    a = a_then_b(installed)
+    write(installed / "a.txt", "a fixed\n")
+    write(installed / "b.txt", "b for B\n")
+
+    run = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}")
+
+    assert warnings(run) == [stray("b.txt", "Add a"), split_off(installed, "b.txt")]
+
+
+def test_a_fixup_of_its_targets_files_says_nothing(installed):
+    a = a_then_b(installed)
+    write(installed / "a.txt", "a fixed\n")
+
+    run = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}")
+
+    assert warnings(run) == []
+
+
+@pytest.mark.parametrize(
+    "form, kind",
+    [
+        (lambda a: ["-m", "fixup! Add a"], "fixup!"),
+        (lambda a: ["-m", f"fixup! {a[:10]}"], "fixup!"),
+        # A title that only starts subjects, as autosquash takes it: the oldest.
+        (lambda a: ["-m", "fixup! Add"], "fixup!"),
+        (lambda a: ["-m", "fixup!   squash! Add a"], "fixup!"),
+        (lambda a: [f"--squash={a}"], "squash!"),
+        (lambda a: [f"--fixup=amend:{a}"], "amend!"),
+        (lambda a: ["-F", "-"], "fixup!"),
+    ],
+    ids=["subject", "ID", "prefix", "prefixes", "squash", "amend", "stdin"],
+)
+def test_each_way_to_name_the_target_finds_it(installed, form, kind):
+    a = a_then_b(installed)
+    write(installed / "a.txt", "a fixed\n")
+    write(installed / "b.txt", "b for B\n")
+
+    run = agent_git(installed, "commit", "-q", "-a", *form(a), stdin="fixup! Add a\n")
+
+    assert git(installed, "log", "-1", "--format=%s").stdout.startswith(kind)
+    assert warnings(run) == [
+        stray("b.txt", "Add a", kind),
+        split_off(installed, "b.txt"),
+    ]
+
+
+def test_amending_a_fixup_compares_the_whole_commit(installed):
+    a = a_then_b(installed)
+    write(installed / "a.txt", "a fixed\n")
+    git(installed, "commit", "-q", "-a", f"--fixup={a}")
+    write(installed / "b.txt", "b for B\n")
+
+    run = agent_git(installed, "commit", "-q", "-a", "--amend", "--no-edit")
+
+    assert warnings(run) == [stray("b.txt", "Add a"), split_off(installed, "b.txt")]
+
+
+def test_a_subject_that_is_the_title_wins_over_one_that_starts_with_it(installed):
+    person_commit(installed, "Add a and c", {"c.txt": "c\n"})
+    person_commit(installed, "Add a", {"a.txt": "a\n"})
+    write(installed / "c.txt", "c fixed\n")
+    write(installed / "a.txt", "a fixed\n")
+
+    run = agent_git(installed, "commit", "-q", "-a", "-m", "fixup! Add a")
+
+    assert warnings(run) == [stray("c.txt", "Add a"), split_off(installed, "c.txt")]
+
+
+def test_of_two_commits_with_the_title_the_oldest_is_the_target(installed):
+    person_commit(installed, "Add a", {"a1.txt": "a\n"})
+    person_commit(installed, "Add a", {"a2.txt": "a\n"})
+    write(installed / "a1.txt", "a fixed\n")
+    write(installed / "a2.txt", "a fixed\n")
+
+    run = agent_git(installed, "commit", "-q", "-a", "-m", "fixup! Add a")
+
+    assert warnings(run) == [stray("a2.txt", "Add a"), split_off(installed, "a2.txt")]
+
+
+def test_a_fixup_of_a_fixup_compares_with_the_first_ones_target(installed):
+    a = a_then_b(installed)
+    write(installed / "a.txt", "a fixed\n")
+    git(installed, "commit", "-q", "-a", f"--fixup={a}")
+    write(installed / "a.txt", "a fixed again\n")
+    write(installed / "b.txt", "b for B\n")
+
+    run = agent_git(installed, "commit", "-q", "-a", "--fixup=HEAD")
+
+    assert warnings(run) == [stray("b.txt", "Add a"), split_off(installed, "b.txt")]
+
+
+def test_a_file_an_earlier_fixup_added_counts_as_the_targets(installed):
+    a = a_then_b(installed)
+    write(installed / "a_test.txt", "test\n")
+    git(installed, "add", "-A")
+    first = agent_git(installed, "commit", "-q", f"--fixup={a}")
+    write(installed / "a_test.txt", "test fixed\n")
+
+    second = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}")
+
+    assert warnings(first)[:1] == [stray("a_test.txt", "Add a")]
+    assert warnings(second) == []
+
+
+def test_a_fixup_whose_target_isnt_found_says_nothing(installed):
+    a_then_b(installed)
+    write(installed / "b.txt", "b for B\n")
+
+    run = agent_git(installed, "commit", "-q", "-a", "-m", "fixup! Nothing like it")
+
+    assert warnings(run) == []
+
+
+def test_a_target_another_branch_holds_is_not_found(installed):
+    """Autosquash replays only the commits a rebase onto that branch would: a commit
+    the branch holds has landed, and no fold reaches it."""
+    person_commit(installed, "Add a", {"a.txt": "a\n"})
+    git(installed, "checkout", "-q", "--detach")
+    person_commit(installed, "Add b", {"b.txt": "b\n"})
+    write(installed / "a.txt", "a fixed\n")
+    unlanded = agent_git(installed, "commit", "-q", "-a", "-m", "fixup! Add b")
+    write(installed / "b.txt", "b for B\n")
+
+    landed = agent_git(installed, "commit", "-q", "-a", "-m", "fixup! Add a")
+
+    assert warnings(unlanded)[:1] == [stray("a.txt", "Add b")]
+    assert warnings(landed) == []
+
+
+def test_a_rebase_that_replays_a_fixup_says_nothing(installed):
+    """git's rebase runs the post-commit hook for each commit it makes. In a detached
+    worktree, as agents work, the commits before the rebased ones are unlanded too."""
+    person_commit(installed, "Start", {"start.txt": "s\n"})
+    git(installed, "checkout", "-q", "--detach")
+    a = a_then_b(installed)
+    write(installed / "b.txt", "b for B\n")
+    made = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}")
+
+    replayed = agent_git(installed, "rebase", "-q", "--force-rebase", "HEAD~2")
+
+    assert warnings(made)
+    assert warnings(replayed) == []
+
+
+def test_a_fixup_with_none_of_its_targets_files_says_to_undo_it(installed):
+    a = a_then_b(installed)
+    write(installed / "b.txt", "b for B\n")
+
+    run = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}")
+
+    undo = (
+        "agent-commit-gate: if it fixes another commit, undo it while HEAD is"
+        f" {head(installed)[:12]} (git reset -q --soft HEAD^) and commit it for that"
+        " one"
+    )
+    assert warnings(run) == [stray("b.txt", "Add a"), undo]
+
+
+def test_renaming_the_targets_file_says_nothing(installed):
+    a = a_then_b(installed)
+    git(installed, "mv", "a.txt", "a2.txt")
+
+    run = agent_git(installed, "commit", "-q", f"--fixup={a}")
+
+    assert warnings(run) == []
+
+
+def test_a_stray_rename_names_both_paths(installed):
+    a = a_then_b(installed)
+    write(installed / "a.txt", "a fixed\n")
+    git(installed, "mv", "b.txt", "b2.txt")
+
+    run = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}")
+
+    assert warnings(run) == [
+        stray("b.txt -> b2.txt", "Add a"),
+        split_off(installed, "b.txt", "b2.txt"),
+    ]
+
+
+def test_the_advice_splits_the_file_off(installed):
+    """Run as printed, from a subfolder, for a path with a glob character, which git
+    would otherwise read as a pattern that also matches b1.txt, a file of the
+    target's."""
+    a = person_commit(installed, "Add a", {"a.txt": "a\n", "b1.txt": "b\n"})
+    person_commit(installed, "Add b", {"b[1].txt": "b\n"})
+    write(installed / "a.txt", "a fixed\n")
+    write(installed / "b1.txt", "b1 fixed\n")
+    write(installed / "b[1].txt", "b for B\n")
+    fix = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}")
+    advice = warnings(fix)
+    assert len(advice) == 2, fix.stderr
+    command = advice[-1].split(": ", 2)[2].split(", then ")[0]
+    (installed / "sub").mkdir()
+
+    subprocess.run(["sh", "-c", command], cwd=installed / "sub", check=True)
+
+    files = git(installed, "show", "--format=", "--name-only", "HEAD").stdout
+    assert files.split() == ["a.txt", "b1.txt"]
+    assert git(installed, "status", "--short").stdout.splitlines() == [" M b[1].txt"]
+
+
+def test_the_advice_says_to_unstage_what_else_is_staged(installed):
+    """`git commit PATHS` leaves the rest of what's staged, which the advised amend, or
+    the commit after an undo, would take in."""
+    a = a_then_b(installed)
+    write(installed / "a.txt", "a fixed\n")
+    write(installed / "b.txt", "b for B\n")
+    write(installed / "c.txt", "c\n")
+    git(installed, "add", "c.txt")
+
+    run = agent_git(installed, "commit", "-q", f"--fixup={a}", "--", "a.txt", "b.txt")
+
+    assert warnings(run) == [
+        stray("b.txt", "Add a"),
+        split_off(installed, "b.txt") + UNSTAGE_FIRST,
+    ]
+
+
+def test_a_rebase_that_rewords_a_fixup_says_nothing(installed):
+    """A rebase makes a reworded commit, as it does one after `rebase --continue`, with
+    a `git commit` of its own."""
+    person_commit(installed, "Start", {"start.txt": "s\n"})
+    git(installed, "checkout", "-q", "--detach")
+    a = a_then_b(installed)
+    write(installed / "b.txt", "b for B\n")
+    made = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}")
+    reword = {
+        "GIT_SEQUENCE_EDITOR": "sed -i '2s/^pick/reword/'",  # the fixup's line
+        "GIT_EDITOR": "sed -i '$a Why.'",
+    }
+
+    reworded = agent_git(
+        installed, "rebase", "-q", "-i", "--no-autosquash", "HEAD~2", env=reword
+    )
+
+    assert git(installed, "log", "-1", "--format=%b").stdout.strip() == "Why."
+    assert warnings(made)
+    assert warnings(reworded) == []
+
+
+def test_a_cherry_pick_of_a_fixup_says_nothing(installed):
+    """A single cherry-pick, like a revert, runs post-commit with no folder of its own
+    in the git dir."""
+    person_commit(installed, "Start", {"start.txt": "s\n"})
+    git(installed, "checkout", "-q", "--detach")
+    a = a_then_b(installed)
+    write(installed / "b.txt", "b for B\n")
+    made = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}")
+    fix = head(installed)
+    git(installed, "reset", "-q", "--hard", "HEAD^")
+
+    picked = agent_git(installed, "cherry-pick", fix)
+
+    assert warnings(made)
+    assert warnings(picked) == []
+
+
+def test_a_persons_fixup_says_nothing(installed):
+    a = a_then_b(installed)
+    write(installed / "b.txt", "b for B\n")
+
+    run = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}", agent=False)
+
+    assert warnings(run) == []
 
 
 def test_a_cd_carries_across_segments(monkeypatch, capsys, tmp_path):

@@ -38,7 +38,9 @@ left alone.
 
 The repo's post-commit and post-merge hooks run `install.py --links` in the
 main worktree, which prunes stale links and links new tools and skills, so a
-tool or skill is ready once it's committed or pulled. Re-run the whole install
+tool or skill is ready once it's committed or pulled. The post-commit hook
+first runs `agent-commit-gate`'s line, which warns when an agent's fix commit
+changes a file its target didn't. Re-run the whole install
 by hand after a fresh clone or a change to `install.py`. It is idempotent and only touches
 links that point into this repo. If a name already belongs to some other
 skill, it reports the conflict and leaves it alone.
@@ -344,6 +346,15 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   so `wt-ship` runs the full check on each such commit when it lands; the line
   marks a commit's run with `AGENT_CHECK_AT_COMMIT=1`, and a hook on an older
   line runs the full check, as before.
+  `--install` also puts a line first in the post-commit hook. After an agent's
+  `fixup!`, `amend!` or `squash!` commit, it finds the target as `git rebase
+  --autosquash` would, among the commits a rebase onto another branch would
+  replay. For each file the commit changes that neither the target nor the
+  target's earlier fix commits change, it prints a line naming the file and the
+  target, then how to split the files off: in a /build, `commit -a --fixup`
+  once swept in edits meant for another commit, and the fold conflicted. It
+  warns, never refuses, and prints nothing otherwise. A repo installed before
+  this gets the line by running `--install` again.
   `install.py` also registers it as a Claude Code hook that refuses `git commit
   --no-verify`, except in a repo with no agent check, such as a scratch repo.
   The check runs once it's its turn in `heavy`'s queue, whose waiting lines

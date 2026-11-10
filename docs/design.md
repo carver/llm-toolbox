@@ -352,6 +352,43 @@ remote but kept here until `fetch --prune`, exempts an ID the remote has lost. A
 named-branch worktree mid-rebase shows as detached, so its branch isn't left out
 while its landing rewrites it.
 
+### A fix commit that changes a file its target didn't gets a warning (2026-11-09)
+
+In a /build, `git commit -a --fixup=A` swept in test edits meant for commit B;
+`build-state finish`'s fold then conflicted in the test file, and the agent reset and
+split both fixups again. The owner's rules: warn, never refuse, since a fix may add a
+file its target forgot; find the target as `git rebase --autosquash` does; say nothing
+when there's none.
+
+- It runs from a post-commit line that `--install` writes. The pre-commit gate already
+  reads the running `git commit`'s arguments, so it could have warned with no
+  re-install, but a review of that plan found its advice could amend the wrong
+  commit: a second commit chained in the same call, or a commit-msg hook or git
+  itself refusing the commit after pre-commit passed, leaves HEAD elsewhere. It also
+  missed `-F -`, the editor, `-C` and `--amend --no-edit`. Post-commit runs only for a
+  commit that landed, reads its own subject and files, and the advice names its ID
+  ("while HEAD is ..."). Each repo installed before needs `--install` again.
+- The range is what a rebase onto another branch, a tag or a remote-tracking branch
+  would replay, and a match goes to the oldest, as autosquash takes it (checked
+  against a real `rebase -i --autosquash`). A target outside the range has landed and
+  no fold reaches it, so nothing is said.
+- The target's files include those of its earlier fix commits, which the fold gives
+  it, so a fixup adding a test file the target forgot warns once, not at each later
+  fixup of that test.
+- Only under `git commit`, and with no rebase, cherry-pick or revert under way (its
+  folder in the git dir): git's rebase runs post-commit for each commit it makes, some
+  through a `git commit` of its own (a reword, a `--continue`), and in a detached
+  worktree a replayed fixup's target is in range. A single cherry-pick or revert keeps
+  no folder, but runs as no `git commit`.
+- The advice names each path from the top of the work tree (`:/`), so it works from a
+  subfolder, and says to unstage first what else is staged, which its amend would
+  take in.
+- One line per file, as the owner asked, with no cap.
+
+Left to the owner: build-state's `fixed_name` and `names_commit` find a fix's target
+by a prefix of the subject or an ID, newest first, which can differ from autosquash
+and from this warning when two subjects match.
+
 ### Rejected: `wt-ship --check CMD` (removed in 9927dd7)
 
 Nothing used it. It came with wt-ship's first version, for a repo that had no

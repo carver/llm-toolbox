@@ -131,6 +131,27 @@ from loading the machine. Beyond that the queue works on trust, as the --no-veri
 refusal below does: a check that names the variable and never exits with its code
 never waits.
 
+`--install` also puts a line first in each repo's post-commit hook, creating the hook
+if needed, which runs `--post-commit` after an agent's `git commit`. It says nothing
+for a rebase, a cherry-pick or a revert, which run that hook too, some through a `git
+commit` of their own (a reword, a `--continue`). When the commit's subject starts
+`fixup! `, `amend! ` or `squash! `, it finds the commit `git rebase --autosquash` would
+fold it into, as git does, from the title (the subject after its prefixes): among the
+commits a rebase onto another branch, a tag or a remote-tracking branch would replay
+(the newest 100, merges left out), and not themselves fix commits, the oldest whose
+subject is the title, else, for a title with no space, the commit it names by ID, else
+the oldest whose subject starts with it. For each file the commit changes that neither
+that target nor the target's earlier fix commits change (a rename counts when either
+path is theirs), it prints a line naming the file and the target's subject,
+then one line saying how to split the files off while HEAD is the fix commit, each path
+named from the top of the work tree (`:/`), or, when none of its files is the target's,
+how to undo it; with more staged than the commit took in, as after `git commit PATHS`,
+the line says to unstage that first. In a /build, `commit -a --fixup=A` once swept in
+test edits meant for commit B, and the fold then conflicted. It warns and never
+refuses, since a fix may add a file its target forgot, and prints nothing when it finds
+no target or every file is the target's, and `--post-commit` always exits 0. A repo
+installed before this gets the line by running --install again.
+
 Without arguments it is a Claude Code PreToolUse hook (install.py registers it
 in ~/.claude/settings.json) that refuses `git commit --no-verify` (or `-n`),
 which would skip the check. It catches a mistake, not an agent set on getting
@@ -138,8 +159,9 @@ around the check (`AI_AGENT= git commit`, `AGENT_PRE_COMMIT=1 git commit`, `git
 -c core.hooksPath=...`, or a line written into the pass record by hand, which
 every worktree then trusts).
 
-    agent-commit-gate --install REPO...    # add the line to each repo's pre-commit
-    agent-commit-gate --run HOOK           # as the line calls it
+    agent-commit-gate --install REPO...    # add the lines to each repo's hooks
+    agent-commit-gate --run HOOK           # as the pre-commit line calls it
+    agent-commit-gate --post-commit        # as the post-commit line calls it
     agent-commit-gate < hook-input.json    # as Claude Code calls it
 """
 
@@ -213,6 +235,16 @@ OLD_LINES = (
         f'{{ echo "COMMIT REFUSED: {HOOK_NAME} failed" >&2; exit 1; }}; fi; exit; fi'
     ),
 )
+# The line --install puts first in the post-commit hook, below this comment: after an
+# agent's commit, it warns when a fix commit changes a file its target didn't.
+POST_COMMENT = (
+    "# After an agent's commit, warn when a fix commit changes a file its target didn't"
+    " (llm-toolbox agent-commit-gate)."
+)
+POST_LINE = (
+    'if [ -n "${AI_AGENT:-}" ] && command -v agent-commit-gate >/dev/null; then '
+    "agent-commit-gate --post-commit; fi"
+)
 # The parts of a variable's name that mark it a secret, which no check gets.
 SECRET_PARTS = frozenset({"KEY", "TOKEN", "SECRET", "PASSWORD", "PASS"})
 # The variable that names a file whose every exported name no check gets either; each
@@ -231,7 +263,8 @@ SHELLS = {"sh", "bash", "dash", "ksh", "zsh"}
 
 # git's own options (before the subcommand) whose value is the next word.
 GIT_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
-# git accepts any unambiguous prefix of a long option; shorter ones clash with --no-verbose.
+# git accepts any unambiguous prefix of a long option; shorter ones clash with
+# --no-verbose.
 NO_VERIFY = "--no-verify"
 NO_VERIFY_SHORTEST = len("--no-veri")
 # git commit options whose value is the next word; u and S take only an attached one.
@@ -555,8 +588,16 @@ def skips_hooks(args):
 
 
 def git_out(*args):
-    """A git command's output, or None when it fails."""
-    run = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+    """A git command's output, or None when it fails. Bytes that aren't UTF-8, as in a
+    path or a subject, decode as surrogates rather than raise, and go back to git as
+    they came."""
+    run = subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        errors="surrogateescape",
+        check=False,
+    )
     return run.stdout.strip() if run.returncode == 0 else None
 
 
@@ -571,19 +612,52 @@ def is_inert(line):
 
 
 def install(repo):
-    """Put LINE first in the repo's pre-commit hook, replacing an older line; returns an
-    error message or None."""
+    """Put LINE first in the repo's pre-commit hook, replacing an older line, and
+    POST_LINE first in its post-commit hook; returns an error message or None."""
     hooks = hooks_dir(repo)
     if hooks is None:
         return f"{repo}: not a git repository"
     agent = hooks / HOOK_NAME
     if not (agent.is_file() and os.access(agent, os.X_OK)):
         return f"{repo}: no executable {agent}"
-    pre = hooks / "pre-commit"
-    exists = pre.exists()
-    lines = (pre.read_text() if exists else "#!/bin/sh\n").splitlines()
-    shebang = lines[0][2:].split() if lines and lines[0].startswith("#!") else []
-    at = 1 if shebang else 0
+    errors = [
+        install_pre_commit(hooks / "pre-commit"),
+        install_post_commit(hooks / "post-commit"),
+    ]
+    return "\n".join(error for error in errors if error) or None
+
+
+class Hook(NamedTuple):
+    """A hook's lines (`#!/bin/sh` alone when there's none), the index of its first
+    line after the shebang, and whether it's a shell script, which a line can go in."""
+
+    lines: list
+    at: int
+    shell: bool
+
+    @classmethod
+    def read(cls, path):
+        lines = (path.read_text() if path.exists() else "#!/bin/sh\n").splitlines()
+        shebang = lines[0][2:].split() if lines and lines[0].startswith("#!") else []
+        at = 1 if shebang else 0
+        if shebang and Path(shebang[0]).name == "env":
+            shebang = shebang[1:]
+        return cls(lines, at, not shebang or Path(shebang[0]).name in SHELLS)
+
+
+def write_hook(path, lines, done):
+    """Write the hook at `path`, executable when it's new, and say what was `done`."""
+    exists = path.exists()
+    path.write_text("\n".join(lines) + "\n")
+    if not exists:
+        path.chmod(0o755)
+    print(f"{path}: {done}")
+
+
+def install_pre_commit(pre):
+    """Put LINE first in the pre-commit hook `pre`, replacing an older line; returns an
+    error message or None."""
+    lines, at, shell = Hook.read(pre)
     found = next(
         (i for i, line in enumerate(lines) if line.strip() in (LINE, *OLD_LINES)), None
     )
@@ -592,9 +666,7 @@ def install(repo):
     if first and lines[found].strip() == LINE:
         print(f"{pre}: already installed")
         return None
-    if shebang and Path(shebang[0]).name == "env":
-        shebang = shebang[1:]
-    if shebang and Path(shebang[0]).name not in SHELLS:
+    if not shell:
         return f"{pre}: not a shell script, so add the agent check by hand"
     done = []
     if found is not None:
@@ -607,10 +679,21 @@ def install(repo):
             start -= 1  # its comment goes with it
         del lines[start : found + 1]
     lines[at:at] = [COMMENT, LINE]
-    pre.write_text("\n".join(lines) + "\n")
-    if not exists:
-        pre.chmod(0o755)
-    print(f"{pre}: {', '.join(done) or 'installed'}")
+    write_hook(pre, lines, ", ".join(done) or "installed")
+    return None
+
+
+def install_post_commit(post):
+    """Put POST_LINE first in the post-commit hook `post`, unless it has the line
+    already; returns an error message or None."""
+    lines, at, shell = Hook.read(post)
+    if POST_LINE in (line.strip() for line in lines):
+        print(f"{post}: already installed")
+        return None
+    if not shell:
+        return f"{post}: not a shell script, so add the fix commit warning by hand"
+    lines[at:at] = [POST_COMMENT, POST_LINE]
+    write_hook(post, lines, "installed")
     return None
 
 
@@ -897,6 +980,191 @@ def run_check(path, queue=True):
     return code
 
 
+# The prefixes git rebase --autosquash takes off a fix commit's subject to find the
+# commit it fixes: as many as it starts with, each with the spaces after it.
+FIX_PREFIXES = ("fixup! ", "amend! ", "squash! ")
+# How many of the commits a rebase would replay, newest first, the gate looks through
+# for a fix commit's target.
+TARGET_SEARCH = 100
+# What git reads as a pattern in a pathspec, which `:(literal)` before it turns off.
+GLOB_CHARS = frozenset("*?[\\")
+
+
+class Commit(NamedTuple):
+    sha: str
+    subject: str
+
+
+def fixed_title(subject):
+    """What git rebase --autosquash looks for to find the commit a fix commit with this
+    subject fixes: the subject after its fix prefixes; None when it has none."""
+    if not subject.startswith(FIX_PREFIXES):
+        return None
+    while subject.startswith(FIX_PREFIXES):
+        subject = subject.partition(" ")[2].lstrip()
+    return subject
+
+
+def replayed_commits():
+    """The commits a rebase of HEAD onto another branch, a tag or a remote-tracking
+    branch would replay, which autosquash folds among: merges left out, the newest
+    TARGET_SEARCH of them, oldest first."""
+    branch = git_out("symbolic-ref", "-q", "--short", "HEAD")
+    log = git_out(
+        *("log", "--no-show-signature", "--no-merges", "--topo-order"),
+        *(f"-n{TARGET_SEARCH}", "--format=%H %s", "HEAD", "--not"),
+        *([f"--exclude={branch}"] if branch else []),
+        *("--branches", "--tags", "--remotes"),
+    )
+    lines = (log or "").splitlines()
+    return [Commit(*line.partition(" ")[::2]) for line in reversed(lines)]
+
+
+def fold_targets(commits):
+    """{a fix commit's ID: the commit autosquash folds it into}, for each fix commit of
+    `commits` (oldest first) whose target is found, as git finds it among the earlier
+    commits that aren't fix commits: the oldest whose subject is the title; else, for a
+    title with no space, the one it names; else the oldest whose subject starts with
+    it. An empty title finds none."""
+    targets, earlier = {}, []
+    for commit in commits:
+        title = fixed_title(commit.subject)
+        if title is None:
+            earlier.append(commit)
+        elif title and (target := find_target(title, earlier)):
+            targets[commit.sha] = target
+    return targets
+
+
+def find_target(title, earlier):
+    """The commit of `earlier` that a fix looking for `title` folds into (fold_targets),
+    or None."""
+    found = next((commit for commit in earlier if commit.subject == title), None)
+    if found is None and " " not in title:
+        named = git_out(
+            "rev-parse", "-q", "--verify", "--end-of-options", f"{title}^{{commit}}"
+        )
+        found = next((commit for commit in earlier if commit.sha == named), None)
+    return found or next(
+        (commit for commit in earlier if commit.subject.startswith(title)), None
+    )
+
+
+def changed(rev, renames=False):
+    """What commit `rev` changes against its parent (a root commit: each of its files),
+    one tuple of paths a file: a rename's old and new path when `renames`, otherwise
+    the one path."""
+    out = git_out(
+        *("diff-tree", "-r", "--root", "--no-commit-id", "--name-status", "-z"),
+        "-M" if renames else "--no-renames",
+        rev,
+    )
+    words, entries = iter((out or "").split("\0")), []
+    for status in words:
+        if status:
+            count = 2 if status[0] in "RC" else 1
+            entries.append(tuple(next(words, "") for _ in range(count)))
+    return entries
+
+
+def pathspec(path):
+    """`path`, from the top of the work tree, as a shell word that names only that path
+    to git from any folder in it: `:/` before it, `:(top,literal)` before one git would
+    read as a pattern."""
+    literal = GLOB_CHARS & set(path)
+    return shlex.quote(f":(top,literal){path}" if literal else f":/{path}")
+
+
+# The folders a rebase, a cherry-pick or a revert keeps in the git dir while it runs:
+# it makes some commits with a `git commit` of its own, a reword's or a `--continue`'s.
+SEQUENCING = ("rebase-merge", "rebase-apply", "sequencer")
+
+
+def sequencing():
+    """Whether a rebase, a cherry-pick or a revert is under way."""
+    return any(
+        (path := git_out("rev-parse", "--git-path", name)) and Path(path).is_dir()
+        for name in SEQUENCING
+    )
+
+
+def staged_beyond_head():
+    """Whether the index holds changes HEAD doesn't, as after `git commit PATHS` with
+    more staged."""
+    run = subprocess.run(["git", "diff", "--cached", "--quiet", "HEAD"], check=False)
+    return run.returncode == 1
+
+
+class Strays(NamedTuple):
+    """The fix commit at HEAD, its target, the files it changes (changed()'s entries)
+    that the target doesn't, and whether that's every file it changes."""
+
+    fix: Commit
+    target: Commit
+    entries: list
+    every: bool
+
+
+def stray_files():
+    """The Strays of the fix commit at HEAD: the files it changes that neither its
+    target in replayed_commits() nor the target's earlier fix commits do, which the
+    fold gives the target too. None when HEAD is no fix commit there, its target isn't
+    found, or every file it changes is the target's."""
+    commits = replayed_commits()
+    if not commits or commits[-1].sha != git_out("rev-parse", "HEAD"):
+        return None
+    fix, targets = commits[-1], fold_targets(commits)
+    if (target := targets.get(fix.sha)) is None:
+        return None
+    folded = [target, *(c for c in commits[:-1] if targets.get(c.sha) == target)]
+    theirs = {
+        path for commit in folded for entry in changed(commit.sha) for path in entry
+    }
+    entries = changed(fix.sha, renames=True)
+    strays = [entry for entry in entries if theirs.isdisjoint(entry)]
+    return Strays(fix, target, strays, len(strays) == len(entries)) if strays else None
+
+
+def split_advice(strays):
+    """How to take the Strays' files off the fix commit, while it is HEAD."""
+    at = strays.fix.sha[:12]
+    if strays.every:
+        # Taking out every file would leave the commit empty, which git refuses.
+        advice = (
+            f"if it fixes another commit, undo it while HEAD is {at} (git reset -q"
+            " --soft HEAD^) and commit it for that one"
+        )
+    else:
+        paths = " ".join(pathspec(path) for entry in strays.entries for path in entry)
+        advice = (
+            f"to split off what belongs to another commit, while HEAD is {at}: git"
+            f" reset -q HEAD^ -- {paths} && git commit -q --amend --no-edit, then"
+            " commit it with that commit"
+        )
+    if staged_beyond_head():
+        advice += "; unstage the rest of what's staged first, or it goes in too"
+    return advice
+
+
+def warn_stray_files():
+    """After an agent's own `git commit` of a fix commit, with no rebase, cherry-pick or
+    revert under way (they run post-commit too), print a line for each of its
+    stray_files(), then split_advice()."""
+    if running_commit_args() is None or sequencing():
+        return
+    if (strays := stray_files()) is None:
+        return
+    kind = strays.fix.subject.partition(" ")[0]
+    for entry in strays.entries:
+        print(
+            f"agent-commit-gate: this {kind} changes"
+            f" {' -> '.join(map(shlex.quote, entry))}, which its target"
+            f' "{strays.target.subject}" didn\'t touch',
+            file=sys.stderr,
+        )
+    print(f"agent-commit-gate: {split_advice(strays)}", file=sys.stderr)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -905,7 +1173,8 @@ def main(argv=None):
         "--install",
         nargs="+",
         metavar="REPO",
-        help="add the agent check line to each repo's pre-commit hook",
+        help="add the agent check line to each repo's pre-commit hook, and the fix "
+        "commit warning's to its post-commit hook",
     )
     parser.add_argument(
         "--run",
@@ -918,7 +1187,16 @@ def main(argv=None):
         action="store_true",
         help=f"with --run: exit {QUEUE_EXIT} instead of waiting in heavy's queue",
     )
+    parser.add_argument(
+        "--post-commit",
+        action="store_true",
+        help="as the post-commit line calls it: warn when the fix commit just made "
+        "changes a file its target didn't",
+    )
     args = parser.parse_args(argv)
+    if args.post_commit:
+        warn_stray_files()
+        return 0
     if args.run:
         try:
             return run_check(args.run, queue=not args.no_queue)

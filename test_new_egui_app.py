@@ -65,6 +65,7 @@ def test_writes_a_complete_project(made: Path) -> None:
         "scripts/install-desktop.sh",
         ".githooks/pre-commit",
         ".githooks/agent-pre-commit",
+        ".githooks/post-commit",
         ".github/workflows/ci.yml",
         "rustfmt.toml",
         ".gitignore",
@@ -146,6 +147,7 @@ def test_scripts_are_executable(made: Path) -> None:
     for name in [
         ".githooks/pre-commit",
         ".githooks/agent-pre-commit",
+        ".githooks/post-commit",
         "scripts/install-desktop.sh",
     ]:
         assert os.access(made / name, os.X_OK), name

@@ -1,0 +1,3 @@
+#!/bin/sh
+# After an agent's commit, warn when a fix commit changes a file its target didn't (llm-toolbox agent-commit-gate).
+if [ -n "${AI_AGENT:-}" ] && command -v agent-commit-gate >/dev/null; then agent-commit-gate --post-commit; fi

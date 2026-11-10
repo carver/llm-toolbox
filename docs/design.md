@@ -96,7 +96,7 @@ quick jobs that yield to an ordinary head they've passed for a minute; a limit o
 wait that gives up the place; the HEAVY_QUICK_* knobs honoured only with a private
 HEAVY_DIR; landings ahead of quick jobs that joined the front before them.
 
-### Rejected: a second job on the holder's cores at nice 10 (71650a7, eadadb6, 2026-11-08)
+### Rejected: a second job on the holder's cores at nice 10 (53e60a8, 6a76738, 2026-11-08)
 
 heavy let one more job start beside a holder that left cores idle, on the same cores
 at nice 10. Under contention a nice-10 process gets about a tenth of a core, so when
@@ -150,7 +150,7 @@ all `agent-pre-commit`, and a landing ran the full check at each commit, again i
 rebase. wt-ship's recheck failed none of 34 logged landings, and most refusals at a
 commit came from tests of the code it changed.
 
-### wt-ship checks every commit it lands (9927dd7, 2026-11-08)
+### wt-ship checks every commit it lands (03bc4c8, 2026-11-08)
 
 Each commit with no pass on agent-commit-gate's record, oldest first, each checked
 out in turn in the worktree, then HEAD. Before, it checked only HEAD, so after a
@@ -178,7 +178,7 @@ design). The running job isn't stopped. The front goes only to a landing under t
 claim and, since 2026-11-09, to a `heavy --quick` job (above), and works on trust, as
 the queue does.
 
-### build-state finish only folds (1465ae5, 2026-11-08)
+### build-state finish only folds (8f13e99, 2026-11-08)
 
 wt-ship checks a fold's new trees when it lands them, so finish's own run of the
 full check on each rewritten commit was a second one.
@@ -209,7 +209,7 @@ commit whose added lines use a name a line added since its target defines (def,
 class, const, `NAME =` and the like), which the target's tree lacks, is left in
 place, and wt-ship lands it with a warning (the owner's call, after a side agent
 raised it). Tried first: any word the parent's tree has and the target's lacks,
-which flagged `Interrupted` in eb8faa1, a word that only prose and a test string
+which flagged `Interrupted` in b37f43f, a word that only prose and a test string
 named.
 
 wt-ship and finish warn; neither refuses. The owner first chose a refusal, then
@@ -221,7 +221,7 @@ too small for a stop every other session meets. A `Fold-check: keep` trailer on 
 commit silences the warning for it, rather than a flag for the whole landing (the
 owner's choice): it lasts through rebases and says which split is on purpose.
 
-### A repo may run a lighter check at each commit (2d50a0e, 2026-11-08)
+### A repo may run a lighter check at each commit (fe1aad9, 2026-11-08)
 
 A repo's `agent-commit-check` runs at each commit in the full check's place, with
 passes on a record of their own, so wt-ship runs the full check on each such commit
@@ -277,7 +277,7 @@ predates the marker.
 
 ### build-state finish stops only for what a fold, or the repo's safety, depends on (2026-11-09)
 
-The fingerprint came from an anki-cards retro (757b220): a subagent's `rebase --exec`
+The fingerprint came from an anki-cards retro (132c422): a subagent's `rebase --exec`
 rewrote the shared config from a worktree unnoticed. In a filedrawer session on
 2026-11-09, finish stopped three times on changes it had no reason to: twice
 `refs/heads/main`, as other sessions landed, and once `core.hooksPath`, which another
@@ -451,7 +451,7 @@ Left to the owner: build-state's `fixed_name` and `names_commit` find a fix's ta
 by a prefix of the subject or an ID, newest first, which can differ from autosquash
 and from this warning when two subjects match.
 
-### Rejected: `wt-ship --check CMD` (removed in 9927dd7)
+### Rejected: `wt-ship --check CMD` (removed in 03bc4c8)
 
 Nothing used it. It came with wt-ship's first version, for a repo that had no
 `agent-pre-commit` then and has one now.

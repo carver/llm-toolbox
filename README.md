@@ -461,9 +461,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   commands, and ticking one where it lives (`issue-todo tick N MATCH --note
   TEXT`, with `--undo` and `--dry-run`). `issue-todo open` lists every open
   issue's open items, a cheap answer to "what's left to do here", and `--titles`
-  one line per open issue (number, title, count of open items), to find an issue
-  by its subject. `issue-todo read N...` prints each issue's body and every
-  comment, with author and date. `show` and `read` end with the issues and pull
+  one line per open issue (number, title, count of open items, and the sessions
+  that claim it), to find an issue by its subject and skip one another session
+  holds. `issue-todo read N...` prints each issue's body and every comment, with
+  author and date. `show` and `read` end with the issues and pull
   requests each issue mentions as `#N`, with their state, open items and title,
   so a plan issue tells which of its steps are done. `issue-todo unticked N...`
   prints each unticked item as `#N TEXT`, one a line, for a script such as

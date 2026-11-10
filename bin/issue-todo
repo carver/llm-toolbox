@@ -8,13 +8,14 @@
 without the body, so a to-do list split between them reads as two partial lists.
 `show` prints every item in one place; `tick` checks one off where it lives; `open`
 prints every open issue's open items, leaving out pull requests and ticked items.
-`open --titles` prints one line per open issue instead: its number, its title, and how
-many open items it has, if any. That is enough to find an issue by its subject.
+`open --titles` prints one line per open issue instead: its number, its title, how
+many open items it has, if any, and who claims it, if anyone. That is enough to find
+an issue by its subject, and to see which ones another session holds.
 `unticked N...` prints each unticked item as `#N TEXT`, one a line, for a script:
 wt-ship lists them for each issue a landing closes.
 
     issue-todo open
-    issue-todo open --titles          # a line like "#16 Site design (3 open items)"
+    issue-todo open --titles          # "#16 Site design (3 open items) [claimed by f3f9b997]"
     issue-todo show 42
     issue-todo read 42 43             # body and every comment, which gh splits in two
     issue-todo unticked 42 43         # each unticked item, as "#42 TEXT", one a line
@@ -270,19 +271,36 @@ CLAIM = re.compile(r"<!-- issue-todo (claim|release) (\S+) -->")
 NAME = re.compile(r"\S+")  # what CLAIM reads back
 
 
-def holders(repo: str, number: int) -> dict[str, str]:
-    """The sessions holding a claim on the issue, with each claim's date."""
+def claims(comments: list[tuple[str, str]]) -> dict[str, str]:
+    """The sessions holding a claim, with each claim's date, from `comments` in order,
+    each as (body, date): a claim stands until a later release by the same ID."""
     held = {}
-    comments = json.loads(
-        gh("api", "--paginate", f"repos/{repo}/issues/{number}/comments")
-    )
-    for comment in comments:
-        for kind, session in CLAIM.findall(comment.get("body") or ""):
+    for body, date in comments:
+        for kind, session in CLAIM.findall(body):
             if kind == "claim":
-                held.setdefault(session, comment["created_at"][:16].replace("T", " "))
+                held.setdefault(session, date)
             else:
                 held.pop(session, None)
     return held
+
+
+def holders(repo: str, number: int) -> dict[str, str]:
+    """The sessions holding a claim on the issue, with each claim's date."""
+    comments = json.loads(
+        gh("api", "--paginate", f"repos/{repo}/issues/{number}/comments")
+    )
+    return claims(
+        [
+            (c.get("body") or "", c["created_at"][:16].replace("T", " "))
+            for c in comments
+        ]
+    )
+
+
+def claimed_by(bodies: list[str]) -> str:
+    """` [claimed by ID, ...]` for the claims standing in the comment `bodies`, or ""."""
+    held = claims([(body, "") for body in bodies])
+    return f" [claimed by {', '.join(held)}]" if held else ""
 
 
 def post_comment(repo: str, number: int, body: str) -> None:
@@ -367,15 +385,13 @@ def show_open(repo: str) -> int:
 
 
 def show_titles(repo: str) -> int:
-    """One line per open issue, with its count of open items."""
+    """One line per open issue, with its count of open items and its claimants."""
     for issue in open_issues(repo):
-        n = sum(
-            not item.done
-            for part in issue_parts(repo, issue)
-            for item in items(part.markdown)
-        )
+        found = issue_parts(repo, issue)
+        n = sum(not item.done for part in found for item in items(part.markdown))
         count = f" ({n} open item{'s' if n > 1 else ''})" if n else ""
-        print(f"#{issue['number']} {issue['title']}{count}")
+        who = claimed_by([part.markdown for part in found[1:]])
+        print(f"#{issue['number']} {issue['title']}{count}{who}")
     return 0
 
 
@@ -448,7 +464,8 @@ def main(argv: list[str] | None = None) -> int:
     o.add_argument(
         "--titles",
         action="store_true",
-        help="one line per open issue instead: number, title, count of open items",
+        help="one line per open issue instead: number, title, count of open items, "
+        "and the sessions holding a claim",
     )
     what = "every task-list item in the issue's body and comments, numbered within each"
     sub.add_parser("show", parents=[common], help=what, description=what)

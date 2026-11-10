@@ -494,3 +494,24 @@ def test_unticked_prints_nothing_for_an_issue_with_every_item_ticked(fake, capsy
     fake.comments[1]["body"] = "- [x] also done"
     assert tool.main(["unticked", "7"]) == 0
     assert capsys.readouterr().out == ""
+
+
+def test_open_titles_names_each_issues_unreleased_claimants(fake, capsys):
+    fake.comments += [
+        claim_comment("held0001"),
+        claim_comment("gone0001"),
+        claim_comment("gone0001", "release"),
+        claim_comment("held0002"),
+    ]
+    fake.listing = [
+        fake.issue | {"comments": 6},
+        {"number": 8, "title": "Unclaimed", "body": "", "comments": 0},
+    ]
+
+    assert tool.main(["open", "--titles"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "#7 Criterion: consistent (4 open items) [claimed by held0001, held0002]",
+        "#8 Unclaimed",
+    ]
+    assert len(fake.calls) == 3  # the repo, the listing and #7's comments

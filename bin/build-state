@@ -761,8 +761,11 @@ make no commits.
 
 Diff: `git diff {base}...{sha}`. Commits:
 {commits}
-Read the files as of that commit, with `git show {sha}:PATH`: the work tree can move on \
-while you review.
+Start from `git diff --stat {base}...{sha}`, then read each file's diff once with \
+`git diff {base}...{sha} -- PATH`, rather than the whole diff in one output. Read a file \
+whole only for context its diff doesn't show, and don't read again what an earlier \
+output showed. Read the files as of that commit, with `git show {sha}:PATH`: the work \
+tree can move on while you review.
 
 Spec: {brief}. Read it in full.
 

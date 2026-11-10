@@ -242,8 +242,11 @@ together with nothing pointing from one to the other.
 - Hungry tools: a tool or script whose output cost more tokens than the agent used.
 - Skipped checks: `--no-verify` or `git commit -n`.
 
-Not findings: one long call that did its job; a `user` wait; a hook refusal \
-followed by a correct retry (the hook working as designed); a subagent reading \
+Report every `HOOK ERROR` as a candidate, even one followed by a correct retry: \
+the checker dismisses those, and the retrospective must account for each \
+refusal, since the same hook refusing several times points to a habit to fix.
+
+Not findings: one long call that did its job; a `user` wait; a subagent reading \
 its brief, a skill, a standards file or a tool's `-h` once; a test that fails \
 first on purpose (test-driven work) or a review finding a problem (the review \
 doing its job); ending a turn to wait for a notification (though a `CACHE \

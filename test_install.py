@@ -247,9 +247,7 @@ def test_the_skill_change_hint_registers_for_loads_and_for_the_check(settings):
     ]
 
 
-def test_the_disk_warning_registers_once_as_a_session_start_hook_on_every_source(
-    settings,
-):
+def test_the_session_start_hooks_register_once_each_on_every_source(settings):
     settings.parent.mkdir(parents=True)
     other = {"matcher": "startup", "hooks": [{"type": "command", "command": "greet"}]}
     settings.write_text(json.dumps({"hooks": {"SessionStart": [other]}}))
@@ -264,6 +262,16 @@ def test_the_disk_warning_registers_once_as_a_session_start_hook_on_every_source
                 {
                     "type": "command",
                     "command": f"{install.BIN_DST / 'scratch-usage'} --warn-if-full",
+                    "timeout": 10,
+                }
+            ],
+        },
+        {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{install.BIN_DST / 'ci-status'} --session-start",
                     "timeout": 10,
                 }
             ],

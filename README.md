@@ -592,6 +592,19 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   folder and those above it), and a plugin's. Loads are kept per session and
   subagent under `${XDG_STATE_HOME:-~/.local/state}/skill-change-hint/`, for a
   week.
+- **ci-status**: prints a line for each GitHub Actions workflow failing on a
+  repo's branch, the default one unless `--branch` names another: ``CI is
+  failing on main: ci.yml (check) at b227171, 2 h ago: URL``. Only push and
+  schedule runs count (a scheduled one says so), a cancelled or skipped run is
+  no verdict, only active workflows count, and the failed jobs are named, their
+  names cut to plain characters. A newer run still going is noted. It asks
+  through `gh api`, within `CI_STATUS_TIMEOUT` seconds (5) for all its calls,
+  and says nothing, exit 0, when all pass, the remote (origin, or `--remote`)
+  isn't on GitHub, or anything fails; `-v` says why. Answers are cached per repo
+  and branch for `CI_STATUS_CACHE_SECONDS` (300; a failed lookup 60) under
+  `${XDG_CACHE_HOME:-~/.cache}/ci-status/`, behind a lock, so sessions starting
+  together ask GitHub once. `install.py` registers `ci-status --session-start`
+  as a SessionStart hook, which adds the lines to the session's context.
 
 - **build-state**: `/build`'s bookkeeping. `start` records the base commit
   (HEAD, or `--base REV`) and the repo's fingerprint (every other ref but the

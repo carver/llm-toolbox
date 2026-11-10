@@ -727,6 +727,31 @@ so loads are kept per agent, or a subagent's load would send its parent a note
 about a skill the parent never read. PreToolUse `additionalContext` reached the
 model on both Bash and Agent calls.
 
+## ci-status
+
+### Failing CI on the default branch reaches the agent at session start (2026-11-10)
+
+The owner pushes main and CI runs on GitHub, so no agent learned when it failed, and
+sessions built and landed on a red main. The owner settled the shape: a SessionStart
+hook adds a line per failing workflow, naming its failed jobs, the commit, the age
+and the run's URL; silent when all pass, off GitHub, or on any error; a deadline of
+a few seconds and a per-repo cache of minutes so sessions starting together don't
+each call GitHub. No issue filing and no email. wt-ship prints the same lines before
+it lands (a warning, never a refusal), through the same tool.
+
+A review of the design, before code, settled the details: GitHub lists runs by
+creation, and a re-run moves only `updated_at`, so the newest run per workflow is
+the first listed (filedrawer's mutants run 44f037e, re-run at 14:23, listed below a
+13:37 run); runs of a deleted or disabled workflow would stay red, so only active
+workflows count; a run cancelled by a newer push is no verdict; job names are
+written by whoever writes the workflow, so they are cut to plain characters before
+they reach an agent's context; the default branch comes from the API, not the local
+`origin/HEAD`, which can be stale, and is cached with the rest. The `gh` calls stay
+in the tool's process group, so wt-ship's timeout stops them with it. Measured on
+filedrawer-dev/filedrawer from the sandbox: the runs call takes about 1.8 s, a jobs
+call 0.4 s; `gh auth status` says not logged in there, yet the calls work through
+the proxy, so the tool tries the call rather than checking auth.
+
 ## path-refs
 
 ### rg runs in the workspace root (2026-11-09)

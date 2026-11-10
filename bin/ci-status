@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Say which GitHub Actions workflows are failing on a repo's branch, one line each.
+
+The owner pushes main and CI runs on GitHub, so an agent learns of a red main only if
+something tells it. Run in a git repo whose remote (origin) is on github.com, it asks
+GitHub, through `gh api`, for the branch's recent runs, and prints a line for each
+workflow whose latest verdict failed:
+
+    CI is failing on main: ci.yml (check) at b227171, 2 h ago: https://github.com/...
+
+- Only runs of push and schedule events count; a scheduled one says so, `(check;
+  scheduled)`. A cancelled, skipped or neutral run is no verdict, so a workflow's
+  latest verdict is its newest run that has one, newest by the order GitHub lists
+  them (by creation, so a re-run of an old run doesn't jump ahead). Failing means
+  failure, timed_out or startup_failure. Only the newest 50 runs are read.
+- Only workflows GitHub lists as active count, so a deleted or disabled one's last
+  failure doesn't linger; when that list can't be had, every workflow counts.
+- The failed jobs are named when one more call per failing run gets them; job and
+  file names are cut to plain characters, 40 at most, since anyone who writes the
+  workflow file writes them.
+- A run of the same workflow still going, newer than the failure, is noted at the
+  end of the line: `(a run for d00d1e5 is in progress)`.
+- The age is when the failing run finished.
+
+It says nothing when every workflow passes, the remote isn't on GitHub, there's no
+gh, gh can't reach GitHub or isn't logged in, or anything else goes wrong, and it
+always exits 0: its callers, a session's start and wt-ship, must never fail or wait
+on it. All its gh calls share one deadline, and it stops them all when that passes.
+
+Answers are cached per repo and branch for some minutes (a failed lookup for one), in
+${XDG_CACHE_HOME:-~/.cache}/ci-status/, and sessions starting together take turns
+on a lock beside the cache, so only the first asks GitHub and the rest read its
+answer.
+
+    ci-status [-C DIR] [--remote NAME] [--branch BRANCH] [-v]
+    ci-status --session-start < hook-event.json
+
+Options:
+  -C DIR           look at the repo in DIR (default: the current folder)
+  --remote NAME    the remote whose GitHub repo to ask about (default: origin)
+  --branch BRANCH  the branch (default: the repo's default branch on GitHub)
+  -v               say on stderr why nothing was printed
+  --session-start  run as Claude Code's SessionStart hook, which install.py
+                   registers: read the event on stdin, look in its cwd, and print
+                   the lines as the session's added context, as hook JSON
+
+Environment:
+  CI_STATUS_TIMEOUT        seconds all the gh calls of one lookup may take (default 5)
+  CI_STATUS_CACHE_SECONDS  seconds an answer stays fresh (default 300); a failed
+                           lookup stays for 60 at most (the tests set these)
+
+Exit status: 0, whatever it found or failed to find; 2 a usage error.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from urllib.parse import quote
+
+# A GitHub remote's URL, by HTTPS or SSH, and the OWNER/REPO in it.
+GITHUB_URL = re.compile(r"(?:^|[@/])github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$")
+EVENTS = {"push", "schedule"}
+FAILING = {"failure", "timed_out", "startup_failure"}
+NO_VERDICT = {"cancelled", "skipped", "neutral", None}
+RUNS = 50
+FAILED_LOOKUP_SECONDS = 60
+UNSAFE = re.compile(r"[^\w .:/-]")
+NAME_LENGTH = 40
+
+
+class Quiet(Exception):
+    """Nothing to say, with the reason -v gives."""
+
+
+class Gh:
+    """`gh api` calls sharing one deadline. Each child stays in this process's group,
+    so a caller that stops the group stops them too, and any still running when the
+    deadline passes, or when this process is told to stop, is killed."""
+
+    def __init__(self, seconds: float):
+        self.deadline = time.monotonic() + seconds
+        self.children: set[subprocess.Popen] = set()
+        # Reentrant: the SIGTERM handler takes it on the main thread, which may hold it.
+        self.lock = threading.RLock()
+
+    def api(self, endpoint: str, **fields) -> object:
+        argv = ["gh", "api", "-X", "GET", endpoint]
+        for key, value in fields.items():
+            argv += ["-f", f"{key}={value}"]
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise Quiet("no time left for gh")
+        try:
+            child = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as error:
+            raise Quiet(f"no gh: {error}") from None
+        with self.lock:
+            self.children.add(child)
+        try:
+            stdout, stderr = child.communicate(timeout=left)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.communicate()
+            raise Quiet(f"gh gave no answer for {endpoint} in time") from None
+        finally:
+            with self.lock:
+                self.children.discard(child)
+        if child.returncode != 0:
+            last = (stderr.strip().splitlines() or ["no message"])[-1]
+            raise Quiet(f"gh failed for {endpoint}: {last}")
+        try:
+            return json.loads(stdout)
+        except ValueError:
+            raise Quiet(f"gh's answer for {endpoint} isn't JSON") from None
+
+    def stop(self) -> None:
+        with self.lock:
+            for child in self.children:
+                child.kill()
+
+
+def in_parallel(*calls):
+    """Each call's result, or a Quiet for one that failed or got an answer of a shape
+    it didn't expect, run at once in threads."""
+    results: list = [None] * len(calls)
+
+    def one(i, call):
+        try:
+            results[i] = call()
+        except Quiet as quiet:
+            results[i] = quiet
+        except (KeyError, TypeError, AttributeError) as error:
+            results[i] = Quiet(f"unexpected answer: {error!r}")
+
+    threads = [
+        threading.Thread(target=one, args=(i, call), daemon=True)
+        for i, call in enumerate(calls)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
+
+
+def github_repo(folder: str, remote: str) -> str:
+    got = subprocess.run(
+        ["git", "-C", folder, "remote", "get-url", remote],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    match = GITHUB_URL.search(got.stdout.strip()) if got.returncode == 0 else None
+    if not match:
+        raise Quiet(f"{remote} isn't on GitHub here")
+    return match.group(1)
+
+
+def plain(name: str) -> str:
+    return UNSAFE.sub("", name)[:NAME_LENGTH]
+
+
+def latest_verdicts(runs: list, active: set | None) -> list[dict]:
+    """Per workflow, its newest run with a verdict, and the newest run in progress
+    listed before it, if any, in the order GitHub lists them."""
+    seen: dict[str, dict] = {}
+    going: dict[str, str] = {}
+    for run in runs:
+        path = run.get("path")
+        if not isinstance(path, str) or run.get("event") not in EVENTS:
+            continue
+        if active is not None and path not in active:
+            continue
+        if path in seen:
+            continue
+        if run.get("status") != "completed":
+            going.setdefault(path, str(run.get("head_sha", ""))[:7])
+            continue
+        if run.get("conclusion") in NO_VERDICT:
+            continue
+        seen[path] = {
+            "id": run["id"],
+            "file": plain(path.rsplit("/", 1)[-1]),
+            "event": run["event"],
+            "conclusion": run["conclusion"],
+            "sha": str(run["head_sha"])[:7],
+            "finished": run["updated_at"],
+            "url": run["html_url"],
+            "going": going.get(path),
+        }
+    return list(seen.values())
+
+
+def look_up(repo: str, branch: str | None, gh: Gh) -> dict:
+    """The branch and its failing workflows, from GitHub."""
+    api = f"repos/{repo}"
+    if branch is None:
+        branch = gh.api(api)["default_branch"]
+    runs, active = in_parallel(
+        lambda: gh.api(f"{api}/actions/runs", branch=branch, per_page=RUNS)[
+            "workflow_runs"
+        ],
+        lambda: {
+            w["path"]
+            for w in gh.api(f"{api}/actions/workflows", per_page=100)["workflows"]
+            if w.get("state") == "active"
+        },
+    )
+    if isinstance(runs, Quiet):
+        raise runs
+    failing = [
+        run
+        for run in latest_verdicts(runs, None if isinstance(active, Quiet) else active)
+        if run["conclusion"] in FAILING
+    ]
+    jobs = in_parallel(
+        *(
+            lambda run=run: [
+                plain(job["name"])
+                for job in gh.api(
+                    f"{api}/actions/runs/{run['id']}/jobs",
+                    filter="latest",
+                    per_page=100,
+                )["jobs"]
+                if job.get("conclusion") in FAILING
+            ]
+            for run in failing
+        )
+    )
+    for run, names in zip(failing, jobs, strict=True):
+        run["jobs"] = [] if isinstance(names, Quiet) else names
+    return {"branch": branch, "failing": failing}
+
+
+def ago(stamp: str) -> str:
+    then = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    minutes = max(1, int((datetime.now(UTC) - then).total_seconds() // 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} h"
+    return f"{minutes // (24 * 60)} d"
+
+
+def line(branch: str, run: dict) -> str:
+    notes = ", ".join(run["jobs"])
+    if run["event"] == "schedule":
+        notes = f"{notes}; scheduled" if notes else "scheduled"
+    named = f"{run['file']} ({notes})" if notes else run["file"]
+    text = (
+        f"CI is failing on {branch}: {named} at {run['sha']},"
+        f" {ago(run['finished'])} ago: {run['url']}"
+    )
+    if run["going"]:
+        text += f" (a run for {run['going']} is in progress)"
+    return text
+
+
+def cache_file(repo: str, branch: str | None) -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    name = f"{quote(repo, safe='')}@{quote(branch or '', safe='') or 'default'}"
+    return Path(base) / "ci-status" / f"{name}.json"
+
+
+def fresh(path: Path) -> dict | None:
+    """The cached answer when it is fresh enough, else None."""
+    try:
+        cached = json.loads(path.read_text())
+        age = time.time() - cached["at"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    keep = float(os.environ.get("CI_STATUS_CACHE_SECONDS", "300"))
+    if "answer" not in cached:
+        keep = min(keep, FAILED_LOOKUP_SECONDS)
+    return cached if 0 <= age < keep else None
+
+
+def save(path: Path, cached: dict) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps(cached))
+    os.replace(tmp, path)
+
+
+def take_lock(path: Path, deadline: float):
+    """The lock file, held, or None when the deadline passes first."""
+    handle = path.open("a")
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                return None
+            time.sleep(0.05)
+
+
+def status(repo: str, branch: str | None, gh: Gh) -> dict:
+    """The answer for repo and branch, from the cache when it's fresh, else from
+    GitHub by whichever session holds the lock first."""
+    path = cache_file(repo, branch)
+    cached = fresh(path)
+    if cached is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = take_lock(path.with_suffix(".lock"), gh.deadline)
+        if lock is None:
+            raise Quiet("another lookup held the lock past the deadline")
+        with lock:
+            cached = fresh(path)  # the holder before us may have just answered
+            if cached is None:
+                try:
+                    cached = {"at": time.time(), "answer": look_up(repo, branch, gh)}
+                except Quiet as quiet:
+                    cached = {"at": time.time(), "why": str(quiet)}
+                except (KeyError, TypeError, AttributeError) as error:
+                    cached = {"at": time.time(), "why": f"unexpected answer: {error}"}
+                save(path, cached)
+    if "answer" not in cached:
+        raise Quiet(cached.get("why", "the last lookup failed"))
+    return cached["answer"]
+
+
+def lines(folder: str, remote: str, branch: str | None, seconds: float) -> list[str]:
+    repo = github_repo(folder, remote)
+    gh = Gh(seconds)
+    signal.signal(signal.SIGTERM, lambda *_: (gh.stop(), sys.exit(0)))
+    answer = status(repo, branch, gh)
+    if not answer["failing"]:
+        raise Quiet(f"every workflow on {answer['branch']} is passing")
+    return [line(answer["branch"], run) for run in answer["failing"]]
+
+
+def parse(argv):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("-C", dest="folder", default=".")
+    parser.add_argument("--remote", default="origin")
+    parser.add_argument("--branch")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--session-start", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse(sys.argv[1:] if argv is None else argv)
+    if args.help:
+        print(__doc__)
+        return 0
+    try:
+        folder = args.folder
+        if args.session_start:
+            folder = json.loads(sys.stdin.read())["cwd"]
+        seconds = float(os.environ.get("CI_STATUS_TIMEOUT", "5"))
+        found = lines(folder, args.remote, args.branch, seconds)
+    except Quiet as quiet:
+        if args.verbose:
+            print(f"ci-status: nothing to say: {quiet}", file=sys.stderr)
+        return 0
+    except Exception as error:  # noqa: BLE001 - a session's start must never fail on it
+        if args.verbose:
+            print(f"ci-status: nothing to say: {error!r}", file=sys.stderr)
+        return 0
+    if args.session_start:
+        context = {
+            "hookEventName": "SessionStart",
+            "additionalContext": "\n".join(found),
+        }
+        print(json.dumps({"hookSpecificOutput": context}))
+    else:
+        print("\n".join(found))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

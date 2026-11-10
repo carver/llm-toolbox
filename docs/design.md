@@ -566,3 +566,24 @@ next starts. Where Claude Code puts the memory elsewhere, the computed folder is
 missing and nothing goes: a working directory inside a git repository (checked:
 the memory folder is the repository's), `CLAUDE_CODE_PROJECT_DIR_NAME`,
 `autoMemoryDirectory` or `CLAUDE_CODE_REMOTE_MEMORY_DIR`.
+
+## path-refs
+
+### rg runs in the workspace root (2026-11-09)
+
+rg anchors a `--glob` that starts with `/`, such as `!/cache/`, at its own working
+directory, not at the search path. With the workspace root as its working directory
+and `.` as the path, the skips (`!/cache/`, `!/keep/`, `!*-wt-*/` and the rest) hold,
+and rg walks about 10.8k files: a search takes about 1.3 s, under half a second warm.
+Run from any other folder, with the absolute root as the path, the two anchored
+globs match nothing, and rg walks the 1.17M files under `cache/` and `keep/`, past
+60 s (measured by the agent that asked for the tool; the anchoring checked on a
+two-folder tree). So the tool runs rg in the root, on `.`, and prints hits relative
+to it. `test_skipped_folders_and_git_ignored_files_are_not_searched_from_any_cwd`
+runs the tool from another folder, and fails when rg doesn't run in the root.
+
+The symlink walk of `--links` can't use rg, which doesn't list links, and doesn't
+skip git-ignored folders, where a link such as `data -> ../cache/X` is most likely to
+live. It walks the rest of the workspace, git-ignored venvs included, in about 2 s
+warm (13 s once, with the host mount's cache cold), as long as `find` takes over
+the same folders.

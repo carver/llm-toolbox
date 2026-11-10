@@ -439,6 +439,29 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   session hears when the disk is nearly full. For the tests,
   `$SCRATCH_USAGE_ROOT` stands in for the root and `$SCRATCH_USAGE_DF` names a
   file of the filesystem's size, used and available bytes.
+- **path-refs**: `path-refs PATH...` lists what in the workspace references a
+  workspace path (`cache/r-shared-model`, or absolute), or anything under it,
+  before you move or rename it: one line per reference, `repo/file:line:` and the
+  path as written, under a count line per repo, with frozen repos searched and
+  marked. It finds the absolute form, `claudedev/cache/X` and
+  `~/code/claudedev/cache/X`, `../` chains, `$root/`, `$(...)/` and
+  `WORKSPACE/` roots, the bare `cache/X` wherever it isn't part of a longer path
+  (`~/.cache/uv` is no reference to `cache/uv`), and, in PATH's own repo, the
+  path relative to the repo; in prose, backticks, links or code. A line of code
+  that builds the path from parts (`HOST_CACHE_ROOT / "tectonic"`) is listed as
+  `maybe`. A one-word PATH, such as a repo, counts bare only before a `/` or in
+  quotes, so the word "keep" isn't a reference to `keep/`. A file with more than
+  10 references, such as generated numbers, gets one line with its count, unless
+  `--all`. It runs rg from the workspace root, skipping git-ignored files and the
+  `cache/`, `keep/`, `.git/`, `*-wt-*/`, `node_modules/`, `.venv/` and `target/`
+  folders, in about half a second. `--links` adds the symlinks under `~` (depth
+  5) and in the workspace that point into PATH, and the crontab lines naming it,
+  in about 2 s more. After the move, `--moved OLD NEW` marks each reference to
+  OLD `moved`, `stayed`, `split` or `missing`, by whether what it names, globs
+  and `{a,b}` included, is now under NEW, still under OLD, under both (a folder
+  whose notes moved and downloads stayed) or neither. `--count` prints only the
+  count lines. For the tests, `$PATH_REFS_ROOT` stands in for the workspace
+  root, and `$HOME` for where `--links` looks.
 - **edit-script-gate**: a Claude Code hook, which `install.py` registers, that
   refuses a Bash command running inline Python (a heredoc or `-c`) whose code
   reads a file, `.replace()`s text and writes that same file back, and points

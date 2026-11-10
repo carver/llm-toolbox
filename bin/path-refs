@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""List what in the workspace references a path, before or after moving it.
+
+  path-refs [--links] [--count | --all] PATH...
+  path-refs [--links] [--count | --all] --moved OLD NEW [--moved OLD NEW ...]
+
+PATH is a file or folder of the workspace, /home/carver/code/claudedev: absolute, or
+relative to the workspace root whatever the current folder (cache/r-shared-model,
+keep/claude-memory/x.md). It needn't exist. Each reference to PATH or anything under
+it is listed, in any of these forms, in prose, backticks, quotes, links or code:
+
+  /home/carver/code/claudedev/cache/X/a.py     absolute
+  claudedev/cache/X, ~/code/claudedev/cache/X  anything ending in the root's name
+  ../cache/X, ../../../cache/X                 a chain of ../
+  $root/cache/X, ${root}/cache/X               after a variable
+  WORKSPACE/cache/X                            after a placeholder in capitals
+  "$(cd .. && pwd)/cache/X", f"{root}/cache/X"  after a computed root
+  cache/X                                      bare, when not part of a longer path
+  bin/tool, ../bin/tool, ./bin/tool            for PATH repo/bin/tool, in repo's
+                                               own files: relative to the repo
+
+A reference must start and end where a path does: ~/.cache/uv, /var/cache/uv and
+mycache/uv aren't references to cache/uv, nor are cache/uvx or cache/uv.bak. A
+reference may go on below PATH, through globs (cache/X/*.md) and {a,b} alternatives
+(cache/X/{a,b}/out.txt). A one-word path such as a repo, or bin for repo/bin, counts
+bare only with a / after it or quotes around it (keep/x, `keep`), so the English
+word keep doesn't. Not found: ./cache/X, which in a repo is the repo's own folder.
+
+A line of code may build the path from its parts. A line that holds PATH's last
+component in quotes, after the one before it as a word in any case, is listed as
+maybe, with that span: `maybe HOST_CACHE_ROOT / "tectonic"` for cache/tectonic,
+`maybe "keep" / "claude-memory"` for keep/claude-memory. A name after a dot
+(".cache") is a home's folder, not the parent.
+
+The search is rg's, from the workspace root, over hidden files too, skipping files
+git ignores and the folders cache/ and keep/ at the root, and .git/, worktrees
+(*-wt-*/), node_modules/, .venv/ and target/ at any depth. Frozen repos (a FROZEN
+file at the repo's root) are searched, and marked: a move that breaks one gets fixed.
+
+Output: a line per group, its count, then a line per reference with the path as
+written; the same path on the same line is listed once. A file with more than 10
+references, such as generated numbers, gets one line with its count and the range of
+their lines. Groups are (workspace) for files at the root, then each repo, then ~
+and crontab (see --links). Last comes the total, after a `no refs to:` line naming
+any of several PATHs that nothing references.
+
+  apart-collusion-sprint (frozen): 2
+    apart-collusion-sprint/notes/R3.md:9: cache/r-shared-model/scratch/R3-dl/
+    apart-collusion-sprint/data -> ../cache/r-shared-model
+  sandbox-setup: 13
+    sandbox-setup/CHANGES.md:20: claudedev/cache/r-shared-model
+    sandbox-setup/notes/numbers.json: 12 refs on lines 3-140
+  total: 15
+
+Options:
+  --count           print only the group lines and the total
+  --all             list each reference of a file with more than 10, too
+  --links           also list symlinks whose target is PATH or under it: under ~ to
+                    depth 5 (group ~), and in the workspace, skipping the folders the
+                    search skips but not git-ignored ones (in their repo's group); and
+                    the lines of `crontab -l` that reference it (group crontab)
+  --moved OLD NEW   after moving OLD to NEW (repeatable, for several moves): list the
+                    references to OLD, each marked with where what it names is now,
+                    looked up under NEW and under OLD:
+                      moved    under NEW only: rewrite the reference
+                      stayed   under OLD only: the reference still works
+                      split    under both, as a folder whose notes moved and whose
+                               downloads stayed
+                      missing  under neither
+                    A path holding * is a glob, and {a,b} counts when any choice is
+                    there. A maybe line is looked up as PATH itself. Group lines, the
+                    total and a file's one line count each status.
+
+Example, moving a folder from cache/ to keep/:
+
+  path-refs --links cache/methods-3.1          # before: what will need fixing
+  mv cache/methods-3.1 keep/
+  path-refs --links --moved cache/methods-3.1 keep/methods-3.1
+
+Environment:
+  PATH_REFS_ROOT  the workspace root. Default: /home/carver/code/claudedev (the
+                  tests point it at a folder of their own)
+  HOME            where --links looks for symlinks
+
+Exit status: 0 references found; 1 none; 2 usage error, such as a PATH outside the
+workspace or a root that isn't a folder; 3 the search failed (rg missing, or an error
+from rg, after printing what it found).
+"""
+
+import argparse
+import fnmatch
+import glob
+import os
+import re
+import subprocess
+import sys
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from pathlib import Path
+
+DEFAULT_ROOT = "/home/carver/code/claudedev"
+WORKSPACE = "(workspace)"
+HOME_GROUP = "~"
+CRONTAB = "crontab"
+HOME_DEPTH = 5
+# The folders the search and the symlink walk skip: these at the root, and these
+# (fnmatch patterns) at any depth.
+ROOT_SKIPS = ("cache", "keep")
+ANY_SKIPS = (".git", "*-wt-*", "node_modules", ".venv", "target")
+# As rg globs. rg anchors a glob that starts with / at its working directory, so it
+# runs in the root: from anywhere else `!/cache/` matches nothing, and rg walks the
+# 1.17M files under cache/ and keep/ (docs/design.md).
+RG_SKIPS = [f"!/{name}/" for name in ROOT_SKIPS] + [f"!{name}/" for name in ANY_SKIPS]
+# The characters a path token runs over before PATH.
+PATH_CHARS = "_.~+%$/-"
+# The path after PATH: the same characters, `*` and `@`, and `{a,b}` alternatives.
+TAIL = re.compile(r"(?:[\w.~+%$@*/-]|\{[\w.~+%$@*/,-]*,[\w.~+%$@*/,-]*\})*")
+RELATIVE = re.compile(r"(?:\.\./)+")
+# What may come before a path relative to its repo, in the repo's own files.
+LOCAL = re.compile(r"\./|(?:\.\./)+")
+# What may follow a `)` or `}` that closes a computed root: `$(cd .. && pwd)/cache/X`.
+COMPUTED = re.compile(r"/(?:\.\./)*")
+# A variable or a placeholder that holds a root: `$root/cache/X`, `WORKSPACE/cache/X`.
+VARIABLE = re.compile(r"(?:\$\w+|[A-Z][A-Z0-9_]*)/(?:\.\./)*")
+OPENER = {")": "(", "}": "{"}
+QUOTES = "`\"'"
+# A file with more references than this is one line, unless --all.
+MANY = 10
+# --moved's statuses, in the order the counts list them.
+STATUSES = ("moved", "stayed", "split", "missing")
+
+
+class UsageError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Target:
+    """A PATH to find references to, relative to the root; with --moved, where it went."""
+
+    rel: str
+    new: str | None = None
+
+    @property
+    def repo(self) -> str:
+        return self.rel.partition("/")[0]
+
+    @property
+    def local(self) -> str | None:
+        """The path relative to its repo, as the repo's own files may write it; None
+        for a repo itself, and in the folders the search skips."""
+        repo, _, rest = self.rel.partition("/")
+        return rest if rest and repo not in ROOT_SKIPS else None
+
+    @property
+    def parts(self) -> tuple[str, str] | None:
+        """The last two components, which code may join to build the path."""
+        parts = self.rel.split("/")
+        return (parts[-2], parts[-1]) if len(parts) > 1 else None
+
+
+@dataclass(frozen=True)
+class Hit:
+    target: Target
+    group: str
+    # How the hit sorts in its group, and its line without the status.
+    key: tuple
+    text: str
+    # The part of the referenced path below the target: "", "/a.py", "/notes/*.md".
+    under: str
+
+
+def in_path(char: str, chars: str) -> bool:
+    return char.isalnum() or char in chars
+
+
+def line_refs(
+    line: str, target: Target, root_names: set[str], repo: str | None
+) -> list[tuple[str, str]]:
+    """The references to `target` in `line` of a file in `repo`, as (what to show, the
+    part of the path below the target). With none, a line that seems to build the
+    path from its parts shows as `maybe` and the parts, below nothing."""
+    found = list(refs_in(line, target.rel, root_names, local=False))
+    if target.local and repo == target.repo:
+        found += refs_in(line, target.local, root_names, local=True)
+    if not found and (parts := built_from_parts(line, target)):
+        found.append((f"maybe {parts}", ""))
+    return found
+
+
+def refs_in(
+    line: str, spelling: str, root_names: set[str], local: bool
+) -> Iterator[tuple[str, str]]:
+    """Each reference to `spelling` in `line`, as (the path as written, the part below
+    it). A local spelling, relative to its repo, takes only `./` or `../`s before it."""
+    word = "/" not in spelling and "." not in spelling
+    for found in re.finditer(re.escape(spelling), line):
+        start, end = found.span()
+        token = start
+        while token > 0 and in_path(line[token - 1], PATH_CHARS):
+            token -= 1
+        prefix = line[token:start]
+        before = line[token - 1] if token else ""
+        tail = TAIL.match(line, end).group().rstrip(".")
+        if tail and not tail.startswith("/"):
+            continue
+        computed = before in OPENER and bool(COMPUTED.fullmatch(prefix))
+        if not prefix:
+            # A one-word path, such as a repo, is often an English word too.
+            quoted = before in QUOTES and line[end : end + 1] == before
+            if word and not tail and not quoted:
+                continue
+        elif local:
+            if not LOCAL.fullmatch(prefix):
+                continue
+        elif not (
+            RELATIVE.fullmatch(prefix)
+            or any(
+                prefix == f"{name}/" or prefix.endswith(f"/{name}/")
+                for name in root_names
+            )
+            or VARIABLE.fullmatch(prefix)
+            or computed
+        ):
+            continue
+        shown = computed_start(line, token - 1) if computed else token
+        yield line[shown : end + len(tail)], tail
+
+
+def built_from_parts(line: str, target: Target) -> str | None:
+    """The first span of `line` from the target's parent folder's name, as a word in
+    any case (`"keep"`, `HOST_CACHE_ROOT`), to its own name quoted after it (`"x"`);
+    None when the line holds no such pair. A name after a dot (`".cache"`) is a
+    folder in a home, so no parent."""
+    if target.parts is None:
+        return None
+    parent, name = target.parts
+    word = re.compile(rf"(?<![a-z0-9.]){re.escape(parent)}(?![a-z0-9])", re.IGNORECASE)
+    for quoted in re.finditer(rf"([\"']){re.escape(name)}\1", line):
+        words = list(word.finditer(line, 0, quoted.start()))
+        if not words:
+            continue
+        start = words[-1].start()
+        while start > 0 and (line[start - 1].isalnum() or line[start - 1] == "_"):
+            start -= 1
+        if start > 0 and line[start - 1] in QUOTES:
+            start -= 1
+        return line[start : quoted.end()]
+    return None
+
+
+def computed_start(line: str, close: int) -> int:
+    """Where the `$(...)`, `${...}` or `{...}` that closes at `close` opens, or `close`
+    when it doesn't open on this line."""
+    closer, opener, depth = line[close], OPENER[line[close]], 0
+    for i in range(close, -1, -1):
+        if line[i] == closer:
+            depth += 1
+        elif line[i] == opener:
+            depth -= 1
+            if depth == 0:
+                return i - 1 if i and line[i - 1] == "$" else i
+    return close
+
+
+def workspace_rel(root: Path, arg: str) -> str:
+    """`arg` as a path relative to the root; UsageError when it is outside it."""
+    path = os.path.normpath(arg)
+    rel = path
+    if os.path.isabs(path):
+        real = os.path.join(
+            os.path.realpath(os.path.dirname(path)), os.path.basename(path)
+        )
+        inside = (
+            os.path.relpath(candidate, base)
+            for candidate in (path, real)
+            for base in (str(root), os.path.realpath(root))
+        )
+        rel = next((rel for rel in inside if not outside(rel)), "..")
+    if rel == "." or outside(rel):
+        raise UsageError(f"{arg} is not a path inside the workspace {root}")
+    return rel
+
+
+def outside(rel: str) -> bool:
+    return rel == ".." or rel.startswith("../")
+
+
+def group_of(rel_file: str) -> str:
+    first, sep, _ = rel_file.partition("/")
+    return first if sep else WORKSPACE
+
+
+class SearchFailed(Exception):
+    pass
+
+
+def file_hits(root: Path, targets: list[Target]) -> tuple[list[Hit], str]:
+    """The references in the workspace's files, and rg's error, if it reported one."""
+    cmd = ["rg", "--no-config", "--hidden", "--no-heading", "--with-filename"]
+    cmd += ["--line-number", "--null", "--color=never", "--fixed-strings"]
+    for skip in RG_SKIPS:
+        cmd += ["--glob", skip]
+    for target in targets:
+        cmd += ["-e", target.rel]
+        if target.local:
+            cmd += ["-e", target.local]
+        if target.parts:
+            cmd += ["-e", f'"{target.parts[1]}"', "-e", f"'{target.parts[1]}'"]
+    try:
+        done = subprocess.run(
+            [*cmd, "--", "."],
+            cwd=root,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise SearchFailed("rg not found on PATH; install ripgrep") from None
+    error = ""
+    if done.returncode not in (0, 1):
+        error = (
+            done.stderr.decode(errors="replace").strip()
+            or f"rg exited {done.returncode}"
+        )
+    hits = []
+    for record in done.stdout.split(b"\n"):
+        name, sep, rest = record.partition(b"\0")
+        if not sep:
+            continue
+        number, _, text = rest.partition(b":")
+        rel_file = os.fsdecode(name).removeprefix("./")
+        line = text.decode(errors="replace")
+        for target in targets:
+            refs = line_refs(line, target, root_names(root), group_of(rel_file))
+            for written, under in refs:
+                hits.append(
+                    Hit(
+                        target,
+                        group_of(rel_file),
+                        (rel_file, int(number)),
+                        f"{rel_file}:{int(number)}: {written}",
+                        under,
+                    )
+                )
+    return hits, error
+
+
+def link_hits(root: Path, home: Path, targets: list[Target]) -> list[Hit]:
+    """The symlinks under HOME (to depth 5) and in the workspace whose target is a
+    target or under it."""
+    real_root = os.path.realpath(root)
+    roots = (str(root), real_root)
+    hits = []
+    for link in symlinks(real_root, None, lambda _, name, depth: skipped(name, depth)):
+        name = os.path.relpath(link, real_root)
+        hits += hits_of_link(link, name, group_of(name), targets, roots)
+    # HOME may hold the workspace, which the walk above covers.
+    real_home = os.path.realpath(home)
+    for link in symlinks(real_home, HOME_DEPTH, lambda path, *_: path == real_root):
+        name = f"~/{os.path.relpath(link, real_home)}"
+        hits += hits_of_link(link, name, HOME_GROUP, targets, roots)
+    return hits
+
+
+def hits_of_link(
+    link: str, name: str, group: str, targets: list[Target], roots: tuple[str, ...]
+) -> list[Hit]:
+    """The link as a hit of each target its target is, or is under."""
+    raw = os.readlink(link)
+    lexical = os.path.normpath(
+        os.path.join(os.path.realpath(os.path.dirname(link)), raw)
+    )
+    # The target as written, and through any symlinked folders on its way.
+    resolved = os.path.join(
+        os.path.realpath(os.path.dirname(lexical)), os.path.basename(lexical)
+    )
+    hits = []
+    for target in targets:
+        under = under_target(lexical, target, roots)
+        if under is None:
+            under = under_target(resolved, target, roots)
+        if under is not None:
+            hits.append(Hit(target, group, (name, 0), f"{name} -> {raw}", under))
+    return hits
+
+
+def under_target(path: str, target: Target, roots: tuple[str, ...]) -> str | None:
+    """The part of absolute `path` below `target`, under any of `roots`, or None when
+    it isn't the target or under it."""
+    for base in roots:
+        full = f"{base.rstrip('/')}/{target.rel}"
+        if path == full or path.startswith(f"{full}/"):
+            return path[len(full) :]
+    return None
+
+
+def symlinks(
+    top: str, max_depth: int | None, prune: Callable[[str, str, int], bool]
+) -> Iterator[str]:
+    """The symlinks under `top`, to `max_depth` (its entries are depth 1), not
+    following links; it leaves out each folder for which prune(path, name, depth of
+    the folder holding it) holds."""
+    for folder, dirs, files in os.walk(top):
+        depth = 0 if folder == top else os.path.relpath(folder, top).count("/") + 1
+        for name in dirs + files:
+            if os.path.islink(os.path.join(folder, name)):
+                yield os.path.join(folder, name)
+        if max_depth is not None and depth + 1 >= max_depth:
+            dirs[:] = []
+        dirs[:] = [
+            name for name in dirs if not prune(os.path.join(folder, name), name, depth)
+        ]
+
+
+def skipped(name: str, depth: int) -> bool:
+    """Whether the search skips a folder of this name, in a folder at `depth` below the
+    root."""
+    return (depth == 0 and name in ROOT_SKIPS) or any(
+        fnmatch.fnmatchcase(name, pattern) for pattern in ANY_SKIPS
+    )
+
+
+def crontab_hits(root: Path, targets: list[Target]) -> list[Hit]:
+    """The references in `crontab -l`'s lines; none when there is no crontab."""
+    try:
+        done = subprocess.run(
+            ["crontab", "-l"],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        return []
+    if done.returncode != 0:
+        return []
+    return [
+        Hit(target, CRONTAB, (CRONTAB, number), f"crontab:{number}: {written}", under)
+        for number, line in enumerate(done.stdout.splitlines(), 1)
+        for target in targets
+        for written, under in line_refs(line, target, root_names(root), None)
+    ]
+
+
+def root_names(root: Path) -> set[str]:
+    """The root's folder name, as given and as its real path has it."""
+    return {root.name, Path(os.path.realpath(root)).name}
+
+
+def status(root: Path, hit: Hit) -> str:
+    """Where the path `hit` names is now, after its target moved: under the new
+    path, the old one, both or neither."""
+
+    def present(base: str) -> bool:
+        for under in expansions(hit.under.rstrip("/")):
+            if "*" in under:
+                if glob.glob(glob.escape(str(root / base)) + under):
+                    return True
+            elif os.path.lexists(str(root / base) + under):
+                return True
+        return False
+
+    assert hit.target.new is not None
+    at_new, at_old = present(hit.target.new), present(hit.target.rel)
+    if at_new:
+        return "split" if at_old else "moved"
+    return "stayed" if at_old else "missing"
+
+
+def expansions(path: str) -> list[str]:
+    """`path` with each `{a,b}` group expanded, as a shell does."""
+    group = re.search(r"\{([^{}]*)\}", path)
+    if not group:
+        return [path]
+    return [
+        expanded
+        for choice in group.group(1).split(",")
+        for expanded in expansions(path[: group.start()] + choice + path[group.end() :])
+    ]
+
+
+def report(
+    root: Path,
+    hits: list[Hit],
+    targets: list[Target],
+    count_only: bool,
+    every_hit: bool,
+) -> list[str]:
+    unique = list({(hit.key, hit.text): hit for hit in hits}.values())
+    moved = any(target.new is not None for target in targets)
+    statuses = {hit: status(root, hit) for hit in unique} if moved else {}
+    groups: dict[str, list[Hit]] = {}
+    for hit in sorted(unique, key=lambda h: (group_order(h.group), h.key, h.text)):
+        groups.setdefault(hit.group, []).append(hit)
+    out = []
+    for group, members in groups.items():
+        frozen = (
+            " (frozen)" if is_repo(group) and (root / group / "FROZEN").exists() else ""
+        )
+        out.append(f"{group}{frozen}: {tally(members, statuses)}")
+        if count_only:
+            continue
+        by_file: dict[str, list[Hit]] = {}
+        for hit in members:
+            by_file.setdefault(hit.key[0], []).append(hit)
+        for file, in_file in by_file.items():
+            if len(in_file) > MANY and not every_hit:
+                lines = sorted(hit.key[1] for hit in in_file)
+                many = f"{file}: {len(in_file)} refs on lines {lines[0]}-{lines[-1]}"
+                if moved:
+                    many = f"{'':<7} {many} ({breakdown(in_file, statuses)})"
+                out.append(f"  {many}")
+                continue
+            out += [
+                f"  {statuses[hit]:<7} {hit.text}" if moved else f"  {hit.text}"
+                for hit in in_file
+            ]
+    referenced = {hit.target for hit in hits}
+    unreferenced = [target.rel for target in targets if target not in referenced]
+    if len(targets) > 1 and unreferenced:
+        out.append(f"no refs to: {', '.join(unreferenced)}")
+    out.append(f"total: {tally(unique, statuses)}")
+    return out
+
+
+def tally(hits: list[Hit], statuses: dict[Hit, str]) -> str:
+    """How many hits, and with --moved how many of each status."""
+    if not statuses or not hits:
+        return str(len(hits))
+    return f"{len(hits)} ({breakdown(hits, statuses)})"
+
+
+def breakdown(hits: list[Hit], statuses: dict[Hit, str]) -> str:
+    """How many of `hits` have each status: `2 moved, 1 missing`."""
+    counts = [(s, sum(statuses[hit] == s for hit in hits)) for s in STATUSES]
+    return ", ".join(f"{n} {s}" for s, n in counts if n)
+
+
+def is_repo(group: str) -> bool:
+    return group not in (WORKSPACE, HOME_GROUP, CRONTAB)
+
+
+def group_order(group: str) -> tuple[int, str]:
+    rank = {WORKSPACE: 0, HOME_GROUP: 2, CRONTAB: 3}.get(group, 1)
+    return (rank, group)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="path-refs",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage="path-refs [--links] [--count | --all] PATH... | --moved OLD NEW ...",
+    )
+    parser.add_argument("paths", nargs="*", metavar="PATH")
+    parser.add_argument("--count", action="store_true")
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--links", action="store_true")
+    parser.add_argument("--moved", nargs=2, action="append", metavar=("OLD", "NEW"))
+    args = parser.parse_args(argv)
+    root = Path(os.environ.get("PATH_REFS_ROOT") or DEFAULT_ROOT)
+    try:
+        if not root.is_dir():
+            raise UsageError(
+                f"the workspace root {root} is not a folder; set PATH_REFS_ROOT"
+            )
+        if args.paths and args.moved:
+            raise UsageError("give PATHs or --moved OLD NEW, not both")
+        if not args.paths and not args.moved:
+            raise UsageError("give a PATH, or --moved OLD NEW (-h for help)")
+        targets = [Target(workspace_rel(root, path)) for path in args.paths] + [
+            Target(workspace_rel(root, old), workspace_rel(root, new))
+            for old, new in args.moved or []
+        ]
+    except UsageError as e:
+        print(f"path-refs: {e}", file=sys.stderr)
+        return 2
+    try:
+        hits, error = file_hits(root, targets)
+    except SearchFailed as e:
+        print(f"path-refs: {e}", file=sys.stderr)
+        return 3
+    if args.links:
+        home = Path(os.environ.get("HOME") or Path.home())
+        hits += link_hits(root, home, targets) + crontab_hits(root, targets)
+    print("\n".join(report(root, hits, targets, args.count, args.all)))
+    if error:
+        print(f"path-refs: rg: {error.splitlines()[0]}", file=sys.stderr)
+        return 3
+    return 0 if hits else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

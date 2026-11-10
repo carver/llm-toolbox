@@ -259,7 +259,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   whose process on this host has ended. A wait of `$FIFO_LOCK_SECONDS` (5) for
   the queue folder's lock names the process holding it, and how to continue it
   when it's stopped. It stops before any check on uncommitted changes, or
-  untracked files, in the main tree that touch the same files.
+  untracked files, in the main tree that touch the same files. Once landed, it
+  fetches origin's copy of the branch and says how many commits the branch is
+  ahead (and behind, when origin moved too), so the agent reminds the user to
+  push (`$WT_SHIP_PUSH_FETCH_SECONDS`, default 20, bounds the fetch).
 - **gui-shot**: runs a GUI app on a headless display (Xvfb, or weston for
   Wayland), clicks and types into it, and saves screenshots. For checking a
   desktop app's UI from a sandbox with no screen. `gui-shot -h` lists the

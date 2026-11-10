@@ -2437,3 +2437,64 @@ def test_the_warning_says_how_to_give_a_commit_the_trailer(setup):
     done = ship(wt, "--local")
 
     assert "`build-state reword SHA`" in done.stdout
+
+
+def test_local_says_to_remind_the_user_to_push(setup):
+    _, _, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    commit(wt, "b.py", "y = 1\n", "Add b")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert "main is 2 commits ahead of origin/main: remind the user to push" in (
+        done.stdout
+    )
+
+
+def test_local_says_when_origin_moved_too(setup):
+    _, _, wt, other = setup
+    commit(other, "c.py", "z = 1\n", "Theirs")
+    git(other, "push", "-q", "origin", "main")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert "main is 1 commit ahead of origin/main and 1 behind" in done.stdout
+
+
+def test_local_says_nothing_of_pushing_without_a_remote_copy(setup):
+    _, main, wt, _ = setup
+    git(main, "remote", "remove", "origin")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert "push" not in done.stdout.split("Notice for other sessions:")[1]
+
+
+def test_local_says_when_it_cant_fetch_to_tell(setup):
+    _, main, wt, _ = setup
+    git(main, "remote", "set-url", "origin", str(main.parent / "gone.git"))
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert "Couldn't fetch origin" in done.stdout
+
+
+def test_local_gives_up_on_a_fetch_that_hangs(setup):
+    _, main, wt, _ = setup
+    git(main, "config", "protocol.ext.allow", "always")
+    git(main, "remote", "set-url", "origin", "ext::sleep 30")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    started = time.monotonic()
+    done = ship(wt, "--local", env={"WT_SHIP_PUSH_FETCH_SECONDS": "1"})
+
+    assert done.returncode == 0, done.stderr
+    assert "no answer in 1 seconds" in done.stdout
+    assert time.monotonic() - started < 20

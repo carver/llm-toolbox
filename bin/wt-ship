@@ -112,7 +112,10 @@ then merges. When the main tree's uncommitted changes, staged or not, or its unt
 files, touch the files the landing changes, it stops before any check, merging
 nothing: ask the user. The flag it made, and its place in the queue, go once the merge
 is done or has failed, or the
-run is stopped. It must run in a linked worktree.
+run is stopped. It must run in a linked worktree. Once landed, since the user pushes,
+it fetches the remote's copy of the branch and, when the branch is ahead of it, says
+by how many commits, and by how many behind when that moved too, to remind the user to
+push; with no copy it says nothing, and a fetch that fails says so in a line.
 
 Environment:
   WT_SHIP_WAIT       seconds --local waits behind one holder of the main tree
@@ -124,6 +127,9 @@ Environment:
   WT_SHIP_UNTICKED_TIMEOUT
                      seconds all the unticked-item lookups of one report may take
                      together (default 30; the tests shorten it)
+  WT_SHIP_PUSH_FETCH_SECONDS
+                     seconds the fetch after a --local landing may take before the
+                     reminder to push gives up (default 20)
 
 Exit status: 0 shipped, landed or nothing to do; 1 a step failed (the message says
 what to do); 2 a usage error; with --local, 3 another session held the main tree's
@@ -353,6 +359,9 @@ REJECTED = (
 
 
 FIXUP_PREFIXES = ("fixup! ", "squash! ", "amend! ")
+# How long the fetch after a --local landing may take before the reminder to push
+# gives up: the landing is done by then, so a hung fetch mustn't hold the run.
+PUSH_FETCH_SECONDS = float(os.environ.get("WT_SHIP_PUSH_FETCH_SECONDS", "20"))
 # A word of a commit message that may be a commit's ID: 7 to 64 hex digits, alone.
 # git abbreviates to 7 by default; shorter words are mostly English (added, decade).
 HEX_ID = "[0-9a-f]{7,64}"
@@ -1040,9 +1049,62 @@ def land(args):
         if not is_ancestor(new, ref):
             raise Stop(f"{branch} doesn't hold {new[:12]} after the merge.")
     report(old, new, LAND.done, branch, f"on {branch} in the main tree ({main_path})")
+    try:
+        push_reminder(branch)
+    except commitcheck.GitError as error:
+        # The landing is done: a reminder that can't be worked out mustn't fail it.
+        print(f"\nCouldn't tell whether {branch} needs a push: {error}")
     if args.remove:
         remove(main_path, here)
     return 0
+
+
+def push_reminder(branch, remote="origin"):
+    """After a --local landing, which the user pushes: how far the branch is ahead of
+    the remote's copy, and behind it when that moved too. Nothing when the remote has
+    no copy; a fetch that fails or takes past PUSH_FETCH_SECONDS says so in a line."""
+    tracking = f"refs/remotes/{remote}/{branch}"
+    if git("rev-parse", "--verify", "--quiet", tracking, check=False).returncode:
+        return
+    # Its own process group, so a timeout stops git's transport helpers too, and no
+    # prompt for credentials, which nobody would answer.
+    fetch = subprocess.Popen(
+        ["git", "fetch", "-q", remote, branch],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        env=os.environ | {"GIT_TERMINAL_PROMPT": "0"},
+        start_new_session=True,
+    )
+    why = None
+    try:
+        _, stderr = fetch.communicate(timeout=PUSH_FETCH_SECONDS)
+        if fetch.returncode:
+            why = (stderr.strip().splitlines() or ["git fetch failed"])[-1]
+    except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError):
+            os.killpg(fetch.pid, signal.SIGKILL)
+        fetch.wait()
+        why = f"no answer in {PUSH_FETCH_SECONDS:g} seconds"
+    if why is not None:
+        print(
+            f"\nCouldn't fetch {remote} to tell whether {branch} needs a push: {why}."
+        )
+        return
+    counts = out(
+        "rev-list", "--left-right", "--count", f"refs/heads/{branch}...{tracking}"
+    )
+    ahead, behind = (int(n) for n in counts.split())
+    if not ahead:
+        return
+    commits = "commit" if ahead == 1 else "commits"
+    tail = (
+        f" and {behind} behind: tell the user, who pulls and pushes."
+        if behind
+        else ": remind the user to push."
+    )
+    print(f"\n{branch} is {ahead} {commits} ahead of {remote}/{branch}{tail}")
 
 
 def main(argv=None):

@@ -5,6 +5,7 @@ The rules a reviewer holds this repo's code to. The global standards in `~/.agen
 ## Layout
 
 - `bin/`: the tools, one executable Python script each, with no extension. `install.py` links each into `~/.local/bin/`, so an edit is live at once on every machine that shares the repo.
+- The repo root: scripts for working on this repo itself, such as `./t`, which runs its tests. They stay out of `bin/`, so they don't land on every shell's PATH.
 - `lib/`: modules two or more tools share. A tool imports them by path from its own location, since it runs through a link.
 - `skills/<name>/SKILL.md`: this repo's skills. `install.py` links them into `~/.claude/skills/` and `~/.agents/skills/`. Changes to another author's skill live in `skill-patches/`, made with `skill-patch`, never by editing the installed copy.
 - Tests sit at the repo root as `test_<tool>.py`, with shared fixtures in `conftest.py`.
@@ -37,4 +38,4 @@ The rules a reviewer holds this repo's code to. The global standards in `~/.agen
 
 ## Checks
 
-`.githooks/pre-commit` runs `bin/pipefail-lint` on the staged files that name pipefail, then `ruff check` and `ruff format --check` on what's staged, and formats a staged file with no unstaged changes. `ruff.toml` brings the extensionless scripts in `bin/` into both. An agent's commit then runs `.githooks/agent-commit-check`, which runs no test, so run the tests you wrote or touched before committing. `wt-ship` runs `.githooks/agent-pre-commit` on each commit when it lands: every test, or for a change to the repo's prose alone, the few its map names. The README's Checks section has the details.
+`./t FILES` runs the tests you name (README, Developer setup). `.githooks/pre-commit` runs `bin/pipefail-lint` on the staged files that name pipefail, then `ruff check` and `ruff format --check` on what's staged, and formats a staged file with no unstaged changes. `ruff.toml` brings the extensionless scripts in `bin/` into both. An agent's commit then runs `.githooks/agent-commit-check`, which runs no test, so run the tests you wrote or touched before committing. `wt-ship` runs `.githooks/agent-pre-commit` on each commit when it lands: every test, or for a change to the repo's prose alone, the few its map names. The README's Checks section has the details.

@@ -15,6 +15,10 @@ versions in `requirements-dev.txt` from `uv run`, which keeps them in uv's
 cache. There's no `.venv`: this repo is shared between the host and a sandbox,
 and a venv works for only one machine's Python.
 
+`./t` runs the tests with those pins, from the repo root wherever it's called:
+`heavy --quick -- ./t test_wt_ship.py -k push` for a few, in one process, and
+`bgrun --wait -o LOG -- heavy -- ./t` for the whole suite, in parallel.
+
 ## Install
 
 ```bash

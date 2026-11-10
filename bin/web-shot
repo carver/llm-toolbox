@@ -13,7 +13,9 @@ Actions (--do, repeatable, run in order once the page has loaded):
   wait MS                wait, e.g. for an animation or a fetch
   eval JS                run JavaScript in the page and print its value as JSON, or undefined;
                          console.log output isn't shown, so make the value what you want to see
-  shot NAME [SELECTOR]   screenshot to OUT/NAME.png: the matching element, else the full page
+  shot NAME [SELECTOR]   screenshot to OUT/NAME.png: the matching element, else the full page;
+                         an element's shot covers what its children draw outside it, such as
+                         a badge hung over its corner, unless it hides their overflow
   text [SELECTOR]        print the visible text of the matching element, else the whole page
   links [REGEX]          print "text -> url" for each link whose text or url matches REGEX
   scroll-all             scroll to the bottom until the page stops growing (endless feeds)
@@ -127,6 +129,36 @@ SKELETON = (
 # What may come before a doctype that still takes effect: whitespace, comments, and an XML
 # declaration, which HTML reads as a comment
 BEFORE_DOCTYPE = re.compile(rb"(?:\s|<!--.*?-->|<\?[^>]*>)*", re.DOTALL)
+# The page area an element and its children draw on: the union of their boxes, each
+# cut to the boxes of the ancestors up to the element that hide their overflow. A
+# fixed child is left out: it sits on the window, not on the element.
+SHOT_AREA_JS = """element => {
+  const box = rect => ({left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom});
+  const cut = (area, limit) => !limit ? area : {
+    left: Math.max(area.left, limit.left), top: Math.max(area.top, limit.top),
+    right: Math.min(area.right, limit.right), bottom: Math.min(area.bottom, limit.bottom)};
+  const hides = style => style.overflowX !== 'visible' || style.overflowY !== 'visible';
+  const own = box(element.getBoundingClientRect());
+  const area = {...own};
+  const walk = (node, limit) => {
+    for (const child of node.children) {
+      const style = getComputedStyle(child);
+      if (style.position === 'fixed') continue;
+      const seen = cut(box(child.getBoundingClientRect()), limit);
+      if (seen.right > seen.left && seen.bottom > seen.top && style.visibility !== 'hidden') {
+        area.left = Math.min(area.left, seen.left);
+        area.top = Math.min(area.top, seen.top);
+        area.right = Math.max(area.right, seen.right);
+        area.bottom = Math.max(area.bottom, seen.bottom);
+      }
+      walk(child, hides(style) ? seen : limit);
+    }
+  };
+  walk(element, hides(getComputedStyle(element)) ? own : null);
+  const x = Math.max(0, area.left + scrollX), y = Math.max(0, area.top + scrollY);
+  return {x, y, width: area.right + scrollX - x, height: area.bottom + scrollY - y};
+}"""
+
 LINKS_JS = """pattern => [...document.querySelectorAll('a[href]')]
   .map(a => [a.innerText.trim().replace(/\\s+/g, ' '), a.href])
   .filter(([text, href]) => !pattern || new RegExp(pattern, 'i').test(text + ' ' + href))"""
@@ -568,7 +600,13 @@ def perform(action, tab, network, out, found):
         found.check_sideways(tab, f"shot {action.args[0]}")
         path = out / f"{action.args[0]}.png"
         if len(action.args) == 2:
-            png = tab.locator(action.args[1]).first.screenshot(path=str(path))
+            # As a locator's own shot would: wait for it to show, and scroll it into
+            # view, out of an inner scroller too.
+            element = tab.locator(action.args[1]).first
+            element.wait_for(state="visible")
+            element.scroll_into_view_if_needed()
+            area = element.evaluate(SHOT_AREA_JS)
+            png = tab.screenshot(path=str(path), full_page=True, clip=area)
         else:
             png = tab.screenshot(path=str(path), full_page=True)
         found.shots += [path, *save_pieces(path, png)]

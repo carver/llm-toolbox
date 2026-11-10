@@ -317,6 +317,65 @@ def test_a_shot_taller_than_1500px_is_also_saved_in_pieces(tmp_path):
 
 
 @needs_chromium
+def test_an_element_shot_covers_children_that_overflow_it_unless_it_clips_them(
+    tmp_path,
+):
+    """A badge hung over a box's corner is in the box's shot; one its box hides isn't."""
+    badge = "position: absolute; top: -10px; right: -20px; width: 30px; height: 20px"
+    page = tmp_path / "p.html"
+    page.write_text(
+        "<!doctype html><style>body { margin: 0 } .box { position: absolute; left: 50px;"
+        " width: 100px; height: 40px }</style>"
+        f'<div id="hung" class="box" style="top: 50px"><span style="{badge}"></span></div>'
+        f'<div id="clipped" class="box" style="top: 150px; overflow: hidden">'
+        f'<span style="{badge}"></span></div>'
+    )
+    run = cli(
+        "--out",
+        tmp_path / "out",
+        "--size",
+        "400x300",
+        "--do",
+        "shot hung #hung",
+        "--do",
+        "shot clipped #clipped",
+        page,
+    )
+    assert run.returncode == 0, run.stderr
+    assert png_size(tmp_path / "out/hung.png") == (120, 50)
+    assert png_size(tmp_path / "out/clipped.png") == (100, 40)
+
+
+@needs_chromium
+def test_an_element_shot_skips_fixed_children_and_reaches_into_a_scroller(tmp_path):
+    """A child fixed to the window isn't the element's; an element scrolled out of an
+    inner scroller's view is scrolled back into it."""
+    page = tmp_path / "p.html"
+    page.write_text(
+        "<!doctype html><style>body { margin: 0 }</style>"
+        '<div id="far" style="margin-top: 1200px; width: 100px; height: 40px">'
+        '<span style="position: fixed; top: 0; left: 300px; width: 20px; height: 20px">'
+        "</span></div>"
+        '<div style="height: 100px; overflow: auto"><div style="height: 500px"></div>'
+        '<div id="inner" style="width: 80px; height: 30px; background: teal"></div></div>'
+    )
+    run = cli(
+        "--out",
+        tmp_path / "out",
+        "--size",
+        "400x300",
+        "--do",
+        "shot far #far",
+        "--do",
+        "shot inner #inner",
+        page,
+    )
+    assert run.returncode == 0, run.stderr
+    assert png_size(tmp_path / "out/far.png") == (100, 40)
+    assert png_size(tmp_path / "out/inner.png") == (80, 30)
+
+
+@needs_chromium
 def test_a_file_without_a_doctype_loads_inside_a_standard_skeleton(tmp_path):
     """As an Artifact file, which its publisher wraps. Its relative URLs and #links still work, and no
     file is written beside it. Given as a file:// URL with a fragment and an unescaped space, it still

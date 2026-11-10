@@ -178,6 +178,18 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   leaves no `.pyc` that a later import takes for current, and a file put back gets
   an mtime a second past the mutant's, for a Python run with `-E` or `-I`. For
   checking that a test which passed on its first run guards what it's meant to.
+
+  `mutate-check --diff BASE [--max N] -- CMD` makes the mutants itself, from the
+  Python and shell lines added or changed since BASE (its merge base with HEAD,
+  work tree included; tests and their helpers left alone): a statement deleted, a
+  condition negated, an and/or operand dropped, `==`/`!=` and `True`/`False`
+  swapped, a string that's a value changed, a shell default changed. It runs CMD
+  unmutated first, then once per mutant, each statement's first before any second,
+  up to `--max` (40), each with a timeout of ten times the unmutated run, at least
+  30 seconds (`$MUTATE_CHECK_MIN_TIMEOUT`). It prints `FILE:LINE: what changed`
+  for each mutant that survived and a summary line, and exits 0 when none
+  survived, 1 when one did, and 3 when no mutant was judged. For a builder to find
+  what the tests let through before a review does.
 - **conflicts**: `conflicts FILE` lists a file's conflict hunks, numbered, with
   each side and its marker label; `conflicts FILE N SIDE` (or `all SIDE`)
   resolves them as `ours`, `theirs`, `both` or `base`, and the triples repeat,

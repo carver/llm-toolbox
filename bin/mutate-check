@@ -9,7 +9,10 @@
   >>>>>>> REPLACE
   EDITS
 
+  mutate-check --diff main -- uv run pytest -q tests/test_watch.py
+
   mutate-check [--timeout SECONDS] [--edits FILE] -- CMD...
+  mutate-check --diff BASE [--max N] [--timeout SECONDS] -- CMD...
 
 Pick a heredoc delimiter that isn't a line of the blocks: a line EOF in the text ends
 <<'EOF' early, and the shell runs the rest as commands.
@@ -53,20 +56,72 @@ tests miss it; 2 usage error, an --edits FILE that can't be read, or blocks that
 apply (the command didn't run);
 3 inconclusive: the build failed, no tests ran, or the command hung; 128+N stopped by
 signal N.
+
+--diff BASE makes the mutants itself, from the lines added or changed since BASE's
+merge base with HEAD, work tree included: commits since BASE, and edits not yet
+committed. Not a moved file's unchanged lines, and not untracked files, which it names
+(`git add -N FILE` brings one in). It reads Python files (.py, or no extension and a
+python or `uv run --script` shebang) and shell scripts (.sh, .bash, or an sh, bash or
+dash shebang). Tests and their helpers are left alone: conftest.py, and a folder or a
+file stem such as tests, test_x, x_test, x_testing or test-x. On those lines:
+
+  Python  a simple statement becomes `pass`; an if, elif or while condition is
+          negated; each operand of an and/or is dropped in turn; ==, is and in swap
+          with !=, is not and not in; True and False swap; a string becomes
+          'XX<string>XX', unless it holds whitespace (a message), a URL or a digest,
+          or sits in a docstring, an annotation, an f-string or a list, tuple, set
+          or dict at a module's top level (a data table).
+  shell   a command becomes `:`, and a `cmd || {` group up to its `}` too; an if,
+          elif, while or until condition is negated; = or == and !=, -eq and -ne
+          swap inside [ ] or [[ ]]; W in ${N:-W}, ${N-W}, ${N:=W} or ${N=W} becomes
+          XXWXX.
+
+Left out as changing nothing a test sees: a return of nothing that ends a function, a
+continue that ends a loop, a final `exit 0`, True and False in a decorator (as
+`@dataclass(frozen=True)`) or as `flush=`, and the conditions of `if __name__ ==
+"__main__"` and `if TYPE_CHECKING`. A mutant that doesn't compile (Python's compile,
+bash -n) is skipped, and two that read the same run once.
+
+CMD runs unmutated first; if that fails or hangs, no mutant runs, and if it rewrites
+a code file, mutate-check puts the file back and stops. Then CMD runs once per
+mutant, judged as above, up to --max N (default 40): each statement's first mutant
+before any statement's second, and last, deleting a message (a call whose arguments
+are all f-strings or strings with spaces, an echo to stderr) or a shell setting
+(set, shopt). Each run stops after --timeout, or else ten times the unmutated run
+and at least 30 seconds ($MUTATE_CHECK_MIN_TIMEOUT; the tests shorten it). CMD's
+stdin is /dev/null, here as in the other mode.
+
+It prints a line for each mutant that survived, `FILE:LINE: what changed`, then
+`mutate-check: N caught, N survived, N inconclusive, N skipped (didn't parse)`, and
+how many --max left out; run again with a higher --max to try those. CMD runs up to
+N+1 times, so run it as a background call under heavy, with the edits to the tree
+done: `bgrun --wait -o LOG -- heavy -- mutate-check --diff BASE -- CMD`.
+
+Exit status with --diff: 0 no mutant survived; 1 one did; 2 usage error, BASE isn't
+a commit, CMD rewrote a code file, or a file couldn't be put back; 3 no mutant was
+judged: CMD failed or hung unmutated, every mutant was inconclusive or skipped, or
+a changed code file couldn't be read and the rest had no mutants; 128+N stopped by
+signal N, after putting the file back.
 """
 
+import ast
+import hashlib
 import importlib.machinery
 import importlib.util
+import itertools
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import FrameType, ModuleType
 
 CAUGHT, MISSED, USAGE, INCONCLUSIVE = 0, 1, 2, 3
@@ -118,21 +173,25 @@ def snapshot(paths: list[Path]) -> dict[Path, Original]:
     return originals
 
 
+def put(target: Path, original: Original) -> None:
+    """Write the file through a temp file beside it, so a crash can't leave half of one."""
+    fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+    with os.fdopen(fd, "wb") as f:
+        f.write(original.content)
+    os.chmod(temp, original.mode)
+    os.replace(temp, target)
+
+
 def restore(originals: dict[Path, Original]) -> list[str]:
-    """Put each file back as it was, through a temp file beside it so a crash can't leave
-    half of one, also when the command deleted it. Its mtime moves on by at least a
-    second, so no .pyc written for the mutant passes for its own. Signals wait until
-    it's done. Returns what couldn't be put back."""
+    """Put each file back as it was, also when the command deleted it. Its mtime moves
+    on by at least a second, so no .pyc written for the mutant passes for its own.
+    Signals wait until it's done. Returns what couldn't be put back."""
     signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
     failed = []
     for target, original in originals.items():
         try:
             mutated = target.stat().st_mtime_ns if target.exists() else 0
-            fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
-            with os.fdopen(fd, "wb") as f:
-                f.write(original.content)
-            os.chmod(temp, original.mode)
-            os.replace(temp, target)
+            put(target, original)
             later = max(time.time_ns(), mutated + 1_000_000_000)
             os.utime(target, ns=(later, later))
         except OSError as e:
@@ -154,6 +213,7 @@ def run(command: list[str], timeout: float) -> tuple[int, str]:
     # binaries cargo runs, too. PYTHONDONTWRITEBYTECODE: the docstring says why.
     child = subprocess.Popen(
         command,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -261,6 +321,48 @@ def summary(output: str) -> list[str]:
     return [last] if last is not None else []
 
 
+@dataclass(frozen=True)
+class Verdict:
+    """What a run with a mutation in place says: CAUGHT, MISSED or INCONCLUSIVE, and
+    the lines that tell why."""
+
+    status: int
+    report: list[str]
+
+
+def judge(code: int, output: str, command: list[str]) -> Verdict:
+    """The verdict on the command's run with a mutation in place: a failure is a catch
+    only when tests ran."""
+    if code == 0:
+        return Verdict(
+            MISSED, ["mutate-check: not caught: the command passed with the mutation"]
+        )
+    lines = output.splitlines()
+    # A Rust build that failed, or a cargo test run, with no line saying a test ran
+    no_rust_test = not tests_ran(lines) and (
+        runs_cargo_tests(command) or rust_build_failed(lines)
+    )
+    errors = rust_errors(lines) if no_rust_test else []
+    if no_rust_test or (runs_pytest(command) and code in PYTEST_NOTHING_RAN):
+        report = [
+            (
+                f"mutate-check: inconclusive: the command exited {code} before any"
+                " test judged the mutation"
+            ),
+            *(f"  {line}" for line in (errors or summary(output))[:SHOWN_ERRORS]),
+        ]
+        if any(RUST_UNUSED.search(line) for line in errors):
+            report.append(UNUSED_HINT)
+        return Verdict(INCONCLUSIVE, report)
+    return Verdict(
+        CAUGHT,
+        [
+            f"mutate-check: caught: the command exited {code}",
+            *(f"  {line}" for line in summary(output)),
+        ],
+    )
+
+
 def stop(signum: int, _frame: FrameType | None) -> None:
     raise Stopped(signum)
 
@@ -283,26 +385,982 @@ def mutated_run(edits: str, command: list[str], timeout: float) -> tuple[int, st
         raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
 
 
-def parse_args(args: list[str]) -> tuple[float, Path | None, list[str]]:
-    """(the timeout, the --edits file or None for stdin, the command), from the
-    options before `--`, in any order. Raises UsageError."""
-    timeout, edits_file = DEFAULT_TIMEOUT, None
-    while args[:1] in (["--timeout"], ["--edits"]):
-        if len(args) < 2:
+@dataclass(frozen=True)
+class Options:
+    command: list[str]
+    timeout: float | None = None
+    edits_file: Path | None = None
+    base: str | None = None
+    limit: int | None = None
+
+
+# --diff BASE: mutants made from the Python and shell lines a diff adds or changes.
+
+DEFAULT_MAX = 40
+TIMEOUT_FACTOR = 10
+MIN_TIMEOUT = 30.0
+SHOWN_SOURCE = 72
+PYTHON, SHELL = "Python", "shell"
+# A folder, or a file's stem, that holds tests or their helpers.
+TEST_PART = re.compile(r"(^|[_-])tests?(ing)?([_-]|$)")
+HUNK = re.compile(r"@@ -\S+ \+(\d+)(?:,\d+)? @@")
+# A mutant's place among its statement's mutants follows its operator's.
+DELETE, NEGATE, DROP, SWAP, BOOL, STRING, DELETE_NAMES = range(7)
+
+
+@dataclass(frozen=True)
+class Mutant:
+    """A change to one file: its bytes from `start` to `end` become `new`."""
+
+    path: Path
+    line: int
+    # Where its statement starts: each statement's first mutant runs before any second.
+    group: int
+    # Its operator, then its column: its place among its statement's mutants.
+    rank: tuple[int, int]
+    # It deletes a message or a setting, so it runs after every other mutant.
+    late: bool
+    start: int
+    end: int
+    new: bytes
+    description: str
+
+    def applied_to(self, text: bytes) -> bytes:
+        return text[: self.start] + self.new + text[self.end :]
+
+
+class NotMutated(Exception):
+    """Why a code file has no mutants."""
+
+
+def short(source: str) -> str:
+    """Source on one line, cut to SHOWN_SOURCE characters."""
+    flat = " ".join(source.split())
+    return flat if len(flat) <= SHOWN_SOURCE else flat[: SHOWN_SOURCE - 3] + "..."
+
+
+def line_starts(text: bytes) -> list[int]:
+    """The byte offset where each line starts, then the text's length."""
+    starts = [0]
+    for line in text.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    return starts
+
+
+SIMPLE_STATEMENTS = (
+    ast.Expr,
+    ast.Assign,
+    ast.AugAssign,
+    ast.AnnAssign,
+    ast.Return,
+    ast.Raise,
+    ast.Delete,
+    ast.Continue,
+)
+FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
+OPPOSITE = {
+    ast.Eq: ast.NotEq,
+    ast.NotEq: ast.Eq,
+    ast.Is: ast.IsNot,
+    ast.IsNot: ast.Is,
+    ast.In: ast.NotIn,
+    ast.NotIn: ast.In,
+}
+SYMBOL = {
+    ast.Eq: "==",
+    ast.NotEq: "!=",
+    ast.Is: "is",
+    ast.IsNot: "is not",
+    ast.In: "in",
+    ast.NotIn: "not in",
+}
+# What an and/or's remaining operand needs brackets for, where the and/or stood.
+LOOSE = (ast.IfExp, ast.Lambda, ast.NamedExpr)
+DISPLAYS = (ast.List, ast.Tuple, ast.Set, ast.Dict)
+HEX_DIGEST = re.compile(r"[0-9a-fA-F]{32}")
+
+
+class PythonFile:
+    """A Python file's text and syntax tree, and the mutants of its changed lines."""
+
+    def __init__(self, path: Path, text: bytes, changed: set[int]) -> None:
+        try:
+            text.decode()
+        except UnicodeDecodeError as e:
+            raise NotMutated("isn't UTF-8") from e
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.tree = ast.parse(text)
+        except (SyntaxError, ValueError) as e:
+            raise NotMutated("doesn't parse") from e
+        self.path, self.text, self.changed = path, text, changed
+        self.starts = line_starts(text)
+        self.parents = {
+            id(child): node
+            for node in ast.walk(self.tree)
+            for child in ast.iter_child_nodes(node)
+        }
+        self.left_alone = left_alone(self.tree)
+        self.decorators = {
+            id(node)
+            for definition in ast.walk(self.tree)
+            if isinstance(definition, (*FUNCTIONS, ast.ClassDef))
+            for decorator in definition.decorator_list
+            for node in ast.walk(decorator)
+        }
+        self.table_strings = {
+            id(node)
+            for statement in self.tree.body
+            if not isinstance(statement, (*FUNCTIONS, ast.ClassDef))
+            for display in ast.walk(statement)
+            if isinstance(display, DISPLAYS)
+            for node in ast.walk(display)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+
+    def mutants(self) -> list[Mutant]:
+        return [
+            mutant
+            for node in ast.walk(self.tree)
+            if id(node) not in self.left_alone
+            for operator in PYTHON_OPERATORS
+            for mutant in operator(self, node)
+        ]
+
+    def touched(self, node: ast.AST) -> bool:
+        return not self.changed.isdisjoint(range(node.lineno, node.end_lineno + 1))
+
+    def offset(self, line: int, col: int) -> int:
+        return self.starts[line - 1] + col
+
+    def source(self, node: ast.AST) -> str:
+        start = self.offset(node.lineno, node.col_offset)
+        return self.text[
+            start : self.offset(node.end_lineno, node.end_col_offset)
+        ].decode()
+
+    def parent(self, node: ast.AST) -> ast.AST | None:
+        return self.parents.get(id(node))
+
+    def ends_its_block(self, node: ast.stmt) -> bool:
+        """A return of nothing that ends a function, or a continue that ends a loop:
+        deleting it changes nothing."""
+        parent = self.parent(node)
+        if isinstance(node, ast.Return) and is_none(node.value):
+            return isinstance(parent, FUNCTIONS) and parent.body[-1] is node
+        if isinstance(node, ast.Continue):
+            loops = (ast.For, ast.AsyncFor, ast.While)
+            return isinstance(parent, loops) and parent.body[-1] is node
+        return False
+
+    def mutant(
+        self,
+        span: ast.AST,
+        rank: int,
+        new: str,
+        description: str,
+        at: ast.AST | None = None,
+        late: bool = False,
+    ) -> Mutant:
+        """`span`'s text becomes `new`; `at` (default `span`) places it."""
+        at = at or span
+        statement = span
+        while not isinstance(statement, ast.stmt):
+            statement = self.parents[id(statement)]
+        return Mutant(
+            self.path,
+            at.lineno,
+            self.offset(statement.lineno, statement.col_offset),
+            (rank, at.col_offset),
+            late,
+            self.offset(span.lineno, span.col_offset),
+            self.offset(span.end_lineno, span.end_col_offset),
+            new.encode(),
+            description,
+        )
+
+
+def left_alone(tree: ast.Module) -> set[int]:
+    """The nodes no operator touches: annotations, f-strings, statements of a lone
+    constant (docstrings), and the conditions of `if __name__ == "__main__"` and `if
+    TYPE_CHECKING`."""
+    roots: list[ast.AST | None] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg):
+            roots.append(node.annotation)
+        elif isinstance(node, FUNCTIONS):
+            roots.append(node.returns)
+        elif isinstance(node, ast.AnnAssign):
+            roots.append(node.annotation)
+        elif isinstance(node, ast.JoinedStr) or (
+            isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+        ):
+            roots.append(node)
+        elif isinstance(node, ast.If) and (
+            is_main_check(node.test) or names_type_checking(node.test)
+        ):
+            roots.append(node.test)
+    return {id(node) for root in roots if root is not None for node in ast.walk(root)}
+
+
+def is_main_check(test: ast.expr) -> bool:
+    return (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "__name__"
+    )
+
+
+def names_type_checking(test: ast.expr) -> bool:
+    return any(
+        (isinstance(node, ast.Name) and node.id == "TYPE_CHECKING")
+        or (isinstance(node, ast.Attribute) and node.attr == "TYPE_CHECKING")
+        for node in ast.walk(test)
+    )
+
+
+def is_none(node: ast.expr | None) -> bool:
+    return node is None or (isinstance(node, ast.Constant) and node.value is None)
+
+
+def is_prose(node: ast.expr) -> bool:
+    """An f-string, or a string with whitespace in it: a message, not a value."""
+    return isinstance(node, ast.JoinedStr) or (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and any(c.isspace() for c in node.value)
+    )
+
+
+def says_a_message(node: ast.stmt) -> bool:
+    """A call such as `say(f"...")`, whose arguments are all messages."""
+    call = node.value if isinstance(node, ast.Expr) else None
+    return (
+        isinstance(call, ast.Call) and bool(call.args) and all(map(is_prose, call.args))
+    )
+
+
+def opposite(test: ast.expr) -> ast.expr:
+    """The condition negated: a lone ==, is or in comparison takes the opposite
+    operator."""
+    if is_lone_swappable(test):
+        return swapped(test, 0)
+    return ast.UnaryOp(ast.Not(), test)
+
+
+def is_lone_swappable(node: ast.AST) -> bool:
+    """A comparison with one operator, and that one ==, !=, is, is not, in or not in."""
+    return (
+        isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and type(node.ops[0]) in OPPOSITE
+    )
+
+
+def swapped(node: ast.Compare, index: int) -> ast.Compare:
+    ops = list(node.ops)
+    ops[index] = OPPOSITE[type(ops[index])]()
+    return ast.Compare(node.left, ops, node.comparators)
+
+
+def deleted(f: PythonFile, node: ast.AST) -> Iterator[Mutant]:
+    """A simple statement becomes `pass`."""
+    if not isinstance(node, SIMPLE_STATEMENTS) or not f.touched(node):
+        return
+    if (isinstance(node, ast.AnnAssign) and node.value is None) or f.ends_its_block(
+        node
+    ):
+        return
+    targets = (
+        node.targets
+        if isinstance(node, ast.Assign)
+        else [node.target]
+        if isinstance(node, ast.AnnAssign)
+        else []
+    )
+    # Deleting an assignment to names mostly raises NameError: other mutants first.
+    names_only = bool(targets) and all(isinstance(t, ast.Name) for t in targets)
+    yield f.mutant(
+        node,
+        DELETE_NAMES if names_only else DELETE,
+        "pass",
+        f"deleted: {short(f.source(node))}",
+        late=says_a_message(node),
+    )
+
+
+def negated(f: PythonFile, node: ast.AST) -> Iterator[Mutant]:
+    """The condition of an if, elif or while is negated."""
+    if not isinstance(node, (ast.If, ast.While)) or not f.touched(node.test):
+        return
+    if id(node.test) in f.left_alone:
+        return
+    yield f.mutant(
+        node.test,
+        NEGATE,
+        ast.unparse(opposite(node.test)),
+        f"negated: {short(f.source(node.test))}",
+    )
+
+
+def dropped_operand(f: PythonFile, node: ast.AST) -> Iterator[Mutant]:
+    """Each operand of an and/or is dropped in turn. Each drop that survives is a gap
+    the and/or swap would miss when the other drop is caught."""
+    if not isinstance(node, ast.BoolOp):
+        return
+    word = "and" if isinstance(node.op, ast.And) else "or"
+    for index, value in enumerate(node.values):
+        if not f.touched(value):
+            continue
+        rest = node.values[:index] + node.values[index + 1 :]
+        kept = rest[0] if len(rest) == 1 else ast.BoolOp(node.op, rest)
+        new = ast.unparse(kept)
+        yield f.mutant(
+            node,
+            DROP,
+            f"({new})" if isinstance(kept, LOOSE) else new,
+            f"dropped from the {word}: {short(f.source(value))}",
+            at=value,
+        )
+
+
+def swapped_comparison(f: PythonFile, node: ast.AST) -> Iterator[Mutant]:
+    """==, is and in swap with !=, is not and not in. Where the comparison is a whole
+    condition, its negation makes the same text, which runs once."""
+    if not isinstance(node, ast.Compare) or not f.touched(node):
+        return
+    for index, op in enumerate(node.ops):
+        if type(op) in OPPOSITE:
+            yield f.mutant(
+                node,
+                SWAP,
+                ast.unparse(swapped(node, index)),
+                f"{SYMBOL[type(op)]} -> {SYMBOL[OPPOSITE[type(op)]]}:"
+                f" {short(f.source(node))}",
+            )
+
+
+def swapped_bool(f: PythonFile, node: ast.AST) -> Iterator[Mutant]:
+    """True and False swap, but not in a decorator, as `@dataclass(frozen=True)`, or as
+    `flush=`: no test sees those."""
+    if not (isinstance(node, ast.Constant) and isinstance(node.value, bool)):
+        return
+    parent = f.parent(node)
+    keyword = parent.arg if isinstance(parent, ast.keyword) else None
+    if not f.touched(node) or id(node) in f.decorators or keyword == "flush":
+        return
+    old, new = str(node.value), str(not node.value)
+    name = f"{keyword}=" if keyword else ""
+    yield f.mutant(node, BOOL, new, f"{name}{old} -> {name}{new}")
+
+
+def changed_string(f: PythonFile, node: ast.AST) -> Iterator[Mutant]:
+    """A string that's a value, not a message, a URL, a digest or a module's data
+    table, becomes 'XX<string>XX'."""
+    if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+        return
+    value = node.value
+    if not f.touched(node) or id(node) in f.table_strings:
+        return
+    if any(c.isspace() for c in value) or "://" in value or HEX_DIGEST.search(value):
+        return
+    new = repr(f"XX{value}XX")
+    yield f.mutant(node, STRING, new, f"{short(f.source(node))} -> {new}")
+
+
+PYTHON_OPERATORS = (
+    deleted,
+    negated,
+    dropped_operand,
+    swapped_comparison,
+    swapped_bool,
+    changed_string,
+)
+
+
+def python_parses(text: bytes) -> bool:
+    """Whether Python compiles the text: syntax, and what the symbol table checks."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compile(text, "<mutant>", "exec", dont_inherit=True)
+    except (SyntaxError, ValueError):
+        return False
+    return True
+
+
+BASH = shutil.which("bash")
+SHELL_CONDITION = re.compile(
+    r"(\s*(?:if|elif|while|until)\s+)(.*?)(\s*;\s*(?:then|do)\b.*)?"
+)
+SHELL_KEYWORDS = {"if", "then", "elif", "else", "fi", "for", "select", "while", "until"}
+SHELL_KEYWORDS |= {"do", "done", "case", "in", "esac", "function", "{", "}", "(", ")"}
+# A line that opens a compound command: a function, a loop, a group.
+SHELL_OPENERS = {"{", "(", "then", "do", "else", "in"}
+CASE_PATTERN = re.compile(r"\s*\(?[^\s()|;]+(\s*\|\s*[^\s()|;]+)*\)")
+HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
+GUARD_GROUP = re.compile(r"(\|\||&&)\s*\{$")
+SHELL_TEST = re.compile(r"\[\[?\s.*?\s\]\]?")
+SHELL_COMPARISON = re.compile(r"(?<=\s)(==|!=|=|-eq|-ne)(?=\s)")
+SHELL_OPPOSITE = {"==": "!=", "=": "!=", "!=": "=", "-eq": "-ne", "-ne": "-eq"}
+SHELL_DEFAULT = re.compile(r"\$\{\w+:?[-=]([^}]+)\}")
+# Settings, and messages to stderr: deleting them runs last.
+SHELL_LATE = re.compile(r"(set|shopt)\s|(echo|printf)\s.*>&2")
+CONTINUED = ("\\", "|", "&&")
+
+
+class ShellFile:
+    """A shell script's lines, and the mutants of its changed ones."""
+
+    def __init__(self, path: Path, text: bytes, changed: set[int]) -> None:
+        if BASH is None:
+            raise NotMutated("no bash to check shell mutants")
+        try:
+            lines = [line.decode() for line in text.splitlines(keepends=True)]
+        except UnicodeDecodeError as e:
+            raise NotMutated("isn't UTF-8") from e
+        if not shell_parses(text):
+            raise NotMutated("doesn't parse")
+        self.path, self.changed = path, changed
+        self.lines = [line.rstrip("\r\n") for line in lines]
+        self.starts = line_starts(text)
+
+    def offset(self, index: int, col: int) -> int:
+        """The byte offset of character `col` of line `index`, counted from 0."""
+        return self.starts[index] + len(self.lines[index][:col].encode())
+
+    def commands(self) -> list[tuple[int, int]]:
+        """Each command's first and last line, counted from 0, with continued lines
+        joined. Comments, blank lines and heredocs are left out."""
+        found, index = [], 0
+        while index < len(self.lines):
+            first = index
+            while index + 1 < len(self.lines) and continues(self.lines[index]):
+                index += 1
+            heredocs = HEREDOC.findall("\n".join(self.lines[first : index + 1]))
+            text = self.lines[first].strip()
+            if text and not text.startswith("#") and not heredocs:
+                found.append((first, index))
+            index += 1
+            for _, word in heredocs:
+                while index < len(self.lines) and self.lines[index].strip() != word:
+                    index += 1
+                index += 1
+        return found
+
+    def mutants(self) -> list[Mutant]:
+        commands = self.commands()
+        return [
+            mutant
+            for number, (first, last) in enumerate(commands)
+            if not self.changed.isdisjoint(range(first + 1, last + 2))
+            for mutant in self.command_mutants(first, last, number == len(commands) - 1)
+        ]
+
+    def command_mutants(self, first: int, last: int, ends_file: bool) -> list[Mutant]:
+        found = list(self.defaults(first, last))
+        line = self.lines[first]
+        condition = SHELL_CONDITION.fullmatch(line) if first == last else None
+        if condition:
+            return [self.negation(first, condition), *found]
+        text = self.text(first, last)
+        words = text.split()
+        if words[0] in SHELL_KEYWORDS or text.startswith(("}", ")", ";;")):
+            return found
+        if CASE_PATTERN.match(line) or (ends_file and text == "exit 0"):
+            return found
+        if GUARD_GROUP.search(text):
+            end = self.group_end(last)
+            if end is not None:
+                found.append(self.deletion(first, end, len(self.lines[end])))
+            return found
+        if words[-1] in SHELL_OPENERS:
+            return found
+        content = self.lines[last].rstrip()
+        end_col = len(content.removesuffix(";;").rstrip())
+        found.append(self.deletion(first, last, end_col))
+        if first == last:
+            found += self.comparisons(first)
+        return found
+
+    def text(self, first: int, last: int) -> str:
+        parts = self.lines[first : last + 1]
+        return " ".join(part.strip().removesuffix("\\").strip() for part in parts)
+
+    def group_end(self, opener: int) -> int | None:
+        """The line that closes the `{` group `opener` ends with."""
+        depth = 1
+        for index in range(opener + 1, len(self.lines)):
+            text = self.lines[index].strip()
+            depth -= text.startswith("}")
+            if depth == 0:
+                return index
+            depth += text.endswith("{")
+        return None
+
+    def mutant(
+        self,
+        index: int,
+        cols: tuple[int, int],
+        rank: int,
+        new: str,
+        description: str,
+        group: int,
+        end_index: int | None = None,
+        late: bool = False,
+    ) -> Mutant:
+        """Line `index` from `cols[0]` to line `end_index` (default `index`) at
+        `cols[1]` becomes `new`."""
+        end = self.offset(index if end_index is None else end_index, cols[1])
+        return Mutant(
+            self.path,
+            index + 1,
+            self.starts[group],
+            (rank, cols[0]),
+            late,
+            self.offset(index, cols[0]),
+            end,
+            new.encode(),
+            description,
+        )
+
+    def deletion(self, first: int, last: int, end_col: int) -> Mutant:
+        """The command becomes `:`."""
+        line = self.lines[first]
+        text = self.text(first, last)
+        return self.mutant(
+            first,
+            (len(line) - len(line.lstrip()), end_col),
+            DELETE,
+            ":",
+            f"deleted: {short(text)}",
+            first,
+            end_index=last,
+            late=SHELL_LATE.match(text) is not None,
+        )
+
+    def negation(self, index: int, condition: re.Match[str]) -> Mutant:
+        """`! C`, `! { C; }` for a list or a pipeline, and `! C` becomes C."""
+        test = condition[2]
+        if test.startswith("! "):
+            new = test[2:].lstrip()
+        elif re.search(r"&&|\|", test):
+            new = f"! {{ {test}; }}"
+        else:
+            new = f"! {test}"
+        cols = condition.span(2)
+        return self.mutant(index, cols, NEGATE, new, f"negated: {short(test)}", index)
+
+    def comparisons(self, index: int) -> Iterator[Mutant]:
+        """= or == and !=, -eq and -ne swap inside [ ] or [[ ]]."""
+        line = self.lines[index]
+        for test in SHELL_TEST.finditer(line):
+            for op in SHELL_COMPARISON.finditer(line, test.start(), test.end()):
+                new = SHELL_OPPOSITE[op[1]]
+                description = f"{op[1]} -> {new}: {short(test[0])}"
+                yield self.mutant(index, op.span(), SWAP, new, description, index)
+
+    def defaults(self, first: int, last: int) -> Iterator[Mutant]:
+        """W in ${N:-W}, ${N-W}, ${N:=W} or ${N=W} becomes XXWXX."""
+        for index in range(first, last + 1):
+            for default in SHELL_DEFAULT.finditer(self.lines[index]):
+                word = f"XX{default[1]}XX"
+                head = default[0][: default.start(1) - default.start()]
+                description = f"{default[0]} -> {head}{word}}}"
+                cols = default.span(1)
+                yield self.mutant(index, cols, STRING, word, description, first)
+
+
+def continues(line: str) -> bool:
+    text = line.rstrip()
+    return not text.lstrip().startswith("#") and text.endswith(CONTINUED)
+
+
+def shell_parses(text: bytes) -> bool:
+    assert BASH is not None
+    checked = subprocess.run([BASH, "-n"], input=text, capture_output=True, check=False)
+    return checked.returncode == 0
+
+
+MUTATORS = {PYTHON: PythonFile, SHELL: ShellFile}
+PARSES = {PYTHON: python_parses, SHELL: shell_parses}
+
+
+def shebang_kind(path: Path) -> str | None:
+    """PYTHON or SHELL by the file's #! line: a python, or `uv run ... --script`, or
+    sh, bash or dash, also through env."""
+    try:
+        with path.open("rb") as f:
+            first = f.readline(256)
+    except OSError:
+        return None
+    if not first.startswith(b"#!"):
+        return None
+    words = first[2:].decode(errors="replace").split()
+    if words and PurePosixPath(words[0]).name == "env":
+        words = list(itertools.dropwhile(env_option, words[1:]))
+    if not words:
+        return None
+    program = PurePosixPath(words[0]).name
+    if re.fullmatch(r"python[\d.]*", program) or (
+        program == "uv" and "--script" in words
+    ):
+        return PYTHON
+    return SHELL if program in ("sh", "bash", "dash") else None
+
+
+def env_option(word: str) -> bool:
+    """An option or a variable that env takes before the program."""
+    return word.startswith("-") or "=" in word
+
+
+def code_kind(path: Path, name: str) -> str | None:
+    """PYTHON or SHELL for a code file, by its name or else its #! line; None for
+    tests, their helpers, and anything that isn't code."""
+    parts = PurePosixPath(name)
+    folders_and_stem = (*parts.parent.parts, parts.stem)
+    if parts.name == "conftest.py" or any(map(TEST_PART.search, folders_and_stem)):
+        return None
+    if path.is_symlink() or not path.is_file():
+        return None
+    if parts.suffix == ".py":
+        return PYTHON
+    if parts.suffix in (".sh", ".bash"):
+        return SHELL
+    return None if parts.suffix else shebang_kind(path)
+
+
+def git(*args: str) -> str:
+    """git's output. Raises UsageError with its message when it fails."""
+    try:
+        done = subprocess.run(
+            ["git", "--literal-pathspecs", *args], capture_output=True, check=False
+        )
+    except OSError as e:
+        raise UsageError(f"mutate-check: --diff needs git: {e.strerror}") from e
+    if done.returncode != 0:
+        said = done.stderr.decode(errors="replace").strip()
+        raise UsageError(f"mutate-check: git {args[0]}: {said}")
+    return os.fsdecode(done.stdout)
+
+
+def added_lines(patch: str) -> set[int]:
+    """The numbers, in the new file, of the lines a patch adds."""
+    added: set[int] = set()
+    number = None
+    for line in patch.split("\n"):
+        hunk = HUNK.match(line)
+        if hunk:
+            number = int(hunk[1])
+        elif number is not None and line.startswith(("+", " ")):
+            if line.startswith("+"):
+                added.add(number)
+            number += 1
+    return added
+
+
+@dataclass(frozen=True)
+class CodeFile:
+    path: Path
+    kind: str
+    original: Original
+
+
+@dataclass(frozen=True)
+class Diff:
+    """The code a diff changed: each file and its mutants, the commit it starts from,
+    and how many code files it changed but has no mutants for."""
+
+    files: dict[Path, CodeFile]
+    mutants: list[Mutant]
+    start: str
+    not_mutated: int
+
+
+def read_diff(base: str) -> Diff:
+    """The mutants of the lines that the diff since BASE's merge base with HEAD adds or
+    changes, work tree included. Prints a line for each code file left without. Raises
+    UsageError when git can't make the diff."""
+    top = Path(git("rev-parse", "--show-toplevel").strip())
+    try:
+        commit = git(
+            "rev-parse", "--verify", "--quiet", "--end-of-options", base + "^{commit}"
+        )
+    except UsageError:
+        raise UsageError(f"mutate-check: --diff {base}: not a commit") from None
+    start = git("merge-base", commit.strip(), "HEAD").strip()
+    listed = git("diff", "--name-status", "-z", "-M", "--no-relative", start, "--")
+    fields = iter(listed.split("\0"))
+    files: dict[Path, CodeFile] = {}
+    mutants: list[Mutant] = []
+    reasons: dict[str, list[str]] = {}
+    for status in fields:
+        if not status:
+            continue
+        paths = [next(fields), next(fields)] if status[0] in "RC" else [next(fields)]
+        path = top / paths[-1]
+        kind = code_kind(path, paths[-1])
+        if status[0] in "DU" or kind is None:
+            continue
+        patch = git(
+            *("diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "-M"),
+            *("--no-relative", start, "--", *(str(top / p) for p in paths)),
+        )
+        changed = added_lines(patch)
+        if not changed:
+            continue
+        text = path.read_bytes()
+        try:
+            found = MUTATORS[kind](path, text, changed).mutants()
+        except NotMutated as e:
+            reasons.setdefault(str(e), []).append(os.path.relpath(path))
+            continue
+        files[path] = CodeFile(path, kind, Original(text, path.stat().st_mode))
+        mutants += found
+    untracked = git("-C", str(top), "ls-files", "-z", "--others", "--exclude-standard")
+    names = [name for name in untracked.split("\0") if name]
+    left = [os.path.relpath(top / n) for n in names if code_kind(top / n, n)]
+    if left:
+        print(
+            f"mutate-check: untracked, so not mutated (git add -N brings one in): {', '.join(left)}"
+        )
+    for reason, names in reasons.items():
+        print(f"mutate-check: {reason}, so not mutated: {', '.join(names)}")
+    not_mutated = sum(map(len, reasons.values()))
+    return Diff(files, mutants, start, not_mutated)
+
+
+def in_turn(diff: Diff) -> list[Mutant]:
+    """The mutants in the order they run: each statement's first, in diff order, then
+    each one's second, and so on; then the late ones, the same way."""
+    files = {path: index for index, path in enumerate(diff.files)}
+    order = []
+    for late in (False, True):
+        groups: dict[tuple[int, int], list[Mutant]] = {}
+        for mutant in diff.mutants:
+            if mutant.late == late:
+                key = (files[mutant.path], mutant.group)
+                groups.setdefault(key, []).append(mutant)
+        queues = [
+            sorted(group, key=lambda m: m.rank) for _, group in sorted(groups.items())
+        ]
+        order += [m for turn in itertools.zip_longest(*queues) for m in turn if m]
+    return order
+
+
+class Unjudged(Exception):
+    """The command fails or hangs with no mutation, so no mutant can be judged."""
+
+
+@dataclass
+class Tally:
+    caught: int = 0
+    survived: int = 0
+    inconclusive: int = 0
+    skipped: int = 0
+    left_out: int = 0
+
+    def judged(self) -> int:
+        return self.caught + self.survived + self.inconclusive
+
+    def summary(self, limit: int) -> str:
+        line = (
+            f"mutate-check: {self.caught} caught, {self.survived} survived,"
+            f" {self.inconclusive} inconclusive, {self.skipped} skipped (didn't parse)"
+        )
+        return line + (
+            f"; {self.left_out} left out by --max {limit}" if self.left_out else ""
+        )
+
+
+def baseline(
+    command: list[str], timeout: float | None, diff: Diff, least: float
+) -> float:
+    """Run the command with no mutation, and give each mutant's timeout: `timeout`, or
+    TIMEOUT_FACTOR times this run, at least `least` seconds. Raises Unjudged when it
+    fails or hangs, and UsageError when it won't start or rewrites a code file."""
+    allowed = timeout or DEFAULT_TIMEOUT
+    started = time.monotonic()
+    try:
+        code, output = run(command, allowed)
+    except TimedOut:
+        raise Unjudged(
+            f"mutate-check: the command hung past {allowed:g} seconds with no mutation,"
+            " so it can't judge one"
+        ) from None
+    except OSError as e:
+        raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
+    took = time.monotonic() - started
+    rewritten = {
+        f.path: f.original for f in diff.files.values() if not holds_original(f)
+    }
+    if rewritten:
+        failed = restore(rewritten)
+        names = ", ".join(map(os.path.relpath, rewritten))
+        said = (
+            f"mutate-check: the command rewrote {names} with no mutation, so the"
+            " mutants' places are wrong; give a command that leaves the code alone"
+        )
+        raise UsageError("\n".join([said, *failed]))
+    if code != 0:
+        said = (
+            f"mutate-check: the command fails with no mutation (exit {code}), so it"
+            " can't judge one; fix it first"
+        )
+        raise Unjudged("\n".join([said, *(f"  {line}" for line in summary(output))]))
+    return timeout or max(least, TIMEOUT_FACTOR * took)
+
+
+def holds_original(file: CodeFile) -> bool:
+    try:
+        return file.path.read_bytes() == file.original.content
+    except OSError:
+        return False
+
+
+def mutant_run(file: CodeFile, text: bytes, command: list[str], timeout: float) -> int:
+    """Run the command with the file holding `text`, put the file back, and give the
+    verdict's status, INCONCLUSIVE for a hang. Raises Stopped, and UsageError when the
+    file can't be written or put back, or the command won't start."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        try:
+            put(file.path, Original(text, file.original.mode))
+        except OSError as e:
+            raise UsageError(
+                f"mutate-check: couldn't write a mutant to {file.path}: {e}"
+            )
+        # A stop that came while the file was being written lands here, inside the try.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+        status = judge(*run(command, timeout), command).status
+    except TimedOut:
+        status = INCONCLUSIVE
+    except OSError as e:
+        raise UsageError(f"mutate-check: can't run {command[0]}: {e}") from e
+    finally:
+        failed = restore({file.path: file.original})
+    if failed:
+        raise UsageError("\n".join(failed))
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+    return status
+
+
+def run_mutants(
+    diff: Diff, command: list[str], timeout: float, limit: int, tally: Tally
+) -> None:
+    """Run the command once for each mutant, up to `limit`, counting the verdicts and
+    printing a line for each that survived."""
+    seen = set()
+    for mutant in in_turn(diff):
+        file = diff.files[mutant.path]
+        text = mutant.applied_to(file.original.content)
+        digest = hashlib.sha256(text).digest()
+        if (mutant.path, digest) in seen:
+            continue
+        seen.add((mutant.path, digest))
+        if tally.judged() == limit:
+            tally.left_out += 1
+        elif not PARSES[file.kind](text):
+            tally.skipped += 1
+        else:
+            status = mutant_run(file, text, command, timeout)
+            if status == MISSED:
+                tally.survived += 1
+                where = f"{os.path.relpath(mutant.path)}:{mutant.line}"
+                print(f"{where}: {mutant.description}", flush=True)
+            elif status == CAUGHT:
+                tally.caught += 1
+            else:
+                tally.inconclusive += 1
+
+
+def diff_main(options: Options) -> int:
+    assert options.base is not None
+    limit = options.limit or DEFAULT_MAX
+    tally = Tally()
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, stop)
+    try:
+        least = seconds(os.environ.get("MUTATE_CHECK_MIN_TIMEOUT"), MIN_TIMEOUT)
+        diff = read_diff(options.base)
+        if not diff.mutants and diff.not_mutated:
+            print("mutate-check: nothing to mutate in the changed code it could read")
+            return INCONCLUSIVE
+        if not diff.mutants:
+            head = git("rev-parse", "HEAD").strip()
+            uncommitted = "; it's HEAD, so only uncommitted changes count"
+            print(
+                f"mutate-check: no Python or shell line changed since {options.base},"
+                f" so nothing to mutate{uncommitted if diff.start == head else ''}"
+            )
+            return CAUGHT
+        timeout = baseline(options.command, options.timeout, diff, least)
+        run_mutants(diff, options.command, timeout, limit, tally)
+    except UsageError as e:
+        print(e, file=sys.stderr)
+        return USAGE
+    except Unjudged as e:
+        print(e)
+        return INCONCLUSIVE
+    except Stopped as e:
+        print(tally.summary(limit))
+        print(f"mutate-check: stopped by signal {e.signum}", file=sys.stderr)
+        return 128 + e.signum
+    print(tally.summary(limit))
+    if tally.survived:
+        return MISSED
+    return CAUGHT if tally.caught else INCONCLUSIVE
+
+
+def seconds(text: str | None, default: float) -> float:
+    """A number of seconds, finite and over 0, or `default` for None. Raises
+    ValueError."""
+    if text is None:
+        return default
+    try:
+        value = float(text)
+    except ValueError:
+        value = 0.0
+    if not (math.isfinite(value) and value > 0):
+        raise ValueError(text)
+    return value
+
+
+def parse_args(args: list[str]) -> Options:
+    """The options before `--`, in any order, and the command. Raises UsageError."""
+    timeout, edits_file, base, limit = None, None, None, None
+    while args[:1] in (["--timeout"], ["--edits"], ["--diff"], ["--max"]):
+        if len(args) < 2 or args[1] == "--":
             raise UsageError(f"mutate-check: {args[0]} takes a value")
-        if args[0] == "--edits":
-            edits_file = Path(args[1])
+        option, value = args[:2]
+        if option == "--edits":
+            edits_file = Path(value)
+        elif option == "--diff":
+            base = value
+        elif option == "--max":
+            limit = int(value) if value.isascii() and value.isdigit() else 0
+            if limit < 1:
+                raise UsageError(
+                    "mutate-check: --max takes a number of mutants, 1 or more"
+                )
         else:
             try:
-                timeout = float(args[1])
+                timeout = seconds(value, DEFAULT_TIMEOUT)
             except ValueError:
-                timeout = 0.0
-            if not (math.isfinite(timeout) and timeout > 0):
-                raise UsageError("mutate-check: --timeout takes a number of seconds")
+                raise UsageError(
+                    "mutate-check: --timeout takes a number of seconds"
+                ) from None
         args = args[2:]
     if args[:1] != ["--"] or len(args) < 2:
         raise UsageError(f"mutate-check: give the command after --\n{__doc__}")
-    return timeout, edits_file, args[1:]
+    if limit is not None and base is None:
+        raise UsageError("mutate-check: --max goes with --diff")
+    if base is not None and edits_file is not None:
+        raise UsageError(
+            "mutate-check: --edits goes without --diff, which makes its own mutants"
+        )
+    return Options(args[1:], timeout, edits_file, base, limit)
 
 
 def main() -> int:
@@ -310,7 +1368,11 @@ def main() -> int:
         print(__doc__)
         return 0
     try:
-        timeout, edits_file, command = parse_args(sys.argv[1:])
+        options = parse_args(sys.argv[1:])
+        if options.base is not None:
+            return diff_main(options)
+        command, edits_file = options.command, options.edits_file
+        timeout = options.timeout or DEFAULT_TIMEOUT
         edits = edits_file.read_text() if edits_file else sys.stdin.read()
     except UsageError as e:
         print(e, file=sys.stderr)
@@ -351,29 +1413,9 @@ def main() -> int:
         return USAGE
     if status is not None:
         return status
-    if code == 0:
-        print("mutate-check: not caught: the command passed with the mutation")
-        return MISSED
-    lines = output.splitlines()
-    # A Rust build that failed, or a cargo test run, with no line saying a test ran
-    no_rust_test = not tests_ran(lines) and (
-        runs_cargo_tests(command) or rust_build_failed(lines)
-    )
-    errors = rust_errors(lines) if no_rust_test else []
-    if no_rust_test or (runs_pytest(command) and code in PYTEST_NOTHING_RAN):
-        print(
-            f"mutate-check: inconclusive: the command exited {code} before any test"
-            " judged the mutation"
-        )
-        for line in (errors or summary(output))[:SHOWN_ERRORS]:
-            print(f"  {line}")
-        if any(RUST_UNUSED.search(line) for line in errors):
-            print(UNUSED_HINT)
-        return INCONCLUSIVE
-    print(f"mutate-check: caught: the command exited {code}")
-    for line in summary(output):
-        print(f"  {line}")
-    return CAUGHT
+    verdict = judge(code, output, command)
+    print("\n".join(verdict.report))
+    return verdict.status
 
 
 if __name__ == "__main__":

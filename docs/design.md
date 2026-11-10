@@ -667,3 +667,47 @@ Dropped: putting back the file's old mtime, which makes cargo and make take
 their mutant build for current and skip the rebuild; and deleting the restored
 file's `__pycache__` entries, which also removes the bytecode of the user's own
 runs and misses a `PYTHONPYCACHEPREFIX`.
+
+### --diff: operators picked from the reviews' survivors (2026-11-09)
+
+`--diff` exists because, in one session, all three /build reviews found mutants of
+the builder's diff that its tests let through, each costing a fix round. Its
+operators are the fewest that flag those: deleting a statement (a `chmod` call, a
+guard's `return`, an idempotence check's `raise`, a `finally` cleanup), negating a
+condition, dropping one operand of an `and`/`or` (a reminder's condition), changing
+a string that's a value (the `"keep"` of three default roots) and a shell default
+(`${CACHE:-.../keep/...}`, which deleting the line doesn't test under `set -u`).
+The rest, `==`/`!=` and `True`/`False`, are the usual cheap ones.
+
+Dropping an operand replaced swapping `and` and `or`: the swap survives exactly
+when both drops survive, so the drops flag every gap the swap does, and more.
+
+Dropping a keyword argument was tried for the sixth survivor, `tar.extractall(x,
+filter="data")` turned into `"fully_trusted"`, and dropped: on Python 3.14 the
+default filter is `data`, so the dropped argument passed even the test that caught
+`"fully_trusted"`, and `"XXdataXX"` raises. No generic operator flags that one.
+Dropping `encoding="utf-8"` or a temp folder's `prefix=` only added survivors.
+
+Strings with whitespace (messages), URLs, digests and the strings of a module's
+data tables are left alone, and deleting a message call runs last. On sandbox-setup
+3260129, the pinned tools table's digests, URLs and versions made 12 survivors no
+useful test kills, and deleting `say(f"...")` calls took 5 of the first 55 runs.
+
+The order puts each statement's first mutant before any statement's second. By
+line, on that diff, the first 40 of 93 runs spent 15 on the pinned tools table and
+never reached the guard, the idempotence check, the `finally` cleanup or the
+reminder. By statement, with the data and messages rules, the diff has 78 mutants,
+and the first 40 reach five of the six examples' lines; the reminder's dropped
+operand is 62nd.
+
+CMD runs once unmutated first: a command that fails would read every mutant as
+caught. That, and a run that judges no mutant, exit 3, so neither passes for "none
+survived". Each mutant's timeout is ten times the unmutated run, at least 30
+seconds: the other mode's 600 would cost ten minutes per hanging mutant, such as a
+deleted loop counter.
+
+Left as the other mode has them, though a review asked: pytest exiting 2 after a
+passing baseline (a mutant that breaks the import) stays inconclusive, not caught,
+and a test pytest-timeout fails stays caught. Suggested, not built: one run per file
+with an exit at its top, to name in one line a file the command never runs, instead
+of a survivor for each of its mutants.

@@ -204,7 +204,9 @@ wrote. `USER (injected, N chars)` is text a skill or hook added. \
 - `> Tool: input` is a tool call; `-> agent-...` names the subagent it started. \
 A long input is cut, ending `…[+N chars]`.
 - `= N chars ~T tok` is the size of a successful call's output; `ERROR ...` is a \
-failed call's error. Calls sent together print first, their results after, in \
+failed call's error, whose last lines usually say why it failed: name that cause \
+in the finding, quoting the line (a shell's `(eval):1: === not found` is zsh \
+expanding `=word`, not a failed read). Calls sent together print first, their results after, in \
 order. `[3m12s]` is how long a call took (shown from a minute); `LONG` marks 40 \
 minutes or more; `user` marks time spent waiting for the user.
 - `| ...` lines under a successful call are its output's last lines (at most 3), \
@@ -329,7 +331,9 @@ a habit of long waits in subagents can be changed.
 
 Judge the event behind a candidate, not only how it is put: when the reader \
 named the wrong cause of a real cost (called a queue wait polling, say), say real \
-and give the right cause in the reason.
+and give the right cause in the reason. For a failed call, the cause is the one \
+its `ERROR` lines state; a finding whose cause or fix they contradict names the \
+wrong cause.
 
 When you can't decide between real and trivial, say real: the retrospective's \
 agent judges every real one again, and may never look at one you dismiss.

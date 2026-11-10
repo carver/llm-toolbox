@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Find where a daily mutants run starts: the commit after which no run has covered
+the lines.
+
+    mutants-base                     in a GitHub Actions job (GITHUB_REPOSITORY set)
+    mutants-base --repo OWNER/NAME --workflow mutants.yml --branch main
+
+A run covers its range when it judged mutants there (cut off or not; the workflow says
+why), and only then uploads the artifact `mutants-covered`. The base is the head
+commit of the newest successful run
+of the workflow on the branch, started by the schedule or by hand, that still holds
+that artifact and whose head is in HEAD's history (a force-push can drop it). With no
+such run, as before the first or once the artifacts expired, it's the commit that
+added the workflow file. --override REV takes REV instead, for a run started by hand
+over a range of its own.
+
+Prints `base=SHA`, and `skip=true` when the base is HEAD (nothing landed since), else
+`skip=false`: lines for $GITHUB_OUTPUT. It asks GitHub through `gh api`, which needs
+GH_TOKEN with `actions: read`; any error from gh, or one that takes past
+MUTANTS_BASE_GH_SECONDS (default 60) per call, fails it: a guessed base would skip
+lines or test old ones again without saying so.
+
+Exit status: 0 found; 1 gh or git failed (the message says which); 2 usage error.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+COVERED = "mutants-covered"
+EVENTS = ("schedule", "workflow_dispatch")
+GH_SECONDS = float(os.environ.get("MUTANTS_BASE_GH_SECONDS", "60"))
+
+
+class Failed(Exception):
+    """A gh or git call failed; the message says which and why."""
+
+
+def run(*argv: str, timeout: float | None = None) -> str:
+    try:
+        done = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired:
+        raise Failed(f"{' '.join(argv)} took past {timeout:g} seconds") from None
+    if done.returncode:
+        said = (done.stderr or done.stdout).strip().splitlines()
+        raise Failed(f"{' '.join(argv)} failed: {said[-1] if said else 'no message'}")
+    return done.stdout
+
+
+def gh_pages(path: str) -> list:
+    """Every page of a GitHub API listing, as a list of JSON pages."""
+    return json.loads(
+        run("gh", "api", "--paginate", "--slurp", path, timeout=GH_SECONDS)
+    )
+
+
+def covered_heads(repo: str, workflow: str, branch: str):
+    """The head commit of each run that covered its range, newest first."""
+    runs = f"repos/{repo}/actions/workflows/{workflow}/runs?branch={branch}&status=success&per_page=100"
+    for page in gh_pages(runs):
+        for found in page["workflow_runs"]:
+            if found["event"] not in EVENTS:
+                continue
+            artifacts = gh_pages(f"repos/{repo}/actions/runs/{found['id']}/artifacts")
+            if any(
+                artifact["name"] == COVERED and not artifact["expired"]
+                for listing in artifacts
+                for artifact in listing["artifacts"]
+            ):
+                yield found["head_sha"]
+
+
+def in_history(sha: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", sha, "HEAD"],
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def find_base(args: argparse.Namespace) -> str:
+    if args.override:
+        return run(
+            "git", "rev-parse", "--verify", f"{args.override}^{{commit}}"
+        ).strip()
+    for head in covered_heads(args.repo, args.workflow, args.branch):
+        if in_history(head):
+            return head
+    path = f".github/workflows/{args.workflow}"
+    added = run("git", "log", "--diff-filter=A", "--format=%H", "--", path).split()
+    if not added:
+        raise Failed(f"no commit in HEAD's history adds {path}")
+    return added[-1]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
+    parser.add_argument("--workflow", default="mutants.yml")
+    parser.add_argument("--branch", default="main")
+    parser.add_argument("--override", metavar="REV")
+    args = parser.parse_args(argv)
+    if not args.repo:
+        parser.error("give --repo OWNER/NAME, or set GITHUB_REPOSITORY")
+    try:
+        base = find_base(args)
+        head = run("git", "rev-parse", "HEAD").strip()
+    except Failed as error:
+        print(f"mutants-base: {error}", file=sys.stderr)
+        return 1
+    print(f"base={base}")
+    print(f"skip={'true' if base == head else 'false'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

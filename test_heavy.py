@@ -69,7 +69,12 @@ def box(tmp_path):
 
 @pytest.fixture
 def sharing(box):
-    """Room to share: 16 GiB free, and a holder idle for 0.3 s lets a waiter in."""
+    """Room to share: 16 GiB free, and a holder idle for 0.3 s lets a waiter in.
+    Below 4 cores no sharer fits by history (a holder's core and a sharer's are more
+    than SHARE_FIT of 2), and the tests' own workers keep the cores too busy to fit
+    by idleness, as on a 2-core CI runner."""
+    if len(os.sched_getaffinity(0)) < 4:
+        pytest.skip("needs at least 4 CPUs to share")
     tmp_path, _, env = box
     meminfo(tmp_path / "meminfo", 16)
     env["HEAVY_SHARE_SECONDS"] = "0.3"

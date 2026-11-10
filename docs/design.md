@@ -769,10 +769,21 @@ or shell, under `heavy --long`, and leave the tree alone until it ended. The own
 dropped it: it blocks the builder for the run (8 minutes for 40 mutants in the
 fold-check build), and its 4-core lane is half of this VM's 6 to 8 cores of real
 compute, while the landing checks wait behind it. Each repo's `mutants.yml` workflow
-now runs daily on the lines changed since the last run that judged every mutant (a
-run cut off keeps that base; filedrawer keeps its full run started by hand too), on
+now runs daily on the lines changed since the last run that judged mutants
+(filedrawer keeps its full run started by hand too), on
 GitHub's runners, and `/upskill` pitches triage of the runs no one has triaged
 (`mutants-pending`). The cost, accepted by name: the --diff entry above exists because
 reviews found survivors the builder hadn't, each a fix round, and those rounds can
 come back, a day later. A builder or reviewer still runs `mutate-check` on one mutant
 to show a test catches what it's meant to (/build step 2, /tdd).
+
+### A daily run cut off at its time limit still moves the base (2026-11-10)
+
+The brief had a run cover its range only when it judged every mutant. A review found
+the base would then stall: with the whole suite per mutant (the owner's choice, kept
+under a third of a private repo's free minutes) and mutate-check's fixed order, a
+range bigger than one run's 15 minutes is cut off at the same mutants every day, and
+never covered. So a run that judged any mutant covers its range, and its summary says
+the mutants it left out are not retried; only a run that judged none (the suite fails
+unmutated on the runner) keeps the base, and fails. Raising MUTANT_MINUTES, as a
+public repo's free minutes would allow, leaves out fewer.

@@ -163,6 +163,14 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   shebang) are skipped, so a hook can pass every staged file; this repo's
   pre-commit hook lints the staged ones that name pipefail. It parses with
   tree-sitter-bash, through `uv run --script`.
+- **mutants-base**: where the daily mutants workflow (`.github/workflows/mutants.yml`)
+  starts: the head of the newest successful run on main, by schedule or by hand,
+  that covered its range (it judged mutants and uploaded `mutants-covered`) and is
+  still in HEAD's
+  history; else the commit that added the workflow; `--override REV` instead.
+  Prints `base=SHA` and `skip=true|false` for `$GITHUB_OUTPUT`. It asks GitHub
+  with `gh api`, each call bounded by `$MUTANTS_BASE_GH_SECONDS` (60), and fails
+  on any gh error rather than guess.
 - **mutate-check**: `mutate-check -- CMD` breaks code briefly with apply-edits
   blocks from stdin (or from `--edits FILE`, for a run under bgrun, which
   gives its job no stdin), runs CMD (a test run), and puts every file back, also
@@ -193,7 +201,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   inconclusive. It prints `FILE:LINE: what changed`
   for each mutant that survived and a summary line, and exits 0 when none
   survived, 1 when one did, and 3 when no mutant was judged. The daily mutants
-  workflow runs it over the lines landed since its last complete run; run it by
+  workflow runs it over the lines landed since its last covered run; run it by
   hand to check a diff's tests before a review does.
 - **conflicts**: `conflicts FILE` lists a file's conflict hunks, numbered, with
   each side and its marker label; `conflicts FILE N SIDE` (or `all SIDE`)

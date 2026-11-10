@@ -1,0 +1,130 @@
+# Mutation testing, daily: bin/mutate-check --diff breaks the Python and shell lines
+# landed since the last complete run in small ways (a statement deleted, a condition
+# negated, == swapped for !=) and runs the whole test suite against each, which /build
+# no longer does after each change (docs/design.md, mutate-check). A survivor is a
+# mutant the tests let through: code no test checks.
+#
+# The base is the head of the newest run that judged every mutant of its range, found
+# by bin/mutants-base; with none, the commit that added this file. Nothing landed
+# since: the run skips. The run stops mutating after MUTANT_MINUTES: a public repo's
+# runner minutes are free, and GitHub stops a job at 6 hours. The whole suite takes
+# about 6 minutes on a private repo's 2-core runner (2026-11-10), so a private repo
+# would need MUTANT_MINUTES near 15 to stay under a third of its 2,000 free
+# minutes a month, a mutant or two a day. A run that
+# judged any mutant uploads `mutants-covered`, cut off or not, and its summary says
+# what it left out; one that judged none (the suite fails unmutated here) keeps the
+# old base and fails.
+#
+# Results: the run's summary page, and the artifact `mutants` (survived.txt,
+# mutate.log, range.txt): `gh run download RUN -n mutants`. Triage them with the
+# repo's mutants-triage skill (.claude/skills/mutants-triage), which comments each
+# run it covers on the tracking issue; `mutants-pending` lists the runs not yet
+# triaged, and /upskill pitches them.
+#
+# Tracking issue: #1
+name: Mutants
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Commit to start from instead of the last complete run's (such a run never counts as complete)
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: mutants
+  cancel-in-progress: false
+
+env:
+  # Minutes of mutating per run, and the most one mutant's run of the suite may take.
+  MUTANT_MINUTES: "180"
+  MUTANT_SECONDS: "1200"
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.3
+      # path-refs searches with rg.
+      - run: sudo apt-get install -y -q ripgrep
+      - name: Find the base
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OVERRIDE: ${{ inputs.base }}
+        run: bin/mutants-base ${OVERRIDE:+--override "$OVERRIDE"} >> "$GITHUB_OUTPUT"
+      - name: Mutate the lines landed since
+        if: steps.base.outputs.skip == 'false'
+        id: mutate
+        env:
+          BASE: ${{ steps.base.outputs.base }}
+        # Exit 0 (none survived) and 1 (some did) are results, and so is 124, the
+        # time limit, which mutate-check survives to print its tally of what it
+        # judged. A run that judged any mutant covers its range, cut off or not, and
+        # its summary says how many it left out: with the whole suite per mutant and
+        # a fixed order, keeping the base after a cut-off run would retry the same
+        # first mutants every day, and the base would never move again. 3 with
+        # nothing to mutate covers the range too; any other 3 (the suite fails
+        # unmutated here, or the first 3 mutants were inconclusive) fails the job and
+        # keeps the base.
+        run: |
+          mkdir -p mutants
+          printf 'base %s\nhead %s\n' "$BASE" "$(git rev-parse HEAD)" > mutants/range.txt
+          started=$SECONDS
+          status=0
+          timeout --signal=TERM "${MUTANT_MINUTES}m" bin/mutate-check --diff "$BASE" \
+            --max 1000 --timeout "$MUTANT_SECONDS" -- \
+            uv run -q --no-project --with-requirements requirements-dev.txt \
+            pytest -q -p no:cacheprovider -x > mutants/mutate.log 2>&1 || status=$?
+          minutes=$(( (SECONDS - started + 59) / 60 ))
+          grep -E '^[^ ]+:[0-9]+: ' mutants/mutate.log > mutants/survived.txt || true
+          tally=$(grep -E '^mutate-check: [0-9]+ caught' mutants/mutate.log | tail -1 || true)
+          complete=false
+          if [ -n "$tally" ] && [ "$status" != 3 ]; then
+            complete=true
+          elif grep -q '^mutate-check: nothing to mutate' mutants/mutate.log; then
+            complete=true
+            tally="mutate-check: nothing to mutate in the changed code it could read"
+          fi
+          {
+            echo "## Mutants since ${BASE:0:12}"
+            echo
+            echo "${tally:-mutate-check judged nothing (exit $status): see mutate.log in the mutants artifact}"
+            echo
+            echo "Mutating took $minutes of the $MUTANT_MINUTES minutes allowed."
+            case "$tally" in
+              *"left out by --max"*|"") ;;
+              *) [ "$status" = 124 ] && echo "Cut off at the time limit: the mutants not yet tried are left out, not retried." ;;
+            esac
+            echo
+            echo '```'
+            cat mutants/survived.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "complete=$complete" >> "$GITHUB_OUTPUT"
+          [ "$complete" = true ] || exit 1
+      - if: always() && steps.base.outputs.skip == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants
+          path: mutants
+          retention-days: 90
+      # Marks the range covered, for bin/mutants-base. A run over a range given by
+      # hand covers that range, not the one since the last covered run.
+      - if: steps.mutate.outputs.complete == 'true' && inputs.base == ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-covered
+          path: mutants/range.txt
+          retention-days: 90

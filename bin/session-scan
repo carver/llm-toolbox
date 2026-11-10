@@ -234,7 +234,9 @@ noticed and set aside ("left for later", "out of scope", a TODO), which still \
 needs a fix. A flaw in a brief or plan that cost a fix cycle: a review finding, \
 a test rewritten after review, or a side agent's note that traces back to a \
 choice the brief made, above all one the issue's own text or a design doc \
-argued against.
+argued against. A tool that answered about the wrong target: another session, \
+file, repo or worktree than the one the agent meant, as a default that picked \
+the newest of several, even when the agent noticed and reran it.
 - Waste: dead ends, oversized reads or outputs, searches that took several \
 tries, work thrown away, slow paths: a LONG call, or a cache rebuild not after a \
 user turn; the same command taking a minute or more several times; polling \
@@ -255,7 +257,10 @@ digging through code that a doc could have told it, including a brief that left 
 a subagent to rediscover what its parent knew, and files that had to change \
 together with nothing pointing from one to the other.
 - Hungry tools: a tool or script whose output cost more tokens than the agent used.
-- Skipped checks: `--no-verify` or `git commit -n`.
+- Skipped checks: `--no-verify` or `git commit -n`; and a step of a skill the \
+agent loaded (its text shows in the digest, as after `/build` or a Skill call) \
+skipped or run out of order, such as a review run after the next commit's work \
+had started, or a sweep or bookkeeping command the skill names never run.
 
 Report every `HOOK ERROR` as a candidate, even one followed by a correct retry: \
 the checker dismisses those, and the retrospective must account for each \

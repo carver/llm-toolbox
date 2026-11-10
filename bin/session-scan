@@ -223,7 +223,12 @@ context: cite the numbered lines, not them.
 
 The categories, by these exact names:
 - Mistakes: wrong assumptions, retracted answers, reverted edits, user \
-corrections, a fix that had to be redone; a design built on a premise nobody \
+corrections, a fix that had to be redone. Corrections also arrive indirectly: a \
+side agent's note the user forwards ("Here is a note offered by a side agent") \
+that names something the agent missed; a question the user sends back to \
+clarify, which means it was unclear; the agent correcting itself ("correcting \
+what I told you", "my reasoning didn't hold"); the user renaming or redefining \
+what the agent built. A design built on a premise nobody \
 checked, which the user or a test then showed false; a bug or problem the agent \
 noticed and set aside ("left for later", "out of scope", a TODO), which still \
 needs a fix.

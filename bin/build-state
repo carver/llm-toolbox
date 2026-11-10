@@ -35,6 +35,12 @@
                             replace commit SHA's message with FILE's text (stdin
                             without FILE), keeping every tree; refuses with
                             uncommitted changes, merges after SHA, or SHA pushed
+    build-state sweep TERM...
+                            search the workspace for text the build may have made
+                            stale (a tool's name, phrases of its old behaviour), and
+                            record the sweep: its terms and HEAD. finish warns of
+                            each commit after the last one recorded (`build-state
+                            sweep -h`)
 
 The state lives in the worktree's git dir, as build-state.json, beside the review
 prompt; finish removes both.
@@ -119,6 +125,20 @@ refs/remotes/*/X). Another session's merge
 or push moves it, so a moved target doesn't fail finish: it finishes as usual, then
 says "X moved since start", adding ": rebase onto it" while HEAD lacks one of its
 commits.
+
+finish also warns, without refusing, of each commit since the base that came after
+the last recorded sweep, or of the build as a whole when it recorded none, naming
+`build-state sweep`; review-prompt warns the same, on stderr, before the review. Fix
+commits (fixup!, squash!, amend!) don't count: they fold into a commit that does. A
+build whose commits change no behaviour that any text describes needs no sweep, and
+may ignore the warning.
+
+Environment:
+  BUILD_STATE_WORKSPACE  the workspace root sweep searches. Default: the folder that
+                         holds the repo's main tree (the tests point it elsewhere)
+
+Exit status: 0 done; 1 refused or failed, saying why; 2 usage error; 3 and 4 (sweep
+only) `build-state sweep -h`.
 """
 
 import argparse
@@ -126,6 +146,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -142,6 +163,54 @@ TEST_FILE = re.compile(
 )
 # The subjects of commits that finish folds into the commits they name.
 FIXES = ("fixup! ", "squash! ", "amend! ")
+
+SWEEP_HELP = """\
+Search the workspace for text this build's change made stale, and record the sweep.
+
+Run it after a change to behaviour that any text may describe (a tool's options or
+output, a server's routes, a library's API), with the tool's or feature's name and
+the key phrases of its old behaviour, one TERM each:
+
+    build-state sweep build-state 'Nothing records a search'
+
+Each TERM is a fixed string, not a regex; put `--` before a TERM that starts with a
+dash (`build-state sweep -- --local`). It runs, from the workspace root,
+
+    rg --no-config -n --hidden --fixed-strings -g '!{cache,keep}/**' -g '!*-wt-*/**'
+       -g '!.git/' -g '!/.*' -e TERM... .
+
+so it skips cache/ and keep/ (over a million files), every worktree beside a repo
+(*-wt-*), .git folders, and the root's own dot-files and dot-folders, where
+credentials live; inside a repo, rg skips what its .gitignore names. rg matches those
+globs against paths relative to the path it searches, which is why it searches `.`
+from the root. In a linked worktree, the repo's own hits come from the worktree, with
+its edits, rather than from its main tree, which the search above then skips. Its
+own repo's hits come first, then the rest by path: at most 5 lines a file and 60 in
+all, each cut at 300 characters, then a line saying how many more it cut. When rg
+can't read some files, it says so on stderr and still records the sweep.
+
+The sweep is recorded in the build's state (`build-state show`): its terms, and HEAD's
+commit, ID, tree and subject, which finds it again after a reword or an amend. A
+sweep made with uncommitted changes covers the next commit too, which holds them,
+unless that commit is a fix, or they were amended into the swept commit.
+finish warns of each commit after the last sweep, fixes left out, and of a build
+with none, and so does review-prompt, on stderr, before the review. A sweep that
+finds nothing is recorded too. With no build open (`build-state start`), it searches
+and records nothing.
+
+The workspace root is the folder that holds the repo's main tree, or
+$BUILD_STATE_WORKSPACE when set (the tests set it). It refuses a root that is $HOME
+or /, as for a clone straight in the home folder.
+
+Exit status: 0 recorded, hits or none; 2 usage error, such as an empty TERM; 3 rg is
+missing or the root is $HOME or /, and nothing was searched; 4 searched, but no build
+is open, so nothing was recorded.
+"""
+# At most SWEEP_PER_FILE hits of a file print, SWEEP_CAP in all, each cut by rg to
+# SWEEP_WIDTH characters.
+SWEEP_CAP = 60
+SWEEP_PER_FILE = 5
+SWEEP_WIDTH = 300
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -515,7 +584,213 @@ def show(args: argparse.Namespace) -> int:
         print(f"reviewed {state['reviewed']}")
     if "refactor_base" in state:
         print(f"refactor base {state['refactor_base']}")
+    if sweeps := state.get("sweeps"):
+        last = sweeps[-1]
+        print(f"swept {last['head']} for {shlex.join(last['terms'])}")
     return 0
+
+
+def workspace_root() -> Path:
+    """The folder that holds the repo's main tree, which a linked worktree beside it
+    shares, or $BUILD_STATE_WORKSPACE."""
+    if root := os.environ.get("BUILD_STATE_WORKSPACE"):
+        return Path(root).resolve()
+    return main_tree().parent
+
+
+def work_tree() -> Path:
+    return Path(git("rev-parse", "--show-toplevel").stdout.strip()).resolve()
+
+
+def main_tree() -> Path:
+    common = git("rev-parse", "--path-format=absolute", "--git-common-dir").stdout
+    return Path(common.strip()).parent.resolve()
+
+
+def shown_from(root: Path, path: Path) -> str:
+    """`path` as the sweep shows it: `./REL` under the workspace root, else absolute."""
+    return f"./{path.relative_to(root)}" if path.is_relative_to(root) else str(path)
+
+
+@dataclass
+class Search:
+    hits: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+def rg(where: Path, prefix: str, globs: list[str], terms: list[str]) -> Search:
+    """rg's hits for `terms` under `where`, each path shown under `prefix`; raises
+    FileNotFoundError when rg is missing."""
+    found = subprocess.run(
+        [
+            *("rg", "--no-config", "-n", "--hidden", "--fixed-strings"),
+            *("--max-columns", str(SWEEP_WIDTH), "--max-columns-preview"),
+            *(arg for glob in globs for arg in ("-g", glob)),
+            *(arg for term in terms for arg in ("-e", term)),
+            ".",
+        ],
+        cwd=where,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    search = Search(
+        [prefix + hit.removeprefix(".") for hit in found.stdout.splitlines()]
+    )
+    if found.returncode not in (0, 1):
+        search.errors = found.stderr.splitlines() or [f"rg exited {found.returncode}"]
+    return search
+
+
+def search_workspace(root: Path, terms: list[str]) -> Search:
+    """Every hit in the workspace's repos as landed, skipping cache/, keep/, the
+    worktrees beside them, .git and the root's own dot-files (credentials live
+    there), except that this repo's hits come from this worktree, not its main
+    tree."""
+    globs = ["!{cache,keep}/**", "!*-wt-*/**", "!.git/", "!/.*"]
+    top, main = work_tree(), main_tree()
+    in_worktree = Search()
+    if top != main:
+        in_worktree = rg(top, shown_from(root, top), ["!.git"], terms)
+        if main.is_relative_to(root):
+            globs.append(f"!/{main.relative_to(root)}/**")
+    rest = rg(root, ".", globs, terms)
+    own_prefix = shown_from(root, top) + "/"
+    hits = sorted(
+        in_worktree.hits + rest.hits, key=lambda hit: sweep_key(hit, own_prefix)
+    )
+    return Search(hits, in_worktree.errors + rest.errors)
+
+
+def sweep_key(hit: str, own_prefix: str) -> tuple[bool, str, int]:
+    """This repo's hits first, then by path and line number (rg's `path:line:text`)."""
+    path, _, rest = hit.partition(":")
+    number = rest.partition(":")[0]
+    return not hit.startswith(own_prefix), path, int(number) if number.isdigit() else 0
+
+
+def print_hits(hits: list[str]) -> None:
+    """At most SWEEP_PER_FILE hits of each file, and SWEEP_CAP in all."""
+    shown, cut, per_file = 0, 0, {}
+    for hit in hits:
+        path = hit.partition(":")[0]
+        per_file[path] = per_file.get(path, 0) + 1
+        if per_file[path] > SWEEP_PER_FILE or shown == SWEEP_CAP:
+            cut += 1
+            continue
+        print(hit)
+        shown += 1
+    if cut:
+        print(
+            f"{cut} more hits not shown (at most {SWEEP_PER_FILE} a file,"
+            f" {SWEEP_CAP} in all): narrow the terms, or read those files."
+        )
+
+
+def sweep(args: argparse.Namespace) -> int:
+    if any(not term for term in args.terms):
+        print("build-state sweep: a TERM is empty.", file=sys.stderr)
+        return 2
+    path = state_file()
+    state = json.loads(path.read_text()) if path.exists() else None
+    root = workspace_root()
+    if root in (Path.home().resolve(), Path("/")):
+        print(
+            f"The workspace root would be {root}, the folder that holds the repo's"
+            " main tree, and a sweep there walks too much: set BUILD_STATE_WORKSPACE.",
+            file=sys.stderr,
+        )
+        return 3
+    try:
+        search = search_workspace(root, args.terms)
+    except FileNotFoundError:
+        print("rg isn't installed: install ripgrep, then sweep again.", file=sys.stderr)
+        return 3
+    print_hits(search.hits)
+    if search.errors:
+        print(
+            "rg reported errors, so files it couldn't read went unsearched:",
+            *search.errors[:3],
+            sep="\n",
+            file=sys.stderr,
+        )
+    if state is None:
+        print(
+            "No build is open here (`build-state start`), so the sweep wasn't recorded.",
+            file=sys.stderr,
+        )
+        return 4
+    state.setdefault("sweeps", []).append(
+        {
+            "terms": args.terms,
+            "head": head(),
+            "tree": tree_of("HEAD"),
+            "subject": git("log", "-1", "--format=%s").stdout.strip(),
+            # The work it covers isn't committed yet: the next commit holds it.
+            "uncommitted": bool(
+                git("status", "--porcelain", "--untracked-files=no").stdout
+            ),
+        }
+    )
+    save(path, state)
+    return 0
+
+
+@dataclass
+class Unswept:
+    """The commits since the base, fixes left out, that came after the build's last
+    sweep, oldest first, or all of them when it recorded none."""
+
+    recorded: bool
+    commits: list[tuple[str, str]]
+
+    def warning(self) -> str | None:
+        if not self.commits:
+            return None
+        ignore = (
+            "A commit that changes no behaviour that any text describes needs no"
+            " sweep: ignore this for it."
+        )
+        if not self.recorded:
+            return (
+                "No sweep for stale text was recorded for this build: run"
+                f" `build-state sweep NAME 'OLD PHRASE'` (-h). {ignore}"
+            )
+        head = (
+            "These commits came after the last sweep for stale text: run"
+            f" `build-state sweep NAME 'OLD PHRASE'` again (-h). {ignore}"
+        )
+        return "\n".join([head, *(f"  {subject}" for _, subject in self.commits)])
+
+
+def swept_commit(state: dict, sweep: dict) -> tuple[str | None, bool]:
+    """The commit the sweep was taken at, as HEAD's history holds it now: by its ID,
+    or its tree after a reword, or its subject after an amend; and whether it was
+    amended, which took in any work the sweep found uncommitted."""
+    if (found := current(sweep["head"], sweep["tree"])) is not None:
+        return found, False
+    for sha, subject in commits(f"{state['base']}..HEAD"):
+        if subject == sweep.get("subject"):
+            return sha, True
+    return None, False
+
+
+def unswept(state: dict) -> Unswept:
+    since, recorded, covers_next = state["base"], False, False
+    if sweeps := state.get("sweeps"):
+        last = sweeps[-1]
+        found, amended = swept_commit(state, last)
+        since = found or state["base"]
+        recorded = True
+        covers_next = last.get("uncommitted", False) and found and not amended
+    after = list(reversed(commits(f"{since}..HEAD")))
+    # Work the sweep found uncommitted went into the next commit, unless that is a
+    # fix, which folds it into a commit before the sweep.
+    if covers_next and after and not after[0][1].startswith(FIXES):
+        after = after[1:]
+    return Unswept(
+        recorded, [commit for commit in after if not commit[1].startswith(FIXES)]
+    )
 
 
 def fail(*lines: str) -> int:
@@ -800,6 +1075,8 @@ def finish(args: argparse.Namespace) -> int:
             "conflict-marker-size in .gitattributes (`git help attributes`).",
             *(f"  {marker}" for marker in markers),
         )
+    # Before the fold, which rewrites the commits a sweep recorded.
+    after_sweep = unswept(state)
     before = head()
     fold_from, why = fold_base(base)
     if not fold_fixups(fold_from):
@@ -825,6 +1102,8 @@ def finish(args: argparse.Namespace) -> int:
     if "refactor_base" in state:
         report_tests(state["refactor_base"])
     warn_of_folds()
+    if warning := after_sweep.warning():
+        print(f"\n{warning}")
     for branch in sorted(changed.targets):
         rebase = ": rebase onto it" if behind(branch) else ""
         print(f"{branch} moved since start{rebase}")
@@ -943,8 +1222,10 @@ def review_prompt(args: argparse.Namespace) -> int:
             f"No {' or '.join(missing)} in {skill}: code-review's layout changed,",
             "so update review_prompt in build-state.",
         )
+    if warning := unswept(state).warning():
+        print(f"build-state: {warning}", file=sys.stderr)
     base, sha = state["base"], head()
-    top = Path(git("rev-parse", "--show-toplevel").stdout.strip())
+    top = work_tree()
     if not (top / "CODING_STANDARDS.md").is_file():
         print(
             f"build-state: {top} has no CODING_STANDARDS.md. Consider writing one: the rules a "
@@ -1291,6 +1572,14 @@ def main(argv: list[str] | None = None) -> int:
     reword_command.add_argument("sha", metavar="SHA")
     reword_command.add_argument("file", nargs="?", type=Path, metavar="FILE")
     reword_command.set_defaults(run=reword)
+    sweep_command = commands.add_parser(
+        "sweep",
+        help="search the workspace for stale text and record the sweep",
+        description=SWEEP_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sweep_command.add_argument("terms", nargs="+", metavar="TERM")
+    sweep_command.set_defaults(run=sweep)
     args = parser.parse_args(argv)
     return args.run(args)
 

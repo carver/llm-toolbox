@@ -636,6 +636,15 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `reword SHA [FILE]` replaces a commit's message (FILE, or stdin), keeping
   every tree; it refuses during a rebase, with uncommitted changes, with merges
   after the commit, a later `fixup!` naming it, or the commit already pushed.
+  `sweep TERM...` searches the workspace for text a change made stale (/build
+  step 2), with rg from the workspace root as fixed strings, skipping cache/,
+  keep/, the worktrees beside repos, .git and the root's own dot-files, this
+  repo's hits taken from the worktree and listed first, at most 5 lines a file
+  and 60 in all; it records the terms and HEAD in the build's state. `finish`
+  and `review-prompt` warn of each commit, fixes aside, after the last sweep,
+  or of a build with none (a build that changes no described behaviour may
+  ignore it). `$BUILD_STATE_WORKSPACE` sets the workspace root, by default the
+  folder that holds the repo's main tree.
   The state lives in the git dir; `show` prints it.
 
 - **skill-patch**: keeps hand edits to other authors' skills. Edit the

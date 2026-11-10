@@ -1272,7 +1272,9 @@ def test_review_prompt_recommends_a_coding_standards_file_when_the_repo_has_none
     )  # the reviewer's prompt is unchanged
     commit(repo, "CODING_STANDARDS.md", "The house rules")
     again = build_state(repo, "review-prompt", str(brief), "--skill", str(skill))
-    assert again.stderr == ""
+    # Its stderr holds only the warning that no sweep was recorded.
+    assert again.stderr.startswith("build-state: No sweep"), again.stderr
+    assert len(again.stderr.splitlines()) == 1
 
 
 def trees(repo, count):
@@ -1952,3 +1954,341 @@ def test_fold_refuses_fixups_it_would_need_folded_first(worktree):
 
     assert done.returncode == 1 and "fixup!" in done.stderr
     assert "build-state finish" in done.stderr
+
+
+def workspace(tmp_path):
+    """A workspace root with one stale line in a doc, and copies of it where the sweep
+    never looks: cache/, keep/, a worktree beside a repo, a .git folder, and the
+    root's own dot-folders, where credentials live."""
+    root = tmp_path / "workspace"
+    for path in (
+        "notes/README.md",
+        "cache/clone/README.md",
+        "keep/run/README.md",
+        "proj-wt-topic/README.md",
+        "proj/.git/description",
+        ".sofa/credentials.json",
+        ".env",
+    ):
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text("Nothing records a search.\n")
+    return root
+
+
+def sweep(repo, root, *terms, env=None):
+    return build_state(
+        repo, "sweep", *terms, env={"BUILD_STATE_WORKSPACE": str(root)} | (env or {})
+    )
+
+
+def test_sweep_prints_the_hits_outside_cache_keep_worktrees_git_and_root_dot_files(
+    repo, tmp_path
+):
+    root = workspace(tmp_path)
+    (root / "proj/.github").mkdir()
+    (root / "proj/.github/ci.yml").write_text("run: old-tool\n")
+    build_state(repo, "start")
+
+    swept = sweep(repo, root, "Nothing records", "old-tool")
+
+    assert swept.returncode == 0, swept.stderr
+    assert swept.stdout.splitlines() == [
+        "./notes/README.md:1:Nothing records a search.",
+        "./proj/.github/ci.yml:1:run: old-tool",
+    ]
+
+
+def test_sweep_takes_each_term_as_a_fixed_string_even_one_like_an_option(
+    repo, tmp_path
+):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "doc.md").write_text("pass --local\ncall f(x\nfoo\n")
+    build_state(repo, "start")
+
+    swept = sweep(repo, root, "--", "--local", "f(")
+
+    assert swept.returncode == 0, swept.stderr
+    assert swept.stdout.splitlines() == [
+        "./doc.md:1:pass --local",
+        "./doc.md:2:call f(x",
+    ]
+
+
+def test_sweep_refuses_an_empty_term(repo, tmp_path):
+    build_state(repo, "start")
+
+    swept = sweep(repo, workspace(tmp_path), "")
+
+    assert swept.returncode == 2
+    assert "swept" not in build_state(repo, "show").stdout
+
+
+def test_sweep_records_its_terms_and_head(repo, tmp_path):
+    root = workspace(tmp_path)
+    build_state(repo, "start")
+    head = commit(repo, "a.py", "Work")
+
+    sweep(repo, root, "Nothing records", "old-tool")
+
+    shown = build_state(repo, "show")
+    assert f"swept {head} for 'Nothing records' old-tool" in shown.stdout
+
+
+def test_sweep_that_finds_nothing_is_recorded_too(repo, tmp_path):
+    root = workspace(tmp_path)
+    build_state(repo, "start")
+
+    swept = sweep(repo, root, "no such phrase")
+
+    assert swept.returncode == 0, swept.stderr
+    assert swept.stdout == ""
+    assert "swept" in build_state(repo, "show").stdout
+
+
+def test_sweep_caps_its_hits_a_file_and_in_all_and_says_how_many_it_cut(repo, tmp_path):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.md").write_text("stale\n" * 10)
+    for number in range(70):
+        (root / f"f{number:02}.md").write_text("x" * 1000 + " stale\n")
+    build_state(repo, "start")
+
+    swept = sweep(repo, root, "stale")
+
+    lines = swept.stdout.splitlines()
+    assert lines[:5] == [f"./a.md:{n}:stale" for n in range(1, 6)]
+    assert lines[5].startswith("./f00.md:1:")
+    assert lines[59].startswith("./f54.md:1:")
+    # 5 cut from a.md, f55 to f69 past the cap of 60.
+    assert lines[60].startswith("20 more hits not shown")
+    assert len(lines) == 61
+    assert max(len(line) for line in lines) < 400
+
+
+def test_sweep_without_a_build_searches_but_records_nothing(repo, tmp_path):
+    swept = sweep(repo, workspace(tmp_path), "Nothing records")
+
+    assert swept.returncode == 4
+    assert swept.stdout == "./notes/README.md:1:Nothing records a search.\n"
+    assert "build-state start" in swept.stderr and "wasn't recorded" in swept.stderr
+
+
+def fake_bin(tmp_path, rg=None):
+    """A PATH folder with git and python3, and `rg` as this script when given."""
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    for tool in ("git", "python3"):
+        (folder / tool).symlink_to(shutil.which(tool))
+    if rg is not None:
+        (folder / "rg").write_text(f"#!/bin/sh\n{rg}\n")
+        (folder / "rg").chmod(0o755)
+    return {"PATH": str(folder)}
+
+
+def test_sweep_still_records_when_rg_cant_read_some_files(repo, tmp_path):
+    rg = "echo './notes/a.md:1:old'; echo 'rg: ./x: Permission denied' >&2; exit 2"
+    build_state(repo, "start")
+
+    swept = sweep(repo, workspace(tmp_path), "old", env=fake_bin(tmp_path, rg))
+
+    assert swept.returncode == 0, swept.stderr
+    assert swept.stdout == "./notes/a.md:1:old\n"
+    assert "Permission denied" in swept.stderr
+    assert "swept" in build_state(repo, "show").stdout
+
+
+def test_sweep_fails_and_records_nothing_when_rg_is_missing(repo, tmp_path):
+    build_state(repo, "start")
+
+    swept = sweep(repo, workspace(tmp_path), "old", env=fake_bin(tmp_path))
+
+    assert swept.returncode == 3
+    assert "rg" in swept.stderr
+    assert "swept" not in build_state(repo, "show").stdout
+
+
+def test_sweep_refuses_the_home_folder_as_the_root(repo, tmp_path):
+    root = workspace(tmp_path)
+    build_state(repo, "start")
+
+    swept = sweep(repo, root, "Nothing records", env={"HOME": str(root)})
+
+    assert swept.returncode == 3
+    assert "BUILD_STATE_WORKSPACE" in swept.stderr
+    assert swept.stdout == ""
+
+
+def test_sweep_searches_the_folder_holding_the_main_tree_and_this_worktree_first(
+    template, tmp_path
+):
+    # A linked worktree beside the main tree, as llm-toolbox-wt-x beside llm-toolbox.
+    root = tmp_path / "workspace"
+    main = root / "proj"
+    shutil.copytree(template, main, symlinks=True)
+    commit(main, "doc.md", "Nothing records a search.")
+    (root / "other").mkdir()
+    (root / "other/notes.md").write_text("Nothing records a search.\n")
+    linked = root / "proj-wt-topic"
+    git(main, "worktree", "add", "-q", "--detach", str(linked))
+    (linked / "doc.md").write_text("A log records each search.\n")
+    (linked / "new.md").write_text("Nothing records a search, yet.\n")
+    build_state(linked, "start")
+    env = {k: v for k, v in os.environ.items() if k != "BUILD_STATE_WORKSPACE"}
+
+    swept = subprocess.run(
+        [str(SCRIPT), "sweep", "Nothing records"],
+        cwd=linked,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert swept.returncode == 0, swept.stderr
+    # The worktree's edit hides the main tree's stale doc.md.
+    assert swept.stdout.splitlines() == [
+        "./proj-wt-topic/new.md:1:Nothing records a search, yet.",
+        "./other/notes.md:1:Nothing records a search.",
+    ]
+
+
+def unswept_warning(output):
+    return "build-state sweep" in output
+
+
+def test_finish_warns_of_each_commit_after_the_last_sweep(repo, tmp_path):
+    root = workspace(tmp_path)
+    build_state(repo, "start")
+    commit(repo, "a.py", "Swept work")
+    sweep(repo, root, "Nothing records")
+    commit(repo, "b.py", "Later work")
+    commit(repo, "c.py", "Last work")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    warning = done.stdout[done.stdout.index("after the last sweep") :]
+    assert "Later work" in warning and "Last work" in warning
+    assert "Swept work" not in warning
+    assert "ignore this" in warning
+
+
+def test_finish_warns_when_no_sweep_was_recorded(repo):
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert "No sweep" in done.stdout and unswept_warning(done.stdout)
+    assert "ignore this" in done.stdout
+
+
+def test_finish_says_nothing_of_sweeps_when_the_last_one_came_after_every_commit(
+    repo, tmp_path
+):
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    sweep(repo, workspace(tmp_path), "Nothing records")
+    commit(repo, "a.py", "fix work", f"--fixup={work}")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert not unswept_warning(done.stdout), done.stdout
+
+
+def test_a_sweep_of_uncommitted_work_covers_the_next_commit(repo, tmp_path):
+    build_state(repo, "start")
+    (repo / "README").write_text("work\n")
+    sweep(repo, workspace(tmp_path), "Nothing records")
+    commit(repo, "README", "Work")
+    commit(repo, "b.py", "Later work")
+
+    done = build_state(repo, "finish")
+
+    warning = done.stdout[done.stdout.index("after the last sweep") :]
+    assert "Later work" in warning
+    assert "  Work" not in warning
+
+
+def test_a_reword_after_the_sweep_keeps_it(repo, tmp_path):
+    build_state(repo, "start")
+    work = commit(repo, "a.py", "Work")
+    sweep(repo, workspace(tmp_path), "Nothing records")
+    (tmp_path / "message").write_text("Work, reworded\n")
+    assert build_state(repo, "reword", work, str(tmp_path / "message")).returncode == 0
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert not unswept_warning(done.stdout), done.stdout
+
+
+def test_an_amend_after_the_sweep_keeps_it(repo, tmp_path):
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    sweep(repo, workspace(tmp_path), "Nothing records")
+    (repo / "a.py").write_text("stale text fixed\n")
+    git(repo, "commit", "-q", "-a", "--amend", "--no-edit")
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 0, done.stderr
+    assert not unswept_warning(done.stdout), done.stdout
+
+
+def test_review_prompt_warns_of_commits_after_the_last_sweep(repo, tmp_path):
+    build_state(repo, "start")
+    commit(repo, "a.py", "Work")
+    (tmp_path / "brief.md").write_text("Work.\n")
+
+    shown = build_state(
+        repo,
+        "review-prompt",
+        str(tmp_path / "brief.md"),
+        "--skill",
+        str(code_review_skill(tmp_path)),
+    )
+
+    assert shown.returncode == 0, shown.stderr
+    assert "No sweep" in shown.stderr and not unswept_warning(shown.stdout)
+
+
+def test_help_documents_sweep(repo):
+    assert "sweep TERM" in build_state(repo, "-h").stdout
+    shown = build_state(repo, "sweep", "-h").stdout
+    assert "BUILD_STATE_WORKSPACE" in shown and "recorded" in shown
+
+
+def test_a_sweep_of_uncommitted_work_folded_into_a_fixup_still_warns_of_later_work(
+    repo, tmp_path
+):
+    build_state(repo, "start")
+    work = commit(repo, "README", "Work")
+    (repo / "README").write_text("stale text fixed\n")
+    sweep(repo, workspace(tmp_path), "Nothing records")
+    git(repo, "commit", "-q", "-a", f"--fixup={work}")
+    commit(repo, "b.py", "Later work")
+
+    done = build_state(repo, "finish")
+
+    assert "after the last sweep" in done.stdout, done.stdout
+    assert "  Later work" in done.stdout
+
+
+def test_a_sweep_of_uncommitted_work_amended_in_still_warns_of_later_work(
+    repo, tmp_path
+):
+    build_state(repo, "start")
+    commit(repo, "README", "Work")
+    (repo / "README").write_text("stale text fixed\n")
+    sweep(repo, workspace(tmp_path), "Nothing records")
+    git(repo, "commit", "-q", "-a", "--amend", "--no-edit")
+    commit(repo, "b.py", "Later work")
+
+    done = build_state(repo, "finish")
+
+    assert "after the last sweep" in done.stdout, done.stdout
+    assert "  Later work" in done.stdout

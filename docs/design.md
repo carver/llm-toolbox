@@ -451,6 +451,44 @@ Left to the owner: build-state's `fixed_name` and `names_commit` find a fix's ta
 by a prefix of the subject or an ID, newest first, which can differ from autosquash
 and from this warning when two subjects match.
 
+### build-state sweep searches for stale text and records it (2026-11-10)
+
+/build's step 2 gave the builder a raw rg to run over the workspace for text a
+behaviour change made stale. In a three-commit build (retrospective, 2026-11-10) it
+was skipped for the first two commits, and a skill kept saying "Nothing records a
+search" after a search log landed; nothing recorded whether the sweep ran. The owner's
+design: `build-state sweep TERM...` runs that rg from the workspace root, prints the
+hits, capped, and records the terms and HEAD in the build's state; finish warns, never
+refuses, of each commit since the base after the last sweep, or of a build with none,
+saying a build that changes no described behaviour may ignore it.
+
+A review of the plan changed the rg and the warning (choices made in the build, not
+the owner's):
+
+- The root's own dot-folders are skipped (`-g '!/.*'`): the workspace root is no git
+  repo, so no .gitignore hides `.sofa/credentials.json` and the API keys beside it,
+  and a sweep for `token` would print them.
+- Terms are fixed strings, since most are phrases and option names (`f(`, `--local`),
+  and `--no-config` keeps a user's rg config out.
+- In a linked worktree, the repo's own hits come from the worktree, and its main tree
+  is skipped: the worktree glob skips the build's own edits too, so a fixed hit kept
+  showing from main and a stale line the change wrote never did. Its hits come first,
+  at most 5 lines a file and 60 in all, so another repo's long file can't push them
+  out.
+- review-prompt warns too, on stderr, before the review the sweep exists to spare; a
+  warning at finish alone comes after it.
+- A sweep made with uncommitted changes covers the next commit, and one whose commit
+  was amended is found by its subject, since builders sweep before committing and
+  amend the fixes in.
+- rg exiting 2 for an unreadable file still records the sweep, saying so; a root that
+  is $HOME or / is refused, as a clone straight in the home folder would walk it all.
+- Fix commits after the sweep don't count, though a spec-gap fix may change described
+  behaviour: counting them would make nearly every build warn, through its review's
+  fixes and refactor.
+
+The workspace root is the folder that holds the repo's main tree, not path-refs'
+hard-coded default, so it holds on any machine with the workspace's layout.
+
 ### Rejected: `wt-ship --check CMD` (removed in 03bc4c8)
 
 Nothing used it. It came with wt-ship's first version, for a repo that had no

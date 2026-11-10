@@ -3,6 +3,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -76,13 +77,50 @@ class FakeGh:
             },
         ]
         self.listing = []  # the open issues and pull requests, as GitHub lists them
+        # Other issues and pull requests, by number, as GraphQL serves them.
+        self.others = {
+            25: {
+                "state": "OPEN",
+                "title": "Agents offer to post",
+                "body": "- [ ] A usability run\n- [x] The skill",
+                "comments": {"nodes": [{"body": "- [ ] One more"}]},
+            },
+            46: {
+                "state": "CLOSED",
+                "title": "A beta stamp",
+                "body": "- [x] done",
+                "comments": {"nodes": []},
+            },
+            48: {
+                "state": "OPEN",
+                "title": "No items",
+                "body": "",
+                "comments": {"nodes": []},
+            },
+        }
+        self.graphql_fails = False
         self.patched = []
         self.calls = []
 
-    def __call__(self, *args, stdin=None):
+    def graphql(self, args):
+        if self.graphql_fails:
+            return ""
+        query = next(a for a in args if a.startswith("query="))
+        data, errors = {}, []
+        for alias, number in re.findall(
+            r"(m\d+): issueOrPullRequest\(number: (\d+)\)", query
+        ):
+            data[alias] = self.others.get(int(number))
+            if data[alias] is None:
+                errors.append({"type": "NOT_FOUND", "path": ["repository", alias]})
+        return json.dumps({"data": {"repository": data}, "errors": errors})
+
+    def __call__(self, *args, stdin=None, check=True):
         self.calls.append(args)
         if args[:2] == ("repo", "view"):
             return "owner/repo\n"
+        if args[:2] == ("api", "graphql"):
+            return self.graphql(args)
         if "-X" in args:
             self.patched.append((args[-3], json.loads(stdin)["body"]))
             return "{}"
@@ -304,6 +342,59 @@ def test_read_prints_the_body_and_every_comment_with_author_and_date(fake, capsy
     assert "body jc 2026-10-22" in out and "The forecast question" in out
     assert "comment 11 alice 2026-10-23\nNo tasks." in out
     assert out.index("No tasks.") < out.index("Replace the forecast measure")
+
+
+def test_mentions_are_this_repos_issue_numbers_in_order_outside_code():
+    text = (
+        "First #25, then #46 and #25 again.\n"
+        "Not other/repo#9, not `#10`, not a#11.\n"
+        "```\n#12 in a fence\n```\n"
+        "(#48) and #1."
+    )
+    assert tool.mentions(text) == [25, 46, 48, 1]
+
+
+def test_a_stray_backtick_hides_no_mention_past_its_paragraph():
+    assert tool.mentions("the ` key, then #5.\n\nLater `x` and #6") == [5, 6]
+
+
+def test_read_ends_with_each_mentioned_issues_state_items_and_title(fake, capsys):
+    fake.issue["body"] = (
+        "Order: #25, then #46, #99 (no such issue), #48, and this one, #7."
+    )
+
+    assert tool.main(["read", "7"]) == 0
+
+    out = capsys.readouterr().out
+    assert out.endswith(
+        "--- mentions\n"
+        "#25 open, 2 open items: Agents offer to post\n"
+        "#46 closed: A beta stamp\n"
+        "#48 open: No items\n"
+    )
+    graphql = [a for a in fake.calls if a[:2] == ("api", "graphql")]
+    assert len(graphql) == 1  # one call for every mention
+
+
+def test_show_ends_with_the_mentions_too(fake, capsys):
+    fake.comments[0]["body"] = "Blocked on #46."
+    assert tool.main(["show", "7"]) == 0
+    assert capsys.readouterr().out.endswith("--- mentions\n#46 closed: A beta stamp\n")
+
+
+def test_an_issue_that_mentions_none_costs_no_graphql_call(fake, capsys):
+    assert tool.main(["read", "7"]) == 0
+    assert "mentions" not in capsys.readouterr().out
+    assert not [a for a in fake.calls if a[:2] == ("api", "graphql")]
+
+
+def test_a_failed_mentions_lookup_still_prints_the_issue(fake, capsys):
+    fake.issue["body"] = "See #25."
+    fake.graphql_fails = True
+    assert tool.main(["read", "7"]) == 0
+    captured = capsys.readouterr()
+    assert "See #25." in captured.out and "--- mentions" not in captured.out
+    assert "couldn't look up the issues #7 mentions" in captured.err
 
 
 def claim_comment(session, kind="claim"):

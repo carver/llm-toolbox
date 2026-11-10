@@ -407,9 +407,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   issue's open items, a cheap answer to "what's left to do here", and `--titles`
   one line per open issue (number, title, count of open items), to find an issue
   by its subject. `issue-todo read N...` prints each issue's body and every
-  comment, with author and date. `issue-todo claim N` claims an issue for this
-  session (`--as NAME`, else `CLAUDE_CODE_SESSION_ID`'s first 8 characters) in a
-  marked comment, and refuses while another session's claim stands; `release N`
+  comment, with author and date. `show` and `read` end with the issues and pull
+  requests each issue mentions as `#N`, with their state, open items and title,
+  so a plan issue tells which of its steps are done. `issue-todo claim N` claims
+  an issue for this session (`--as NAME`, else `CLAUDE_CODE_SESSION_ID`'s first 8
+  characters) in a marked comment, and refuses while another session's claim stands; `release N`
   frees it. It writes through `gh api`.
 - **openrouter-credits**: prints an OpenRouter account's credits, bought, used
   and left. The key comes from `OPENROUTER_API_KEY`, else from `./.env` (or

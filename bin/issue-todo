@@ -28,6 +28,11 @@ and writes that body or comment back, unless it changed since it was read. No ma
 or several, writes nothing and lists the candidates. It calls `gh`, so it acts as
 gh's logged-in user, in the current directory's repo unless --repo names one.
 
+`show` and `read` end with a `--- mentions` section: each issue or pull request of the
+repo that the issue mentions as `#N` outside code, in order, with its state, its count
+of open items and its title, such as `#25 open, 1 open item: Agents offer to post`. One
+GraphQL call fetches them all, so a plan issue tells which of its steps are done.
+
 `claim` and `release` keep a claim in the issue's comments, each with a hidden marker
 `<!-- issue-todo claim ID -->` (or `release`), so two sessions don't both take one
 issue. ID is the session's name: --as NAME, else $CLAUDE_CODE_SESSION_ID's first 8
@@ -40,11 +45,16 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 BOX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+\[)([ xX])(\]\s+)(.*)$")
 FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
 WIDTH = 100  # show cuts an item's text to this many characters
+# `#N`, but not `owner/repo#N`, `a#N` or an HTML entity's `&#N`.
+MENTION = re.compile(r"(?<![\w/&])#(\d+)\b")
+INLINE_CODE = re.compile(r"(`+).+?\1", re.DOTALL)  # within one paragraph
+PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n")
 
 
 @dataclass(frozen=True)
@@ -63,10 +73,10 @@ class Part:
     markdown: str
 
 
-def items(markdown: str) -> list[Item]:
-    """The task-list items in `markdown`, in order, leaving out lines in fenced code. A
+def outside_fences(markdown: str) -> Iterator[tuple[int, str]]:
+    """Each line of `markdown` outside fenced code, with its index, without its "\\r". A
     fence closes only on a fence of its own character, at least as long."""
-    found, fence = [], None
+    fence = None
     for i, line in enumerate(markdown.split("\n")):
         line = line.removesuffix("\r")
         if m := FENCE.match(line):
@@ -75,9 +85,17 @@ def items(markdown: str) -> list[Item]:
                 fence = mark
             elif mark[0] == fence[0] and len(mark) >= len(fence):
                 fence = None
-        elif fence is None and (m := BOX.match(line)):
-            found.append(Item(i, m.group(2) != " ", m.group(4)))
-    return found
+        elif fence is None:
+            yield i, line
+
+
+def items(markdown: str) -> list[Item]:
+    """The task-list items in `markdown`, in order, leaving out lines in fenced code."""
+    return [
+        Item(i, m.group(2) != " ", m.group(4))
+        for i, line in outside_fences(markdown)
+        if (m := BOX.match(line))
+    ]
 
 
 def tick(markdown: str, item: Item, note: str | None, undo: bool = False) -> str:
@@ -97,12 +115,17 @@ def short(text: str) -> str:
     return text if len(text) <= WIDTH else text[: WIDTH - 1] + "…"
 
 
-def gh(*args: str, stdin: str | None = None) -> str:
-    """gh's output; exits with gh's message when it fails."""
+def gh(*args: str, stdin: str | None = None, check: bool = True) -> str:
+    """gh's output; exits with gh's message when it fails, unless `check` is off."""
     r = subprocess.run(
         ["gh", *args], input=stdin, capture_output=True, text=True, check=False
     )
-    if r.returncode != 0:
+    if r.returncode != 0 and not check and not r.stdout.strip():
+        print(
+            f"issue-todo: gh {' '.join(args[:2])}: {r.stderr.strip()[-300:]}",
+            file=sys.stderr,
+        )
+    if r.returncode != 0 and check:
         sys.exit(
             f"issue-todo: gh {' '.join(args[:3])} failed: {r.stderr.strip()[-300:]}"
         )
@@ -144,7 +167,72 @@ def show(repo: str, number: int) -> int:
         print(part.label)
         for i, item in enumerate(listed, 1):
             print(f"  [{'x' if item.done else ' '}] {i}  {short(item.text)}")
+    print_mentions(repo, issue["number"], found)
     return 0
+
+
+def prose(markdown: str) -> str:
+    """`markdown` without its fenced code blocks and inline code spans. A code span
+    ends at its paragraph's end, so a stray backtick hides nothing past it."""
+    text = "\n".join(line for _, line in outside_fences(markdown))
+    return "\n\n".join(INLINE_CODE.sub("", p) for p in PARAGRAPH_BREAK.split(text))
+
+
+def mentions(markdown: str) -> list[int]:
+    """The issue numbers `markdown` mentions as `#N`, in order of first mention, leaving
+    out code and another repo's `owner/repo#N`."""
+    return list(dict.fromkeys(int(n) for n in MENTION.findall(prose(markdown))))
+
+
+def mentioned(repo: str, numbers: list[int]) -> list[str] | None:
+    """A line for each of `numbers` that names an issue or pull request in `repo`: its
+    state, its open items if it has any, and its title. One GraphQL call fetches them
+    all. None when the call fails; a number that names nothing is left out."""
+    owner, name = repo.split("/", 1)
+    fields = "state title body comments(first: 100) { nodes { body } }"
+    asked = " ".join(
+        f"m{n}: issueOrPullRequest(number: {n}) "
+        f"{{ ... on Issue {{ {fields} }} ... on PullRequest {{ {fields} }} }}"
+        for n in numbers
+    )
+    query = f"query {{ repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{ {asked} }} }}"
+    # A number that names nothing makes gh exit 1, with the rest of the answer intact.
+    out = gh("api", "graphql", "-f", f"query={query}", check=False)
+    try:
+        found = json.loads(out)["data"]["repository"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    lines = []
+    for n in numbers:
+        node = found.get(f"m{n}")
+        if not node:
+            continue
+        texts = [node.get("body") or ""] + [
+            c.get("body") or "" for c in node["comments"]["nodes"]
+        ]
+        n_open = sum(not item.done for text in texts for item in items(text))
+        count = f", {n_open} open item{'s' if n_open > 1 else ''}" if n_open else ""
+        lines.append(f"#{n} {node['state'].lower()}{count}: {node['title']}")
+    return lines
+
+
+def print_mentions(repo: str, number: int, found: list[Part]) -> None:
+    """The issues and pull requests that `found` mentions, under `--- mentions`."""
+    numbers = [
+        n for n in mentions("\n".join(part.markdown for part in found)) if n != number
+    ]
+    if not numbers:
+        return
+    lines = mentioned(repo, numbers)
+    if lines is None:
+        print(
+            f"issue-todo: couldn't look up the issues #{number} mentions; "
+            "`gh auth status` checks gh's login, and the issue above is complete",
+            file=sys.stderr,
+        )
+    elif lines:
+        print("--- mentions")
+        print("\n".join(lines))
 
 
 def read(repo: str, numbers: list[int]) -> int:
@@ -157,9 +245,11 @@ def read(repo: str, numbers: list[int]) -> int:
         author = (issue.get("user") or {}).get("login", "?")
         print(f"--- body {author} {(issue.get('created_at') or '')[:10]}".rstrip())
         print((issue.get("body") or "").rstrip())
-        for part in issue_parts(repo, issue)[1:]:
+        found = issue_parts(repo, issue)
+        for part in found[1:]:
             print(f"--- {part.label}")
             print(part.markdown.rstrip())
+        print_mentions(repo, issue["number"], found)
     return 0
 
 

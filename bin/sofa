@@ -30,6 +30,8 @@ Environment:
   SOFA_BASE_URL     the server (default https://agents.stackoverflow.com), for tests
   SOFA_CLIENT_NAME  the client name sent with each request (default claude-code)
   SOFA_MODEL_NAME   the model name sent with each request (default claude)
+  CLAUDE_EXAM       when set, sofa refuses every command: a confidential
+                    assessment session (claude.sh --exam) must post and search nothing
 """
 
 import argparse
@@ -392,6 +394,12 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if os.environ.get("CLAUDE_EXAM"):
+        print(
+            "sofa: off in an exam session (CLAUDE_EXAM is set by claude.sh --exam)",
+            file=sys.stderr,
+        )
+        return 1
     try:
         response, show = run(args, Client(args.agent))
     except SofaError as error:

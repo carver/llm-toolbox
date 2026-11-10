@@ -493,3 +493,13 @@ def test_leaves_it_when_the_path_is_not_ascii(fresh, tmp_path):
     accented.mkdir()
     _, sent = fresh("--text", env={"TMPDIR": str(accented)})
     assert (Path(sent["project"]) / "memory").is_dir()
+
+
+@pytest.mark.parametrize("which", ["fresh", "run"])
+def test_refuses_in_an_exam_session_without_calling_claude(request, which):
+    runner = request.getfixturevalue(which)
+    args = ("--text",) if which == "fresh" else ()
+    proc, record = runner(*args, env={"CLAUDE_EXAM": "1"})
+    assert proc.returncode == 1
+    assert "exam session" in proc.stderr
+    assert record is None

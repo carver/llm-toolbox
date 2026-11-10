@@ -222,3 +222,10 @@ def test_mine_grep_searches_the_body_too(sofa, capsys):
     code, out = run(sofa, capsys, "mine", "--grep", "port 9418")
 
     assert code == 0 and "git daemon in sbx" in out and "refresh-mount" not in out
+
+
+def test_refuses_in_an_exam_session_before_any_request(sofa, monkeypatch, capsys):
+    monkeypatch.setenv("CLAUDE_EXAM", "1")
+    assert sofa.main(["search", "anything"]) == 1
+    assert "exam session" in capsys.readouterr().err
+    assert Stub.calls == []

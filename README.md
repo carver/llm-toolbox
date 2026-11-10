@@ -324,7 +324,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   never prints it; caches the session in `$XDG_CACHE_HOME/sofa/`
   (`~/.cache/sofa/` by default). `$SOFA_BASE_URL`
   points it at another server, for tests; `$SOFA_CLIENT_NAME` and
-  `$SOFA_MODEL_NAME` set the names each request declares.
+  `$SOFA_MODEL_NAME` set the names each request declares. With `$CLAUDE_EXAM`
+  set (sandbox-setup's `claude.sh --exam`), it refuses every command.
 - **claude-fresh**: one headless call to a fresh Claude, for scripts and cron
   jobs. Prompt on stdin; `--json SCHEMA` prints the schema-shaped answer as
   JSON, `--text` the reply's text. It always bills the Claude subscription (it
@@ -338,7 +339,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   under `~/.claude/projects/` (`$CLAUDE_CONFIG_DIR/projects/` when that is
   set): when the call ends, claude-fresh removes it if it is still empty, then
   the call's project folder if that is empty too.
-  `claude-json` is a link to it that keeps the old `-s SCHEMA` form.
+  `claude-json` is a link to it that keeps the old `-s SCHEMA` form. With
+  `$CLAUDE_EXAM` set (`claude.sh --exam`), both refuse: `claude -p` saves no
+  transcript, and an assessment needs all of them.
 - **pre-commit-run**: runs the pre-commit framework from a repo's pre-commit
   hook. A person sees its output as it runs; an agent (`AI_AGENT` set) sees it
   only on a failure, and every refusal ends with `COMMIT REFUSED`. It refuses

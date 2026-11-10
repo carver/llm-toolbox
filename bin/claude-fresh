@@ -38,6 +38,10 @@ A refused or failed call exits 1 and says why on stderr, including the reason
 `claude -p` gives only in its JSON output (an API safeguard's flag, a spent
 budget).
 
+In an exam session ($CLAUDE_EXAM set, by claude.sh --exam) it refuses and
+exits 1 without calling Claude: `claude -p` saves no transcript, and an
+assessment needs every AI transcript.
+
 Exit status: 0 success, 1 the call failed (message on stderr), 2 usage error.
 """
 
@@ -256,6 +260,13 @@ def main(argv: list[str] | None = None) -> int:
         help="kill the call after this long (default %(default)g)",
     )
     args = parser.parse_args(argv)
+    if os.environ.get("CLAUDE_EXAM"):
+        print(
+            f"{prog}: off in an exam session (CLAUDE_EXAM is set by claude.sh --exam): "
+            "`claude -p` saves no transcript",
+            file=sys.stderr,
+        )
+        return 1
 
     schema = None
     if args.schema is not None:

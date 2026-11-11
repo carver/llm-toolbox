@@ -34,7 +34,7 @@ The rules a reviewer holds this repo's code to. The global standards in `~/.agen
 ## Skills
 
 - A skill is written with the `writing-for-agents` skill, and its prose passes `slop-lint`.
-- Every skill, slash command and `~/.agents/skills/` path a skill, the guidelines or a patch names is one `install.py` installs (`test_skill_refs.py`).
+- Every skill, slash command and `~/.agents/skills/` path a skill, the guidelines or a patch names is one `install.py` installs (`test_skill_refs.py`). A patch's removed lines don't count: they are upstream text the patch takes out.
 
 ## Checks
 

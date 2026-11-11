@@ -30,6 +30,20 @@ def broken_refs(text: str) -> list[str]:
     return broken
 
 
+def without_removed_lines(patch: str) -> str:
+    """A patch's text minus the upstream lines it removes, which this repo doesn't name."""
+    return "".join(
+        line
+        for line in patch.splitlines(keepends=True)
+        if not line.startswith("-") or line.startswith("---")
+    )
+
+
+def refs_text(doc: Path) -> str:
+    text = doc.read_text()
+    return without_removed_lines(text) if doc.suffix == ".patch" else text
+
+
 def docs() -> list[Path]:
     return [
         ROOT / "GLOBAL_CLAUDE.md",
@@ -53,10 +67,28 @@ def test_finds_each_kind_of_broken_ref() -> None:
     ]
 
 
+def test_a_patch_s_removed_lines_are_not_refs() -> None:
+    patch = (
+        "--- a/SKILL.md\n"
+        "+++ b/SKILL.md\n"
+        "@@ -1,3 +1,3 @@\n"
+        " Then run `/build`.\n"
+        "-Write it to `/tmp`, then run `/retro`.\n"
+        "+Publish it, then run `/upskill`.\n"
+    )
+    assert without_removed_lines(patch) == (
+        "--- a/SKILL.md\n"
+        "+++ b/SKILL.md\n"
+        "@@ -1,3 +1,3 @@\n"
+        " Then run `/build`.\n"
+        "+Publish it, then run `/upskill`.\n"
+    )
+
+
 def test_every_named_skill_is_installed() -> None:
     broken = {
         str(doc.relative_to(ROOT)): refs
         for doc in docs()
-        if (refs := broken_refs(doc.read_text()))
+        if (refs := broken_refs(refs_text(doc)))
     }
     assert broken == {}

@@ -363,8 +363,8 @@ def test_finish_takes_fixes_after_the_review_and_commits_after_the_refactor_base
 
 
 CODE_REVIEW = Path.home() / ".agents/skills/code-review/SKILL.md"
-STANDARDS_BRIEF = "Report every standard broken. Under 400 words."
-SPEC_BRIEF = "Report: (a) what's missing; (b) scope creep. Under 400 words."
+STANDARDS_BRIEF = "Report every standard broken."
+SPEC_BRIEF = "Report: (a) what's missing; (b) scope creep."
 
 
 # A stand-in for code-review's SKILL.md, laid out like the real one.
@@ -521,7 +521,7 @@ def test_review_prompt_finds_both_briefs_in_the_installed_code_review(repo, tmp_
     assert shown.returncode == 0, shown.stderr
     git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").strip())
     prompt = (git_dir / "build-review-prompt.md").read_text()
-    assert prompt.count("Under 400 words") == 2
+    assert prompt.count('Brief, verbatim: "Report') == 2
 
 
 def test_finish_without_start_says_so(repo):

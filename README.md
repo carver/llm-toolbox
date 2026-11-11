@@ -342,6 +342,24 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `claude-json` is a link to it that keeps the old `-s SCHEMA` form. With
   `$CLAUDE_EXAM` set (`claude.sh --exam`), both refuse: `claude -p` saves no
   transcript, and an assessment needs all of them.
+- **drive-agent**: runs a scripted session of Claude Code's or Codex's own TUI,
+  as a person would, for usability tests of what agents read.
+  `drive-agent run SCENARIO --harness claude|codex --name NAME --out DIR` makes
+  a system user NAME with a fresh home and runs the harness in tmux as that
+  user inside bwrap, which hides the workspace, other homes, the driver's
+  processes and the sandbox's shell setup; a proxy it runs refuses github.com,
+  api.github.com and loopback, and an iptables rule lets the user reach nothing
+  else. It types each scripted turn once the agent's last turn ends, asks a
+  simulated human (`claude-fresh`) to answer open questions and judge
+  conditional turns (never sent when it fails), and saves screens, transcripts
+  and the files the run made, then removes the user. `--setup FILE` prepares
+  the home first, `--agent-env`/`--setup-env`/`--var` pass named variables
+  without putting them on a command line. `digest RUN_DIR` prints a run's
+  transcripts compactly; `cleanup NAME` removes a crashed run's user. Tests
+  set `DRIVE_AGENT_ISOLATION=none` (no user or sandbox, homes under
+  `DRIVE_AGENT_HOME_ROOT`) and shorten `DRIVE_AGENT_TURN_LIMIT`,
+  `DRIVE_AGENT_SETTLE` and `DRIVE_AGENT_LAUNCH_LIMIT`; the proxy forwards
+  through `HTTPS_PROXY`. Needs tmux, passwordless sudo, bwrap and iptables.
 - **pre-commit-run**: runs the pre-commit framework from a repo's pre-commit
   hook. A person sees its output as it runs; an agent (`AI_AGENT` set) sees it
   only on a failure, and every refusal ends with `COMMIT REFUSED`. It refuses

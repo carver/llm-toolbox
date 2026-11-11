@@ -1,0 +1,1616 @@
+#!/usr/bin/env python3
+"""Drive one scripted session of a coding agent's own TUI, as a person would, for
+usability tests of what agents read (skills, installers, docs).
+
+    drive-agent run SCENARIO --harness claude|codex --name NAME --out DIR [options]
+    drive-agent digest RUN_DIR [--width N] [-v] [--redact REGEX]...
+    drive-agent cleanup NAME
+
+`run` makes a system user NAME with a fresh home, /home/NAME, and runs the harness
+(Claude Code or Codex) in tmux as that user inside bwrap: it sees only its own home,
+a private /tmp, its own processes, and the network through a proxy drive-agent runs,
+which refuses github.com, api.github.com and loopback or private addresses (an
+iptables rule lets the user reach nothing else). So the agent under test can't read
+or write the workspace, see the driver's command lines, or push with credentials the
+network adds. drive-agent types each human turn of SCENARIO once the agent's last
+turn has ended (Claude Code's Stop hook; Codex's notify program), saves the screen
+after each, then the transcripts and the files the run made, and removes the user,
+its home, its state folder and its iptables rule, on any exit.
+
+SCENARIO is JSON:
+  turns       the human's messages, in order. A string is sent as it is; {NAME} in it
+              becomes the driver's variable NAME when --var NAME is given.
+              {"text", "only_if", "else"} is
+              sent only when the simulated human judges `only_if` holds of the
+              agent's last message, else `else` (or nothing). "{RESTART}" quits the
+              harness and starts a new session in the same home.
+  gated       actions the simulated human never approves unless a scripted message
+              has, such as ["posting to File Drawer"]. Required.
+  persona     text added to --persona's.
+  projects    folders under --projects, copied into ~/code/ and committed once; the
+              agent starts in the first, else in ~.
+  print_mode  true: one `claude -p` / `codex exec --json` call with the first turn.
+Other keys are the setup script's.
+
+A simulated human (`claude-fresh --json`, Sonnet) reads each agent message before a
+scripted turn: it answers a question the script leaves open, from the persona, and
+judges conditions. When it fails, a conditional turn is skipped, never sent blind;
+an unconditional one is sent as scripted.
+
+run options:
+  --harness H          claude or codex
+  --name NAME          the user's name, which the agent sees as its USER
+  --out DIR            where the run goes; must not exist
+  --persona FILE       who the simulated human is: facts it may give
+  --projects DIR       where the scenario's projects are
+  --setup FILE         a program run as the user, in the sandbox, before the agent
+                       starts, with the scenario's path as its argument. It and the
+                       scenario are bound read-only outside the home for that step
+                       only. Its environment is no secret from the agent, which runs
+                       as the same user.
+  --setup-env NAME     pass the driver's variable NAME to the setup (repeatable)
+  --agent-env NAME     pass the driver's variable NAME to the agent (repeatable)
+  --var NAME           fill {NAME} in turns from the driver's variable (repeatable)
+  --git-name N         the projects' commit author and ~/.gitconfig name (default NAME)
+  --git-email E        default NAME@example.org
+  --deny-host HOST     also refuse HOST at the proxy (repeatable)
+  --bind-tool PATH     also give the agent this program in ~/.local/bin (repeatable);
+                       the harness, uv and uvx are given when they live where
+                       the box hides (/home, /tmp, /var/tmp, /dev/shm)
+  --hide PATH          also show the agent PATH as an empty file (repeatable); the
+                       box already hides /etc/sandbox-persistent.sh and
+                       /etc/sandbox-secrets.sh, which set this sandbox's own
+                       variables in every shell
+  --keep-home          leave the home in place (isolation none only; for tests)
+
+The run's DIR holds scenario.json, run.json (harness, version, isolation, times,
+outcome), turns.md, screen-NN.txt (screen-launch.txt when the harness never got
+ready), transcript-*.jsonl or print-mode.jsonl, and files/: regular files the run
+made or changed in the home, outside .claude, .codex, .cache, .npm, .local and
+.config, and outside the projects' unchanged files, up to 1 MB each.
+
+Claude Code gets the driver's access token as CLAUDE_CODE_OAUTH_TOKEN, so no copy of
+the refresh token leaves the driver's home; the run warns when it expires within 2
+hours. Codex gets a CODEX_HOME in the home holding the driver's auth.json without its
+refresh token, and a config of only model and model_reasoning_effort.
+
+`digest` prints a run's transcripts compactly: each human turn, the agent's text,
+one line per tool call (-v adds Codex's tool output). --redact blanks each match.
+`cleanup NAME` removes a run's user, home, state folder and rule after a crash.
+
+Environment:
+  DRIVE_AGENT_ISOLATION      "none" (tests): no user, bwrap or iptables; the agent
+                             runs as the driver, in a home under DRIVE_AGENT_HOME_ROOT
+  DRIVE_AGENT_HOME_ROOT      where homes go with isolation none
+  DRIVE_AGENT_TURN_LIMIT     seconds a turn may take (default 1200)
+  DRIVE_AGENT_SETTLE         seconds a turn end must hold before the next turn (8)
+  DRIVE_AGENT_LAUNCH_LIMIT   seconds the harness has to show its prompt (60)
+  HTTPS_PROXY, https_proxy   the proxy drive-agent's own proxy forwards through
+
+Needs tmux, and for isolation, passwordless sudo, bwrap (the bubblewrap package) and
+iptables. Exit status: 0 the run ended, 1 it failed (harness not ready, a turn
+timed out, a setup error), 2 usage error.
+"""
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+KEEP_ENV = [
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "TZ",
+    "COLORTERM",
+    "NODE_OPTIONS",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_USE_ENV_PROXY",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+]
+DENY = ["github.com", "api.github.com"]
+DENY_NAMES = {"localhost", "host.docker.internal"}
+HARNESS_DIRS = {".claude", ".codex", ".cache", ".npm", ".local", ".config"}
+# Files every shell sources on this sandbox (docker sbx), which set the workspace's
+# own variables, such as cache paths under the hidden /home; the box shows them empty.
+HIDE = ["/etc/sandbox-persistent.sh", "/etc/sandbox-secrets.sh"]
+HIDDEN_ROOTS = ("/home", "/tmp", "/var/tmp", "/dev/shm")
+# Each run's state folder (turn file, environment file, Codex's notify program),
+# which the agent sees, so its name says nothing of a test.
+STATE_ROOT = Path("/run/session-state")
+# The users drive-agent made and hasn't removed, one a line; `cleanup` acts on no
+# other.
+REGISTRY = Path("/var/lib/drive-agent/users")
+NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")
+DIALOG = "Enter to select"
+READY = ("for shortcuts", "❯", "›")
+COLLECT_LIMIT = 1 << 20
+
+
+def number(name: str, default: float) -> float:
+    return float(os.environ.get(name, default))
+
+
+TURN_LIMIT = number("DRIVE_AGENT_TURN_LIMIT", 1200)
+SETTLE = number("DRIVE_AGENT_SETTLE", 8)
+LAUNCH_LIMIT = number("DRIVE_AGENT_LAUNCH_LIMIT", 60)
+
+
+class Usage(Exception):
+    """A usage error: exit 2."""
+
+
+class Failed(Exception):
+    """The run failed: exit 1."""
+
+
+def run(*args, check=True, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(args, check=check, text=True, capture_output=True, **kw)
+
+
+# ---------------------------------------------------------------- the proxy
+
+
+def local(address: str) -> bool:
+    """Whether an IP address is this machine's or its networks', not the internet's."""
+    ip = ipaddress.ip_address(address.split("%", 1)[0])
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_unspecified
+        or ip.is_multicast
+        or ip.is_reserved
+    )
+
+
+def denied(host: str, deny: list[str]) -> tuple[bool, str | None]:
+    """Whether the proxy refuses `host`, and else an address to connect to: a denied
+    domain or any of its subdomains, and any name or number form (127.1, 0x7f000001,
+    a name that resolves to ::1) that reaches a local address. A name that doesn't
+    resolve here is passed on to the upstream proxy, which resolves it itself."""
+    host = host.strip("[]").lower().rstrip(".")
+    if host in DENY_NAMES or any(host == d or host.endswith("." + d) for d in deny):
+        return True, None
+    try:
+        found = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return False, None
+    addresses = [info[4][0] for info in found]
+    if any(local(address) for address in addresses):
+        return True, None
+    return False, addresses[0] if addresses else None
+
+
+def target_of(method: str, target: str) -> tuple[str, int]:
+    """The host and port a request asks for: CONNECT's host:port, or a plain HTTP
+    request's absolute URL."""
+    if method == "CONNECT":
+        hostport, default = target, 443
+    else:
+        hostport, default = re.sub(r"^\w+://", "", target).split("/", 1)[0], 80
+    host, _, port = hostport.rpartition(":")
+    if not host or host.startswith("[") and not host.endswith("]") or "]" in port:
+        host, port = hostport, ""
+    return host.strip("[]"), int(port) if port.isdigit() else default
+
+
+class Proxy:
+    """A forward proxy on 127.0.0.1: CONNECT and plain HTTP, refusing denied hosts
+    with a 403 and forwarding the rest through HTTPS_PROXY (or directly)."""
+
+    def __init__(self, deny: list[str]):
+        self.deny = [h.lower() for h in deny]
+        upstream = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        self.upstream = None
+        if upstream:
+            hostport = upstream.split("//", 1)[-1].split("/", 1)[0].rsplit("@", 1)[-1]
+            host, port = hostport.rsplit(":", 1)
+            self.upstream = (host, int(port))
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(64)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+
+    def handle(self, conn: socket.socket) -> None:
+        try:
+            head = b""
+            while b"\r\n\r\n" not in head and len(head) < 65536:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                head += chunk
+            line = head.split(b"\r\n", 1)[0].decode("latin-1")
+            method, target, _ = (line.split(" ") + ["", ""])[:3]
+            host, port = target_of(method, target)
+            refused, address = denied(host, self.deny)
+            if refused:
+                conn.sendall(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"
+                    b"Connection: close\r\n\r\n"
+                    b"Refused by drive-agent's network policy.\n"
+                )
+                return
+            if self.upstream:
+                remote = socket.create_connection(self.upstream, timeout=30)
+                remote.sendall(head)
+            elif method == "CONNECT":
+                # The address checked, not the name again, which could resolve
+                # elsewhere the second time.
+                remote = socket.create_connection((address or host, port), timeout=30)
+                conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                rest = head.split(b"\r\n\r\n", 1)[1]
+                if rest:
+                    remote.sendall(rest)
+            else:
+                remote = socket.create_connection((address or host, port), timeout=30)
+                remote.sendall(head)
+            remote.settimeout(None)
+            conn.settimeout(None)
+            pipe(conn, remote)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+
+def pipe(a: socket.socket, b: socket.socket) -> None:
+    try:
+        while True:
+            ready, _, _ = select.select([a, b], [], [], 600)
+            if not ready:
+                return
+            for s in ready:
+                data = s.recv(65536)
+                if not data:
+                    return
+                (b if s is a else a).sendall(data)
+    finally:
+        b.close()
+
+
+# ---------------------------------------------------------------- the box
+
+LAUNCH = (
+    "import json, os, sys\n"
+    "env = json.load(open(sys.argv[1]))\n"
+    "os.chdir(sys.argv[2])\n"
+    "os.execvpe(sys.argv[3], sys.argv[3:], env)\n"
+)
+
+
+class Box:
+    """Where the agent runs. UserBox: a system user in bwrap. NoBox (tests): the
+    driver's own user. Every path is absolute; reads and writes in the home run as
+    the box's user."""
+
+    isolation = "user"
+
+    def __init__(self, name: str):
+        self.name = name
+        self.home = Path("/home") / name
+        self.state = STATE_ROOT / name
+        self.binds: list[tuple[str, str]] = []
+        self.made = False
+        self.calls = 0
+        self.empty_made = False
+        self.keep_home = False
+        self.hide: list[str] = list(HIDE)
+
+    # Setup and teardown.
+
+    def check_free(self) -> None:
+        """Refuses a name whose user, home or state folder exists."""
+        if run("getent", "passwd", self.name, check=False).returncode == 0:
+            raise Usage(
+                f"a user named {self.name} exists; pick another name, or "
+                f"`drive-agent cleanup {self.name}` after a crashed run"
+            )
+        if self.home.exists() or self.state.exists():
+            raise Usage(f"{self.home} exists; pick another name")
+        if not shutil.which("bwrap"):
+            raise Usage("bwrap is missing: install the bubblewrap package")
+
+    def create(self) -> None:
+        # Recorded first, so `drive-agent cleanup` will act on this user, and only
+        # on the users drive-agent made.
+        run("sudo", "-n", "install", "-d", "-m", "755", str(REGISTRY.parent))
+        subprocess.run(
+            ["sudo", "-n", "tee", "-a", str(REGISTRY)],
+            input=self.name + "\n",
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.made = True
+        run(
+            "sudo",
+            "-n",
+            "useradd",
+            "-m",
+            "-d",
+            str(self.home),
+            "-s",
+            "/bin/bash",
+            "-U",
+            self.name,
+        )
+        run("sudo", "-n", "chmod", "700", str(self.home))
+        run("sudo", "-n", "install", "-d", "-m", "755", str(STATE_ROOT))
+        run(
+            "sudo",
+            "-n",
+            "install",
+            "-d",
+            "-o",
+            self.name,
+            "-g",
+            self.name,
+            "-m",
+            "700",
+            str(self.state),
+        )
+        self.uid = run("id", "-u", self.name).stdout.strip()
+
+    def firewall(self, port: int) -> None:
+        tag = f"drive-agent-{self.name}"
+        for tool in ("iptables", "ip6tables"):
+            base = [
+                "sudo",
+                "-n",
+                tool,
+                "-I",
+                "OUTPUT",
+                "-m",
+                "owner",
+                "--uid-owner",
+                self.uid,
+                "-m",
+                "comment",
+                "--comment",
+                tag,
+            ]
+            run(*base, "-j", "REJECT")
+            if tool == "iptables":
+                run(
+                    *base,
+                    "-d",
+                    "127.0.0.1",
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    str(port),
+                    "-j",
+                    "ACCEPT",
+                )
+
+    def destroy(self) -> None:
+        cleanup_user(self.name)
+
+    # Files in the home or state folder, as the box's user.
+
+    def as_user(self) -> list[str]:
+        return ["sudo", "-n", "-u", self.name, "--"]
+
+    def write(self, path: Path, data: str | bytes, mode: int = 0o644) -> None:
+        data = data.encode() if isinstance(data, str) else data
+        code = (
+            "import os, sys\n"
+            "p = sys.argv[1]\n"
+            "os.makedirs(os.path.dirname(p), exist_ok=True)\n"
+            "fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, int(sys.argv[2], 8))\n"
+            "os.write(fd, sys.stdin.buffer.read()); os.close(fd)\n"
+        )
+        subprocess.run(
+            [*self.as_user(), "python3", "-c", code, str(path), oct(mode)[2:]],
+            input=data,
+            check=True,
+            capture_output=True,
+        )
+
+    def read(self, path: Path) -> bytes | None:
+        done = subprocess.run(
+            [*self.as_user(), "cat", "--", str(path)], capture_output=True, check=False
+        )
+        return done.stdout if done.returncode == 0 else None
+
+    def files(self, folder: Path) -> list[tuple[str, int, float]]:
+        """Regular files under `folder`, not following links, as (relative path,
+        size, modification time)."""
+        done = subprocess.run(
+            [
+                *self.as_user(),
+                "find",
+                str(folder),
+                "-type",
+                "f",
+                "-printf",
+                r"%P\0%s\0%T@\0",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        parts = done.stdout.decode(errors="replace").split("\0")[:-1]
+        return [
+            (parts[i], int(parts[i + 1]), float(parts[i + 2]))
+            for i in range(0, len(parts), 3)
+        ]
+
+    def remove(self, path: Path) -> None:
+        subprocess.run([*self.as_user(), "rm", "-f", "--", str(path)], check=True)
+
+    def copy_in(self, source: Path, dest: Path) -> None:
+        tar = subprocess.Popen(
+            ["tar", "-C", str(source), "-cf", "-", "."], stdout=subprocess.PIPE
+        )
+        subprocess.run(
+            [
+                *self.as_user(),
+                "sh",
+                "-c",
+                'mkdir -p "$1" && tar -C "$1" -xf -',
+                "sh",
+                str(dest),
+            ],
+            stdin=tar.stdout,
+            check=True,
+            capture_output=True,
+        )
+        tar.stdout.close()
+        if tar.wait():
+            raise Failed(f"couldn't copy {source}")
+
+    def give_tool(self, path: str) -> None:
+        """Makes `path` runnable as ~/.local/bin/<its name> inside the box: bound
+        read-only when the box's user can read it (bwrap opens it as that user),
+        else copied, as from a folder only the driver can enter."""
+        source = os.path.realpath(path)
+        target = self.home / ".local" / "bin" / Path(path).name
+        readable = (
+            run(*self.as_user(), "test", "-r", source, check=False).returncode == 0
+        )
+        if readable:
+            self.write(target, b"", 0o755)
+            self.binds.append((source, str(target)))
+        else:
+            self.write(target, Path(source).read_bytes(), 0o755)
+
+    # Commands in the box.
+
+    def argv(self, command: list[str], env_file: Path, cwd: Path) -> list[str]:
+        """The argv that runs `command` in the box with the environment in
+        `env_file` (JSON, read inside, so no value is on a command line). bwrap
+        reads its options from a file: inside the box it is process 1, and its
+        command line would show the agent how the box is made."""
+        binds = []
+        for source, target in self.binds:
+            binds += ["--ro-bind", source, target]
+        # An empty file, not /dev/null: bwrap's binds are nodev, so a device bound
+        # over a file can't be opened.
+        empty = self.state / "empty"
+        for path in self.hide:
+            if os.path.exists(path):
+                if not self.empty_made:
+                    self.write(empty, b"", 0o444)
+                    self.empty_made = True
+                binds += ["--ro-bind", str(empty), path]
+        bwrap = [
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--unshare-pid",
+            "--die-with-parent",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            "/var/tmp",
+            "--tmpfs",
+            "/dev/shm",
+            "--tmpfs",
+            "/home",
+            "--bind",
+            str(self.home),
+            str(self.home),
+            "--tmpfs",
+            str(STATE_ROOT),
+            "--bind",
+            str(self.state),
+            str(self.state),
+            *binds,
+        ]
+        self.calls += 1
+        args_file = self.state / f"args-{self.calls}"
+        self.write(args_file, "".join(a + "\0" for a in bwrap), 0o600)
+        # The file is open on fd 3 and gone before bwrap starts.
+        return [
+            *self.as_user(),
+            "sh",
+            "-c",
+            'f=$1; shift; exec 3<"$f"; rm -f "$f"; exec bwrap --args 3 "$@"',
+            "sh",
+            str(args_file),
+            "--",
+            "python3",
+            "-c",
+            LAUNCH,
+            str(env_file),
+            str(cwd),
+            *command,
+        ]
+
+
+class NoBox(Box):
+    """Isolation none, for tests: the driver's own user, no sandbox or firewall."""
+
+    isolation = "none"
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        root = Path(os.environ.get("DRIVE_AGENT_HOME_ROOT", "/tmp/drive-agent"))
+        self.home = root / name
+        self.state = root / f".{name}-state"
+
+    def check_free(self) -> None:
+        if self.home.exists() or self.state.exists():
+            raise Usage(f"{self.home} exists; pick another name")
+
+    def create(self) -> None:
+        self.made = True
+        self.home.mkdir(parents=True)
+        self.state.mkdir(mode=0o700)
+        print(
+            "drive-agent: isolation none: the agent runs as you, unsandboxed",
+            file=sys.stderr,
+        )
+
+    def firewall(self, port: int) -> None:
+        pass
+
+    def destroy(self) -> None:
+        shutil.rmtree(self.state, ignore_errors=True)
+        if not self.keep_home:
+            shutil.rmtree(self.home, ignore_errors=True)
+
+    def as_user(self) -> list[str]:
+        return []
+
+    def give_tool(self, path: str) -> None:
+        target = self.home / ".local" / "bin" / Path(path).name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(os.path.realpath(path))
+
+    def argv(self, command, env_file, cwd):
+        return ["python3", "-c", LAUNCH, str(env_file), str(cwd), *command]
+
+
+def made_users() -> list[str]:
+    try:
+        return REGISTRY.read_text().split()
+    except OSError:
+        return []
+
+
+def cleanup_user(name: str) -> None:
+    """Removes user `name`'s processes, iptables rules, state folder and home, and
+    its line in the registry. Raises Failed when the user outlives it."""
+    tag = f"drive-agent-{name}"
+    found = run("id", "-u", name, check=False)
+    if found.returncode == 0:
+        uid = found.stdout.strip()
+        for _ in range(100):
+            run("sudo", "-n", "pkill", "-KILL", "-u", uid, check=False)
+            if run("pgrep", "-u", uid, check=False).returncode:
+                break
+            time.sleep(0.1)
+        # The box lets the user write only its home and state folder (its /tmp,
+        # /var/tmp and /dev/shm are its own tmpfs), so nothing else needs removing;
+        # a search by UID would also hit other files with that number, which
+        # useradd hands out again, such as Docker's image layers.
+        run("sudo", "-n", "userdel", "-r", name, check=False)
+    for tool in ("iptables", "ip6tables"):
+        rules = run("sudo", "-n", tool, "-S", "OUTPUT", check=False).stdout
+        for rule in rules.splitlines():
+            if f'"{tag}"' in rule or f" {tag} " in rule + " ":
+                run(
+                    "sudo",
+                    "-n",
+                    tool,
+                    *rule.replace("-A OUTPUT", "-D OUTPUT", 1).replace('"', "").split(),
+                    check=False,
+                )
+    run("sudo", "-n", "rm", "-rf", f"/home/{name}", str(STATE_ROOT / name), check=False)
+    if run("getent", "passwd", name, check=False).returncode == 0:
+        raise Failed(
+            f"user {name} is still there (a process outlived pkill?): "
+            f"run `drive-agent cleanup {name}` again"
+        )
+    kept = [n for n in made_users() if n != name]
+    subprocess.run(
+        ["sudo", "-n", "tee", str(REGISTRY)],
+        text=True,
+        capture_output=True,
+        input="".join(n + "\n" for n in kept),
+        check=False,
+    )
+
+
+# ---------------------------------------------------------------- harnesses
+
+
+class Harness:
+    """What differs between Claude Code and Codex."""
+
+    transcript_dir = ""  # under the home
+
+    def __init__(self, box: Box):
+        self.box = box
+        self.turns_file = box.state / "turns"
+
+    def env(self) -> dict:
+        return {}
+
+    def prepare(self, project: Path) -> None:
+        pass
+
+    def command(self) -> list[str]:
+        raise NotImplementedError
+
+    def print_command(self, text: str) -> list[str]:
+        raise NotImplementedError
+
+    def last_message(self) -> str:
+        raise NotImplementedError
+
+    def transcripts(self) -> list[Path]:
+        """The session transcripts, oldest first."""
+        folder = self.box.home / self.transcript_dir
+        found = [
+            (mtime, rel)
+            for rel, _, mtime in self.box.files(folder)
+            if rel.endswith(".jsonl")
+        ]
+        return [folder / rel for _, rel in sorted(found)]
+
+
+class Claude(Harness):
+    transcript_dir = ".claude/projects"
+
+    def env(self) -> dict:
+        path = Path.home() / ".claude" / ".credentials.json"
+        try:
+            oauth = json.loads(path.read_text())["claudeAiOauth"]
+        except (OSError, ValueError, KeyError):
+            raise Usage(
+                f"no Claude Code login in {path}: log in with `claude` first"
+            ) from None
+        left = oauth.get("expiresAt", 0) / 1000 - time.time()
+        if left < 0:
+            raise Usage(
+                "the driver's Claude Code token has expired: run any `claude` "
+                "call to refresh it"
+            )
+        if left < 2 * 3600:
+            print(
+                f"drive-agent: the Claude Code token expires in {int(left // 60)} "
+                "minutes, maybe within the run",
+                file=sys.stderr,
+            )
+        return {
+            "CLAUDE_CODE_OAUTH_TOKEN": oauth["accessToken"],
+            "DISABLE_AUTOUPDATER": "1",
+        }
+
+    def prepare(self, project: Path) -> None:
+        home = self.box.home
+        self.box.write(
+            home / ".claude.json",
+            json.dumps(
+                {
+                    "hasCompletedOnboarding": True,
+                    "bypassPermissionsModeAccepted": True,
+                    "theme": "dark",
+                    "projects": {
+                        str(project): {
+                            "hasTrustDialogAccepted": True,
+                            "hasCompletedProjectOnboarding": True,
+                        }
+                    },
+                }
+            ),
+        )
+        self.box.write(
+            home / ".claude" / "settings.json",
+            json.dumps(
+                {
+                    "hooks": {
+                        "Stop": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": f"date +%s >> {self.turns_file}",
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ),
+        )
+
+    def command(self) -> list[str]:
+        return ["claude", "--dangerously-skip-permissions"]
+
+    def print_command(self, text: str) -> list[str]:
+        return [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            text,
+        ]
+
+    def last_message(self) -> str:
+        """The agent's last text to the human, from the newest transcript."""
+        paths = self.transcripts()
+        text = (
+            (self.box.read(paths[-1]) or b"").decode(errors="replace") if paths else ""
+        )
+        for line in reversed(text.splitlines()):
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("type") != "assistant":
+                continue
+            parts = []
+            for p in rec.get("message", {}).get("content", []):
+                if not isinstance(p, dict):
+                    continue
+                if p.get("type") == "text":
+                    parts.append(p["text"])
+                elif p.get("type") == "tool_use" and p.get("name") == "AskUserQuestion":
+                    parts.append("(asks in a dialog) " + json.dumps(p.get("input")))
+            if parts:
+                return "\n".join(parts)
+        return ""
+
+
+class Codex(Harness):
+    transcript_dir = ".codex/sessions"
+
+    def env(self) -> dict:
+        return {"CODEX_HOME": str(self.box.home / ".codex")}
+
+    def prepare(self, project: Path) -> None:
+        source = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        try:
+            auth = json.loads((source / "auth.json").read_text())
+        except (OSError, ValueError):
+            raise Failed(
+                f"no Codex login in {source / 'auth.json'}: log in with "
+                "`codex login` first"
+            ) from None
+        if isinstance(auth.get("tokens"), dict):
+            auth["tokens"]["refresh_token"] = ""
+        codex = self.box.home / ".codex"
+        self.box.write(codex / "auth.json", json.dumps(auth), 0o600)
+        kept = []
+        config = source / "config.toml"
+        if config.exists():
+            for line in config.read_text().splitlines():
+                if line.startswith("["):
+                    break
+                if re.match(r"\s*(model|model_reasoning_effort)\s*=", line):
+                    kept.append(line.strip())
+        self.box.write(codex / "config.toml", "\n".join(kept) + "\n")
+        notify = self.box.state / "notify.py"
+        self.box.write(
+            notify,
+            (
+                "#!/usr/bin/env python3\nimport json, sys, time\n"
+                "e = json.loads(sys.argv[1])\n"
+                "if any(m.startswith('Generate a concise, single-line task title')"
+                " for m in e.get('input-messages', [])):\n    sys.exit()\n"
+                f"open('{self.box.state}/last-agent', 'w').write("
+                "e.get('last-assistant-message') or '')\n"
+                f"open('{self.turns_file}', 'a').write(str(int(time.time())) + '\\n')\n"
+            ),
+            0o755,
+        )
+
+    def command(self) -> list[str]:
+        return [
+            "codex",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--search",
+            "-c",
+            "check_for_update_on_startup=false",
+            "-c",
+            f'notify=["{self.box.state / "notify.py"}"]',
+        ]
+
+    def print_command(self, text: str) -> list[str]:
+        return [
+            "codex",
+            "exec",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check",
+            text,
+        ]
+
+    def last_message(self) -> str:
+        return (self.box.read(self.box.state / "last-agent") or b"").decode(
+            errors="replace"
+        )
+
+
+HARNESSES = {"claude": Claude, "codex": Codex}
+
+
+# ---------------------------------------------------------------- the human
+
+HUMAN_PROMPT = """{persona}
+{extra}
+
+You are scripted: your next message is fixed, below. Your one job is to keep the
+conversation from derailing when the agent's last message asks you something the
+scripted message doesn't answer.
+
+{condition}
+
+Rules:
+- If the agent's last message asks you a question or asks for your go-ahead, and the
+  scripted message doesn't settle it, start your message with a short answer as the
+  person above would, from the facts above, then the scripted message word for word.
+- Never approve any of these unless a scripted message so far, or the scripted next
+  message, approves it: {gated}. When the agent asks for one of them and no
+  scripted message approves it, say you'll decide later.
+- Never raise a topic that neither the scripted message nor the agent's last message
+  raises.
+- Otherwise send the scripted message unchanged.
+
+Scripted messages so far: {history}
+
+The agent's last message:
+<<<
+{last}
+>>>
+
+The scripted next message:
+<<<
+{scripted}
+>>>
+"""
+
+HUMAN_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "condition_met": {"type": "boolean"},
+            "message": {"type": "string"},
+        },
+        "required": ["condition_met", "message"],
+    }
+)
+
+
+def ask_human(prompt: str) -> dict | None:
+    try:
+        done = subprocess.run(
+            ["claude-fresh", "--json", HUMAN_SCHEMA, "-m", "sonnet"],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=300,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"drive-agent: simulated human failed: {error}", file=sys.stderr)
+        return None
+    if done.returncode:
+        print(
+            f"drive-agent: simulated human failed: {done.stderr.strip()[-300:]}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        return json.loads(done.stdout)
+    except ValueError:
+        return None
+
+
+def human_turn(
+    turn: dict, scenario: dict, persona: str, last: str, history: list[str]
+) -> tuple[str | None, str]:
+    """The message to send for `turn` and a note for the log."""
+    conditional = "only_if" in turn
+    if not last:
+        if conditional:
+            if turn.get("else"):
+                return turn["else"], "no agent message to judge; sent its else"
+            return None, "no agent message to judge"
+        return turn["text"], ""
+    if conditional:
+        otherwise = turn.get("else") or (
+            "nothing, except a short answer to any question the agent's last message "
+            "left open, as the person above would give it (an empty string when none "
+            "is open)"
+        )
+        condition = (
+            f"Before anything else, judge this condition on the agent's last "
+            f"message: {turn['only_if']}. Set condition_met to whether it "
+            f"holds. If it doesn't, your scripted message is instead: {otherwise}"
+        )
+    else:
+        condition = "Set condition_met to true."
+    prompt = HUMAN_PROMPT.format(
+        persona=persona,
+        extra=scenario.get("persona", ""),
+        condition=condition,
+        gated="; ".join(scenario["gated"]),
+        history=json.dumps(history),
+        last=last[-6000:],
+        scripted=turn["text"],
+    )
+    answer = ask_human(prompt)
+    if answer is None:
+        if conditional:
+            return None, "simulated human failed"
+        return turn["text"], "simulated human failed; sent as scripted"
+    if not conditional:
+        if not answer.get("message"):
+            return turn["text"], "simulated human sent nothing; sent as scripted"
+        return answer["message"], ""
+    return answer.get(
+        "message"
+    ) or None, f"condition_met: {answer.get('condition_met')}"
+
+
+# ---------------------------------------------------------------- the session
+
+
+class Session:
+    def __init__(
+        self, box: Box, harness: Harness, out: Path, env_file: Path, project: Path
+    ):
+        self.box = box
+        self.harness = harness
+        self.out = out
+        self.env_file = env_file
+        self.project = project
+        self.launches = 0
+        self.socket = f"drive-agent-{box.name}"
+        self.name = "agent"
+
+    def tmux(self, *args, check=True) -> subprocess.CompletedProcess:
+        return run("tmux", "-L", self.socket, *args, check=check)
+
+    def screen(self) -> str:
+        return self.tmux(
+            "capture-pane", "-p", "-J", "-S", "-5000", "-t", self.name, check=False
+        ).stdout
+
+    def alive(self) -> bool:
+        """Whether the harness still runs. A pane whose program exited stays open
+        (remain-on-exit), so its last screen, a crash's traceback say, is saved."""
+        done = self.tmux(
+            "display-message", "-p", "-t", self.name, "#{pane_dead}", check=False
+        )
+        return done.returncode == 0 and done.stdout.strip() == "0"
+
+    def launch(self) -> None:
+        # A tmux server of its own for each session: a new one on the socket of the
+        # server {RESTART} just killed can find it still exiting.
+        self.launches += 1
+        self.socket = f"drive-agent-{self.box.name}-{self.launches}"
+        argv = self.box.argv(self.harness.command(), self.env_file, self.project)
+        self.tmux(
+            "new-session",
+            "-d",
+            "-s",
+            self.name,
+            "-x",
+            "220",
+            "-y",
+            "60",
+            "-c",
+            "/",
+            *argv,
+        )
+        self.tmux("set-option", "-t", self.name, "remain-on-exit", "on", check=False)
+        deadline = time.time() + LAUNCH_LIMIT
+        while time.time() < deadline:
+            time.sleep(1)
+            shown = self.screen()
+            if "Trust this folder" in shown or "trust the files" in shown.lower():
+                self.tmux("send-keys", "-t", self.name, "Enter")
+            elif any(marker in shown for marker in READY):
+                time.sleep(min(2, SETTLE))
+                return
+        (self.out / "screen-launch.txt").write_text(self.screen())
+        raise NotReady
+
+    def stop(self) -> None:
+        self.tmux("kill-server", check=False)
+
+    def turns_seen(self) -> int:
+        data = self.box.read(self.harness.turns_file)
+        return len(data.splitlines()) if data else 0
+
+    def dialog_open(self) -> bool:
+        lines = [line for line in self.screen().splitlines() if line.strip()]
+        return any(DIALOG in line for line in lines[-3:])
+
+    def wait_turn(self, before: int) -> bool:
+        """Waits for the agent's turn to end, or for Claude Code's question dialog,
+        which waits for the human without ending the turn."""
+        deadline = time.time() + TURN_LIMIT
+        while time.time() < deadline:
+            if self.dialog_open():
+                time.sleep(SETTLE)
+                return True
+            seen = self.turns_seen()
+            if seen > before:
+                time.sleep(SETTLE)
+                if self.turns_seen() == seen:
+                    return True
+                continue
+            if not self.alive():
+                return False
+            time.sleep(min(2, SETTLE))
+        return False
+
+    def send(self, text: str) -> None:
+        """Types `text` as the human's message, or, when Claude Code's question
+        dialog is open, as the dialog's free-text answer."""
+        if self.dialog_open():
+            choice = re.findall(r"(\d+)\. Type something", self.screen())
+            if choice:
+                self.tmux("send-keys", "-t", self.name, choice[-1])
+                time.sleep(1)
+        self.tmux("send-keys", "-t", self.name, "-l", text)
+        time.sleep(min(1.5, SETTLE + 0.2))
+        self.tmux("send-keys", "-t", self.name, "Enter")
+
+
+class NotReady(Exception):
+    pass
+
+
+# What a harness shows when it can't go on, matched only on the screen's last lines
+# after a turn that never ended: narrow, since the agents under test talk about
+# tokens and logins themselves.
+STUCK = (
+    (
+        "auth",
+        re.compile(
+            r"Please run /login|Invalid API key|OAuth token has expired|"
+            r"API Error: 401|Not logged in"
+        ),
+    ),
+    (
+        "rate-limit",
+        re.compile(
+            r"rate_limit_error|API Error: 429|usage limit reached|"
+            r"You've hit your (usage )?limit",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def why_stuck(screen: str) -> str:
+    tail = "\n".join(screen.splitlines()[-15:])
+    for outcome, pattern in STUCK:
+        if pattern.search(tail):
+            return outcome
+    return "timeout"
+
+
+def interactive(
+    session: Session, scenario: dict, persona: str, values: dict, log: Path
+) -> str:
+    session.launch()
+    history: list[str] = []
+    for n, turn in enumerate(scenario["turns"], 1):
+        if turn == "{RESTART}":
+            session.stop()
+            session.launch()
+            with log.open("a") as f:
+                f.write(f"## Turn {n}: new session\n\n")
+            continue
+        turn = {"text": turn} if isinstance(turn, str) else turn
+        last = session.harness.last_message() if history else ""
+        text, note = human_turn(turn, scenario, persona, last, history)
+        if text is None:
+            with log.open("a") as f:
+                f.write(
+                    f"## Turn {n}: skipped, {note or 'its condition did not hold'}\n\n"
+                    f"Scripted: {json.dumps(turn)}\n\n"
+                )
+            continue
+        # Only what was sent counts as scripted so far, so a skipped "Yes, post it."
+        # approves nothing later.
+        history.append(text)
+        before = session.turns_seen()
+        session.send(fill(text, values))
+        ended = session.wait_turn(before)
+        (session.out / f"screen-{n:02}.txt").write_text(session.screen())
+        with log.open("a") as f:
+            f.write(
+                f"## Turn {n} ({'ended' if ended else 'NO END SEEN'}, "
+                f"{time.strftime('%H:%M:%S')})\n\nScripted: {json.dumps(turn)}\n\n"
+                + (f"{note}\n\n" if note else "")
+                + f"Sent: {text}\n\n"
+            )
+        print(
+            f"{session.box.name}: turn {n} {'ended' if ended else 'timed out'}",
+            flush=True,
+        )
+        if not ended:
+            return why_stuck(session.screen())
+    return "done"
+
+
+def fill(text: str, values: dict) -> str:
+    for name, value in values.items():
+        text = text.replace("{" + name + "}", value)
+    return text
+
+
+def hidden(path: str) -> bool:
+    """Whether the box hides `path`: it shows its own empty /home, /tmp, /var/tmp
+    and /dev/shm."""
+    return any(path == root or path.startswith(root + "/") for root in HIDDEN_ROOTS)
+
+
+def agent_path(box: Box) -> str:
+    kept = [p for p in os.environ.get("PATH", "").split(":") if p and not hidden(p)]
+    return ":".join([str(box.home / ".local" / "bin"), *dict.fromkeys(kept)])
+
+
+def collect(
+    box: Box, out: Path, projects_dir: Path | None, projects: list[str]
+) -> None:
+    for rel, size, _ in box.files(box.home):
+        parts = Path(rel).parts
+        if not parts or parts[0] in HARNESS_DIRS or parts[0] == ".claude.json":
+            continue
+        if size > COLLECT_LIMIT:
+            continue
+        data = box.read(box.home / rel)
+        if data is None:
+            continue
+        if parts[0] == "code" and len(parts) > 2 and projects_dir:
+            if parts[1] in projects and ".git" in parts[2:3]:
+                continue
+            source = projects_dir / Path(*parts[1:])
+            if source.is_file() and source.read_bytes() == data:
+                continue
+        if parts[0] == ".gitconfig":
+            continue
+        dest = out / "files" / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+
+
+def prepare_home(
+    box: Box, args, scenario: dict, scenario_path: Path, harness_bin: str, proxy: Proxy
+) -> tuple[Path, dict]:
+    """Gives the box its tools, git identity, projects and setup; returns the folder
+    the agent starts in and the environment every command in the box gets."""
+    # The agent's PATH leaves out every folder the box hides.
+    tools = [harness_bin, *filter(None, map(shutil.which, ("uv", "uvx")))]
+    for tool in tools:
+        if hidden(tool) or hidden(os.path.realpath(tool)):
+            box.give_tool(tool)
+    for tool in args.bind_tool:
+        box.give_tool(tool)
+    git_name = args.git_name or args.name
+    git_email = args.git_email or f"{args.name}@example.org"
+    box.write(
+        box.home / ".gitconfig",
+        f"[user]\n\tname = {git_name}\n\temail = {git_email}\n",
+    )
+    projects = scenario.get("projects", [])
+    for project in projects:
+        if not args.projects:
+            raise Usage("the scenario names projects: give --projects")
+        box.copy_in(Path(args.projects) / project, box.home / "code" / project)
+    project = box.home / "code" / projects[0] if projects else box.home
+
+    base_env = {k: os.environ[k] for k in KEEP_ENV if k in os.environ}
+    base_env.update(
+        HOME=str(box.home),
+        USER=args.name,
+        LOGNAME=args.name,
+        SHELL="/bin/bash",
+        PATH=agent_path(box),
+        HTTPS_PROXY=proxy.url,
+        HTTP_PROXY=proxy.url,
+        https_proxy=proxy.url,
+        http_proxy=proxy.url,
+    )
+    base_env.setdefault("TERM", "xterm-256color")
+
+    setup_file = box.state / "setup-env.json"
+    box.write(
+        setup_file,
+        json.dumps({**base_env, **{k: os.environ[k] for k in args.setup_env}}),
+        0o600,
+    )
+    for project_name in projects:
+        folder = box.home / "code" / project_name
+        for git in (
+            ["git", "init", "-q"],
+            ["git", "add", "-A"],
+            ["git", "commit", "-qm", "Results so far"],
+        ):
+            done = subprocess.run(
+                box.argv(git, setup_file, folder),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if done.returncode:
+                raise Failed(f"git in {project_name}: {done.stderr.strip()}")
+    if args.setup:
+        # The setup and the scenario go in the state folder for this step only,
+        # so the agent never finds the script it's tested with.
+        setup = box.state / "setup"
+        setup_scenario = box.state / "scenario.json"
+        box.write(setup, Path(args.setup).read_bytes(), 0o700)
+        box.write(setup_scenario, scenario_path.read_bytes(), 0o600)
+        done = subprocess.run(
+            box.argv([str(setup), str(setup_scenario)], setup_file, box.home),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        box.remove(setup)
+        box.remove(setup_scenario)
+        if done.returncode:
+            raise Failed(f"the setup failed: {done.stderr.strip()[-500:]}")
+    box.remove(setup_file)
+    return project, base_env
+
+
+def drive(args) -> int:
+    scenario_path = Path(args.scenario)
+    try:
+        scenario = json.loads(scenario_path.read_text())
+    except (OSError, ValueError) as error:
+        raise Usage(f"can't read the scenario: {error}")
+    if not isinstance(scenario.get("gated"), list):
+        raise Usage(
+            "the scenario needs `gated`: the actions the simulated human never "
+            "approves unless the script does"
+        )
+    if not scenario.get("turns"):
+        raise Usage("the scenario has no turns")
+    values = {}
+    for name in args.var:
+        if name not in os.environ:
+            raise Usage(f"--var {name}: ${name} is unset")
+        values[name] = os.environ[name]
+    for name in [*args.setup_env, *args.agent_env]:
+        if name not in os.environ:
+            raise Usage(f"${name} is unset")
+    out = Path(args.out)
+    if out.exists():
+        raise Usage(f"{out} exists")
+    persona = Path(args.persona).read_text() if args.persona else ""
+    harness_bin = shutil.which(args.harness)
+    if not harness_bin:
+        raise Usage(f"{args.harness} isn't on PATH")
+    if not shutil.which("tmux"):
+        raise Usage("tmux is missing")
+
+    isolation = os.environ.get("DRIVE_AGENT_ISOLATION", "user")
+    box = NoBox(args.name) if isolation == "none" else Box(args.name)
+    box.keep_home = args.keep_home
+    box.hide += args.hide
+    if args.keep_home and isolation != "none":
+        raise Usage("--keep-home is for isolation none only")
+    harness = HARNESSES[args.harness](box)
+    harness_env = harness.env()
+    box.check_free()
+    record = {
+        "harness": args.harness,
+        "isolation": box.isolation,
+        "name": args.name,
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "outcome": "failed",
+    }
+    session = None
+    try:
+        out.mkdir(parents=True)
+        shutil.copy(scenario_path, out / "scenario.json")
+        box.create()
+        proxy = Proxy([*DENY, *args.deny_host])
+        box.firewall(proxy.port)
+        project, base_env = prepare_home(
+            box, args, scenario, scenario_path, harness_bin, proxy
+        )
+        projects = scenario.get("projects", [])
+
+        env_file = box.state / "agent-env.json"
+        box.write(
+            env_file,
+            json.dumps(
+                {
+                    **base_env,
+                    **harness_env,
+                    **{k: os.environ[k] for k in args.agent_env},
+                }
+            ),
+            0o600,
+        )
+        version = subprocess.run(
+            box.argv([args.harness, "--version"], env_file, box.home),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        record["version"] = (version.stdout or version.stderr).strip()[:200]
+        harness.prepare(project)
+        log = out / "turns.md"
+        if scenario.get("print_mode"):
+            text = fill(scenario["turns"][0], values)
+            try:
+                done = subprocess.run(
+                    box.argv(harness.print_command(text), env_file, project),
+                    capture_output=True,
+                    timeout=TURN_LIMIT,
+                    check=False,
+                )
+                (out / "print-mode.jsonl").write_bytes(done.stdout + done.stderr)
+                record["outcome"] = "done"
+            except subprocess.TimeoutExpired as error:
+                (out / "print-mode.jsonl").write_bytes(error.stdout or b"")
+                record["outcome"] = "timeout"
+        else:
+            session = Session(box, harness, out, env_file, project)
+            record["outcome"] = interactive(session, scenario, persona, values, log)
+        for path in harness.transcripts():
+            data = box.read(path)
+            if data is not None:
+                (out / f"transcript-{path.name}").write_bytes(data)
+        collect(box, out, Path(args.projects) if args.projects else None, projects)
+    except NotReady:
+        record["outcome"] = "not-ready"
+        print(
+            f"drive-agent: {args.harness} never showed its prompt; see "
+            f"{out / 'screen-launch.txt'}",
+            file=sys.stderr,
+        )
+    finally:
+        if session:
+            session.stop()
+        record["ended"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        if out.is_dir():
+            (out / "run.json").write_text(json.dumps(record, indent=1) + "\n")
+        if box.made:
+            box.destroy()
+    print(f"{args.name}: {record['outcome']}, {out}")
+    return 0 if record["outcome"] == "done" else 1
+
+
+# ---------------------------------------------------------------- digest
+
+
+def short(text, width: int) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def digest_claude(lines, width, verbose):
+    for line in lines:
+        rec = json.loads(line)
+        kind = rec.get("type")
+        content = (rec.get("message") or {}).get("content")
+        if kind == "user" and not rec.get("isMeta"):
+            if isinstance(content, str):
+                yield f"\n### HUMAN: {content}"
+            continue
+        if kind != "assistant" or not isinstance(content, list):
+            continue
+        for part in content:
+            if part.get("type") == "text":
+                yield f"AGENT: {part['text']}"
+            elif part.get("type") == "tool_use":
+                inp = part.get("input", {})
+                arg = (
+                    inp.get("command") or inp.get("url") or inp.get("file_path") or inp
+                )
+                yield f"  [{part['name']}] {short(arg, width)}"
+
+
+def digest_codex(lines, width, verbose):
+    for line in lines:
+        rec = json.loads(line)
+        p = rec.get("payload") or {}
+        t = p.get("type")
+        if rec.get("type") == "response_item" and t == "message":
+            text = "".join(
+                c.get("text", "") for c in p.get("content", []) if isinstance(c, dict)
+            )
+            if p.get("role") == "user" and not text.lstrip().startswith("<"):
+                yield f"\n### HUMAN: {text}"
+            elif p.get("role") == "assistant":
+                yield f"AGENT: {text}"
+        elif rec.get("type") == "response_item" and t in (
+            "function_call",
+            "custom_tool_call",
+        ):
+            arg = p.get("arguments") or p.get("input") or ""
+            try:
+                parsed = json.loads(arg)
+                arg = parsed.get("cmd") or parsed.get("command") or arg
+                if isinstance(arg, list):
+                    arg = " ".join(arg)
+            except (ValueError, AttributeError):
+                pass
+            yield f"  [{p.get('name')}] {short(arg, width)}"
+        elif (
+            rec.get("type") == "response_item"
+            and t in ("function_call_output", "custom_tool_call_output")
+            and verbose
+        ):
+            yield f"    -> {short(p.get('output'), width)}"
+        elif rec.get("type") == "response_item" and t == "web_search_call":
+            yield f"  [web] {short(p.get('action'), width)}"
+        elif rec.get("type") == "item.completed":
+            item = rec.get("item") or {}
+            if item.get("type") == "agent_message":
+                yield f"AGENT: {item.get('text')}"
+            elif item.get("type") == "command_execution":
+                yield f"  [exec] {short(item.get('command'), width)}"
+                if verbose:
+                    yield f"    -> {short(item.get('aggregated_output', ''), width)}"
+
+
+def digest(args) -> int:
+    folder = Path(args.run_dir)
+    patterns = [re.compile(r) for r in args.redact]
+    paths = sorted(folder.glob("transcript-*.jsonl")) + sorted(
+        folder.glob("print-mode.jsonl")
+    )
+    if not paths:
+        raise Usage(f"no transcript in {folder}")
+    for path in paths:
+        lines = [line for line in path.read_text().splitlines() if line.startswith("{")]
+        codex = path.name.startswith("transcript-rollout") or any(
+            '"thread.started"' in line or '"response_item"' in line
+            for line in lines[:5]
+        )
+        print(f"# {path.name}")
+        for row in (digest_codex if codex else digest_claude)(
+            lines, args.width, args.verbose
+        ):
+            for pattern in patterns:
+                row = pattern.sub("", row)
+            print(row)
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="drive-agent", add_help=False)
+    parser.add_argument("-h", "--help", action="store_true")
+    sub = parser.add_subparsers(dest="command")
+    r = sub.add_parser("run", add_help=False)
+    r.add_argument("scenario")
+    r.add_argument("--harness", choices=sorted(HARNESSES), required=True)
+    r.add_argument("--name", required=True)
+    r.add_argument("--out", required=True)
+    r.add_argument("--persona")
+    r.add_argument("--projects")
+    r.add_argument("--setup")
+    r.add_argument("--setup-env", action="append", default=[])
+    r.add_argument("--agent-env", action="append", default=[])
+    r.add_argument("--var", action="append", default=[])
+    r.add_argument("--git-name")
+    r.add_argument("--git-email")
+    r.add_argument("--deny-host", action="append", default=[])
+    r.add_argument("--bind-tool", action="append", default=[])
+    r.add_argument("--hide", action="append", default=[])
+    r.add_argument("--keep-home", action="store_true")
+    d = sub.add_parser("digest", add_help=False)
+    d.add_argument("run_dir")
+    d.add_argument("--width", type=int, default=160)
+    d.add_argument("-v", "--verbose", action="store_true")
+    d.add_argument("--redact", action="append", default=[])
+    c = sub.add_parser("cleanup", add_help=False)
+    c.add_argument("name")
+    if any(a in ("-h", "--help") for a in sys.argv[1:]) or len(sys.argv) == 1:
+        print(__doc__.strip())
+        return 0
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        return 2
+    if args.command == "run" and not NAME.fullmatch(args.name):
+        print(
+            "drive-agent: --name is a user name: lower-case letters, digits and -",
+            file=sys.stderr,
+        )
+        return 2
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
+    try:
+        if args.command == "run":
+            return drive(args)
+        if args.command == "digest":
+            return digest(args)
+        if not NAME.fullmatch(args.name) or args.name not in made_users():
+            raise Usage(
+                f"drive-agent made no user named {args.name} (it lists the "
+                f"ones it made in {REGISTRY})"
+            )
+        cleanup_user(args.name)
+        return 0
+    except subprocess.CalledProcessError as error:
+        detail = (
+            (error.stderr or "").strip().splitlines()[-1:]
+            if isinstance(error.stderr, str)
+            else []
+        )
+        print(
+            f"drive-agent: `{' '.join(map(str, error.cmd[:4]))}` failed"
+            + (f": {detail[0]}" if detail else "")
+            + " (does sudo -n work, and are tmux, bwrap and iptables installed?)",
+            file=sys.stderr,
+        )
+        return 1
+    except Usage as error:
+        print(f"drive-agent: {error}", file=sys.stderr)
+        return 2
+    except Failed as error:
+        print(f"drive-agent: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("drive-agent: stopped", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

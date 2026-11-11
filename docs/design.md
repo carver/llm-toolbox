@@ -704,6 +704,22 @@ missing and nothing goes: a working directory inside a git repository (checked:
 the memory folder is the repository's), `CLAUDE_CODE_PROJECT_DIR_NAME`,
 `autoMemoryDirectory` or `CLAUDE_CODE_REMOTE_MEMORY_DIR`.
 
+## drive-agent
+
+### Each run is a system user in bwrap, with a filtering proxy (2026-11-10)
+
+drive-agent runs the harness under test as a new system user inside `bwrap`: `/` read-only, its own `/tmp`, `/var/tmp` and `/dev/shm`, a tmpfs over `/home` with only its home bound in, its own PID namespace, and `/etc/sandbox-persistent.sh` shown empty.
+Its network goes through a proxy drive-agent runs, which refuses github.com, api.github.com and loopback or private addresses; a per-UID iptables rule rejects every other connection.
+Reason: round 1 of filedrawer's usability runs (filedrawer#68) ran agents as the driver's own user, so they could have read or written the workspace, and through the sandbox proxy, which adds a GitHub token, pushed to a repo whose main deploys staging.
+A separate user alone still lets the agent read world-readable workspace files, such as the project's design docs, which spoils a usability test; the shared `/proc` showed the driver's command line, and bwrap's own command line, as PID 1, showed how the box was made, so bwrap reads its options from a file.
+The agent's environment is a mode-600 file the box reads, never an argv, since every user can read `/proc/*/cmdline`.
+Claude Code gets only the driver's access token; Codex a copy of `auth.json` without its refresh token, which `codex exec` was checked to run on.
+Cleanup removes the user, home, state folder and rule, and no files by UID: useradd hands the same UID out again, and Docker's image layers hold files owned by it.
+
+### Rejected: a separate user without bwrap (2026-11-10)
+
+It blocks writes but not reads of the workspace, which is world-readable, and leaves `/proc` and `/var/tmp` shared between runs.
+
 ## skill-change-hint
 
 ### A loaded skill that changed on disk gets one note, never a refusal (2026-11-10)

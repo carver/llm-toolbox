@@ -1,7 +1,16 @@
 # Why: Publish lessons as Artifacts; a CLI open does nothing with a local file here.
+# Why: List and link GLOSSARY.md and its format file; the glossary lives there, not in ./reference/.
 --- a/SKILL.md
 +++ b/SKILL.md
-@@ -52,7 +52,7 @@
+@@ -14,6 +14,7 @@
+ - `MISSION.md`: A document capturing the _reason_ the user is interested in the topic. This should be used to ground all teaching. Use the format in [MISSION-FORMAT.md](./MISSION-FORMAT.md).
+ - `./reference/*.html`: A directory of reference materials. These are the compressed learnings from the lessons - cheat sheets, reference algorithms, syntax, yoga poses, glossaries. They are the raw units of learning. They should be beautiful documents which print out well, and are designed for quick reference.
+ - `RESOURCES.md`: A list of resources which can be explored to ground your teaching in contextual knowledge, or to acquire knowledge and wisdom. Use the format in [RESOURCES-FORMAT.md](./RESOURCES-FORMAT.md).
++- `GLOSSARY.md`: The canonical terms for the topic, which every lesson, reference document, and learning record uses. Use the format in [GLOSSARY-FORMAT.md](./GLOSSARY-FORMAT.md).
+ - `./learning-records/*.md`: A directory of learning records, which capture what the user has learned. These are loosely equivalent to architectural decision records in software development - they capture non-obvious lessons and key insights that may need to be revised later, or drive future sessions. These should be used to calculate the zone of proximal development. They are titled `0001-<dash-case-name>.md`, where the number increments each time. Use the format in [LEARNING-RECORD-FORMAT.md](./LEARNING-RECORD-FORMAT.md).
+ - `./lessons/*.html`: A directory of lessons. A **lesson** is a single, self-contained HTML output that teaches one tightly-scoped thing tied to the mission. This is the primary unit of teaching in this workspace.
+ - `./assets/*`: Reusable **components** shared across lessons. See [Assets](#assets).
+@@ -52,7 +53,7 @@
  
  The lesson should be short, and completable very quickly. Learners' working memory is very small, and we need to stay within it. But each lesson should give the user a single tangible win that they can build on. It should be directly tied to the mission, and should be in the user's zone of proximal development.
  
@@ -9,4 +18,13 @@
 +Publish the lesson as an Artifact, with the `./assets/` files and other lessons it links, and give the user its link along with the lesson file's path: a CLI `open` does nothing with a local file in a sandbox with no desktop.
  
  Each lesson should link via HTML anchors to other lessons and reference documents.
+ 
+@@ -133,7 +134,7 @@
+ - Exercises and routines for fitness
+ - Glossaries for any topic with its own nomenclature
+ 
+-Glossaries, in particular, are an essential reference. Once one is created, it should be adhered to in every lesson.
++The glossary is the essential reference. It lives in `GLOSSARY.md` (see [GLOSSARY-FORMAT.md](./GLOSSARY-FORMAT.md)), not in `./reference/`, and once it exists every lesson adheres to it.
+ 
+ ## `NOTES.md`
  

@@ -1,0 +1,12 @@
+# Why: Publish lessons as Artifacts; a CLI open does nothing with a local file here.
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -52,7 +52,7 @@
+ 
+ The lesson should be short, and completable very quickly. Learners' working memory is very small, and we need to stay within it. But each lesson should give the user a single tangible win that they can build on. It should be directly tied to the mission, and should be in the user's zone of proximal development.
+ 
+-If possible, open the lesson file for the user by running a CLI command.
++Publish the lesson as an Artifact, with the `./assets/` files and other lessons it links, and give the user its link along with the lesson file's path: a CLI `open` does nothing with a local file in a sandbox with no desktop.
+ 
+ Each lesson should link via HTML anchors to other lessons and reference documents.
+ 

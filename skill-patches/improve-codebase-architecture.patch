@@ -1,0 +1,34 @@
+# Why: Publish the report as an Artifact with pinned CDN versions; open does nothing with a local file here.
+--- a/HTML-REPORT.md
++++ b/HTML-REPORT.md
+@@ -1,6 +1,6 @@
+ # HTML Report Format
+ 
+-The architectural review is rendered as a single self-contained HTML file in the OS temp directory. Tailwind and Mermaid both come from CDNs. Mermaid handles graph-shaped diagrams reliably; hand-built divs and inline SVG handle the more editorial visuals (mass diagrams, cross-sections). Mix the two: don't lean on Mermaid for everything, it'll start to look generic.
++The architectural review is rendered as a single self-contained HTML file, published as an Artifact. Tailwind and Mermaid both come from CDNs, each pinned to an exact version, as an Artifact requires. Mermaid handles graph-shaped diagrams reliably; hand-built divs and inline SVG handle the more editorial visuals (mass diagrams, cross-sections). Mix the two: don't lean on Mermaid for everything, it'll start to look generic.
+ 
+ ## Scaffold
+ 
+@@ -10,9 +10,9 @@
+   <head>
+     <meta charset="utf-8" />
+     <title>Architecture review for {{repo name}}</title>
+-    <script src="https://cdn.tailwindcss.com"></script>
++    <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+     <script type="module">
+-      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
++      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+       mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose" });
+     </script>
+     <style>
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -36,7 +36,7 @@
+ 
+ ### 2. Present candidates as an HTML report
+ 
+-Write a self-contained HTML file to the OS temp directory so nothing lands in the repo. Resolve the temp dir from `$TMPDIR`, falling back to `/tmp` (or `%TEMP%` on Windows), and write to `<tmpdir>/architecture-review-<timestamp>.html` so each run gets a fresh file. Open it for the user (`xdg-open <path>` on Linux, `open <path>` on macOS, `start <path>` on Windows) and tell them the absolute path.
++Write a self-contained HTML file outside the repo, in your scratchpad directory (else the system temp directory), named `architecture-review-<timestamp>.html` so each run gets a fresh file. Then publish it as an Artifact and give the user its link: `open` and `xdg-open` do nothing with a local file in a sandbox with no desktop.
+ 
+ The report uses **Tailwind via CDN** for layout and styling, and **Mermaid via CDN** for diagrams where a graph/flow/sequence reliably communicates the structure. Mix Mermaid with hand-crafted CSS/SVG visuals: use Mermaid when relationships are graph-shaped (call graphs, dependencies, sequences), and hand-built divs/SVG when you want something more editorial (mass diagrams, cross-sections, collapse animations). Each candidate gets a **before/after visualisation**. Be visual.
+ 

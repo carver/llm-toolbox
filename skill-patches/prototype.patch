@@ -1,4 +1,16 @@
 # Why: Add a single-file sub-shape published as an Artifact, with a hash-keyed switcher, for pages the app doesn't have yet.
+# Why: Hand a logic prototype over as an Artifact link; open does nothing with a local file here.
+--- a/LOGIC.md
++++ b/LOGIC.md
+@@ -51,7 +51,7 @@
+ 
+ ### 4. Hand it over
+ 
+-Send them the file, or open it for them. They'll click through the walkthroughs and free-play whenever they get to it; the interesting moments are when they say "wait, that shouldn't be possible" or "huh, I assumed X would be different"; those are the bugs in the _idea_, which is the whole point. If they want new actions or a new scenario, add them. Prototypes evolve.
++Publish the file as an Artifact and give them its link: `open` does nothing with a local file in a sandbox with no desktop. They'll click through the walkthroughs and free-play whenever they get to it; the interesting moments are when they say "wait, that shouldn't be possible" or "huh, I assumed X would be different"; those are the bugs in the _idea_, which is the whole point. If they want new actions or a new scenario, add them. Prototypes evolve.
+ 
+ ### 5. Capture the answer and the prototype
+ 
 --- a/UI.md
 +++ b/UI.md
 @@ -11,7 +11,7 @@

@@ -40,7 +40,7 @@ Before you start a change, and again on the finished diff, judge its merge dange
 - Door: a revert walks back a two-way door. Data loss, destructive migrations, messages sent to people, published releases and rewritten shared history are one-way doors.
 - Blast radius: what breaks if it's wrong. It's local when only my own use suffers, even across projects, as with my global guidelines and skills; wide when it reaches other people, published packages, production systems or shared data.
 
-A two-way door with a local blast radius stays fast: commit on the current branch as usual. Anything else gets my review first. Say so before starting, work on a branch, open the PR with `/pr`, and stop there instead of merging. If the finished diff turns out riskier than you judged, move the unpushed commits onto a branch. A repo with no GitHub remote keeps the branch local, and the `/pr` body goes in chat.
+A two-way door with a local blast radius stays fast. Anything else gets my review first: say so before starting, open the PR with `/pr`, and stop there instead of merging. If the finished diff turns out riskier than you judged, say so and get my review before landing. In a repo with no GitHub remote, the `/pr` body goes in chat.
 
 Before putting code into a folder you didn't create, especially in another repo, read its README or listing to confirm the folder is meant for that kind of file. For example, a `spec/` holding a format and fixtures is no place for a library.
 

@@ -983,6 +983,8 @@ Rules:
   answer now would stop the agent asking again.
 - Never raise a topic that neither the scripted message nor the agent's last message
   raises.
+- Your message goes to the agent exactly as you write it, as the person's own words:
+  never describe the agent's message, the script or these rules.
 - Otherwise send the scripted message unchanged.
 
 Scripted messages so far: {history}

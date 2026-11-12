@@ -127,8 +127,9 @@ HARNESS_DIRS = {".claude", ".codex", ".cache", ".npm", ".local", ".config"}
 HIDE = ["/etc/sandbox-persistent.sh", "/etc/sandbox-secrets.sh"]
 HIDDEN_ROOTS = ("/home", "/tmp", "/var/tmp", "/dev/shm")
 # Each run's state folder (turn file, environment file, Codex's notify program),
-# which the agent sees, so its name says nothing of a test.
-STATE_ROOT = Path("/run/session-state")
+# which the agent sees in its mount table: /run/user/<uid>, its XDG_RUNTIME_DIR, as a
+# login session's would be, so its path says nothing of a test.
+STATE_ROOT = Path("/run/user")
 # The users drive-agent made and hasn't removed, one a line; `cleanup` acts on no
 # other.
 REGISTRY = Path("/var/lib/drive-agent/users")
@@ -313,7 +314,8 @@ class Box:
     def __init__(self, name: str):
         self.name = name
         self.home = Path("/home") / name
-        self.state = STATE_ROOT / name
+        # Named for the user's UID, which `create` learns.
+        self.state = Path()
         self.binds: list[tuple[str, str]] = []
         self.made = False
         self.calls = 0
@@ -324,13 +326,13 @@ class Box:
     # Setup and teardown.
 
     def check_free(self) -> None:
-        """Refuses a name whose user, home or state folder exists."""
+        """Refuses a name whose user or home exists."""
         if run("getent", "passwd", self.name, check=False).returncode == 0:
             raise Usage(
                 f"a user named {self.name} exists; pick another name, or "
                 f"`drive-agent cleanup {self.name}` after a crashed run"
             )
-        if self.home.exists() or self.state.exists():
+        if self.home.exists():
             raise Usage(f"{self.home} exists; pick another name")
         if not shutil.which("bwrap"):
             raise Usage("bwrap is missing: install the bubblewrap package")
@@ -360,7 +362,11 @@ class Box:
             self.name,
         )
         run("sudo", "-n", "chmod", "700", str(self.home))
+        self.uid = run("id", "-u", self.name).stdout.strip()
+        self.state = STATE_ROOT / self.uid
         run("sudo", "-n", "install", "-d", "-m", "755", str(STATE_ROOT))
+        # A UID useradd hands out again may find a crashed run's folder.
+        run("sudo", "-n", "rm", "-rf", str(self.state))
         run(
             "sudo",
             "-n",
@@ -374,7 +380,6 @@ class Box:
             "700",
             str(self.state),
         )
-        self.uid = run("id", "-u", self.name).stdout.strip()
 
     def firewall(self, port: int) -> None:
         tag = f"drive-agent-{self.name}"
@@ -635,6 +640,7 @@ def cleanup_user(name: str) -> None:
         # a search by UID would also hit other files with that number, which
         # useradd hands out again, such as Docker's image layers.
         run("sudo", "-n", "userdel", "-r", name, check=False)
+        run("sudo", "-n", "rm", "-rf", str(STATE_ROOT / uid), check=False)
     for tool in ("iptables", "ip6tables"):
         rules = run("sudo", "-n", tool, "-S", "OUTPUT", check=False).stdout
         for rule in rules.splitlines():
@@ -646,7 +652,7 @@ def cleanup_user(name: str) -> None:
                     *rule.replace("-A OUTPUT", "-D OUTPUT", 1).replace('"', "").split(),
                     check=False,
                 )
-    run("sudo", "-n", "rm", "-rf", f"/home/{name}", str(STATE_ROOT / name), check=False)
+    run("sudo", "-n", "rm", "-rf", f"/home/{name}", check=False)
     if run("getent", "passwd", name, check=False).returncode == 0:
         raise Failed(
             f"user {name} is still there (a process outlived pkill?): "
@@ -672,7 +678,11 @@ class Harness:
 
     def __init__(self, box: Box):
         self.box = box
-        self.turns_file = box.state / "turns"
+
+    @property
+    def turns_file(self) -> Path:
+        # A property: the box names its state folder only once it makes the user.
+        return self.box.state / "turns"
 
     def env(self) -> dict:
         return {}
@@ -1266,6 +1276,8 @@ def prepare_home(
         http_proxy=proxy.url,
     )
     base_env.setdefault("TERM", "xterm-256color")
+    if box.isolation == "user":
+        base_env["XDG_RUNTIME_DIR"] = str(box.state)
 
     setup_file = box.state / "setup-env.json"
     box.write(

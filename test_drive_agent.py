@@ -65,7 +65,8 @@ def seen():
                 pass
         json.dump({"user": os.environ.get("USER"), "env": dict(os.environ),
                    "cwd": os.getcwd(), "argv": sys.argv, "homes": sorted(os.listdir("/home")),
-                   "cmdlines": cmdlines,
+                   "cmdlines": cmdlines, "uid": os.getuid(),
+                   "mounts": open("/proc/self/mountinfo").read(),
                    "hidden": open(os.environ["FAKE_HIDDEN"]).read() if "FAKE_HIDDEN" in os.environ else None}, f)
 
 session = str(uuid.uuid4())
@@ -816,6 +817,16 @@ def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
     assert not any(
         "drive-agent" in c or "pytest" in c or "--bind" in c for c in seen["cmdlines"]
     )
+    # The run's own folder is where a login session's would be, and nothing the
+    # agent can see mounted names the driver.
+    runtime = f"/run/user/{seen['uid']}"
+    assert seen["env"]["XDG_RUNTIME_DIR"] == runtime
+    mount_points = [line.split()[4] for line in seen["mounts"].splitlines()]
+    assert [p for p in mount_points if p.startswith("/run/user")] == [
+        "/run/user",
+        runtime,
+    ]
+    assert not [p for p in mount_points if "session-state" in p]
     assert "fetched: HTTP/1.1 403" in (out / "screen-01.txt").read_text()
     assert "fetched: HTTP/1.1 200" in (out / "screen-02.txt").read_text()
     for n in (3, 4):
@@ -825,6 +836,7 @@ def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
         subprocess.run(["id", name], capture_output=True, check=False).returncode == 1
     )
     assert not Path(f"/home/{name}").exists()
+    assert not Path(runtime).exists()
     rules = subprocess.run(
         ["sudo", "-n", "iptables", "-S", "OUTPUT"],
         capture_output=True,

@@ -126,6 +126,18 @@ if os.environ.get("FAKE_NEVER_READY") or os.path.exists(os.path.join(os.environ[
     time.sleep(60)
 print("? for shortcuts")
 print("❯ ", end="", flush=True)
+if os.path.exists(os.path.join(os.environ["HOME"], "trust-late")):
+    # As Codex in a git project: the prompt shows, then the folder-trust dialog a
+    # moment later, which drops typed text until Enter alone answers it.
+    time.sleep(1)  # fixed sleep: the dialog must come after the prompt
+    print("\nTrust this folder? Codex can read, edit, and run files here.")
+    print("› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit", flush=True)
+    for line in sys.stdin:
+        if not line.strip():
+            break
+        print("dropped: " + line.strip(), flush=True)
+    print("? for shortcuts")
+    print("❯ ", end="", flush=True)
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -216,6 +228,7 @@ def env(tmp_path):
         DRIVE_AGENT_SETTLE="0.3",
         DRIVE_AGENT_TURN_LIMIT="20",
         DRIVE_AGENT_LAUNCH_LIMIT="10",
+        DRIVE_AGENT_TRUST_GRACE="0.5",
         FAKE_HUMAN_LOG=str(tmp_path / "human.log"),
     )
     return e
@@ -571,6 +584,30 @@ def test_print_mode_sends_the_first_turn_once(tmp_path, env):
     out = tmp_path / "out"
     drive(env, "run", path, "--harness", "codex", "--name", "jason12", "--out", out)
     assert "done: just this" in (out / "print-mode.jsonl").read_text()
+
+
+def test_a_trust_dialog_after_the_prompt_is_answered_before_the_first_turn(
+    tmp_path, env
+):
+    setup = tmp_path / "setup.py"
+    setup.write_text('#!/bin/sh\ntouch "$HOME/trust-late"\n')
+    path = scenario(tmp_path, turns=["hi"])
+    out = tmp_path / "out"
+    drive(
+        {**env, "DRIVE_AGENT_TRUST_GRACE": "3"},
+        "run",
+        path,
+        "--harness",
+        "codex",
+        "--name",
+        "jason20",
+        "--out",
+        out,
+        "--setup",
+        setup,
+    )
+    screen = (out / "screen-01.txt").read_text()
+    assert "done: hi" in screen and "dropped:" not in screen
 
 
 def test_a_harness_that_never_gets_ready_fails_with_its_screen(tmp_path, env):

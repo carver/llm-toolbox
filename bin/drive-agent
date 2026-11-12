@@ -86,6 +86,8 @@ Environment:
   DRIVE_AGENT_TURN_LIMIT     seconds a turn may take (default 1200)
   DRIVE_AGENT_SETTLE         seconds a turn end must hold before the next turn (8)
   DRIVE_AGENT_LAUNCH_LIMIT   seconds the harness has to show its prompt (60)
+  DRIVE_AGENT_TRUST_GRACE    seconds the prompt must show with no folder-trust
+                             dialog after it before the first turn (4)
   HTTPS_PROXY, https_proxy   the proxy drive-agent's own proxy forwards through
 
 Needs tmux, and for isolation, passwordless sudo, bwrap (the bubblewrap package) and
@@ -149,6 +151,10 @@ def number(name: str, default: float) -> float:
 TURN_LIMIT = number("DRIVE_AGENT_TURN_LIMIT", 1200)
 SETTLE = number("DRIVE_AGENT_SETTLE", 8)
 LAUNCH_LIMIT = number("DRIVE_AGENT_LAUNCH_LIMIT", 60)
+# How long the prompt must show with no trust dialog before the first turn: Codex in
+# a git project draws its prompt, then the folder-trust dialog a moment later, which
+# drops what is typed into it.
+TRUST_GRACE = number("DRIVE_AGENT_TRUST_GRACE", 4)
 
 
 class Usage(Exception):
@@ -1129,14 +1135,17 @@ class Session:
         )
         self.tmux("set-option", "-t", self.name, "remain-on-exit", "on", check=False)
         deadline = time.time() + LAUNCH_LIMIT
+        ready_since = None
         while time.time() < deadline:
             time.sleep(1)
             shown = self.screen()
-            if "Trust this folder" in shown or "trust the files" in shown.lower():
+            if trust_dialog_open(shown):
                 self.tmux("send-keys", "-t", self.name, "Enter")
+                ready_since = None
             elif any(marker in shown for marker in READY):
-                time.sleep(min(2, SETTLE))
-                return
+                ready_since = ready_since or time.time()
+                if time.time() - ready_since >= TRUST_GRACE:
+                    return
         (self.out / "screen-launch.txt").write_text(self.screen())
         raise NotReady
 
@@ -1181,6 +1190,26 @@ class Session:
         self.tmux("send-keys", "-t", self.name, "-l", text)
         time.sleep(min(1.5, SETTLE + 0.2))
         self.tmux("send-keys", "-t", self.name, "Enter")
+
+
+def trust_dialog_open(screen: str) -> bool:
+    """Whether a folder-trust dialog is the last thing on `screen`: one answered
+    stays in the scrollback, above the prompt that follows it."""
+    lines = [line for line in screen.splitlines() if line.strip()]
+    asks = [
+        i
+        for i, line in enumerate(lines)
+        if "Trust this folder" in line or "trust the files" in line.lower()
+    ]
+    # A prompt: the footer, or Claude Code's ❯ but not as a dialog's cursor
+    # ("❯ 1. Yes"). Codex's prompt and dialog cursor are both ›, so for Codex only
+    # its footer counts (checked against codex-cli 0.164).
+    prompts = [
+        i
+        for i, line in enumerate(lines)
+        if "for shortcuts" in line or re.match(r"❯(?!\s*\d+\.)", line.lstrip())
+    ]
+    return bool(asks) and (not prompts or asks[-1] > prompts[-1])
 
 
 class NotReady(Exception):

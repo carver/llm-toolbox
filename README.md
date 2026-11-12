@@ -347,9 +347,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `drive-agent run SCENARIO --harness claude|codex --name NAME --out DIR` makes
   a system user NAME with a fresh home and runs the harness in tmux as that
   user inside bwrap, which hides the workspace, other homes, the driver's
-  processes and the sandbox's shell setup; a proxy it runs refuses github.com,
-  api.github.com and loopback, and an iptables rule lets the user reach nothing
-  else. It types each scripted turn once the agent's last turn ends, asks a
+  processes and the sandbox's shell setup; the box has its own network with
+  only its own loopback, and a proxy it runs, reached through a unix socket,
+  refuses github.com, api.github.com and loopback. It types each scripted turn once the agent's last turn ends, asks a
   simulated human (`claude-fresh`) to answer open questions and judge
   conditional turns (never sent when it fails), and saves screens, transcripts
   and the files the run made, then removes the user. `--setup FILE` prepares

@@ -45,6 +45,17 @@ def reply(line):
             return "direct: connected"
         except OSError as error:
             return "direct: " + type(error).__name__
+    if line == "selfserve":
+        # A server of the agent's own on loopback, fetched as a tool would, with
+        # the proxy variables honoured (Codex's built-in MCP server).
+        import http.server, threading, urllib.request
+        server = http.server.HTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = "http://127.0.0.1:%d/" % server.server_address[1]
+            return "selfserve: %d" % urllib.request.urlopen(url, timeout=5).status
+        except Exception as error:
+            return "selfserve: " + str(getattr(error, "code", type(error).__name__))
     if line.startswith("fetch "):
         host = line.split()[1]
         proxy = os.environ.get("HTTPS_PROXY", "")
@@ -778,6 +789,7 @@ def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
             "fetch example.org",
             "direct 1.1.1.1 443",
             "direct 127.0.0.1 22",
+            "selfserve",
         ],
     )
     out = tmp_path / "out"
@@ -825,6 +837,7 @@ def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
     assert [p for p in mount_points if p.startswith("/run/user")] == [
         "/run/user",
         runtime,
+        f"{runtime}/bus",
     ]
     assert not [p for p in mount_points if "session-state" in p]
     assert "fetched: HTTP/1.1 403" in (out / "screen-01.txt").read_text()
@@ -832,6 +845,7 @@ def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
     for n in (3, 4):
         screen = (out / f"screen-0{n}.txt").read_text()
         assert "direct: " in screen and "direct: connected" not in screen
+    assert "selfserve: 200" in (out / "screen-05.txt").read_text()
     assert (
         subprocess.run(["id", name], capture_output=True, check=False).returncode == 1
     )

@@ -710,6 +710,7 @@ the memory folder is the repository's), `CLAUDE_CODE_PROJECT_DIR_NAME`,
 
 drive-agent runs the harness under test as a new system user inside `bwrap`: `/` read-only, its own `/tmp`, `/var/tmp` and `/dev/shm`, a tmpfs over `/home` with only its home bound in, its own PID namespace, and `/etc/sandbox-persistent.sh` shown empty.
 Its network goes through a proxy drive-agent runs, which refuses github.com, api.github.com and loopback or private addresses; a per-UID iptables rule rejects every other connection.
+The box has its own network namespace, so its loopback is its own: a tool's own server there, such as the MCP server Codex's TUI starts in a git project, is reached directly (`NO_PROXY`), and the box reaches the proxy through a unix socket at `/run/user/<uid>/bus`, which the in-box launcher relays from the proxy's port.
 Reason: round 1 of filedrawer's usability runs (filedrawer#68) ran agents as the driver's own user, so they could have read or written the workspace, and through the sandbox proxy, which adds a GitHub token, pushed to a repo whose main deploys staging.
 A separate user alone still lets the agent read world-readable workspace files, such as the project's design docs, which spoils a usability test; the shared `/proc` showed the driver's command line, and bwrap's own command line, as PID 1, showed how the box was made, so bwrap reads its options from a file.
 The agent's environment is a mode-600 file the box reads, never an argv, since every user can read `/proc/*/cmdline`.

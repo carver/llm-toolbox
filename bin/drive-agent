@@ -8,9 +8,10 @@ usability tests of what agents read (skills, installers, docs).
 
 `run` makes a system user NAME with a fresh home, /home/NAME, and runs the harness
 (Claude Code or Codex) in tmux as that user inside bwrap: it sees only its own home,
-a private /tmp, its own processes, and the network through a proxy drive-agent runs,
-which refuses github.com, api.github.com and loopback or private addresses (an
-iptables rule lets the user reach nothing else). So the agent under test can't read
+a private /tmp, its own processes, its own network with only its own loopback, and
+the internet through a proxy drive-agent runs, which refuses github.com,
+api.github.com and loopback or private addresses (an iptables rule also lets the
+user reach nothing else). So the agent under test can't read
 or write the workspace, see the driver's command lines, or push with credentials the
 network adds. drive-agent types each human turn of SCENARIO once the agent's last
 turn has ended (Claude Code's Stop hook; Codex's notify program), saves the screen
@@ -93,6 +94,7 @@ timed out, a setup error), 2 usage error.
 """
 
 import argparse
+import atexit
 import ipaddress
 import json
 import os
@@ -103,6 +105,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -223,16 +226,28 @@ class Proxy:
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(64)
         self.port = self.sock.getsockname()[1]
-        threading.Thread(target=self.serve, daemon=True).start()
+        threading.Thread(target=self.serve, args=(self.sock,), daemon=True).start()
+        # The box has its own network, so it reaches the proxy through this socket,
+        # in a folder of a name that says nothing, under /tmp, which the box's user
+        # can pass through.
+        folder = tempfile.mkdtemp(dir="/tmp")
+        atexit.register(shutil.rmtree, folder, True)
+        os.chmod(folder, 0o755)
+        self.path = os.path.join(folder, "bus")
+        self.unix = socket.socket(socket.AF_UNIX)
+        self.unix.bind(self.path)
+        os.chmod(self.path, 0o666)
+        self.unix.listen(64)
+        threading.Thread(target=self.serve, args=(self.unix,), daemon=True).start()
 
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def serve(self) -> None:
+    def serve(self, listener: socket.socket) -> None:
         while True:
             try:
-                conn, _ = self.sock.accept()
+                conn, _ = listener.accept()
             except OSError:
                 return
             threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
@@ -296,11 +311,50 @@ def pipe(a: socket.socket, b: socket.socket) -> None:
 
 # ---------------------------------------------------------------- the box
 
+# Runs in the box: argv is the environment file, the folder to start in, "-" or
+# PORT:SOCKET, then the command. With PORT:SOCKET it serves 127.0.0.1:PORT in the
+# box's own network, before the command starts, relaying each connection to the
+# proxy's SOCKET, from a child the box's end takes with it.
 LAUNCH = (
-    "import json, os, sys\n"
+    "import json, os, socket, sys, threading\n"
     "env = json.load(open(sys.argv[1]))\n"
     "os.chdir(sys.argv[2])\n"
-    "os.execvpe(sys.argv[3], sys.argv[3:], env)\n"
+    "if sys.argv[3] != '-':\n"
+    "    port, path = sys.argv[3].split(':', 1)\n"
+    "    srv = socket.socket()\n"
+    "    srv.bind(('127.0.0.1', int(port)))\n"
+    "    srv.listen(64)\n"
+    "    if os.fork() == 0:\n"
+    "        os.setsid()\n"
+    "        null = os.open(os.devnull, os.O_RDWR)\n"
+    "        for fd in (0, 1, 2):\n"
+    "            os.dup2(null, fd)\n"
+    "        def pipe(a, b):\n"
+    "            try:\n"
+    "                while data := a.recv(65536):\n"
+    "                    b.sendall(data)\n"
+    "            except OSError:\n"
+    "                pass\n"
+    "            for s in (a, b):\n"
+    "                try:\n"
+    "                    s.shutdown(socket.SHUT_RDWR)\n"
+    "                except OSError:\n"
+    "                    pass\n"
+    "        try:\n"
+    "            while True:\n"
+    "                conn, _ = srv.accept()\n"
+    "                up = socket.socket(socket.AF_UNIX)\n"
+    "                try:\n"
+    "                    up.connect(path)\n"
+    "                except OSError:\n"
+    "                    conn.close()\n"
+    "                    continue\n"
+    "                for a, b in ((conn, up), (up, conn)):\n"
+    "                    threading.Thread(target=pipe, args=(a, b), daemon=True).start()\n"
+    "        finally:\n"
+    "            os._exit(0)\n"
+    "    srv.close()\n"
+    "os.execvpe(sys.argv[4], sys.argv[4:], env)\n"
 )
 
 
@@ -320,8 +374,11 @@ class Box:
         self.made = False
         self.calls = 0
         self.empty_made = False
+        self.bus_made = False
         self.keep_home = False
         self.hide: list[str] = list(HIDE)
+        # The run's proxy, once it starts; the box reaches it through its socket.
+        self.proxy: Proxy | None = None
 
     # Setup and teardown.
 
@@ -551,6 +608,14 @@ class Box:
             str(self.state),
             *binds,
         ]
+        forward = "-"
+        if self.proxy:
+            bus = self.state / "bus"
+            if not self.bus_made:
+                self.write(bus, b"", 0o600)
+                self.bus_made = True
+            bwrap += ["--unshare-net", "--bind", self.proxy.path, str(bus)]
+            forward = f"{self.proxy.port}:{bus}"
         self.calls += 1
         args_file = self.state / f"args-{self.calls}"
         self.write(args_file, "".join(a + "\0" for a in bwrap), 0o600)
@@ -568,6 +633,7 @@ class Box:
             LAUNCH,
             str(env_file),
             str(cwd),
+            forward,
             *command,
         ]
 
@@ -613,7 +679,7 @@ class NoBox(Box):
         target.symlink_to(os.path.realpath(path))
 
     def argv(self, command, env_file, cwd):
-        return ["python3", "-c", LAUNCH, str(env_file), str(cwd), *command]
+        return ["python3", "-c", LAUNCH, str(env_file), str(cwd), "-", *command]
 
 
 def made_users() -> list[str]:
@@ -1278,6 +1344,9 @@ def prepare_home(
     base_env.setdefault("TERM", "xterm-256color")
     if box.isolation == "user":
         base_env["XDG_RUNTIME_DIR"] = str(box.state)
+        # The box's loopback is its own, so a tool's own server there, such as
+        # Codex's built-in MCP server, is reached directly, not through the proxy.
+        base_env["NO_PROXY"] = base_env["no_proxy"] = "localhost,127.0.0.1,::1"
 
     setup_file = box.state / "setup-env.json"
     box.write(
@@ -1374,6 +1443,7 @@ def drive(args) -> int:
         shutil.copy(scenario_path, out / "scenario.json")
         box.create()
         proxy = Proxy([*DENY, *args.deny_host])
+        box.proxy = proxy
         box.firewall(proxy.port)
         project, base_env = prepare_home(
             box, args, scenario, scenario_path, harness_bin, proxy

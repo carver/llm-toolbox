@@ -895,8 +895,10 @@ Rules:
   scripted message doesn't settle it, start your message with a short answer as the
   person above would, from the facts above, then the scripted message word for word.
 - Never approve any of these unless a scripted message so far, or the scripted next
-  message, approves it: {gated}. When the agent asks for one of them and no
-  scripted message approves it, say you'll decide later.
+  message, approves it: {gated}. When the agent asks for or offers one of them and
+  no scripted message approves it, leave that unanswered: don't approve, refuse,
+  defer or comment on it, since a later scripted message may answer it, and an
+  answer now would stop the agent asking again.
 - Never raise a topic that neither the scripted message nor the agent's last message
   raises.
 - Otherwise send the scripted message unchanged.

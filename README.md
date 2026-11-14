@@ -354,10 +354,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   dialog of several questions, or a multi-select one, is left through "Chat about this" and the turn sent as a message), asks a
   simulated human (`claude-fresh`) to answer open questions and judge
   conditional turns (never sent when it fails), and saves screens, transcripts
-  and the files the run made, then removes the user. `--setup FILE` prepares
+  and the files the run made (`~/.config` with the values it was given and
+  keys or tokens blanked), then removes the user. `--setup FILE` prepares
   the home first, `--agent-env`/`--setup-env`/`--var` pass named variables
   without putting them on a command line. `digest RUN_DIR` prints a run's
-  transcripts compactly; `cleanup NAME` removes a crashed run's user. Tests
+  transcripts compactly, sessions in the order they ran, with keys and tokens
+  blanked unless `--no-redact`; `--calls` shows only the human turns and the
+  tool calls, one line each. `cleanup NAME` removes a crashed run's user. Tests
   set `DRIVE_AGENT_ISOLATION=none` (no user or sandbox, homes under
   `DRIVE_AGENT_HOME_ROOT`) and shorten `DRIVE_AGENT_TURN_LIMIT`,
   `DRIVE_AGENT_SETTLE`, `DRIVE_AGENT_LAUNCH_LIMIT`, `DRIVE_AGENT_TRUST_GRACE`

@@ -3,7 +3,7 @@
 usability tests of what agents read (skills, installers, docs).
 
     drive-agent run SCENARIO --harness claude|codex --name NAME --out DIR [options]
-    drive-agent digest RUN_DIR [--width N] [-v] [--redact REGEX]...
+    drive-agent digest RUN_DIR [--calls] [--width N] [-v] [--no-redact] [--redact REGEX]...
     drive-agent cleanup NAME
 
 `run` makes a system user NAME with a fresh home, /home/NAME, and runs the harness
@@ -75,16 +75,30 @@ run options:
 The run's DIR holds scenario.json, run.json (harness, version, isolation, times,
 outcome), turns.md, screen-NN.txt (screen-launch.txt when the harness never got
 ready), transcript-*.jsonl or print-mode.jsonl, and files/: regular files the run
-made or changed in the home, outside .claude, .codex, .cache, .npm, .local and
-.config, and outside the projects' unchanged files, up to 1 MB each.
+made or changed in the home, outside .claude, .codex, .cache, .npm and .local, and
+outside the projects' unchanged files, up to 1 MB each. Each saved file has every
+value of 8 characters or more given through --var, --setup-env or --agent-env, and
+the harness's access token, replaced by REDACTED; files under .config also have what
+digest blanks by default.
 
 Claude Code gets the driver's access token as CLAUDE_CODE_OAUTH_TOKEN, so no copy of
 the refresh token leaves the driver's home; the run warns when it expires within 2
 hours. Codex gets a CODEX_HOME in the home holding the driver's auth.json without its
 refresh token, and a config of only model and model_reasoning_effort.
 
-`digest` prints a run's transcripts compactly: each human turn, the agent's text,
-one line per tool call (-v adds Codex's tool output). --redact blanks each match.
+`digest` prints a run's transcripts compactly, in the order the sessions ran: each
+human turn (an answer typed into Claude Code's question dialog as "HUMAN (in the
+dialog)"), the agent's text, and one line per tool call, its input cut to --width
+characters (default 160). -v adds Codex's tool output. --calls prints only the
+human turns, each on one line, and the tool calls. By default it replaces with
+REDACTED, before cutting a line: runs of 32 or more hex digits, except runs of
+exactly 40 (git commits); the value of a header named X-...-Key, X-...-Token or
+Authorization (after its scheme word, such as Bearer or Basic); the word after
+"Bearer"; the value of an upper-case NAME_KEY=, _TOKEN=, _SECRET= or _PASSWORD=;
+a key= value in a URL; and a token of a short prefix, an underscore and 32 or more
+letters and digits (fdt_…, ghp_…), keeping the prefix. A value ends at a space, a
+quote or a backslash. --no-redact turns that off; --redact REGEX deletes each match
+as well (repeatable). The saved transcripts are left as they are.
 `cleanup NAME` removes a run's user, home, state folder and rule after a crash.
 
 Environment:
@@ -138,7 +152,30 @@ KEEP_ENV = [
 ]
 DENY = ["github.com", "api.github.com"]
 DENY_NAMES = {"localhost", "host.docker.internal"}
-HARNESS_DIRS = {".claude", ".codex", ".cache", ".npm", ".local", ".config"}
+HARNESS_DIRS = {".claude", ".codex", ".cache", ".npm", ".local"}
+# What digest, and files/ under ~/.config, blank by default: keys and tokens the
+# runs so far held in URLs, shell variables and header files.
+# A value stops at a space, a quote or a backslash, so `grep "^Authorization:\""` in
+# a JSON-escaped command keeps its quote.
+VALUE = r"[^\s'\"\\]+"
+REDACTIONS = [
+    # Not exactly 40, a git commit's length, which readers need to see.
+    (
+        re.compile(
+            r"(?<![0-9a-fA-F])(?:[0-9a-fA-F]{41,}|[0-9a-fA-F]{32,39})(?![0-9a-fA-F])"
+        ),
+        "REDACTED",
+    ),
+    (re.compile(rf"(?i)(\bX-[\w-]*(?:Key|Token):\s*){VALUE}"), r"\1REDACTED"),
+    (re.compile(rf"(?i)(\bAuthorization:\s*(?:[A-Za-z]+\s+)?){VALUE}"), r"\1REDACTED"),
+    (re.compile(rf"(?i)(\bBearer\s+){VALUE}"), r"\1REDACTED"),
+    (
+        re.compile(rf"(\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)=){VALUE}"),
+        r"\1REDACTED",
+    ),
+    (re.compile(r"([?&]key=)[^&#\s'\"\\]+"), r"\1REDACTED"),
+    (re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,7}_)[A-Za-z0-9]{32,}"), r"\1REDACTED"),
+]
 # Files every shell sources on this sandbox (docker sbx), which set the workspace's
 # own variables, such as cache paths under the hidden /home; the box shows them empty.
 HIDE = ["/etc/sandbox-persistent.sh", "/etc/sandbox-secrets.sh"]
@@ -1496,8 +1533,35 @@ def agent_path(box: Box) -> str:
     return ":".join([str(box.home / ".local" / "bin"), *dict.fromkeys(kept)])
 
 
+def redact(text: str, values=()) -> str:
+    """`text` with each of `values` and each REDACTIONS match blanked."""
+    for value in values:
+        text = text.replace(value, "REDACTED")
+    for pattern, replacement in REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def redact_values(data: bytes, values) -> bytes:
+    for value in values:
+        data = data.replace(value.encode(), b"REDACTED")
+    return data
+
+
+def redact_bytes(data: bytes, values) -> bytes:
+    """A file's bytes, redacted as text when they are UTF-8, else only by value."""
+    try:
+        return redact(data.decode(), values).encode()
+    except UnicodeDecodeError:
+        return redact_values(data, values)
+
+
 def collect(
-    box: Box, out: Path, projects_dir: Path | None, projects: list[str]
+    box: Box,
+    out: Path,
+    projects_dir: Path | None,
+    projects: list[str],
+    secrets: list[str],
 ) -> None:
     for rel, size, _ in box.files(box.home):
         parts = Path(rel).parts
@@ -1516,6 +1580,11 @@ def collect(
                 continue
         if parts[0] == ".gitconfig":
             continue
+        data = (
+            redact_bytes(data, secrets)
+            if parts[0] == ".config"
+            else redact_values(data, secrets)
+        )
         dest = out / "files" / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
@@ -1709,7 +1778,20 @@ def drive(args) -> int:
             data = box.read(path)
             if data is not None:
                 (out / f"transcript-{path.name}").write_bytes(data)
-        collect(box, out, Path(args.projects) if args.projects else None, projects)
+        given = [
+            *values.values(),
+            *(os.environ[k] for k in [*args.setup_env, *args.agent_env]),
+            *(v for k, v in harness_env.items() if "TOKEN" in k),
+        ]
+        collect(
+            box,
+            out,
+            Path(args.projects) if args.projects else None,
+            projects,
+            # Longest first, so a value that holds another is blanked whole; short
+            # ones would blank ordinary words.
+            sorted({v for v in given if len(v) >= 8}, key=len, reverse=True),
+        )
     except NotReady:
         record["outcome"] = "not-ready"
         print(
@@ -1737,14 +1819,21 @@ def short(text, width: int) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
-def digest_claude(lines, width, verbose):
+def digest_claude(lines, cut, verbose):
     for line in lines:
         rec = json.loads(line)
         kind = rec.get("type")
         content = (rec.get("message") or {}).get("content")
         if kind == "user" and not rec.get("isMeta"):
+            answered = rec.get("toolUseResult")
             if isinstance(content, str):
                 yield f"\n### HUMAN: {content}"
+            elif isinstance(answered, dict) and isinstance(
+                answered.get("answers"), dict
+            ):
+                # An answer typed into the question dialog (AskUserQuestion).
+                answers = "; ".join(map(str, answered["answers"].values()))
+                yield f"\n### HUMAN (in the dialog): {answers}"
             continue
         if kind != "assistant" or not isinstance(content, list):
             continue
@@ -1753,13 +1842,22 @@ def digest_claude(lines, width, verbose):
                 yield f"AGENT: {part['text']}"
             elif part.get("type") == "tool_use":
                 inp = part.get("input", {})
+                asked = [
+                    q.get("question")
+                    for q in inp.get("questions") or []
+                    if isinstance(q, dict)
+                ]
                 arg = (
-                    inp.get("command") or inp.get("url") or inp.get("file_path") or inp
+                    inp.get("command")
+                    or inp.get("url")
+                    or inp.get("file_path")
+                    or " | ".join(map(str, asked))
+                    or inp
                 )
-                yield f"  [{part['name']}] {short(arg, width)}"
+                yield f"  [{part['name']}] {cut(arg)}"
 
 
-def digest_codex(lines, width, verbose):
+def digest_codex(lines, cut, verbose):
     for line in lines:
         rec = json.loads(line)
         p = rec.get("payload") or {}
@@ -1784,46 +1882,83 @@ def digest_codex(lines, width, verbose):
                     arg = " ".join(arg)
             except (ValueError, AttributeError):
                 pass
-            yield f"  [{p.get('name')}] {short(arg, width)}"
+            yield f"  [{p.get('name')}] {cut(arg)}"
         elif (
             rec.get("type") == "response_item"
             and t in ("function_call_output", "custom_tool_call_output")
             and verbose
         ):
-            yield f"    -> {short(p.get('output'), width)}"
+            yield f"    -> {cut(p.get('output'))}"
         elif rec.get("type") == "response_item" and t == "web_search_call":
-            yield f"  [web] {short(p.get('action'), width)}"
+            yield f"  [web] {cut(p.get('action'))}"
         elif rec.get("type") == "item.completed":
             item = rec.get("item") or {}
             if item.get("type") == "agent_message":
                 yield f"AGENT: {item.get('text')}"
             elif item.get("type") == "command_execution":
-                yield f"  [exec] {short(item.get('command'), width)}"
+                yield f"  [exec] {cut(item.get('command'))}"
                 if verbose:
-                    yield f"    -> {short(item.get('aggregated_output', ''), width)}"
+                    yield f"    -> {cut(item.get('aggregated_output', ''))}"
+
+
+def first_time(lines: list[str]) -> str:
+    """A transcript's first timestamp (ISO 8601, UTC), or "" when it has none."""
+    for line in lines:
+        try:
+            stamp = json.loads(line).get("timestamp")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(stamp, str):
+            return stamp
+    return ""
 
 
 def digest(args) -> int:
     folder = Path(args.run_dir)
-    patterns = [re.compile(r) for r in args.redact]
-    paths = sorted(folder.glob("transcript-*.jsonl")) + sorted(
-        folder.glob("print-mode.jsonl")
-    )
-    if not paths:
-        raise Usage(f"no transcript in {folder}")
-    for path in paths:
+    try:
+        patterns = [re.compile(r) for r in args.redact]
+    except re.error as error:
+        raise Usage(f"--redact: {error}") from None
+    transcripts = []
+    for path in folder.glob("transcript-*.jsonl"):
         lines = [line for line in path.read_text().splitlines() if line.startswith("{")]
-        codex = path.name.startswith("transcript-rollout") or any(
+        transcripts.append((first_time(lines), path.name, path, lines))
+    # Sessions in the order they ran: a restarted run's file names don't sort so.
+    transcripts.sort(key=lambda t: t[:2])
+    for path in folder.glob("print-mode.jsonl"):
+        lines = [line for line in path.read_text().splitlines() if line.startswith("{")]
+        transcripts.append(("", path.name, path, lines))
+    if not transcripts:
+        raise Usage(f"no transcript in {folder}")
+
+    def clean(text: str) -> str:
+        if not args.no_redact:
+            text = redact(text)
+        for pattern in patterns:
+            text = pattern.sub("", text)
+        return text
+
+    def cut(text) -> str:
+        # Blank before cutting: a key cut short no longer matches.
+        return short(clean(str(text)), args.width)
+
+    for _, name, path, lines in transcripts:
+        codex = name.startswith("transcript-rollout") or any(
             '"thread.started"' in line or '"response_item"' in line
             for line in lines[:5]
         )
-        print(f"# {path.name}")
-        for row in (digest_codex if codex else digest_claude)(
-            lines, args.width, args.verbose
-        ):
-            for pattern in patterns:
-                row = pattern.sub("", row)
-            print(row)
+        print(f"# {name}")
+        rows = (digest_codex if codex else digest_claude)(
+            lines, cut, args.verbose and not args.calls
+        )
+        for row in rows:
+            if args.calls:
+                if row.startswith("AGENT: "):
+                    continue
+                if row.startswith("\n### HUMAN"):
+                    head, _, text = row.strip().partition(": ")
+                    row = f"{head}: {cut(text)}"
+            print(clean(row))
     return 0
 
 
@@ -1856,6 +1991,8 @@ def main() -> int:
     d.add_argument("--width", type=int, default=160)
     d.add_argument("-v", "--verbose", action="store_true")
     d.add_argument("--redact", action="append", default=[])
+    d.add_argument("--no-redact", action="store_true")
+    d.add_argument("--calls", action="store_true")
     c = sub.add_parser("cleanup", add_help=False)
     c.add_argument("name")
     if any(a in ("-h", "--help") for a in sys.argv[1:]) or len(sys.argv) == 1:

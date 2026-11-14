@@ -415,7 +415,8 @@ def test_agent_gets_only_its_own_environment(tmp_path, env):
     agent_env = seen["env"]
     assert agent_env["PASSED"] == "p1"
     assert "SECRET_OF_DRIVER" not in agent_env
-    assert agent_env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-access"
+    # The agent got the token; files/ saves it blanked.
+    assert agent_env["CLAUDE_CODE_OAUTH_TOKEN"] == "REDACTED"
     assert agent_env["HOME"].endswith("/jason2")
     assert agent_env["HTTPS_PROXY"].startswith("http://127.0.0.1:")
     assert not any("/home/" in p for p in agent_env["PATH"].split(":")[1:])
@@ -840,6 +841,51 @@ def test_setup_runs_before_the_agent_with_its_own_environment(tmp_path, env):
     assert "SETUP_ONLY" not in seen["env"]
 
 
+def test_config_is_saved_with_the_given_values_and_keys_blanked(tmp_path, env):
+    key = "a1" * 20
+    token = "fdt_" + "k" * 52
+    setup = tmp_path / "setup.py"
+    setup.write_text(
+        "#!/usr/bin/env python3\nimport os\n"
+        "d = os.path.join(os.environ['HOME'], '.config', 'tool')\n"
+        "os.makedirs(d)\n"
+        "open(os.path.join(d, 'site.header'), 'w').write("
+        f"'X-Staging-Key: ' + os.environ['STAGING'] + '\\nAuthorization: Bearer {token}\\n')\n"
+        "open(os.path.join(d, 'upgrade'), 'w').write('manual\\n')\n"
+        "open(os.path.join(d, 'note'), 'w').write('pw ' + os.environ['PLAIN'] + ' end')\n"
+        "open(os.path.join(os.environ['HOME'], 'copy.txt'), 'w')"
+        ".write('copy ' + os.environ['PLAIN'])\n"
+    )
+    out = tmp_path / "out"
+    drive(
+        {**env, "STAGING": key, "PLAIN": "open-sesame-42"},
+        "run",
+        scenario(tmp_path, turns=["hi"]),
+        "--harness",
+        "claude",
+        "--name",
+        "jason12",
+        "--out",
+        out,
+        "--setup",
+        setup,
+        "--setup-env",
+        "STAGING",
+        "--setup-env",
+        "PLAIN",
+    )
+    saved = out / "files" / ".config" / "tool"
+    assert (saved / "upgrade").read_text() == "manual\n"
+    header = (saved / "site.header").read_text()
+    assert key not in header and token not in header
+    assert header.startswith("X-Staging-Key: ") and "Authorization: Bearer " in header
+    note = (saved / "note").read_text()
+    assert "open-sesame-42" not in note
+    assert note.startswith("pw ") and note.endswith(" end")
+    # A given value is blanked outside ~/.config too.
+    assert (out / "files" / "copy.txt").read_text() == "copy REDACTED"
+
+
 def test_print_mode_sends_the_first_turn_once(tmp_path, env):
     path = scenario(tmp_path, turns=["just this"], print_mode=True)
     out = tmp_path / "out"
@@ -1061,6 +1107,183 @@ def test_digest_shows_turns_and_tools_and_redacts(tmp_path):
         check=True,
     ).stdout
     assert "-> total 0" in verbose
+
+
+def claude_record(ts, kind, content):
+    return {"type": kind, "timestamp": ts, "message": {"content": content}}
+
+
+def call(name, **given):
+    return [{"type": "tool_use", "name": name, "input": given}]
+
+
+def write_jsonl(path, records):
+    path.write_text("\n".join(map(json.dumps, records)) + "\n")
+
+
+def test_digest_calls_shows_humans_and_calls_one_line_each_in_time_order(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    # The file named first ran second, as a restarted session's may.
+    write_jsonl(
+        run / "transcript-a.jsonl",
+        [
+            {"type": "mode", "mode": "normal"},
+            claude_record("2026-11-13T23:25:00Z", "user", "second session"),
+            claude_record(
+                "2026-11-13T23:25:01Z", "assistant", call("Skill", skill="s")
+            ),
+        ],
+    )
+    write_jsonl(
+        run / "transcript-b.jsonl",
+        [
+            claude_record("2026-11-13T23:24:00Z", "user", "first\nsession"),
+            claude_record(
+                "2026-11-13T23:24:01Z",
+                "assistant",
+                [{"type": "text", "text": "Sure, fetching it now."}]
+                + call("Bash", command="curl -fsSL https://x.dev/skill.md | head"),
+            ),
+            claude_record(
+                "2026-11-13T23:24:02Z",
+                "user",
+                [{"type": "tool_result", "content": "# Skill text"}],
+            ),
+            claude_record(
+                "2026-11-13T23:24:03Z",
+                "assistant",
+                call("WebFetch", url="https://x.dev/a"),
+            ),
+            claude_record(
+                "2026-11-13T23:24:04Z",
+                "assistant",
+                call("AskUserQuestion", questions=[{"question": "Install them?"}]),
+            ),
+            {
+                **claude_record(
+                    "2026-11-13T23:24:05Z",
+                    "user",
+                    [{"type": "tool_result", "content": "The user answered: …"}],
+                ),
+                "toolUseResult": {"answers": {"Install them?": "Yes, both."}},
+            },
+        ],
+    )
+    out = subprocess.run(
+        [str(TOOL), "digest", str(run), "--calls", "--width", "30"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert out.splitlines() == [
+        "# transcript-b.jsonl",
+        "### HUMAN: first session",
+        "  [Bash] curl -fsSL https://x.dev/skil…",
+        "  [WebFetch] https://x.dev/a",
+        "  [AskUserQuestion] Install them?",
+        "### HUMAN (in the dialog): Yes, both.",
+        "# transcript-a.jsonl",
+        "### HUMAN: second session",
+        "  [Skill] {'skill': 's'}",
+    ]
+
+
+def test_digest_calls_reads_codex_transcripts(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    write_jsonl(
+        run / "transcript-rollout-x.jsonl",
+        [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"text": "install it"}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"text": "Installing."}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "sh install.sh auto"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {"type": "function_call_output", "output": "installed"},
+            },
+        ],
+    )
+    out = subprocess.run(
+        [str(TOOL), "digest", str(run), "--calls", "-v"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert out.splitlines() == [
+        "# transcript-rollout-x.jsonl",
+        "### HUMAN: install it",
+        "  [exec_command] sh install.sh auto",
+    ]
+
+
+def test_digest_blanks_keys_and_tokens_unless_told_not_to(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    key = "0123456789abcdef" * 4
+    token = "fdt_" + "q7" * 26
+    commit = "c0ffee" * 6 + "abcd"
+    command = (
+        f"K={key}; curl -H 'X-Staging-Key: notahexkey' -H 'Authorization: Bearer "
+        f"tok-123' 'https://x.dev/a?key=fieldkey&b=1' -d {token} -H 'Authorization: "
+        f"Basic dXNlcjpw' && FILEDRAWER_TOKEN=plain-tok git show {commit} && "
+        'grep -v "^Authorization:\\"" f'
+    )
+    write_jsonl(
+        run / "transcript-a.jsonl",
+        [
+            claude_record(
+                "2026-11-13T23:24:00Z", "assistant", call("Bash", command=command)
+            )
+        ],
+    )
+
+    def digest(*extra):
+        return subprocess.run(
+            [str(TOOL), "digest", str(run), "--width", "400", *extra],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    out = digest()
+    for secret in (
+        key,
+        "notahexkey",
+        "tok-123",
+        "fieldkey",
+        token[4:],
+        "dXNlcjpw",
+        "plain-tok",
+    ):
+        assert secret not in out
+    assert "X-Staging-Key: " in out and "Bearer " in out and "fdt_" in out
+    assert "&b=1" in out and commit in out and '"^Authorization:\\""' in out
+    # A key cut short by --width is blanked before the cut.
+    assert key[:20] not in digest("--width", "30")
+    assert "curl" not in digest("--redact", "curl")
+    assert key in digest("--no-redact") and token in digest("--no-redact")
 
 
 def sudo_and_bwrap():

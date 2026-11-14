@@ -18,6 +18,13 @@ turn has ended (Claude Code's Stop hook; Codex's notify program), saves the scre
 after each, then the transcripts and the files the run made, and removes the user,
 its home, its state folder and its iptables rule, on any exit.
 
+When Claude Code asks through its question dialog (AskUserQuestion), that ends the
+agent's turn: the next turn is typed into the dialog's free-text option ("Type
+something") and submitted, as a person would type their own answer, and turns.md
+names the question. A dialog that doesn't take the answer within
+DRIVE_AGENT_ANSWER_LIMIT, or one that asks several questions at once (tabs), fails
+the run there.
+
 SCENARIO is JSON:
   turns       the human's messages, in order. A string is sent as it is; {NAME} in it
               becomes the driver's variable NAME when --var NAME is given.
@@ -88,11 +95,16 @@ Environment:
   DRIVE_AGENT_LAUNCH_LIMIT   seconds the harness has to show its prompt (60)
   DRIVE_AGENT_TRUST_GRACE    seconds the prompt must show with no folder-trust
                              dialog after it before the first turn (4)
+  DRIVE_AGENT_ANSWER_LIMIT   seconds Claude Code's question dialog has to take a
+                             typed answer (30)
   HTTPS_PROXY, https_proxy   the proxy drive-agent's own proxy forwards through
 
 Needs tmux, and for isolation, passwordless sudo, bwrap (the bubblewrap package) and
 iptables. Exit status: 0 the run ended, 1 it failed (harness not ready, a turn
-timed out, a setup error), 2 usage error.
+timed out, a question dialog it couldn't answer, a setup error), 2 usage error.
+run.json's outcome then says which: failed, not-ready, timeout, auth, rate-limit,
+dialog (a turn stopped on some other dialog), dialog-unanswered,
+multi-question-dialog.
 """
 
 import argparse
@@ -155,6 +167,9 @@ LAUNCH_LIMIT = number("DRIVE_AGENT_LAUNCH_LIMIT", 60)
 # a git project draws its prompt, then the folder-trust dialog a moment later, which
 # drops what is typed into it.
 TRUST_GRACE = number("DRIVE_AGENT_TRUST_GRACE", 4)
+# How long Claude Code's question dialog has to take a typed answer, which it writes
+# to the transcript at once.
+ANSWER_LIMIT = number("DRIVE_AGENT_ANSWER_LIMIT", 30)
 
 
 class Usage(Exception):
@@ -768,8 +783,16 @@ class Harness:
     def print_command(self, text: str) -> list[str]:
         raise NotImplementedError
 
+    def begin_session(self) -> None:
+        """Called as each session starts, so nothing of an earlier one counts as
+        the new one's."""
+
     def last_message(self) -> str:
         raise NotImplementedError
+
+    def pending_question(self) -> dict | None:
+        """The question dialog waiting for the human: {"id", "questions"}."""
+        return None
 
     def transcripts(self) -> list[Path]:
         """The session transcripts, oldest first."""
@@ -784,6 +807,11 @@ class Harness:
 
 class Claude(Harness):
     transcript_dir = ".claude/projects"
+
+    def __init__(self, box: Box):
+        super().__init__(box)
+        # The transcripts of earlier sessions, which the current one ignores.
+        self.earlier: set[Path] = set()
 
     def env(self) -> dict:
         path = Path.home() / ".claude" / ".credentials.json"
@@ -862,17 +890,53 @@ class Claude(Harness):
             text,
         ]
 
-    def last_message(self) -> str:
-        """The agent's last text to the human, from the newest transcript."""
-        paths = self.transcripts()
+    def begin_session(self) -> None:
+        # A new session has no transcript until its first prompt, so until then the
+        # newest is the last session's.
+        self.earlier = set(self.transcripts())
+
+    def records(self) -> list[dict]:
+        """The current session's transcript records, oldest first."""
+        # A subagent's transcript, under <session>/subagents/, may be the newest.
+        paths = [
+            p
+            for p in self.transcripts()
+            if p not in self.earlier and "subagents" not in p.parts
+        ]
         text = (
             (self.box.read(paths[-1]) or b"").decode(errors="replace") if paths else ""
         )
-        for line in reversed(text.splitlines()):
+        found = []
+        for line in text.splitlines():
             try:
                 rec = json.loads(line)
             except ValueError:
                 continue
+            if isinstance(rec, dict) and isinstance(rec.get("message"), dict):
+                found.append(rec)
+        return found
+
+    def pending_question(self) -> dict | None:
+        """The last AskUserQuestion call with no answer yet: Claude Code writes the
+        call when it opens the dialog, and the answer as its tool_result."""
+        calls, answered = [], set()
+        for rec in self.records():
+            for p in rec["message"].get("content") or []:
+                if not isinstance(p, dict):
+                    continue
+                if p.get("type") == "tool_use" and p.get("name") == "AskUserQuestion":
+                    calls.append(p)
+                elif p.get("type") == "tool_result":
+                    answered.add(p.get("tool_use_id"))
+        for p in reversed(calls):
+            if p.get("id") not in answered:
+                questions = (p.get("input") or {}).get("questions") or []
+                return {"id": p.get("id"), "questions": questions}
+        return None
+
+    def last_message(self) -> str:
+        """The agent's last text to the human in this session."""
+        for rec in reversed(self.records()):
             if rec.get("type") != "assistant":
                 continue
             parts = []
@@ -930,6 +994,9 @@ class Codex(Harness):
             ),
             0o755,
         )
+
+    def begin_session(self) -> None:
+        self.box.remove(self.box.state / "last-agent")
 
     def command(self) -> list[str]:
         return [
@@ -1121,6 +1188,7 @@ class Session:
         # server {RESTART} just killed can find it still exiting.
         self.launches += 1
         self.socket = f"drive-agent-{self.box.name}-{self.launches}"
+        self.harness.begin_session()
         argv = self.box.argv(self.harness.command(), self.env_file, self.project)
         self.tmux(
             "new-session",
@@ -1162,36 +1230,60 @@ class Session:
         lines = [line for line in self.screen().splitlines() if line.strip()]
         return any(DIALOG in line for line in lines[-3:])
 
-    def wait_turn(self, before: int) -> bool:
-        """Waits for the agent's turn to end, or for Claude Code's question dialog,
-        which waits for the human without ending the turn."""
+    def asking(self) -> dict | None:
+        """Claude Code's question dialog, when it waits for the human: a question
+        the transcript holds no answer to, with the dialog on screen. The screen
+        alone can't tell: an answered dialog stays drawn a moment after Enter."""
+        # The screen first: reading the transcript costs a find and a cat.
+        return self.harness.pending_question() if self.dialog_open() else None
+
+    def wait_turn(self, before: int) -> tuple[bool, dict | None]:
+        """Waits for the agent's turn to end (the turn-end hook fired after
+        `before` turns, then held still for SETTLE), or for a question dialog,
+        which waits for the human without ending the turn. Returns whether either
+        came, and the dialog's question if one did."""
         deadline = time.time() + TURN_LIMIT
         while time.time() < deadline:
-            if self.dialog_open():
+            question = self.asking()
+            if question:
                 time.sleep(SETTLE)
-                return True
+                return True, question
             seen = self.turns_seen()
             if seen > before:
                 time.sleep(SETTLE)
                 if self.turns_seen() == seen:
-                    return True
+                    return True, None
                 continue
             if not self.alive():
-                return False
+                return False, None
             time.sleep(min(2, SETTLE))
-        return False
+        return False, None
 
     def send(self, text: str) -> None:
-        """Types `text` as the human's message, or, when Claude Code's question
-        dialog is open, as the dialog's free-text answer."""
-        if self.dialog_open():
-            choice = re.findall(r"(\d+)\. Type something", self.screen())
-            if choice:
-                self.tmux("send-keys", "-t", self.name, choice[-1])
-                time.sleep(1)
+        """Types `text` as the human's message."""
         self.tmux("send-keys", "-t", self.name, "-l", text)
         time.sleep(min(1.5, SETTLE + 0.2))
         self.tmux("send-keys", "-t", self.name, "Enter")
+
+    def answer(self, text: str, question: dict) -> str | None:
+        """Types `text` into the question dialog's free-text option and submits it.
+        Returns why it failed, or None once the transcript holds the answer."""
+        shown = self.asking()
+        if not shown or shown["id"] != question["id"]:
+            return "the dialog closed before the answer was typed"
+        choice = re.findall(r"(\d+)\. Type something", self.screen())
+        if not choice:
+            return "the dialog shows no free-text option (Type something)"
+        self.tmux("send-keys", "-t", self.name, choice[-1])
+        time.sleep(1)
+        self.send(text)
+        deadline = time.time() + ANSWER_LIMIT
+        while time.time() < deadline:
+            pending = self.harness.pending_question()
+            if not pending or pending["id"] != question["id"]:
+                return None
+            time.sleep(0.2)
+        return f"the dialog didn't take the answer within {ANSWER_LIMIT:g} s"
 
 
 def trust_dialog_open(screen: str) -> bool:
@@ -1237,6 +1329,8 @@ STUCK = (
             re.IGNORECASE,
         ),
     ),
+    # A dialog that isn't a question to the human, which drive-agent never answers.
+    ("dialog", re.compile(re.escape(DIALOG))),
 )
 
 
@@ -1253,14 +1347,29 @@ def interactive(
 ) -> str:
     session.launch()
     history: list[str] = []
+    # The question dialog the agent's last turn ended in, which the next turn answers.
+    asked = None
     for n, turn in enumerate(scenario["turns"], 1):
         if turn == "{RESTART}":
             session.stop()
             session.launch()
+            asked = None
             with log.open("a") as f:
                 f.write(f"## Turn {n}: new session\n\n")
             continue
         turn = {"text": turn} if isinstance(turn, str) else turn
+        if asked and len(asked["questions"]) > 1:
+            why = (
+                f"the agent asked {len(asked['questions'])} questions in one dialog, "
+                "which drive-agent can't answer"
+            )
+            with log.open("a") as f:
+                f.write(
+                    f"## Turn {n}: FAILED, {why}\n\nScripted: {json.dumps(turn)}\n\n"
+                    f"Questions:\n{questions_text(asked)}\n\n"
+                )
+            print(f"drive-agent: turn {n}: {why}; see turns.md", file=sys.stderr)
+            return "multi-question-dialog"
         last = session.harness.last_message() if history else ""
         text, note = human_turn(turn, scenario, persona, last, history)
         if text is None:
@@ -1274,15 +1383,43 @@ def interactive(
         # approves nothing later.
         history.append(text)
         before = session.turns_seen()
-        session.send(fill(text, values))
-        ended = session.wait_turn(before)
+        answered = (
+            f"Answered in the question dialog, to:\n{questions_text(asked)}\n\n"
+            if asked
+            else ""
+        )
+        if asked:
+            failed = session.answer(fill(text, values), asked)
+            if failed:
+                (session.out / f"screen-{n:02}.txt").write_text(session.screen())
+                with log.open("a") as f:
+                    f.write(
+                        f"## Turn {n}: FAILED, {failed}\n\n"
+                        f"Scripted: {json.dumps(turn)}\n\n{answered}Typed: {text}\n\n"
+                    )
+                print(
+                    f"drive-agent: turn {n}: {failed}; see turns.md and "
+                    f"screen-{n:02}.txt",
+                    file=sys.stderr,
+                )
+                return "dialog-unanswered"
+        else:
+            session.send(fill(text, values))
+        ended, asked = session.wait_turn(before)
         (session.out / f"screen-{n:02}.txt").write_text(session.screen())
+        status = "asks in a dialog" if asked else "ended" if ended else "NO END SEEN"
         with log.open("a") as f:
             f.write(
-                f"## Turn {n} ({'ended' if ended else 'NO END SEEN'}, "
+                f"## Turn {n} ({status}, "
                 f"{time.strftime('%H:%M:%S')})\n\nScripted: {json.dumps(turn)}\n\n"
                 + (f"{note}\n\n" if note else "")
+                + answered
                 + f"Sent: {text}\n\n"
+                + (
+                    f"The agent asks in a dialog:\n{questions_text(asked)}\n\n"
+                    if asked
+                    else ""
+                )
             )
         print(
             f"{session.box.name}: turn {n} {'ended' if ended else 'timed out'}",
@@ -1291,6 +1428,21 @@ def interactive(
         if not ended:
             return why_stuck(session.screen())
     return "done"
+
+
+def questions_text(asked: dict) -> str:
+    """A question dialog's questions, one a line, with their options."""
+    lines = []
+    for q in asked["questions"]:
+        options = " / ".join(
+            str(o.get("label", ""))
+            for o in q.get("options") or []
+            if isinstance(o, dict)
+        )
+        lines.append(
+            f"- {q.get('question', '')}" + (f" ({options})" if options else "")
+        )
+    return "\n".join(lines)
 
 
 def fill(text: str, values: dict) -> str:

@@ -349,7 +349,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   user inside bwrap, which hides the workspace, other homes, the driver's
   processes and the sandbox's shell setup; the box has its own network with
   only its own loopback, and a proxy it runs, reached through a unix socket,
-  refuses github.com, api.github.com and loopback. It types each scripted turn once the agent's last turn ends, asks a
+  refuses github.com, api.github.com and loopback. It types each scripted turn once the agent's last turn ends (or, when
+  Claude Code asks in its question dialog, into the dialog's free-text option, and turns.md names the question; a
+  dialog with several questions fails the run), asks a
   simulated human (`claude-fresh`) to answer open questions and judge
   conditional turns (never sent when it fails), and saves screens, transcripts
   and the files the run made, then removes the user. `--setup FILE` prepares
@@ -358,8 +360,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   transcripts compactly; `cleanup NAME` removes a crashed run's user. Tests
   set `DRIVE_AGENT_ISOLATION=none` (no user or sandbox, homes under
   `DRIVE_AGENT_HOME_ROOT`) and shorten `DRIVE_AGENT_TURN_LIMIT`,
-  `DRIVE_AGENT_SETTLE`, `DRIVE_AGENT_LAUNCH_LIMIT` and
-  `DRIVE_AGENT_TRUST_GRACE`; the proxy forwards
+  `DRIVE_AGENT_SETTLE`, `DRIVE_AGENT_LAUNCH_LIMIT`, `DRIVE_AGENT_TRUST_GRACE`
+  and `DRIVE_AGENT_ANSWER_LIMIT`; the proxy forwards
   through `HTTPS_PROXY`. Needs tmux, passwordless sudo, bwrap and iptables.
 - **pre-commit-run**: runs the pre-commit framework from a repo's pre-commit
   hook. A person sees its output as it runs; an agent (`AI_AGENT` set) sees it

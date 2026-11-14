@@ -27,6 +27,12 @@ TOOL = Path(__file__).resolve().parent / "bin" / "drive-agent"
 # A fake agent's reply to a typed line: "ask" makes it ask to post, "fetch HOST" makes
 # it CONNECT to HOST through $HTTPS_PROXY and report the status line, anything else
 # gets "done: <line>". Every turn writes ~/seen.json: user, env, cwd.
+# The fake Claude Code also asks in a question dialog, as AskUserQuestion does:
+# "dialog" asks one question, "dialog2" two in one dialog (tabs), "deaf" one it never
+# takes an answer to. The dialog writes its tool_use to the transcript and fires no
+# Stop hook. Its free-text option is 3, so its answer arrives as "3<text>" (a cooked
+# tty holds the 3 until Enter); then it writes the tool_result, works a while with
+# the answered dialog still drawn, replies "done: answer <text>" and fires Stop.
 FAKE_AGENT = r"""#!/usr/bin/env python3
 import json, os, socket, subprocess, sys, time, uuid
 HARNESS = os.path.basename(sys.argv[0])
@@ -80,6 +86,34 @@ def seen():
                    "mounts": open("/proc/self/mountinfo").read(),
                    "hidden": open(os.environ["FAKE_HIDDEN"]).read() if "FAKE_HIDDEN" in os.environ else None}, f)
 
+QUESTIONS = {
+    "colour": {"question": "Which colour do you prefer?", "header": "Colour",
+               "multiSelect": False,
+               "options": [{"label": "Red", "description": "warm"},
+                           {"label": "Blue", "description": "cool"}]},
+    "animal": {"question": "Which animal do you prefer?", "header": "Animal",
+               "multiSelect": False,
+               "options": [{"label": "Cat", "description": ""},
+                           {"label": "Dog", "description": ""}]},
+}
+DIALOGS = {"dialog": ["colour"], "dialog2": ["colour", "animal"], "deaf": ["colour"]}
+
+def draw(questions):
+    first = questions[0]
+    print("─" * 40)
+    if len(questions) > 1:
+        print("←  " + "  ".join("☐ " + q["header"] for q in questions) + "  ✔ Submit  →")
+    else:
+        print(" ☐ " + first["header"])
+    print(first["question"])
+    for n, option in enumerate(first["options"], 1):
+        print(("❯ " if n == 1 else "  ") + f"{n}. {option['label']}")
+    print("  3. Type something.")
+    print("─" * 40)
+    print("  4. Chat about this")
+    nav = "Tab/Arrow keys" if len(questions) > 1 else "↑/↓"
+    print(f"Enter to select · {nav} to navigate · Esc to cancel", flush=True)
+
 session = str(uuid.uuid4())
 if HARNESS == "claude":
     proj = os.path.join(os.environ["HOME"], ".claude", "projects", "p")
@@ -90,6 +124,29 @@ if HARNESS == "claude":
             f.write(json.dumps({"type": "user", "message": {"content": line}}) + "\n")
             f.write(json.dumps({"type": "assistant", "message": {"content": [
                 {"type": "text", "text": text}]}}) + "\n")
+    def write(*records):
+        with open(transcript, "a") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+    def ask(line):
+        questions = [QUESTIONS[k] for k in DIALOGS[line]]
+        tool_id = "toolu_" + uuid.uuid4().hex
+        write({"type": "user", "message": {"content": line}},
+              {"type": "assistant", "message": {"content": [
+                  {"type": "tool_use", "id": tool_id, "name": "AskUserQuestion",
+                   "input": {"questions": questions}}]}})
+        # A subagent's transcript, written after the question, is the newest file.
+        sub = os.path.join(proj, session, "subagents")
+        os.makedirs(sub, exist_ok=True)
+        with open(os.path.join(sub, "agent-1.jsonl"), "a") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "subagent at work"}]}}) + "\n")
+        draw(questions)
+        return tool_id, questions
+    def answer(tool_id, questions, text):
+        write({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tool_id,
+             "content": f'User has answered your questions: "{questions[0]["question"]}"="{text}".'}]}})
     def turn_end(line, text):
         settings = json.load(open(os.path.join(os.environ["HOME"], ".claude", "settings.json")))
         for hook in settings["hooks"]["Stop"][0]["hooks"]:
@@ -138,9 +195,31 @@ if os.path.exists(os.path.join(os.environ["HOME"], "trust-late")):
         print("dropped: " + line.strip(), flush=True)
     print("? for shortcuts")
     print("❯ ", end="", flush=True)
+pending = None
 for line in sys.stdin:
     line = line.strip()
     if not line:
+        continue
+    if pending:
+        tool_id, questions, kind = pending
+        if kind == "deaf" or not line.startswith("3"):
+            draw(questions)
+            continue
+        pending = None
+        given = line[1:]
+        answer(tool_id, questions, given)
+        # fixed sleep: the agent works on while the answered dialog is still drawn
+        time.sleep(1.5)
+        text = "done: answer " + given
+        with open(transcript, "a") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": text}]}}) + "\n")
+        print(text)
+        turn_end(line, text)
+        print("❯ ", end="", flush=True)
+        continue
+    if HARNESS == "claude" and line in DIALOGS:
+        pending = (*ask(line), line)
         continue
     text = reply(line)
     seen()
@@ -445,6 +524,133 @@ def test_restart_starts_a_new_session_in_the_same_home(tmp_path, env):
     log = (out / "turns.md").read_text()
     assert "## Turn 2: new session" in log and "Sent: two" in log
     assert len(list(out.glob("transcript-*.jsonl"))) == 2
+
+
+def transcript_records(out):
+    """Every record of each saved session transcript (not a subagent's), by
+    transcript, oldest first."""
+    return {
+        path.name: [json.loads(line) for line in path.read_text().splitlines()]
+        for path in out.glob("transcript-*.jsonl")
+        if not path.name.startswith("transcript-agent-")
+    }
+
+
+def dialog_answers(records):
+    return [
+        part["content"]
+        for rec in records
+        for part in (rec["message"]["content"] if rec["type"] == "user" else [])
+        if isinstance(part, dict) and part.get("type") == "tool_result"
+    ]
+
+
+def typed(records):
+    return [
+        rec["message"]["content"]
+        for rec in records
+        if rec["type"] == "user" and isinstance(rec["message"]["content"], str)
+    ]
+
+
+def test_a_question_dialog_ends_the_turn_and_takes_the_next_one_as_its_answer(
+    tmp_path, env
+):
+    # jason86: the answered dialog stays drawn while the agent works on, which the
+    # driver took for the end of the turn, typing the next turn mid-work.
+    path = scenario(tmp_path, turns=["dialog", "Yes, both.", "after"])
+    out = tmp_path / "out"
+    drive(env, "run", path, "--harness", "claude", "--name", "jason30", "--out", out)
+    (records,) = transcript_records(out).values()
+    answers = dialog_answers(records)
+    assert len(answers) == 1 and '="Yes, both."' in answers[0]
+    assert typed(records) == ["dialog", "after"]
+    assert "done: answer Yes, both." in (out / "screen-02.txt").read_text()
+    log = (out / "turns.md").read_text()
+    turn1, turn2 = log.split("## Turn 2")[0], log.split("## Turn 2")[1]
+    assert "asks in a dialog" in turn1 and "Which colour do you prefer?" in turn1
+    assert "Answered in the question dialog" in turn2
+    assert "Which colour do you prefer?" in turn2.split("## Turn 3")[0]
+    assert json.loads((out / "run.json").read_text())["outcome"] == "done"
+
+
+def test_a_restart_after_a_dialog_shows_the_human_nothing_of_the_old_session(
+    tmp_path, env
+):
+    # jason86: after {RESTART} the simulated human read the old session's dialog
+    # and answered it again at the top of the next turn.
+    path = scenario(tmp_path, turns=["dialog", "Yes, both.", "{RESTART}", "next"])
+    out = tmp_path / "out"
+    drive(env, "run", path, "--harness", "claude", "--name", "jason31", "--out", out)
+    # The new session has said nothing, so there is nothing to ask the human about.
+    assert not [p for p in human_prompts(env) if "<<<\nnext\n>>>" in p]
+    sessions = transcript_records(out).values()
+    assert sorted(typed(records) for records in sessions) == [["dialog"], ["next"]]
+    assert sum(len(dialog_answers(records)) for records in sessions) == 1
+
+
+@pytest.mark.parametrize("harness", ["claude", "codex"])
+def test_a_condition_after_a_restart_is_judged_on_nothing_of_the_old_session(
+    tmp_path, env, harness
+):
+    path = scenario(
+        tmp_path,
+        turns=["ask", "{RESTART}", {"text": "Yes, post it.", "only_if": "it asks"}],
+    )
+    out = tmp_path / "out"
+    drive(env, "run", path, "--harness", harness, "--name", "jason34", "--out", out)
+    log = (out / "turns.md").read_text()
+    assert "## Turn 3: skipped, no agent message to judge" in log
+
+
+def test_several_questions_in_one_dialog_fail_the_run_loudly(tmp_path, env):
+    # jason82 and jason85: the answer went into the first tab and the dialog moved
+    # on to the next, which the driver took for a turn end; nothing was submitted.
+    path = scenario(tmp_path, turns=["dialog2", "Yes, both.", "after"])
+    out = tmp_path / "out"
+    done = drive(
+        env,
+        "run",
+        path,
+        "--harness",
+        "claude",
+        "--name",
+        "jason32",
+        "--out",
+        out,
+        check=False,
+    )
+    assert done.returncode == 1
+    assert json.loads((out / "run.json").read_text())["outcome"] == (
+        "multi-question-dialog"
+    )
+    log = (out / "turns.md").read_text()
+    assert "Which colour do you prefer?" in log and "Which animal" in log
+    assert "Sent: Yes, both." not in log and "## Turn 3" not in log
+    (records,) = transcript_records(out).values()
+    assert typed(records) == ["dialog2"] and not dialog_answers(records)
+
+
+def test_a_dialog_that_never_takes_the_answer_fails_the_run(tmp_path, env):
+    path = scenario(tmp_path, turns=["deaf", "Yes, both.", "after"])
+    out = tmp_path / "out"
+    done = drive(
+        {**env, "DRIVE_AGENT_ANSWER_LIMIT": "1"},
+        "run",
+        path,
+        "--harness",
+        "claude",
+        "--name",
+        "jason33",
+        "--out",
+        out,
+        check=False,
+    )
+    assert done.returncode == 1
+    assert json.loads((out / "run.json").read_text())["outcome"] == (
+        "dialog-unanswered"
+    )
+    assert "## Turn 3" not in (out / "turns.md").read_text()
 
 
 def test_cleanup_refuses_a_user_drive_agent_didnt_make(tmp_path, env):

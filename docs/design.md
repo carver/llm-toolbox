@@ -717,6 +717,16 @@ The agent's environment is a mode-600 file the box reads, never an argv, since e
 Claude Code gets only the driver's access token; Codex a copy of `auth.json` without its refresh token, which `codex exec` was checked to run on.
 Cleanup removes the user, home, state folder and rule, and no files by UID: useradd hands the same UID out again, and Docker's image layers hold files owned by it.
 
+### Claude Code's question dialog ends a turn, read from the transcript (2026-11-13)
+
+When the agent calls AskUserQuestion, Claude Code draws a dialog and fires no Stop hook.
+drive-agent takes the dialog as the end of the agent's turn only while the transcript holds the call with no tool_result and the dialog's footer is on screen, then types the next turn into its free-text option and waits for the tool_result before waiting for Stop.
+Reason: in filedrawer's usability runs of 2026-11-13 the screen alone misled it.
+An answered dialog stays drawn a moment after Enter, so the turn "ended" while the agent worked and a restart cut its install short (jason86); a dialog of two questions moved to its second tab, which also looked like a turn end, so nothing was submitted (jason82, jason85).
+A dialog of several questions fails the run, since the script holds one answer and tabs need one each.
+A session reads only its own transcript: before its first prompt the newest one is the last session's, and the simulated human answered that session's dialog again after a restart (jason86).
+Codex has no such dialog in default mode: `request_user_input` is for Plan mode, and `request_user_input_async` returns at once and shows its question as an agent message.
+
 ### Rejected: a separate user without bwrap (2026-11-10)
 
 It blocks writes but not reads of the workspace, which is world-readable, and leaves `/proc` and `/var/tmp` shared between runs.

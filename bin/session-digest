@@ -29,6 +29,13 @@ the tokens written, and says when a user turn came in the gap (the user's pause,
 not the agent's). The summary lists every one.
 A background task's notification gets one line, its id, status and summary,
 without the report: a subagent's report shows in that agent's own timeline.
+Each agent's row also gives its peak-in, the largest single request's context;
+msgs, the messages other agents sent it (records whose origin is coordinator or
+peer: a resume after it stopped and a message while it worked count alike); and
+wakes, the turns a task notification started that made no tool call, such as a
+parent's turn on a subagent's status. The summary lists, under big subagents,
+each subagent whose peak-in reached 200k, or that got 2 or more msgs and reached
+100k, and under idle wakes each agent with 5 or more wakes.
 An image counts about width * height / 750 tokens, from its header (PNG, GIF,
 JPEG), capped at 1600.
 
@@ -127,6 +134,17 @@ SIDE_NOTE = "Here is a note offered by a side agent:"
 # A request that wrote this many tokens or more to the prompt cache, and read fewer from
 # it, rebuilt the cache: it had expired, or been lost some other way.
 REBUILD_TOKENS = 100_000
+# Where a message from another agent comes from: the agent that started this one
+# (coordinator), or another (peer). Claude Code logs it as the record's origin.
+SENT_BY_AGENT = ("coordinator", "peer")
+# A subagent is listed as big when its largest request's context reached BIG_CONTEXT, or
+# it got MANY_MESSAGES from other agents with BIG_RESUMED of context: a follow-up given to
+# a fresh agent with the landed commit starts far smaller.
+BIG_CONTEXT = 200_000
+MANY_MESSAGES = 2
+BIG_RESUMED = 100_000
+# An agent is listed when this many task notifications woke it to a turn with no call.
+IDLE_WAKES = 5
 
 
 @dataclass
@@ -157,6 +175,9 @@ class Agent:
     short_form: list[list[str]] = field(default_factory=list)
     hook_errors: Counter[str] = field(default_factory=Counter)
     context_in: int = 0
+    peak_in: int = 0  # the largest single request's context
+    messages: int = 0  # records another agent sent it
+    idle_wakes: int = 0  # turns a task notification started that made no tool call
     output: int = 0
     workflow: bool = False
 
@@ -453,6 +474,10 @@ def digest(
     last_reply: datetime | None = None
     user_since_reply = False
     requests: set[str] = set()
+    # The last reply's stop reason, and whether a notification began the current turn
+    # with no tool call since.
+    last_stop: str | None = None
+    woken = False
     hooks_by_call = hook_lines(records)
     failing = failed_calls(records)
     failures: dict[str, list[str]] = {}
@@ -485,6 +510,11 @@ def digest(
     for record in records:
         message = record.get("message") or {}
         content = message.get("content")
+        origin = record.get("origin") or (record.get("attachment") or {}).get("origin")
+        kind = origin.get("kind") if isinstance(origin, dict) else None
+        agent.messages += kind in SENT_BY_AGENT
+        if kind == "task-notification" and last_stop == "end_turn":
+            woken = True
         if record.get("type") == "attachment":
             attachment = record.get("attachment") or {}
             # A prompt or notification that arrived while the agent worked.
@@ -509,11 +539,13 @@ def digest(
             if usage and request not in requests:
                 first_request = not requests
                 requests.add(request)
-                agent.context_in += (
+                context = (
                     usage.get("input_tokens", 0)
                     + usage.get("cache_creation_input_tokens", 0)
                     + usage.get("cache_read_input_tokens", 0)
                 )
+                agent.context_in += context
+                agent.peak_in = max(agent.peak_in, context)
                 agent.output += usage.get("output_tokens", 0)
                 now = timestamp(record)
                 idle = (
@@ -525,6 +557,13 @@ def digest(
                     agent.lines.append(rebuild.line())
             last_reply = timestamp(record) or last_reply
             user_since_reply = False
+            if any(b.get("type") == "tool_use" for b in content or []):
+                woken = False
+            if stop := message.get("stop_reason"):
+                if stop == "end_turn" and woken:
+                    agent.idle_wakes += 1
+                    woken = False
+                last_stop = stop
             for block in content or []:
                 if block.get("type") == "text":
                     agent.lines.append(f"  {view.text(block['text'])}")
@@ -657,8 +696,20 @@ def load_workflow_agents(session: Path) -> list[tuple[str, dict, list[dict]]]:
 
 def summary(agents: list[Agent]) -> list[str]:
     width = max(24, *(len(a.name) for a in agents))  # workflow names run long
-    row = f"{{:<{width}}} {{:>6}} {{:>6}} {{:>9}} {{:>10}} {{:>8}}"
-    lines = [row.format("agent", "calls", "errors", "out~tok", "api-in", "api-out")]
+    row = f"{{:<{width}}} {{:>6}} {{:>6}} {{:>9}} {{:>10}} {{:>8}} {{:>8}} {{:>4}} {{:>5}}"
+    lines = [
+        row.format(
+            "agent",
+            "calls",
+            "errors",
+            "out~tok",
+            "api-in",
+            "api-out",
+            "peak-in",
+            "msgs",
+            "wakes",
+        )
+    ]
     for a in agents:
         t = a.totals
         lines.append(
@@ -669,6 +720,9 @@ def summary(agents: list[Agent]) -> list[str]:
                 human(t.tokens),
                 human(a.context_in),
                 human(a.output),
+                human(a.peak_in),
+                a.messages,
+                a.idle_wakes,
             )
         )
     tools: dict[str, ToolStats] = {}
@@ -685,7 +739,9 @@ def summary(agents: list[Agent]) -> list[str]:
     lines += [
         "",
         "out~tok: tool output the agent read, estimated. api-in: context sent per",
-        "request, summed (cache reads included). api-out: tokens generated.",
+        "request, summed (cache reads included). api-out: tokens generated. peak-in:",
+        "the largest request's context. msgs: messages from other agents. wakes:",
+        "turns a task notification started that made no tool call.",
         "",
         "biggest outputs",
     ]
@@ -714,6 +770,27 @@ def summary(agents: list[Agent]) -> list[str]:
     if rebuilds:
         legend = f"idle, then {human(REBUILD_TOKENS)}+ tokens rewritten to the cache"
         lines += ["", "cache rebuilds", legend, *rebuilds]
+    big = [
+        f"{human(a.peak_in):>7}  {a.messages:>3} msgs  {a.name}"
+        for a in agents
+        if a.name != "main"
+        and (
+            a.peak_in >= BIG_CONTEXT
+            or (a.messages >= MANY_MESSAGES and a.peak_in >= BIG_RESUMED)
+        )
+    ]
+    if big:
+        legend = (
+            f"peak-in {human(BIG_CONTEXT)}+, or {MANY_MESSAGES}+ msgs at "
+            f"{human(BIG_RESUMED)}+: a fresh agent briefed with the landed sha starts small"
+        )
+        lines += ["", "big subagents", legend, *big]
+    woken = [
+        f"{a.idle_wakes:>7}  {a.name}" for a in agents if a.idle_wakes >= IDLE_WAKES
+    ]
+    if woken:
+        legend = f"{IDLE_WAKES}+ turns a notification started that made no tool call"
+        lines += ["", "idle wakes", legend, *woken]
     hook_errors = sum((a.hook_errors for a in agents), Counter())
     if hook_errors:
         lines += ["", "hook errors"]

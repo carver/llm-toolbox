@@ -732,7 +732,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **session-digest**: condenses a Claude Code session log, and each of its
   subagents' and workflow agents' logs, for a retrospective. Prints what each
   agent and tool cost (calls, errors, estimated tokens of tool output, API
-  tokens in and out), its five biggest tool outputs and its longest calls,
+  tokens in and out, the largest request's context, messages from other agents,
+  and turns a notification started that made no tool call), with sections for
+  big or often-resumed subagents and for agents woken 5+ times for nothing,
+  its five biggest tool outputs and its longest calls,
   then each subagent's timeline: user turns (a forwarded side agent's note
   marked `USER (side-agent note)`), the assistant's text, one line per
   tool call with its output's size and, for a call of a minute or more, how

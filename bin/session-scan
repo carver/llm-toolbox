@@ -221,7 +221,8 @@ say what to do instead.
 resent the agent's whole context because its prompt cache had expired. The main \
 agent's cache lasts an hour, a subagent's five minutes.
 Before the lines come the digest's summary (each agent's and tool's cost, the \
-biggest outputs, the longest calls, the cache rebuilds) and the user's turns in \
+biggest outputs, the longest calls, the cache rebuilds, the big subagents and \
+the idle wakes) and the user's turns in \
 the main session, which hold their standing instructions and approvals. They are \
 context: cite the numbered lines, not them.
 
@@ -255,7 +256,13 @@ agent wrote to get around a tool's limit, such as cropping a screenshot with \
 PIL or parsing a tool's output in a heredoc, which the tool could do itself. \
 Waste can land outside the session: \
 a change to a shared tool that slowed or broke other sessions' runs, or a queue \
-held so that others waited.
+held so that others waited. A subagent resumed or messaged with new work again \
+and again while its context grew (the summary's `msgs` and `peak-in`, its `big \
+subagents`), where a fresh agent briefed with the landed commit would start \
+small. An agent spending many turns on task notifications that changed nothing it \
+did (the summary's `wakes`, its `idle wakes`): each such turn resends the whole \
+context, so 25 of them at 300k tokens cost millions. A subagent that ends its \
+turn to wait for a job, rather than blocking on it with `waitone`.
 - Repetition: the same command sequence, lookup or explanation done more than \
 once, in one agent or across the agents you see.
 - Missing context: anything an agent learned by trial, by asking the user or by \
@@ -278,9 +285,9 @@ refusal, since the same hook refusing several times points to a habit to fix.
 Not findings: one long call that did its job; a `user` wait; a subagent reading \
 its brief, a skill, a standards file or a tool's `-h` once; a test that fails \
 first on purpose (test-driven work) or a review finding a problem (the review \
-doing its job); ending a turn to wait for a notification (though a `CACHE \
-REBUILT` after the wait is still its cost); a check the user made light on \
-purpose (see their turns).
+doing its job); the main session ending a turn to wait for a notification \
+(though a `CACHE REBUILT` after the wait is still its cost); a check the user \
+made light on purpose (see their turns).
 
 For each finding give its category; first_line and last_line, the digest line \
 numbers (the left column) of the shortest range that shows it, at most about 30 \
@@ -322,12 +329,14 @@ Not findings, so trivial: one long call that did its job; a `user` wait; a hook 
 refusal followed by a correct retry (the hook working as designed); a subagent \
 reading its brief, a skill, a standards file or a tool's `-h` once; a test that \
 fails first on purpose; a mutant caught by mutate-check (the check working); a \
-review finding problems (the review working); ending a turn to wait for a \
-notification; a check the user made light on purpose (see their turns); an exit \
-status other than 0 that isn't a failure (grep finding nothing, a check \
-reporting). Ending a turn to wait is right, but a `CACHE REBUILT` after the wait \
-is still a cost of it, and a real one: a subagent's cache lasts five minutes, so \
-a habit of long waits in subagents can be changed.
+review finding problems (the review working); the main session ending a turn to \
+wait for a notification; a check the user made light on purpose (see their \
+turns); an exit status other than 0 that isn't a failure (grep finding nothing, a \
+check reporting). The main session's wait is right, but a `CACHE REBUILT` after \
+it is still a cost; a subagent that ends its turn to wait is real waste, since \
+its cache lasts five minutes and its parent spends a turn on each stop. Many \
+status-only turns on notifications (`wakes`) are real too, not trivial \
+harness noise: each resends the whole context.
 
 Judge the event behind a candidate, not only how it is put: when the reader \
 named the wrong cause of a real cost (called a queue wait polling, say), say real \

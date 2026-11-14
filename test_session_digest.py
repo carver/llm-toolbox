@@ -200,7 +200,7 @@ def test_api_usage_counts_each_request_once(config: Path) -> None:
     summary = digest(config).split("\n== main")[0]
     main = next(line for line in summary.splitlines() if line.startswith("main"))
     # 3 requests (r1 twice): context in 3 x 1105, out 3 x 10.
-    assert main.split()[-2:] == ["3.3k", "30"]
+    assert main.split()[4:6] == ["3.3k", "30"]
 
 
 def test_session_by_id(config: Path) -> None:
@@ -1378,3 +1378,126 @@ def test_a_side_agents_note_is_labelled_as_one(side_note_config: Path, args) -> 
     assert "USER Fix the flaky test" in out
     assert "USER (side-agent note) Fix" not in out
     assert "Here is a note offered" not in out
+
+
+def reply(
+    request: str, *blocks: dict, stop: str = "end_turn", context: int = 0
+) -> dict:
+    """An assistant record that ends with stop_reason ``stop``; ``context`` tokens
+    read from the cache when given."""
+    record = assistant(request, *blocks)
+    record["message"]["stop_reason"] = stop
+    if context:
+        record["message"]["usage"]["cache_read_input_tokens"] = context
+    return record
+
+
+def text(words: str) -> dict:
+    return {"type": "text", "text": words}
+
+
+def summary_rows(out: str) -> dict[str, list[str]]:
+    table = out.split("\n\n")[0].splitlines()
+    return {line.split()[0]: line.split() for line in table[1:]}
+
+
+def test_summary_shows_each_agents_peak_context_and_messages(tmp_path: Path) -> None:
+    """peak-in is the largest single request's context; msgs counts what another agent
+    sent (coordinator or peer), whether it arrived mid-work or after a stop."""
+    records = [
+        user("Build it"),
+        reply("r1", text("Started."), context=40_000),
+        queued(None, "Scope change", isMeta=True, origin={"kind": "coordinator"}),
+        reply("r2", text("Adjusted."), context=250_000),
+        user("A follow-up", isMeta=True, origin={"kind": "coordinator"}),
+        user("From a peer", isMeta=True, origin={"kind": "peer"}),
+        user("Hi", origin={"kind": "human"}),
+        reply("r3", text("Done."), context=120_000),
+    ]
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    out = digest(tmp_path)
+    assert summary_rows(out)["agent"][-3:] == [
+        "peak-in",
+        "msgs",
+        "wakes",
+    ]
+    # 5 input + 100 written + the cache read
+    assert summary_rows(out)["main"][-3:] == ["250.1k", "3", "0"]
+
+
+def test_wakes_count_notification_turns_that_made_no_tool_call(tmp_path: Path) -> None:
+    """A notification that starts a turn which only talks is a status-only turn; one
+    the agent acts on, or one that arrives while it works, isn't."""
+    notice = notice_text("b1", "completed", "Agent finished")
+    records = [
+        user("Go"),
+        reply("r1", text("Waiting.")),
+        user(notice, origin={"kind": "task-notification"}),
+        reply("r2", text("Still waiting on the other one.")),
+        user(notice, origin={"kind": "task-notification"}),
+        reply("r3", text("Noted.")),
+        user(notice, origin={"kind": "task-notification"}),
+        reply("r4", tool_use("t1", "Bash", command="cat log"), stop="tool_use"),
+        user([result("t1", "ok")]),
+        queued("task-notification", notice, origin={"kind": "task-notification"}),
+        reply("r5", text("Done.")),
+    ]
+    write_jsonl(tmp_path / "projects" / "-work-repo" / "s.jsonl", records)
+    assert summary_rows(digest(tmp_path))["main"][-1] == "2"
+
+
+def big_session(tmp_path: Path, peak: int, msgs: int, wakes: int = 0) -> str:
+    """A main session and one subagent with these figures; the digest's summary."""
+    project = tmp_path / "projects" / "-work-repo"
+    notice = notice_text("a", "completed", "Agent finished")
+    main = [user("Go"), reply("m1", text("Waiting."))]
+    for n in range(wakes):
+        main += [user(notice, origin={"kind": "task-notification"})]
+        main += [reply(f"m{n + 2}", text("Still waiting."))]
+    write_jsonl(project / "s.jsonl", main)
+    sub = [user("Brief"), reply("s1", text("Done."), context=peak)]
+    for n in range(msgs):
+        sub += [user("More work", isMeta=True, origin={"kind": "coordinator"})]
+        sub += [reply(f"s{n + 2}", text("Done."), context=peak)]
+    write_jsonl(project / "s" / "subagents" / "agent-big.jsonl", sub)
+    return digest(tmp_path).split("\n== ")[0]
+
+
+def section(summary: str, title: str) -> list[str]:
+    """A summary section's rows, after its title and legend; [] when it's absent."""
+    if f"\n{title}\n" not in summary:
+        return []
+    return summary.split(f"\n{title}\n")[1].split("\n\n")[0].splitlines()[1:]
+
+
+@pytest.mark.parametrize(
+    ("peak", "msgs", "listed"),
+    [
+        (200_000, 0, True),
+        (150_000, 2, True),
+        (199_000, 1, False),
+        (90_000, 3, False),
+    ],
+    ids=["peak", "resumed", "small", "resumed-but-small"],
+)
+def test_summary_lists_big_subagents(
+    tmp_path: Path, peak: int, msgs: int, listed: bool
+) -> None:
+    rows = section(big_session(tmp_path, peak, msgs), "big subagents")
+    if listed:
+        assert [row.split() for row in rows] == [
+            [human_k(peak + 105), str(msgs), "msgs", "agent-big"]
+        ]
+    else:
+        assert rows == []
+
+
+def human_k(n: int) -> str:
+    return f"{n / 1000:.1f}k"
+
+
+def test_summary_lists_agents_woken_often_for_nothing(tmp_path: Path) -> None:
+    assert [
+        r.split() for r in section(big_session(tmp_path, 1, 0, 5), "idle wakes")
+    ] == [["5", "main"]]
+    assert section(big_session(tmp_path / "few", 1, 0, 4), "idle wakes") == []

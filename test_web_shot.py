@@ -270,6 +270,52 @@ def test_the_page_sees_the_color_scheme_and_motion_asked_for(tmp_path, flags, lo
     assert json.loads(run.stdout.splitlines()[0]) == look
 
 
+@needs_chromium
+def test_variants_runs_the_actions_at_desktop_and_phone_widths_light_and_dark(
+    tmp_path,
+):
+    """Each variant sees its own viewport and scheme, names its shots after itself and
+    reports its own errors: here only the dark phone's page throws."""
+    page = tmp_path / "p.html"
+    page.write_text(
+        "<!doctype html><style>body { margin: 0; background: rgb(255, 255, 255) }"
+        "@media (prefers-color-scheme: dark) { body { background: rgb(0, 0, 0) } }"
+        "</style><p id=t>hi</p><script>"
+        "if (innerWidth < 500 && matchMedia('(prefers-color-scheme: dark)').matches)"
+        " setTimeout(() => { throw new Error('too narrow and dark') }, 0)</script>"
+    )
+    out = tmp_path / "out"
+    run = cli(
+        *("--out", out, "--size", "1000x700", "--variants", "--do", "wait 50"),
+        *("--do", "eval [innerWidth, getComputedStyle(document.body).backgroundColor]"),
+        *("--do", "shot top #t", page),
+    )
+    assert run.returncode == 3, run.stderr
+    expected = []
+    for variant, width, background in [
+        ("desktop-light", 1000, "rgb(255, 255, 255)"),
+        ("desktop-dark", 1000, "rgb(0, 0, 0)"),
+        ("phone-light", 400, "rgb(255, 255, 255)"),
+        ("phone-dark", 400, "rgb(0, 0, 0)"),
+    ]:
+        expected += [
+            f"== {variant}",
+            json.dumps([width, background]),
+            str(out / f"top.{variant}.png"),
+            str(out / f"final.{variant}.png"),
+        ]
+        assert png_size(out / f"final.{variant}.png")[0] == width
+    assert run.stdout.splitlines() == expected
+    assert run.stderr.splitlines() == ["phone-dark: page error: too narrow and dark"]
+    assert not (out / "final.png").exists()
+
+
+def test_variants_does_not_go_with_a_color_scheme(tmp_path):
+    run = cli("--variants", "--color-scheme", "dark", tmp_path / "p.html")
+    assert run.returncode == 2
+    assert "--color-scheme: not allowed with argument --variants" in run.stderr
+
+
 def png_size(path):
     """(width, height) from a PNG's header."""
     header = Path(path).read_bytes()[16:24]

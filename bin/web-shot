@@ -34,6 +34,16 @@ and prefers-reduced-motion media queries see, such as to shoot its dark look.
 Without them it sees Playwright's defaults: a light scheme, and no preference
 about motion.
 
+--variants runs the actions four times, each in a browser of its own: at the
+--size given (desktop) and at 400 wide and --size's height (phone), each in the
+light and the dark scheme, so it doesn't go with --color-scheme. Each run
+starts with a line `== desktop-light`, `== desktop-dark`, `== phone-light` or
+`== phone-dark` on stdout, saves its shots as OUT/NAME.desktop-light.png and so
+on, the final one as OUT/final.desktop-light.png, and prints its paths before
+the next run starts. Each line on stderr about a run starts with its name, as
+in `phone-dark: page error: ...`. A run that fails ends the command, so the
+runs after it aren't made.
+
 Every run checks whether the page scrolls sideways, after it loads and at each
 shot, and says so on stderr: the page's width against the viewport's, then up
 to 5 elements that widen it, the furthest-reaching first, each with the start of
@@ -56,13 +66,14 @@ download is needed; with none cached it prints the install command.
 
 Exit status: 0; 1 when the page doesn't load or an action fails, with one line
 saying which, after what came before it is printed; 2 for a bad argument or no
-Chromium; 3 when the page had errors.
+Chromium; 3 when the page had errors, in any run of --variants.
 
 Examples:
   web-shot report/page.html
   web-shot --do "click #legend button[data-series=human]" --do "shot chart #trajectory" report/page.html
   web-shot --size 390x844 https://example.com
   web-shot --color-scheme dark --do "shot dark" https://example.com
+  web-shot --variants --do "shot header header" report/page.html   # 4 looks of one page
   web-shot --do "wait 5000" --do text https://airtable.com/app.../form     # read a JS-rendered form
   web-shot --do scroll-all --do "links /event/" https://example.com/calendar
 """
@@ -223,6 +234,7 @@ SIDEWAYS_JS = r"""keep => {
   walk(root, null);
   return {scrollWidth, width, culprits};
 }"""
+PHONE_WIDTH = 400  # --variants' phone viewport
 SIDEWAYS_SHOWN = 5  # culprits named; the rest are counted
 SNIPPET = 40  # characters of a culprit's text
 
@@ -278,8 +290,10 @@ def parse_action(text):
 
 @dataclass
 class Findings:
-    """What a run found, kept as it goes, so an action that fails doesn't lose what came before."""
+    """What a run found, kept as it goes, so an action that fails doesn't lose what came before.
+    `variant` is the run's name under --variants, such as phone-dark, else None."""
 
+    variant: str | None = None
     shots: list = field(default_factory=list)
     errors: list = field(default_factory=list)
     # a sideways report's lines -> the moments it was seen
@@ -303,20 +317,26 @@ class Findings:
 
     def show(self):
         """Prints the shots' paths on stdout, and on stderr each sideways report once, naming the
-        moments it was seen, then the page's errors."""
+        moments it was seen, then the page's errors, each starting with the variant's name, if
+        any."""
         if self.shots:
-            print("\n".join(map(str, self.shots)))
+            print("\n".join(map(str, self.shots)), flush=True)
+        prefix = f"{self.variant}: " if self.variant else ""
         for line in self.unchecked:
-            print(line, file=sys.stderr)
+            print(prefix + line, file=sys.stderr)
         for (head, *rest), moments in self.sideways.items():
             print(
-                f"scrolls sideways ({', '.join(moments)}): {head}",
+                f"{prefix}scrolls sideways ({', '.join(moments)}): {head}",
                 *rest,
                 sep="\n",
                 file=sys.stderr,
             )
         for error in collapse(self.errors):
-            print(error, file=sys.stderr)
+            print(prefix + error, file=sys.stderr, flush=True)
+
+    def shot_path(self, out, name):
+        """Where the shot NAME goes in OUT: NAME.png, or NAME.VARIANT.png under --variants."""
+        return out / (f"{name}.{self.variant}.png" if self.variant else f"{name}.png")
 
 
 def sideways_report(tab):
@@ -598,7 +618,7 @@ def perform(action, tab, network, out, found):
         scroll_all(tab, network)
     else:
         found.check_sideways(tab, f"shot {action.args[0]}")
-        path = out / f"{action.args[0]}.png"
+        path = found.shot_path(out, action.args[0])
         if len(action.args) == 2:
             # As a locator's own shot would: wait for it to show, and scroll it into
             # view, out of an inner scroller too.
@@ -640,6 +660,26 @@ def context_options(args):
     return options
 
 
+def variants(args):
+    """Each run to make, as (its name, new_context's arguments): one unnamed run, or under
+    --variants the desktop and phone viewports, each light and dark."""
+    options = context_options(args)
+    if not args.variants:
+        return [(None, options)]
+    viewports = {
+        "desktop": options["viewport"],
+        "phone": {**options["viewport"], "width": PHONE_WIDTH},
+    }
+    return [
+        (
+            f"{device}-{scheme}",
+            {**options, "viewport": viewport, "color_scheme": scheme},
+        )
+        for device, viewport in viewports.items()
+        for scheme in ("light", "dark")
+    ]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         # The usage, PAGE and the actions come before the options, so the help's first
@@ -673,10 +713,17 @@ def main(argv=None):
         default=(1280, 900),
         help="viewport WxH (default 1280x900)",
     )
-    parser.add_argument(
+    scheme = parser.add_mutually_exclusive_group()
+    scheme.add_argument(
         "--color-scheme",
         choices=("light", "dark"),
         help="what the page's prefers-color-scheme media queries see (default: light)",
+    )
+    scheme.add_argument(
+        "--variants",
+        action="store_true",
+        help=f"run the actions at --size and {PHONE_WIDTH} wide, each light and dark; "
+        "shots are NAME.<desktop|phone>-<light|dark>.png",
     )
     parser.add_argument(
         "--reduced-motion",
@@ -684,24 +731,29 @@ def main(argv=None):
         help="have the page's prefers-reduced-motion media queries see reduce",
     )
     args = parser.parse_args(argv)
-    found = Findings()
+    errors = False
     try:
         actions = [parse_action(a) for a in args.do]
         if args.cookie and not page_url(args.page).startswith(("http://", "https://")):
             raise UsageError("--cookie needs an http(s) page, not a file")
         out = args.out or Path(tempfile.mkdtemp(prefix="web-shot-"))
         out.mkdir(parents=True, exist_ok=True)
-        try:
-            run(args.page, actions, out, context_options(args), args.cookie, found)
-        finally:
-            found.show()
+        for variant, options in variants(args):
+            found = Findings(variant)
+            if variant:
+                print(f"== {variant}", flush=True)
+            try:
+                run(args.page, actions, out, options, args.cookie, found)
+            finally:
+                found.show()
+                errors = errors or bool(found.errors)
     except UsageError as error:
         print(f"web-shot: {error}", file=sys.stderr)
         return 2
     except Failed as error:
         print(f"web-shot: {error}", file=sys.stderr)
         return 1
-    return 3 if found.errors else 0
+    return 3 if errors else 0
 
 
 if __name__ == "__main__":

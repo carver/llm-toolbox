@@ -1010,3 +1010,18 @@ says on stderr when the final URL's host or path differs from the one asked for.
 And every `text`, `outline` and `grep` of a page prints its title and fetch date on
 stderr, so a wrong page reused from the cache shows each time. Markdown cached
 without its `.json` is fetched again.
+
+## web-shot
+
+### --variants shoots four looks; --fragment was dropped as a duplicate (2026-11-13)
+
+To preview an Artifact page, an agent pasted an HTML skeleton around its body
+fragment five times and shot it by hand at each width and scheme. The request was
+one option that wraps the file and shoots desktop and phone, light and dark. The
+wrapping half already existed: since commit 57cbb15 (2026-11-07) web-shot loads a
+local `.html` file with no doctype inside the skeleton the Artifact publisher adds.
+So the planned `--fragment` was dropped as a duplicate of it, and only `--variants`
+was added.
+
+The phone run is 400 wide at `--size`'s height, so the two viewports differ only
+in width. A run that fails ends the command, and the runs after it aren't made.

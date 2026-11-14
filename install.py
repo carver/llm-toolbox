@@ -104,6 +104,8 @@ HOOKS = [
     ("PostToolUse", "Skill", "skill-change-hint", {"timeout": 10}),
     ("UserPromptSubmit", "*", "skill-change-hint", {"timeout": 10}),
     ("PreToolUse", "Bash|Agent", "skill-change-hint", {"timeout": 10}),
+    # Refuses a subagent's stop while a background job it started still runs.
+    ("SubagentStop", "*", "subagent-wait-gate", {"timeout": 10}),
 ]
 # (key path, value, why). Claude Code reads these only at user scope.
 SETTINGS_VALUES = [

@@ -12,7 +12,10 @@ hook refuses a foreground call that runs it unless the call's own timeout is the
 tool's longest, 600000 ms; a `timeout` command around heavy doesn't count.
 Background call or not, it refuses heavy around bgrun (`heavy -- bgrun ...`), and
 around git commit and wt-ship, which queue their own checks and run bare. install.py
-registers it in ~/.claude/settings.json.
+registers it in ~/.claude/settings.json. A subagent's call (the event has an agent_id)
+gets the same verdict, but its refusal names the blocking form, plain bgrun in the
+foreground and then waitone, since a subagent doesn't end its turn to wait for a job
+(subagent-wait-gate).
 
 It reads the command as shell words and looks only at what runs: each simple command's
 command word, past variable settings, redirections, keywords such as `if` and `do`, and
@@ -73,6 +76,29 @@ QUICK_TIMEOUT = (
 )
 # Most specific first: the first that applies is the one printed.
 REFUSALS = (RUN_BARE, WRONG_ORDER, FOREGROUND, QUICK_TIMEOUT)
+# A subagent's prompt cache lasts five minutes, and its parent spends a turn on each of
+# its stops, so it blocks on the job rather than wait for a background call's
+# notification; its Bash calls go to the background after 180 s.
+SUBAGENT_FORM = (
+    "bgrun -o <scratchpad>/LOG -- heavy -- CMD in the foreground, which prints the "
+    "job's PID at once, then `waitone --pid PID -t 170`, again until it exits (a "
+    "subagent's Bash call goes to the background after 180 s), and read LOG"
+)
+SUBAGENT = {
+    FOREGROUND: (
+        "Refused: heavy waits its turn with no time limit, and a Bash call that waits on "
+        f"it is killed at the tool's limit. In a subagent, run {SUBAGENT_FORM}. Only a "
+        "run of seconds, such as a few tests, may run in the foreground, as heavy "
+        f"--quick -- CMD with the call's timeout at {LONGEST_TIMEOUT_MS}."
+    ),
+    WRONG_ORDER: f"Refused: heavy goes inside bgrun, not around it: {SUBAGENT_FORM}.",
+    QUICK_TIMEOUT: (
+        "Refused: heavy --quick can wait minutes at the queue's front, past this call's "
+        "time limit (two minutes by default). Set the Bash tool's timeout parameter to "
+        f"{LONGEST_TIMEOUT_MS} (ms; a timeout command doesn't count), or run "
+        f"{SUBAGENT_FORM}."
+    ),
+}
 
 # Set in front of heavy, these give it a queue of its own or put it inside a job.
 OWN_QUEUE = {"HEAVY_DIR", "HEAVY_SLOT"}
@@ -178,6 +204,8 @@ def main(argv=None) -> int:
         found.discard(QUICK_TIMEOUT)
     for refusal in REFUSALS:
         if refusal in found:
+            if event.get("agent_id"):
+                refusal = SUBAGENT.get(refusal, refusal)
             print(f"{refusal} {NOTHING_RAN}", file=sys.stderr)
             return 2
     return 0

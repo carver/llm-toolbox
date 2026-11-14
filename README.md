@@ -112,9 +112,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `--wait` then waits for CMD, prints its exit status and LOG's last lines
   (`--tail N`, default 10) and exits with CMD's status: run it as an agent's
   background job to get one notification when CMD ends, while CMD survives if
-  the waiting bgrun is killed. CMD gets the caller's environment, without the
-  `VIRTUAL_ENV` and PATH entry of the uv environment bgrun itself runs in (a
-  `VIRTUAL_ENV` the caller had set is gone too: uv replaced it first).
+  the waiting bgrun is killed. That's for the main session: a subagent runs
+  bgrun without `--wait` and waits with `waitone --pid PID -t 170`. CMD gets
+  the caller's environment, without the `VIRTUAL_ENV` and PATH entry of the uv
+  environment bgrun itself runs in (a `VIRTUAL_ENV` the caller had set is gone
+  too: uv replaced it first).
 - **apply-edits**: replaces old text with new across files, all or nothing,
   from Aider-style `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` blocks
   under `--- PATH` lines on stdin (bare markers and Aider's bare path lines
@@ -579,6 +581,18 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   and `nice`, `bash -c`, a heredoc fed to a shell and `$(...)`. A word that only
   mentions heavy passes, as do `heavy status`, `heavy -h`, `bgrun` without
   `--wait`, and a heavy with `HEAVY_DIR` or `HEAVY_SLOT` set in front of it.
+  A subagent's refusal names plain `bgrun` in the foreground and then
+  `waitone --pid PID -t 170` instead of a background call.
+- **subagent-wait-gate**: a Claude Code `SubagentStop` hook, which `install.py`
+  registers, that refuses a subagent's stop while a background Bash call it
+  made still runs, and gives it `waitone --pid PID -t 170` for each such job
+  (the PID bgrun printed in the job's output). A subagent's prompt cache lasts
+  five minutes and its parent spends a turn on each of its stops, so it waits by
+  blocking; its Bash calls go to the background after 180 s. A tool call starts
+  the count again; two refusals in a row with no tool call between them, or a
+  job an hour old, let the stop through, and so does any error inside it. The
+  main session's stop never runs it. State is kept per session and subagent
+  under `${XDG_STATE_HOME:-~/.local/state}/subagent-wait-gate/`, for a week.
 - **pipe-status-gate**: a Claude Code hook, which `install.py` registers, that
   refuses a Bash command piping `git commit`, `wt-ship` or `bgrun --wait` into
   another command. A pipeline exits with its last command's status, so in

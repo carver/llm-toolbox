@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""A Claude Code SubagentStop hook that keeps a subagent from ending its turn to wait for a job.
+
+The main session ends its turn while a background job runs and the job's notification
+resumes it; its prompt cache lasts an hour. A subagent's lasts five minutes, so a wait
+of more than that resends its whole context, and each time a subagent ends its turn its
+parent gets a notification and spends a turn on it. A subagent waits instead by
+blocking: `waitone --pid PID -t 170`, again until the job exits. (Claude Code moves a
+subagent's Bash call to the background after 180 s, so the wait stays under that.)
+
+When a subagent tries to stop while a background Bash call it made is still running,
+the hook refuses the stop and gives it the waitone line for each such job: for a bgrun
+job, the PID bgrun printed in the job's output, while that process runs. A tool call,
+such as a wait, starts the count again, but after two refusals in a row with no tool
+call between them the stop goes through, and so does one while every running job is
+an hour old or more: a job that never ends, or a server left running on purpose, can't
+keep a subagent from stopping. Anything unexpected lets the stop through: input that
+isn't JSON, a transcript it can't read, no `background_tasks` field (an older Claude
+Code), a state file it can't write.
+
+Its own jobs are the task ids in its transcript (`agent_transcript_path`), where a
+Bash result says the command runs in the background ("Command running in background
+with ID: ...", or "was moved to the background (ID: ...)"), leaving out records another
+agent wrote, as in a fork's copy of its parent's history. Running ones are the shell
+tasks in the event's `background_tasks` with status running or pending. The main
+session's Stop event has no agent_id and passes, and install.py registers the hook for
+SubagentStop only.
+
+What it last refused is kept per session and subagent in
+${XDG_STATE_HOME:-~/.local/state}/subagent-wait-gate/; a file untouched for a week is
+removed when the next one is written.
+
+    subagent-wait-gate < hook-input.json    # as Claude Code calls it
+
+Exit status: 0 always. A refusal is a JSON decision on stdout.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import NamedTuple
+
+MAX_REFUSALS = 2  # in a row, with no tool call between them
+MAX_AGE = 60 * 60  # seconds: a job older than this is let go
+WAIT_SECONDS = 170
+KEEP_DAYS = 7
+LIVE = ("running", "pending")
+OUTPUT_PATH = re.compile(r"Output is being written to: (\S+?\.output)")
+# How a Bash result says its command went to the background: started there, or moved.
+BACKGROUND_ID = re.compile(
+    r"\ACommand (?:running in background with ID: |was moved to the background \(ID: )"
+    r"([\w-]+)"
+)
+UNSAFE = re.compile(r"[^\w.-]")
+COMMAND_LIMIT = 120
+PID_LINES = 3  # bgrun may say it moved an old LOG aside before it prints the PID
+
+
+class Job(NamedTuple):
+    output: str | None  # the file its output goes to, when the transcript names it
+    started: datetime | None
+
+
+def read_transcript(transcript: Path, agent: str) -> tuple[dict[str, Job], int]:
+    """The background tasks the subagent started, and how many tool calls it made."""
+    jobs: dict[str, Job] = {}
+    calls = 0
+    for line in transcript.read_text().splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or record.get("agentId", agent) != agent:
+            continue
+        content = (record.get("message") or {}).get("content")
+        if record.get("type") == "assistant" and isinstance(content, list):
+            calls += sum(
+                isinstance(b, dict) and b.get("type") == "tool_use" for b in content
+            )
+        if record.get("type") != "user" or not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                text = result_text(block.get("content"))
+                if started := BACKGROUND_ID.match(text):
+                    found = OUTPUT_PATH.search(text)
+                    jobs[started.group(1)] = Job(
+                        found.group(1) if found else None, timestamp(record)
+                    )
+    return jobs, calls
+
+
+def result_text(content: object) -> str:
+    if isinstance(content, list):
+        return "\n".join(str(b.get("text", "")) for b in content if isinstance(b, dict))
+    return str(content or "")
+
+
+def timestamp(record: dict) -> datetime | None:
+    try:
+        when = datetime.fromisoformat(str(record["timestamp"]))
+    except (KeyError, ValueError):
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=UTC)
+
+
+def young(job: Job, now: datetime) -> bool:
+    """Whether the job started less than MAX_AGE ago; one of unknown age counts as young."""
+    return job.started is None or (now - job.started).total_seconds() < MAX_AGE
+
+
+def state_file(event: dict) -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    key = f"{event['session_id']}@{event['agent_id']}"
+    name = UNSAFE.sub("_", key).lstrip(".") or "_"
+    return Path(base) / "subagent-wait-gate" / f"{name}.json"
+
+
+def read_state(path: Path) -> dict:
+    """{"calls": tool calls at the last refusal, "refused": {task id: refusals in a row}}"""
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def write_state(path: Path, state: dict) -> None:
+    """Raises OSError when it can't: then nothing caps the refusals, so the caller lets
+    the stop through."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - KEEP_DAYS * 86400
+    for old in path.parent.glob("*.json"):
+        try:
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
+        except OSError:
+            pass
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(state))
+    temp.replace(path)
+
+
+def pid_of(task: dict, output: str | None) -> str | None:
+    """The PID bgrun printed for a bgrun job, while that process runs."""
+    if not output or not re.search(r"\bbgrun\b", str(task.get("command") or "")):
+        return None
+    try:
+        with open(output) as f:
+            head = [f.readline().strip() for _ in range(PID_LINES)]
+    except OSError:
+        return None
+    pid = next((line for line in head if line.isdigit()), None)
+    return pid if pid and Path(f"/proc/{pid}").exists() else None
+
+
+def job_line(task: dict, output: str | None) -> str:
+    command = " ".join(str(task.get("command") or "").split())
+    if len(command) > COMMAND_LIMIT:
+        command = command[:COMMAND_LIMIT] + "…"
+    pid = pid_of(task, output)
+    wait = (
+        f"`waitone --pid {pid} -t {WAIT_SECONDS}`"
+        if pid
+        else "find its PID with `safeps -f WORD`, a word only its command line holds, "
+        f"then `waitone --pid PID -t {WAIT_SECONDS}`"
+    )
+    log = f", then read {output}" if output else ""
+    name = task.get("description") or task["id"]
+    return f"- {name} (task {task['id']}: `{command}`): {wait}{log}"
+
+
+def reason(lines: list[str]) -> str:
+    return (
+        "Refused: a background job you started is still running. A subagent that ends "
+        "its turn to wait loses its prompt cache after five minutes, and its parent "
+        "spends a turn on each stop. Wait for it in the foreground, again after each "
+        "timeout (waitone exits 4 while it runs) until it exits:\n"
+        + "\n".join(lines)
+        + "\nNext time start a job with `bgrun -o LOG -- CMD` in the foreground, which "
+        "prints its PID at once, and wait the same way. Stop a job you no longer need "
+        "with TaskStop. To leave one running on purpose, such as a server, end your "
+        f"turn again: after {MAX_REFUSALS} refusals in a row with no tool call between "
+        "them, this hook lets the stop through."
+    )
+
+
+def decide(event: dict) -> str | None:
+    """The reason to refuse the stop, or None to let it through."""
+    if event.get("hook_event_name") != "SubagentStop" or not event.get("agent_id"):
+        return None
+    tasks = event.get("background_tasks")
+    transcript = event.get("agent_transcript_path")
+    if not isinstance(tasks, list) or not tasks or not transcript:
+        return None
+    jobs, calls = read_transcript(Path(transcript), str(event["agent_id"]))
+    path = state_file(event)
+    state = read_state(path)
+    # A tool call since the last refusal, such as a wait, starts the count again.
+    refusals = state.get("refused", {}) if state.get("calls") == calls else {}
+    now = datetime.now(UTC)
+    refused = [
+        task
+        for task in tasks
+        if isinstance(task, dict)
+        and task.get("type") == "shell"
+        and task.get("status") in LIVE
+        and str(task.get("id")) in jobs
+        and refusals.get(str(task["id"]), 0) < MAX_REFUSALS
+        and young(jobs[str(task["id"])], now)
+    ]
+    if not refused:
+        return None
+    for task in refused:
+        refusals[str(task["id"])] = refusals.get(str(task["id"]), 0) + 1
+    write_state(path, {"calls": calls, "refused": refusals})
+    return reason([job_line(task, jobs[str(task["id"])].output) for task in refused])
+
+
+def main() -> int:
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print(__doc__)
+        return 0
+    try:
+        why = decide(json.load(sys.stdin))
+    except Exception:  # noqa: BLE001 - a stop hook that fails must let the stop through
+        return 0
+    if why:
+        print(json.dumps({"decision": "block", "reason": why}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -756,6 +756,43 @@ so loads are kept per agent, or a subagent's load would send its parent a note
 about a skill the parent never read. PreToolUse `additionalContext` reached the
 model on both Bash and Agent calls.
 
+## subagent-wait-gate
+
+### A subagent blocks on its job; a SubagentStop hook refuses a stop to wait (2026-11-13)
+
+The guidelines told every agent to end its turn while a background job ran and let the
+notification resume it. Right for the main session, whose prompt cache lasts an hour.
+In session 27f72ef3 subagents did the same: six cache rebuilds of 137k to 355k tokens
+after waits of 6 to 22 minutes (a subagent's cache lasts five minutes), and about 25
+turns of the parent's spent on the notifications of subagents that had stopped to
+wait. The owner asked for the fix "both as guidance and enforced".
+
+What the hook sees, from Claude Code 2.1.325 (the hooks reference, and a `claude -p`
+run whose subagent ran `sleep 25` in the background and ended its turn):
+SubagentStop carries `agent_id`, `agent_transcript_path` and `background_tasks`, the
+running tasks of the whole session, each with `id`, `type` (`shell`), `status`
+(`running`) and `command`; the main session's Stop has no `agent_id`. The subagent's
+transcript holds each task it started in the Bash result's text ("Command running in
+background with ID: ..."), so running jobs come from the event and ownership from the
+transcript. An interactive session's transcript also records the id as
+`toolUseResult.backgroundTaskId`, but the `claude -p` run's had no `toolUseResult`, so
+the hook reads the text. A subagent's foreground Bash call is moved to the background
+after 180 s (`subagentCapApplied`), so the wait it is given is `waitone -t 170`, not
+the four minutes first proposed.
+
+It can't trap a subagent: two refusals in a row with no tool call between them let
+the stop through (a server left running on purpose), as does a job an hour old or
+any error inside the hook. `stop_hook_active` can't be the cap, since it is set after
+any hook-caused continuation, and Claude Code's own cap of eight blocks resets on each
+tool call.
+
+### Rejected: refusing `bgrun --wait` as a background call in a subagent (2026-11-13)
+
+The background call isn't the waste; ending the turn is, and an agent may work while
+the job runs. Nor can bgrun tell that a subagent started it: no documented variable
+says so. heavy-gate, which sees `agent_id`, gives a subagent the blocking form in its
+refusals instead.
+
 ## ci-status
 
 ### Failing CI on the default branch reaches the agent at session start (2026-11-10)

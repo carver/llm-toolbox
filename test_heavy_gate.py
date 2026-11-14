@@ -13,9 +13,9 @@ SCRIPT = Path(__file__).resolve().parent / "bin" / "heavy-gate"
 NOTHING_RAN = "Nothing in this command ran, the parts before the refused one included."
 
 
-def run_hook(command, background=None, tool="Bash", timeout=None):
+def run_hook(command, background=None, tool="Bash", timeout=None, agent=None):
     """The hook's exit status and stderr for one call, its input shaped as Claude Code sends it.
-    ``timeout`` is the Bash call's own, in ms."""
+    ``timeout`` is the Bash call's own, in ms; ``agent`` a subagent's id, when it made the call."""
     tool_input = {"command": command, "description": "Run it"}
     if background is not None:
         tool_input["run_in_background"] = background
@@ -30,6 +30,8 @@ def run_hook(command, background=None, tool="Bash", timeout=None):
         "tool_name": tool,
         "tool_input": tool_input,
     }
+    if agent:
+        event |= {"agent_id": agent, "agent_type": "general-purpose"}
     result = subprocess.run(
         [SCRIPT], input=json.dumps(event), capture_output=True, text=True, check=False
     )
@@ -92,6 +94,33 @@ def test_a_foreground_call_that_waits_on_heavy_is_refused(command):
     assert "heavy --quick -- CMD" in err
     assert len(err.splitlines()) <= 2
     assert err.rstrip().endswith(NOTHING_RAN)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "heavy -- cargo test",
+        "heavy --quick -- pytest -q test_x.py",
+        "heavy -- bgrun -o log -- make",
+    ],
+)
+def test_a_subagent_is_told_to_wait_in_the_foreground(command):
+    """A subagent's prompt cache lasts five minutes, so it blocks on the job rather than
+    ending its turn to wait for a background call's notification."""
+    code, err = run_hook(command, agent="a1")
+
+    assert code == 2
+    assert "bgrun -o <scratchpad>/LOG -- heavy -- CMD" in err
+    assert "waitone --pid PID -t 170" in err
+    assert "bgrun --wait" not in err and "run_in_background" not in err
+    assert err.rstrip().endswith(NOTHING_RAN)
+
+
+def test_a_subagents_quick_run_with_the_longest_timeout_passes():
+    assert (
+        run_hook("heavy --quick -- pytest -q test_x.py", timeout=600000, agent="a1")[0]
+        == 0
+    )
 
 
 WAITS_ON_QUICK = [

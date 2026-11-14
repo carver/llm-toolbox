@@ -43,7 +43,7 @@ Read the code at each survivor's line at the run's head (`git show HEAD_SHA:FILE
 
 Pass over:
 - a mutant that changes no behaviour (an equivalent mutant), or only the wording of a message;
-- code whose tests skip on the runner: `bin/web-shot` and `bin/gui-shot` (no browser or display), `bin/paper`'s pdftotext path, and `heavy`'s lane sharing (its tests need 4 cores);
+- code whose tests skip on the runner: `bin/web-shot` and `bin/gui-shot` (no browser or display), `bin/paper`'s pdftotext path and its web page conversion (no pandoc), and `heavy`'s lane sharing (its tests need 4 cores);
 - code an open worktree or branch is changing (`git worktree list`), which its own tests may cover soon.
 
 Several survivors in one function are one gap.

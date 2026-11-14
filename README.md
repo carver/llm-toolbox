@@ -811,7 +811,18 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   can read a section instead of the whole paper. `text`, `outline`, `grep` and `meta` also take a
   LessWrong or Alignment Forum post, by its LessWrong, Alignment Forum or GreaterWrong URL or as
   `lw:ID`: one request to LessWrong's GraphQL API caches its Markdown as `lesswrong/ID.md` and its
-  title, date, authors, karma and URL beside it, and `outline` lists its Markdown headings. Takes
+  title, date, authors, karma and URL beside it, and `outline` lists its Markdown headings.
+  `text`, `outline` and `grep` also take a paper published as an HTML page, by any other
+  http(s) URL that doesn't end in `.pdf` (one that serves a PDF anyway is read as a PDF):
+  pandoc, which must be on `PATH`, turns the page into Markdown, cached under `web/`, without
+  its comments, scripts, styles and inline `<svg>` and with Distill's elements kept as text
+  (`<d-math>` as `$X$` or `$$X$$`, `<d-cite>` as `[cite:KEY]`, a `<d-footnote>`'s text in
+  place), an image as `[IMG PATH]` (`[IMG inline]` for a `data:` URI) and a heading's id
+  before its text (`## {#methods} Methods`). A page with under
+  2,000 characters of text is refused as a login page or an app shell, and each read
+  of a page names its title and fetch date on stderr, from the `.json` cached beside its
+  Markdown, so a page that isn't the paper shows; `meta`, `bib` and `cites` refuse a page.
+  Takes
   arXiv ids and URLs, DOIs and Semantic Scholar
   paperIds, and prints a few lines per paper; `meta` asks Semantic Scholar for
   all its uncached ids in one batch request, so pass every id to one call, and

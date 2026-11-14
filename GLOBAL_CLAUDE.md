@@ -23,7 +23,7 @@ A follow-up to work a subagent landed goes to a fresh agent, briefed with the co
 
 ## Research subagents
 
-A brief that sends a subagent to read papers, or LessWrong and Alignment Forum posts, tells it to fetch them with `paper` (`paper -h`; a post goes by its URL), start each paper from `paper outline ID` and read only the sections it needs by line range, and find single facts with `paper grep ID PATTERN`. When several agents read in parallel, assign each paper to one agent. `paper text` caches each paper's full text on the host disk, so a paper that two agents do need is downloaded and converted once.
+A brief that sends a subagent to read papers, or LessWrong and Alignment Forum posts, tells it to fetch them with `paper` (`paper -h`; a post goes by its URL, and so does a paper published as a web page, as on transformer-circuits.pub or distill.pub, which `paper text`, `outline` and `grep` read in full and `meta`, `bib` and `cites` refuse), start each paper from `paper outline ID` and read only the sections it needs by line range, and find single facts with `paper grep ID PATTERN`. When several agents read in parallel, assign each paper to one agent. `paper text` caches each paper's full text on the host disk, so a paper that two agents do need is downloaded and converted once.
 
 ## Claims
 

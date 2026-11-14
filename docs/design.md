@@ -961,3 +961,52 @@ never covered. So a run that judged any mutant covers its range, and its summary
 the mutants it left out are not retried; only a run that judged none (the suite fails
 unmutated on the runner) keeps the base, and fails. Raising MUTANT_MINUTES, as a
 public repo's free minutes would allow, leaves out fewer.
+
+## paper
+
+### A web page's text comes through pandoc, with stand-ins for what it would lose (2026-11-13)
+
+`paper` refused a paper published as a web page, such as
+https://transformer-circuits.pub/2026/workspace/index.html, so an agent wrote an
+HTML-to-text converter by hand. `text`, `outline` and `grep` now take any http(s)
+URL that isn't arXiv's, doi.org's or a post's and doesn't end in `.pdf`: an HTML
+answer goes through `pandoc --from=html --to=gfm-raw_html --wrap=none` and is cached
+as Markdown in `web/`, so `outline` and `grep` work as they do for a post. The owner
+chose a thin layer over pandoc, not a converter of our own.
+
+Before pandoc runs, the text it would escape or drop is swapped for a numbered
+stand-in in private-use characters, and put back afterwards: Distill's `<d-math>`
+(pandoc would escape the TeX's backslashes and underscores), `<d-cite>`, the
+brackets around a `<d-footnote>`'s text, an image (`[IMG PATH]`) and a heading's id
+(`{#ID}`, which gfm has no form for). `raw_html` is off because with it pandoc
+writes a figure, a div and a table with merged cells as HTML tags; without it,
+their text. The page's own private-use characters are swapped for stand-ins first,
+so one that looks like a stand-in is put back as it was, where it used to end the
+run with an IndexError.
+
+Before any of that, comments are removed, and then scripts, styles and inline
+`<svg>`: in that order, since `<!-- <script> -->` once opened an element that ran to
+the next `</script>` and took the text between with it. No base64 reaches the
+cached text, which agents read whole: pandoc wrote an inline `<svg>` as a
+`data:image/svg+xml;base64` image, so it goes, and an `<img>` whose `src` is a
+`data:` URI is `[IMG inline]`. The bytes are decoded in the charset the
+`Content-Type` header names, else the `<meta>` in the first 1024 bytes, else UTF-8
+with U+FFFD for what doesn't decode; before, an ISO-8859-1 page lost every accented
+letter.
+
+A URL that names no PDF but serves one (`openreview.net/pdf?id=...`) is read as a
+PDF, as before. A URL ending in `.pdf` that serves a page is still refused.
+
+### A web page that may not be the paper is refused or shown, never reused silently (2026-11-13)
+
+Any HTML answer was converted and cached, so `https://openreview.net/forum?id=...`
+answering `<html>login</html>` was cached as a paper and every later read reused it
+without a word. Nothing tells a login or error page from a paper for certain, so
+there are three guards. A page whose Markdown has under 2,000 characters is refused
+with exit 1 and nothing cached: a login page, an app shell or a landing page. A
+`.json` beside the Markdown keeps the URL asked for, the URL redirects ended at,
+the page's `<title>`, the fetch time and the character count, and the conversion
+says on stderr when the final URL's host or path differs from the one asked for.
+And every `text`, `outline` and `grep` of a page prints its title and fetch date on
+stderr, so a wrong page reused from the cache shows each time. Markdown cached
+without its `.json` is fetched again.

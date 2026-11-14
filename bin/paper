@@ -3,7 +3,8 @@
 # dependencies = ["requests"]
 # ///
 """Fetch a paper's metadata, citations or full text from Semantic Scholar and arXiv,
-and a LessWrong or Alignment Forum post's text and metadata from LessWrong.
+a LessWrong or Alignment Forum post's text and metadata from LessWrong, and the
+text of a paper published as a web page.
 
     paper meta ID...
     paper bib ID...
@@ -66,6 +67,29 @@ level), and meta prints its title, date posted, author and coauthors, karma
 and URL. cites, bib, search and sweep refuse a post. Comments and sequences
 aren't fetched.
 
+text, outline and grep also take a paper published as an HTML page, such as
+https://transformer-circuits.pub/2026/workspace/index.html: any other http(s)
+URL whose path doesn't end in .pdf and that answers with HTML (one that
+answers with a PDF is read as a PDF URL is). text fetches the page, turns it
+into GitHub Markdown with pandoc, which must be on PATH, and prints the path
+of the .md file; outline lists its headings as it does a post's. The page is
+decoded in the charset its Content-Type header names, else its <meta
+charset>, else UTF-8. Comments, scripts, styles and inline <svg> drawings are
+dropped, and Distill's elements are kept as text:
+<d-math>X</d-math> as $X$, <d-math block> as $$X$$, <d-cite key="KEY"> as
+[cite:KEY], and a <d-footnote>'s text where it stands, as [footnote: ...]. An
+image is [IMG PATH], with its src as written, or [IMG inline] when its src is
+a data: URI, so no base64 reaches the text, and a heading with an id starts
+with it, as in `## {#methods} Methods`. A figure, a div or a table Markdown
+has no form for gives its text without its tags. The page is read as its HTML
+arrives: what its scripts would add isn't there. A page whose Markdown has
+under 2,000 characters is refused, as a login page, an app shell or a landing
+page, and nothing is cached. Every text, outline and grep of a page says on
+stderr which page it read, by its <title> and the day it was fetched, and the
+first also says when the URL redirected to another host or path: check them,
+since any page with enough text is taken for the paper. meta, bib and cites
+refuse a web page.
+
 sweep fetches every paper matching QUERY from Semantic Scholar's bulk search,
 most cited first, up to --max (default 1000), optionally only papers from
 --year (2024, 2016-2020, 2010-, -2015), with --min-citations, or in
@@ -96,7 +120,8 @@ pdf URL, a DOI (10.1145/... bare or as a doi.org URL), or a 40-character
 Semantic Scholar paperId. text takes arXiv ids and URLs, DOIs or a direct PDF
 URL: an arXiv DOI (10.48550/arXiv....) fetches from arXiv, and any other DOI
 fetches the open-access PDF OpenAlex lists, if it lists one. For a paper with
-none of these (PMLR, OpenReview), find its paperId with search. bib takes
+none of these (PMLR, OpenReview), find its paperId with search. text, outline
+and grep take a web page's URL too (see above). bib takes
 DOIs and arXiv ids and URLs. A post is its LessWrong, Alignment Forum or
 GreaterWrong URL (https://www.lesswrong.com/posts/ID/slug, slug optional,
 or .../s/SEQUENCE/p/ID) or lw:ID.
@@ -107,11 +132,15 @@ Every answer is cached in $PAPER_CACHE (default
 OpenAlex and Crossref responses likewise in openalex/ and crossref/, BibTeX
 entries in bibtex/, arXiv's latest version of each paper (its number, dates,
 title and authors) for a day, as new versions appear, PDFs with their text,
-and each post as lesswrong/ID.md, with its metadata in ID.json.
+each post as lesswrong/ID.md, with its metadata in ID.json, and each web
+page's Markdown in web/, named for a hash of its URL (without any #fragment),
+its host and its path, with a .json beside it: the URL asked for, the URL
+redirects ended at, the page's title, when it was fetched and its character
+count.
 Delete the s2 folder there to refetch Semantic Scholar answers (metadata,
-citations, searches), a paper's files in pdf/ to fetch its text anew, or a
-post's in lesswrong/. If arXiv can't be reached, meta prints the rest and
-warns.
+citations, searches), a paper's files in pdf/ to fetch its text anew, a
+post's in lesswrong/, or a page's in web/. If arXiv can't be reached, meta
+prints the rest and warns.
 
 Semantic Scholar answers more requests, and 429s less, with an API key. paper
 sends one when $S2_API_KEY is set, else when the file
@@ -125,7 +154,7 @@ least 1.1 seconds apart (a key allows about one a second), OpenAlex's at least
 0.15 seconds, Crossref's and doi.org's at least 0.2 seconds, LessWrong's at
 least 1 second, the arXiv API's at least 3 seconds apart. Each waits its turn
 on a lock file in the cache.
-PDF downloads aren't paced.
+PDF and web page downloads aren't paced.
 
 Rate limits (HTTP 429, including Semantic Scholar's JSON error object), 5xx
 and timeouts are retried with exponential backoff, honouring Retry-After: up
@@ -149,14 +178,23 @@ one small daily budget. A key OpenAlex refuses (not yet activated, or
 invalid) is dropped, with a warning. OpenAlex lists at most 200 papers per
 request, so --limit above 200 gets 200.
 
-Exit status: 0 success, 1 not found (or the URL is not a PDF pdftotext can
-read, or a DOI has no open-access PDF or no BibTeX; search with no hits exits
-1, and so do grep with no matching line and outline with no heading; cites
-with no citing papers says so and exits 0), 2 usage error, 3 the remote
-refused or failed the request after retries, or sent an unexpected answer,
-including Semantic Scholar failing while neither OpenAlex nor Crossref
-answers, and OpenAlex or Crossref failing for a paper Semantic Scholar
-doesn't know while neither has it: try again later.
+Exit status:
+  0  success. cites with no citing papers says so and exits 0.
+  1  nothing to give:
+     - the paper, post or page was not found
+     - search with no hits exits 1, as do grep with no matching line and
+       outline with no heading
+     - a DOI has no open-access PDF, or no BibTeX
+     - the URL serves neither a PDF pdftotext can read nor an HTML page
+       (a URL ending in .pdf must serve a PDF)
+     - a web page has under 2,000 characters of text
+     - pandoc is not installed, for a web page
+  2  usage error
+  3  the remote refused or failed the request after retries, or sent an
+     unexpected answer: try again later. That includes Semantic Scholar
+     failing while neither OpenAlex nor Crossref answers, and OpenAlex or
+     Crossref failing for a paper Semantic Scholar doesn't know while
+     neither has it.
 
 Examples:
     paper meta 2404.00806 10.1145/3442188.3445922
@@ -169,6 +207,7 @@ Examples:
     paper grep 2404.00806 'collusion rate|markup' -C 1
     paper outline https://www.alignmentforum.org/posts/HLJoJYi52mxgomujc
     paper meta lw:HLJoJYi52mxgomujc
+    paper outline https://transformer-circuits.pub/2026/workspace/index.html
 """
 
 import argparse
@@ -176,6 +215,7 @@ import bisect
 import calendar
 import fcntl
 import hashlib
+import html
 import json
 import os
 import random
@@ -192,7 +232,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlparse, urlsplit
+from urllib.parse import quote, unquote, urldefrag, urlparse, urlsplit
 from xml.etree import ElementTree
 
 OK, NOT_FOUND, USAGE, REMOTE = 0, 1, 2, 3
@@ -395,6 +435,29 @@ class PdfUrl(PaperId):
         return self.value, cache_stem("url", self.value, name)
 
 
+class WebUrl(PdfUrl):
+    """An http(s) URL whose path doesn't end in .pdf: an HTML page, which becomes
+    Markdown, or a PDF after all, cached as a PdfUrl's is."""
+
+    def s2_path(self) -> str:
+        raise UsageError(f"{PAGES_ONLY}: {self.value!r}")
+
+    def doi(self) -> str:
+        raise UsageError(f"needs a DOI or an arXiv id; {PAGES_ONLY}: {self.value!r}")
+
+    def page_url(self) -> str:
+        """The URL without its fragment, which names a place in the same page."""
+        return urldefrag(self.value).url
+
+    def page_stem(self) -> str:
+        """The cache file stem for the page's Markdown."""
+        url = urlsplit(self.page_url())
+        return cache_stem("web", self.page_url(), f"{url.hostname}{url.path}")
+
+
+PAGES_ONLY = "only `paper text`, `outline` and `grep` take a web page"
+
+
 class LessWrongPost(PaperId):
     """A LessWrong post, by its id: Alignment Forum and GreaterWrong share the ids."""
 
@@ -469,10 +532,10 @@ def parse_id(text: str) -> PaperId:
             if m := POST_PATH.fullmatch(url.path):
                 return LessWrongPost(m.group(1))
             raise UsageError(f"not a LessWrong post URL: {text!r}")
-        return PdfUrl(text)
+        return PdfUrl(text) if url.path.lower().endswith(".pdf") else WebUrl(text)
     raise UsageError(
-        f"not a paper id: {text!r} (an arXiv id or URL, DOI, S2 paperId or PDF URL,"
-        " or a LessWrong post URL or lw:ID)"
+        f"not a paper id: {text!r} (an arXiv id or URL, DOI, S2 paperId, PDF URL or"
+        " web page URL, or a LessWrong post URL or lw:ID)"
     )
 
 
@@ -484,6 +547,7 @@ class Response:
     status: int
     headers: dict[str, str]
     content: bytes
+    url: str = ""  # where redirects ended, when the fetcher says
 
 
 Fetch = Callable[
@@ -508,7 +572,7 @@ def requests_fetch(
         )
     except (requests.Timeout, requests.ConnectionError) as e:
         raise TransportError(type(e).__name__) from e
-    return Response(r.status_code, dict(r.headers), r.content)
+    return Response(r.status_code, dict(r.headers), r.content, r.url)
 
 
 @dataclass(frozen=True)
@@ -559,6 +623,182 @@ def pdftotext(pdf: Path, txt: Path) -> None:
         ) from e
     except subprocess.CalledProcessError as e:
         raise ExtractFailed(f"pdftotext failed: {e.stderr.strip()}") from e
+
+
+# Stand-ins for the text pandoc would escape or drop, put back in its Markdown: private
+# use characters around a number, which pandoc passes through as they are.
+STAND_IN = "\ue000{}\ue001"
+STOOD_IN = re.compile("(\\d+)")
+STAND_IN_CHARACTER = re.compile("[]")
+HTML_FLAGS = re.IGNORECASE | re.DOTALL
+COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+# An inline <svg> is a drawing: pandoc would write it out as a base64 image.
+UNREAD_ELEMENTS = re.compile(r"<(script|style|svg)\b[^>]*>.*?</\1\s*>", HTML_FLAGS)
+D_MATH = re.compile(r"<d-math\b([^>]*)>(.*?)</d-math\s*>", HTML_FLAGS)
+D_CITE = re.compile(
+    r"""<d-cite\b[^>]*?\bkey\s*=\s*["']([^"']*)["'][^>]*>(?:\s*</d-cite\s*>)?""",
+    HTML_FLAGS,
+)
+D_FOOTNOTE_OPEN = re.compile(r"\s*<d-footnote\b[^>]*>\s*", HTML_FLAGS)
+D_FOOTNOTE_CLOSE = re.compile(r"\s*</d-footnote\s*>", HTML_FLAGS)
+IMG = re.compile(r"<img\b[^>]*>", HTML_FLAGS)
+HEADING_OPEN = re.compile(r"<h[1-6]\b[^>]*>", HTML_FLAGS)
+
+
+def html_attribute(tag: str, name: str) -> str | None:
+    """The value of the tag's attribute, unescaped, or None when it has none."""
+    m = re.search(
+        rf"""\s{name}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", tag, HTML_FLAGS
+    )
+    return html.unescape(next(g for g in m.groups() if g is not None)) if m else None
+
+
+def page_markdown(page: str) -> str:
+    """An HTML page as GitHub Markdown, through pandoc, headings as # lines.
+
+    Comments, scripts, styles and inline <svg> drawings are dropped. Distill's
+    elements, which pandoc doesn't know, are kept as text: <d-math>X</d-math> as
+    $X$ and <d-math block> as $$X$$,
+    <d-cite key="K"> as [cite:K], a <d-footnote>'s text in place as [footnote: ...].
+    An image is [IMG PATH], or [IMG inline] when its src is a data: URI, and a
+    heading's id goes before its text as {#ID}."""
+    kept: list[str] = []
+
+    def stand_in(text: str) -> str:
+        kept.append(text)
+        return STAND_IN.format(len(kept) - 1)
+
+    def math(m: re.Match[str]) -> str:
+        tex = html.unescape(m.group(2)).strip()
+        if re.search(r"\bblock\b", m.group(1), re.IGNORECASE):
+            return f"<p>{stand_in(f'$${tex}$$')}</p>"
+        return stand_in(f"${tex}$")
+
+    def image(m: re.Match[str]) -> str:
+        src = html_attribute(m.group(0), "src")
+        if src and src.strip().lower().startswith("data:"):
+            src = "inline"  # the image itself, in base64
+        return stand_in(f"[IMG {src}]") if src else ""
+
+    def heading(m: re.Match[str]) -> str:
+        anchor = html_attribute(m.group(0), "id")
+        return m.group(0) + (stand_in(f"{{#{anchor}}} ") if anchor else "")
+
+    def restored(text: str) -> str:
+        """The text with what was kept put back, and inside what was kept."""
+        return STOOD_IN.sub(lambda m: restored(kept[int(m.group(1))]), text)
+
+    # First, so that every stand-in character left is one of ours: the page's own.
+    page = STAND_IN_CHARACTER.sub(lambda m: stand_in(m.group(0)), page)
+    # Comments before scripts: a <script> in a comment would open an element to drop.
+    page = COMMENT.sub("", page)
+    page = UNREAD_ELEMENTS.sub("", page)
+    page = D_MATH.sub(math, page)
+    page = D_CITE.sub(lambda m: stand_in(f"[cite:{html.unescape(m.group(1))}]"), page)
+    page = D_FOOTNOTE_OPEN.sub(lambda m: stand_in(" [footnote: "), page)
+    page = D_FOOTNOTE_CLOSE.sub(lambda m: stand_in("]"), page)
+    page = IMG.sub(image, page)
+    page = HEADING_OPEN.sub(heading, page)
+    try:
+        # Without raw_html, an element Markdown has no form for (a figure, a div, a
+        # table with merged cells) gives its text, not its tags.
+        done = subprocess.run(
+            ["pandoc", "--from=html", "--to=gfm-raw_html", "--wrap=none"],
+            input=page,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:
+        raise ExtractFailed(
+            "pandoc is not installed (https://pandoc.org/installing.html); "
+            "it turns an HTML page into text"
+        ) from e
+    except subprocess.CalledProcessError as e:
+        raise ExtractFailed(f"pandoc failed: {e.stderr.strip()}") from e
+    return restored(done.stdout)
+
+
+# A paper has more text than this; a login page, an app shell or a landing page less.
+MIN_PAGE_CHARACTERS = 2000
+TITLE = re.compile(r"<title\b[^>]*>(.*?)</title\s*>", HTML_FLAGS)
+
+
+@dataclass(frozen=True)
+class PageOrigin:
+    """Where a cached web page's Markdown came from, kept beside it."""
+
+    asked: str  # the URL asked for, without its fragment
+    url: str  # where redirects ended
+    title: str  # the page's <title>
+    fetched: str  # UTC, as utc_now() gives it
+    characters: int  # of its Markdown
+
+    def line(self) -> str:
+        """What every read of the page says on stderr, so that a page that isn't
+        the paper asked for shows."""
+        title = f'"{self.title}"' if self.title else "with no title"
+        return f"paper: web page {title}, fetched {self.fetched[:10]}"
+
+
+def page_from_answer(asked: str, response: "Response") -> tuple[str, PageOrigin]:
+    """The Markdown of the HTML page that answered a request for `asked`, and its
+    origin. ExtractFailed for a page with too little text to be a paper."""
+    page = decoded_page(response)
+    text = page_markdown(page)
+    characters = len(text.strip())
+    if characters < MIN_PAGE_CHARACTERS:
+        raise ExtractFailed(
+            f"the page at {asked} has only {characters} characters of text: "
+            "probably a login page, an app shell or a landing page, not a paper"
+        )
+    title = TITLE.search(page)
+    return text, PageOrigin(
+        asked,
+        response.url or asked,
+        " ".join(html.unescape(title.group(1)).split()) if title else "",
+        utc_now(),
+        characters,
+    )
+
+
+CHARSET = r"""charset\s*=\s*["']?([\w.:-]+)"""
+META_CHARSET = re.compile(rb"<meta\b[^>]*?\b" + CHARSET.encode(), re.IGNORECASE)
+
+
+def decoded_page(response: "Response") -> str:
+    """The page's text, in the charset its Content-Type header declares, else the
+    <meta> in its first 1024 bytes, else UTF-8, as it is when Python doesn't know
+    the charset named. Bytes that aren't in the charset become U+FFFD."""
+    content_type = header(response, "Content-Type") or ""
+    named = []
+    if in_header := re.search(CHARSET, content_type, re.IGNORECASE):
+        named.append(in_header.group(1))
+    if in_meta := META_CHARSET.search(response.content[:1024]):
+        named.append(in_meta.group(1).decode("ascii"))
+    for charset in named:
+        try:
+            return response.content.decode(charset, errors="replace")
+        except LookupError:
+            continue
+    return response.content.decode("utf-8", errors="replace")
+
+
+def cached_page_origin(path: Path) -> PageOrigin | None:
+    """The origin cached at `path`, or None when it's missing or was cached in a
+    shape this version doesn't read."""
+    try:
+        return PageOrigin(**json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def is_html(response: "Response") -> bool:
+    """Whether the answer says it is HTML, or starts as an HTML document does."""
+    start = response.content[:200].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    return "html" in (header(response, "Content-Type") or "").lower() or (
+        start.startswith((b"<!doctype html", b"<html"))
+    )
 
 
 @dataclass(frozen=True)
@@ -1013,7 +1253,7 @@ class Client:
                 f"HTTP {code}: {error_text(response)}",
                 parse_retry_after(response.headers),
             )
-        return Response(code, response.headers, response.content)
+        return replace(response, status=code)
 
 
 def backoff(attempt: int, retry_after: float | None) -> float:
@@ -1680,7 +1920,7 @@ def cmd_search(client: Client, args: argparse.Namespace) -> int:
 
 def cached_text(client: Client, id_text: str, command: str) -> Path:
     """The paper's extracted text, downloaded and extracted first if not cached, or
-    the post's Markdown, fetched first if not cached."""
+    the post's or web page's Markdown, fetched first if not cached."""
     try:
         pid = parse_id(id_text)
         if isinstance(pid, LessWrongPost):
@@ -1690,20 +1930,43 @@ def cached_text(client: Client, id_text: str, command: str) -> Path:
         raise UsageError(f"`paper {command}` {e}") from e
     folder = client.cache / "pdf"
     pdf, txt = folder / (stem + ".pdf"), folder / (stem + ".txt")
-    if not txt.exists():
-        if url is None:
-            url = open_access_pdf(client, pid)
-        response = client.request("PDF download", "GET", url)
-        if response.status == 404:
-            raise NotFound(url)
-        if response.status != 200:
-            raise RemoteError(f"PDF download: HTTP {response.status} for {url}")
-        if not response.content.startswith(b"%PDF"):
-            raise ExtractFailed(f"not a PDF at {url}")
+    if txt.exists():
+        return txt
+    # A URL that names no PDF is a page, unless what it serves is a PDF after all.
+    page = pid if isinstance(pid, WebUrl) else None
+    service = "PDF download"
+    if page:
+        markdown = client.cache / "web" / (page.page_stem() + ".md")
+        origin_file = markdown.with_suffix(".json")
+        origin = cached_page_origin(origin_file) if markdown.exists() else None
+        if origin:
+            print(origin.line(), file=sys.stderr)
+            return markdown
+        url, service = page.page_url(), "Web page download"
+    if url is None:
+        url = open_access_pdf(client, pid)
+    response = client.request(service, "GET", url)
+    if response.status == 404:
+        raise NotFound(url)
+    if response.status != 200:
+        raise RemoteError(f"{service}: HTTP {response.status} for {url}")
+    if response.content.startswith(b"%PDF"):
         write_atomic(pdf, response.content)
         with replaced_on_success(txt) as partial:
             client.extract(pdf, partial)
-    return txt
+        return txt
+    if page is None:
+        raise ExtractFailed(f"not a PDF at {url}")
+    if not is_html(response):
+        raise ExtractFailed(f"not a PDF or an HTML page at {url}")
+    text, origin = page_from_answer(url, response)
+    asked, landed = urlsplit(origin.asked), urlsplit(origin.url)
+    if (asked.hostname, asked.path) != (landed.hostname, landed.path):
+        print(f"paper: {origin.asked} redirected to {origin.url}", file=sys.stderr)
+    write_atomic(markdown, text.encode())
+    write_atomic(origin_file, json.dumps(asdict(origin)).encode())
+    print(origin.line(), file=sys.stderr)
+    return markdown
 
 
 def open_access_pdf(client: Client, pid: PaperId) -> str:
@@ -2644,7 +2907,9 @@ def main(
     stats.add_argument(
         "--hours", type=float, default=24, help="how far back (default 24)"
     )
-    id_help = "arXiv id or URL, DOI, PDF URL, or LessWrong post URL or lw:ID"
+    id_help = (
+        "arXiv id or URL, DOI, PDF or web page URL, or LessWrong post URL or lw:ID"
+    )
     text = sub.add_parser("text", help="full text: prints the cached .txt or .md path")
     text.add_argument("id", metavar="ID", help=id_help)
     outline = sub.add_parser("outline", help="section headings with line numbers")

@@ -521,14 +521,16 @@ def test_text_retries_a_busy_arxiv(cache, capsys):
     assert sleeps == [5]
 
 
-def test_text_of_a_page_that_is_not_a_pdf_exits_1_and_caches_nothing(cache, capsys):
-    html = paper.Response(200, {"Content-Type": "text/html"}, b"<html>login</html>")
+def test_text_of_what_is_neither_a_pdf_nor_a_page_exits_1_and_caches_nothing(
+    cache, capsys
+):
+    answer = paper.Response(200, {"Content-Type": "application/json"}, b'{"a": 1}')
     url = "https://openreview.net/forum?id=abc"
     code, out, err, _ = run(
-        capsys, ["text", url], FakeHTTP(("GET", url, [html])), extract=fake_extract
+        capsys, ["text", url], FakeHTTP(("GET", url, [answer])), extract=fake_extract
     )
     assert (code, out) == (1, "")
-    assert "not a PDF" in err
+    assert "not a PDF or an HTML page" in err
     assert [p.name for p in cache.rglob("*.*")] == ["requests.jsonl"]
 
 
@@ -3734,3 +3736,316 @@ def test_outline_of_a_post_follows_commonmark_on_rules_and_fences(
     http = FakeHTTP(post_route(post_answer(contents={"markdown": markdown})))
     code, out, err, _ = run(capsys, ["outline", f"lw:{POST_ID}"], http)
     assert (code, out.splitlines()) == (0, headings), err
+
+
+# A web-native paper, in Distill's markup. A page with less text than the filler
+# gives it is refused as no paper.
+WEB_URL = "https://transformer-circuits.pub/2026/workspace/index.html"
+FILLER = "<p>" + "The lens reads one direction at a time. " * 60 + "</p>"
+WEB_HTML = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Workspace</title>
+<script src="template.v2.js"></script>
+<style>d-article { color: red; }</style>
+</head><body>
+<d-front-matter><script type="text/json">{"title": "Workspace"}</script></d-front-matter>
+<d-title><h1>A Global Workspace in a Language Model</h1></d-title>
+<d-article>
+<h2 id="methods">Methods</h2>
+<p>We read the residual stream <d-math>h_\ell</d-math> at layer
+<d-math>\ell</d-math><d-cite key="elhage2021"></d-cite>, which costs 12
+units.<d-footnote>Measured on one seed.</d-footnote></p>
+<d-math block>
+  J = \frac{\partial h_L}{\partial h_\ell}
+</d-math>
+<figure><img src="figures/lens.png" alt="The lens" width="704">
+<figcaption>Figure 1: the lens at each layer.</figcaption></figure>
+<h3 id="setup-details">Setup <em>details</em></h3>
+<p>The probe is linear.</p>
+FILLER
+</d-article>
+<script>var tracking = "do-not-keep";</script>
+</body></html>
+""".replace("FILLER", FILLER)
+needs_pandoc = pytest.mark.skipif(not shutil.which("pandoc"), reason="needs pandoc")
+
+
+def web_route(url=WEB_URL, html=WEB_HTML, final_url=""):
+    headers = {"Content-Type": "text/html; charset=utf-8"}
+    return ("GET", url, [paper.Response(200, headers, html.encode(), final_url)])
+
+
+def page_of(body):
+    """A page long enough to be read as a paper, holding `body`."""
+    return f"<!doctype html><title>A page</title><body>{body}{FILLER}</body>"
+
+
+@needs_pandoc
+def test_text_of_a_web_page_caches_its_markdown_and_prints_the_path(cache, capsys):
+    http = FakeHTTP(web_route())
+    code, out, err, _ = run(capsys, ["text", WEB_URL], http)
+    assert code == 0, err
+    path = Path(out.strip())
+    assert path.suffix == ".md" and path.is_relative_to(cache / "web")
+    text = path.read_text()
+    assert r"residual stream $h_\ell$ at layer $\ell$[cite:elhage2021], which" in text
+    assert r"$$J = \frac{\partial h_L}{\partial h_\ell}$$" in text
+    assert "units. [footnote: Measured on one seed.]" in text
+    assert "[IMG figures/lens.png]" in text
+    assert "Figure 1: the lens at each layer." in text
+    assert "The probe is linear." in text
+    for dropped in ("do-not-keep", "color: red", "template.v2.js", '"title"', "<"):
+        assert dropped not in text
+    assert [call["url"] for call in http.calls] == [WEB_URL]
+
+
+@needs_pandoc
+def test_outline_of_a_web_page_lists_its_headings_with_their_anchors(cache, capsys):
+    code, out, err, _ = run(capsys, ["outline", WEB_URL], FakeHTTP(web_route()))
+    assert code == 0, err
+    found = [line.split(None, 1) for line in out.splitlines()]
+    assert [heading for _, heading in found] == [
+        "# A Global Workspace in a Language Model",
+        "## {#methods} Methods",
+        "### {#setup-details} Setup *details*",
+    ]
+    _, text, _, _ = run(capsys, ["text", WEB_URL], FakeHTTP())
+    lines = Path(text.strip()).read_text().split("\n")
+    assert lines[int(found[1][0]) - 1] == "## {#methods} Methods"
+
+
+@needs_pandoc
+def test_grep_finds_a_line_in_a_web_page(cache, capsys):
+    argv = ["grep", WEB_URL, r"\\partial h_L", "-C", "0"]
+    code, out, err, _ = run(capsys, argv, FakeHTTP(web_route()))
+    assert code == 0, err
+    number, _, line = out.strip().partition(":")
+    assert number.isdigit()
+    assert line == r"$$J = \frac{\partial h_L}{\partial h_\ell}$$"
+
+
+@needs_pandoc
+def test_a_second_text_of_a_web_page_reads_the_cache_whatever_its_fragment(
+    cache, capsys
+):
+    _, first, _, _ = run(capsys, ["text", WEB_URL], FakeHTTP(web_route()))
+    code, again, err, _ = run(capsys, ["text", WEB_URL + "#methods"], FakeHTTP())
+    assert (code, again) == (0, first), err
+
+
+def page_text(capsys, body, headers=None, encoding="utf-8"):
+    """The cached Markdown of a page holding `body`."""
+    headers = headers or {"Content-Type": "text/html; charset=utf-8"}
+    answer = paper.Response(200, headers, page_of(body).encode(encoding))
+    code, out, err, _ = run(
+        capsys, ["text", WEB_URL], FakeHTTP(("GET", WEB_URL, [answer]))
+    )
+    assert code == 0, err
+    return Path(out.strip()).read_text()
+
+
+@needs_pandoc
+def test_a_page_holding_the_stand_in_characters_keeps_them(cache, capsys):
+    body = "<p>Private 7 use, and <d-math>x_0</d-math>.</p>"
+    text = page_text(capsys, body)
+    assert "Private 7 use, and $x_0$." in text
+
+
+@needs_pandoc
+@pytest.mark.parametrize(
+    "content_type, declared",
+    [
+        ("text/html; charset=ISO-8859-1", ""),
+        ("text/html", '<meta charset="iso-8859-1">'),
+        (
+            "text/html",
+            "<meta http-equiv='Content-Type' content='text/html; charset=iso-8859-1'>",
+        ),
+        ('text/html; charset="iso-8859-1"', '<meta charset="utf-8">'),
+        ("text/html; charset=no-such-charset", '<meta charset="iso-8859-1">'),
+    ],
+)
+def test_a_page_is_read_in_the_charset_it_declares(
+    cache, capsys, content_type, declared
+):
+    body = declared + "<p>Poincaré's café costs £5.</p>"
+    text = page_text(capsys, body, {"Content-Type": content_type}, "iso-8859-1")
+    assert "Poincaré's café costs £5." in text
+
+
+@needs_pandoc
+def test_a_page_that_declares_no_charset_is_read_as_utf8_with_replacements(
+    cache, capsys
+):
+    answer = page_of("<p>naïve cafE9</p>").encode().replace(b"E9", b"\xe9")
+    http = FakeHTTP(("GET", WEB_URL, [paper.Response(200, {}, answer)]))
+    code, out, err, _ = run(capsys, ["text", WEB_URL], http)
+    assert code == 0, err
+    assert "naïve caf�" in Path(out.strip()).read_text()
+
+
+@needs_pandoc
+@pytest.mark.parametrize("start", ["<!DOCTYPE html>", "﻿ \n<HTML lang='en'>"])
+def test_a_page_served_as_another_type_is_known_by_how_it_starts(cache, capsys, start):
+    body = f"{start}<title>A page</title><p>Sniffed.</p>{FILLER}".encode()
+    answer = paper.Response(200, {"Content-Type": "application/octet-stream"}, body)
+    http = FakeHTTP(("GET", WEB_URL, [answer]))
+    code, out, err, _ = run(capsys, ["text", WEB_URL], http)
+    assert code == 0, err
+    assert "Sniffed." in Path(out.strip()).read_text()
+
+
+@needs_pandoc
+def test_text_between_commented_out_tags_survives(cache, capsys):
+    body = (
+        "<!-- <script> --><p>Kept between comments.</p><!-- </script> -->"
+        "<!-- <p>A commented\nparagraph.</p> --><p>After.</p>"
+    )
+    text = page_text(capsys, body)
+    assert "Kept between comments." in text and "After." in text
+    assert "commented" not in text and "script" not in text
+
+
+@needs_pandoc
+def test_an_inline_image_or_svg_leaves_no_base64_or_markup(cache, capsys):
+    body = (
+        '<p>Before <img alt="plot" src="data:image/png;base64,iVBORw0KGgoAAAANSU">'
+        " after.</p>"
+        '<figure><svg viewBox="0 0 10 10"><title>Drawn</title><path d="M0 0L9 9"/>'
+        '<image href="data:image/png;base64,QUJDREVGRw=="/></svg>'
+        "<figcaption>Figure 2: a drawing.</figcaption></figure>"
+    )
+    text = page_text(capsys, body)
+    assert "Before [IMG inline] after." in text
+    assert "Figure 2: a drawing." in text
+    for dropped in ("base64", "iVBORw0KGgo", "QUJDREVGRw", "Drawn", "M0 0L9 9"):
+        assert dropped not in text
+
+
+@needs_pandoc
+def test_text_of_a_page_with_little_text_exits_1_and_caches_nothing(cache, capsys):
+    html = paper.Response(200, {"Content-Type": "text/html"}, b"<html>login</html>")
+    url = "https://openreview.net/forum?id=abc"
+    code, out, err, _ = run(capsys, ["text", url], FakeHTTP(("GET", url, [html])))
+    assert (code, out) == (1, "")
+    (line,) = err.splitlines()
+    assert url in line and "only 5 characters of text" in line
+    assert "login page" in line
+    assert [p.name for p in cache.rglob("*.*")] == ["requests.jsonl"]
+
+
+@needs_pandoc
+def test_a_web_pages_origin_is_cached_beside_its_markdown(cache, capsys):
+    _, out, err, _ = run(capsys, ["text", WEB_URL + "#methods"], FakeHTTP(web_route()))
+    path = Path(out.strip())
+    origin = json.loads(path.with_suffix(".json").read_text())
+    assert sorted(origin) == ["asked", "characters", "fetched", "title", "url"]
+    assert (origin["asked"], origin["url"]) == (WEB_URL, WEB_URL)
+    assert origin["title"] == "Workspace"
+    assert origin["characters"] == len(path.read_text().strip())
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", origin["fetched"])
+    assert "redirected" not in err
+
+
+@needs_pandoc
+@pytest.mark.parametrize("command", [["text"], ["outline"], ["grep", "-C", "0"]])
+def test_reading_a_web_page_names_its_title_and_fetch_date_on_stderr(
+    cache, capsys, command
+):
+    argv = [*command, WEB_URL, *(["probe"] if command[0] == "grep" else [])]
+    code, first_out, first, _ = run(capsys, argv, FakeHTTP(web_route()))
+    assert code == 0, first
+    origin = json.loads(next((cache / "web").glob("*.json")).read_text())
+    assert first == f'paper: web page "Workspace", fetched {origin["fetched"][:10]}\n'
+    code, out, again, _ = run(capsys, argv, FakeHTTP())
+    assert (code, out, again) == (0, first_out, first)
+
+
+@needs_pandoc
+def test_a_web_page_that_redirects_elsewhere_says_so_when_converted(cache, capsys):
+    landed = "https://login.example.org/sso/start?next=workspace"
+    http = FakeHTTP(web_route(final_url=landed))
+    code, out, err, _ = run(capsys, ["text", WEB_URL], http)
+    assert code == 0, err
+    said, origin_line = err.splitlines()
+    assert "redirected" in said and WEB_URL in said and landed in said
+    assert origin_line.startswith('paper: web page "Workspace"')
+    origin = json.loads(Path(out.strip()).with_suffix(".json").read_text())
+    assert (origin["asked"], origin["url"]) == (WEB_URL, landed)
+    _, _, again, _ = run(capsys, ["text", WEB_URL], FakeHTTP())
+    assert again == origin_line + "\n"
+
+
+@needs_pandoc
+def test_a_redirect_to_the_same_host_and_path_is_not_announced(cache, capsys):
+    http = FakeHTTP(web_route(final_url=WEB_URL + "?utm=1"))
+    _, _, err, _ = run(capsys, ["text", WEB_URL], http)
+    assert "redirected" not in err
+
+
+@needs_pandoc
+def test_a_web_page_cached_without_its_origin_is_fetched_again(cache, capsys):
+    _, out, _, _ = run(capsys, ["text", WEB_URL], FakeHTTP(web_route()))
+    Path(out.strip()).with_suffix(".json").unlink()
+    http = FakeHTTP(web_route())
+    code, again, err, _ = run(capsys, ["text", WEB_URL], http)
+    assert (code, again) == (0, out), err
+    assert len(http.calls) == 1
+    assert Path(out.strip()).with_suffix(".json").exists()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["meta", WEB_URL], ["cites", WEB_URL], ["bib", "1706.03762", WEB_URL]],
+)
+def test_meta_bib_and_cites_refuse_a_web_page_before_any_request(cache, capsys, argv):
+    http = FakeHTTP()
+    code, out, err, _ = run(capsys, argv, http)
+    assert (code, out) == (2, "")
+    assert len(err.splitlines()) == 1
+    assert "`paper text`, `outline` and `grep`" in err and WEB_URL in err
+    assert http.calls == []
+
+
+def test_a_web_page_without_pandoc_says_so_and_caches_no_text(
+    cache, capsys, monkeypatch, tmp_path
+):
+    empty = tmp_path / "no-pandoc"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    code, out, err, _ = run(capsys, ["text", WEB_URL], FakeHTTP(web_route()))
+    assert (code, out) == (1, "")
+    assert "pandoc is not installed" in err
+    assert not list(cache.rglob("*.md"))
+
+
+def test_a_url_that_isnt_named_pdf_but_serves_one_is_still_extracted(cache, capsys):
+    url = "https://openreview.net/pdf?id=abc"
+    http = FakeHTTP(("GET", url, [pdf_response()]))
+    code, out, err, _ = run(capsys, ["text", url], http, extract=fake_extract)
+    assert code == 0, err
+    assert Path(out.strip()).read_text() == "extracted from %PDF-1.4"
+
+
+def test_a_url_named_pdf_that_serves_a_page_is_still_not_a_pdf(cache, capsys):
+    url = "https://example.com/paper.pdf"
+    code, out, err, _ = run(
+        capsys, ["text", url], FakeHTTP(web_route(url)), extract=fake_extract
+    )
+    assert (code, out) == (1, "")
+    assert "not a PDF" in err
+    assert not (cache / "web").exists()
+
+
+def test_a_missing_web_page_exits_1(cache, capsys):
+    http = FakeHTTP(("GET", WEB_URL, [paper.Response(404, {}, b"nope")]))
+    code, _, err, _ = run(capsys, ["text", WEB_URL], http)
+    assert code == 1
+    assert "not found" in err
+
+
+def test_help_says_which_commands_take_a_web_page(capsys):
+    with pytest.raises(SystemExit):
+        paper.main(["-h"])
+    out = " ".join(capsys.readouterr().out.split())
+    for words in ("HTML page", "pandoc", "web/", "[cite:KEY]", "[IMG PATH]"):
+        assert words in out

@@ -44,7 +44,7 @@ How you wait for a job depends on which agent you are. You are a subagent when a
 
 Either way, each poll (an `until grep` loop, `sleep`, `heavy status`, a `tail` of the log) sends the whole conversation again, which late in a long session runs to half a million tokens a call: wait with the notification or `waitone`.
 
-To make several text replacements in one or more files, pipe blocks to `apply-edits` rather than writing a Python heredoc script: a `--- PATH` line starts each file, then each block is `<<<<<<< SEARCH`, the old text, `=======`, the new text, `>>>>>>> REPLACE`, every marker on its own line. It applies all or nothing, and a miss shows the closest text. With `--cached` it edits only the staged copy, in git's index, to commit part of a change.
+To make several text replacements in one or more files, pipe blocks to `apply-edits` rather than writing a Python heredoc script: a `--- PATH` line starts each file, then each block is `<<<<<<< SEARCH`, the old text, `=======`, the new text, `>>>>>>> REPLACE`, every marker on its own line. It applies all or nothing, and a miss shows the closest text. With `--cached` it edits only the staged copy, in git's index, to commit part of a change. Write large new content (a long heredoc, a generated file) in a call of its own, before any step a hook might refuse: a refused call runs nothing, so everything typed into it is lost and has to be generated again.
 
 When ruff reports a line too long (E501) in a docstring or a comment, run `rewrap FILE...` rather than rewrapping by hand: it reflows only the paragraphs past the line length, and lists the lines it can't fix.
 

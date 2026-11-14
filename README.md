@@ -351,7 +351,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   only its own loopback, and a proxy it runs, reached through a unix socket,
   refuses github.com, api.github.com and loopback. It types each scripted turn once the agent's last turn ends (or, when
   Claude Code asks in its question dialog, into the dialog's free-text option, and turns.md names the question; a
-  dialog with several questions fails the run), asks a
+  dialog of several questions, or a multi-select one, is left through "Chat about this" and the turn sent as a message), asks a
   simulated human (`claude-fresh`) to answer open questions and judge
   conditional turns (never sent when it fails), and saves screens, transcripts
   and the files the run made, then removes the user. `--setup FILE` prepares

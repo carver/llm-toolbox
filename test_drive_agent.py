@@ -28,13 +28,16 @@ TOOL = Path(__file__).resolve().parent / "bin" / "drive-agent"
 # it CONNECT to HOST through $HTTPS_PROXY and report the status line, anything else
 # gets "done: <line>". Every turn writes ~/seen.json: user, env, cwd.
 # The fake Claude Code also asks in a question dialog, as AskUserQuestion does:
-# "dialog" asks one question, "dialog2" two in one dialog (tabs), "deaf" one it never
-# takes an answer to. The dialog writes its tool_use to the transcript and fires no
-# Stop hook. Its free-text option is 3, so its answer arrives as "3<text>" (a cooked
-# tty holds the 3 until Enter); then it writes the tool_result, works a while with
-# the answered dialog still drawn, replies "done: answer <text>" and fires Stop.
+# "dialog" asks one question, "dialog2" two in one dialog (tabs), "dialogm" one
+# multi-select question, "deaf" one it never takes an answer to, "nochat" two with no
+# "Chat about this". The dialog writes its tool_use to the transcript and fires no
+# Stop hook, and reads keys as they come, as Claude Code does. Key 3, its free-text
+# option, takes a typed line: for a single question it writes the tool_result, works
+# a while with the answered dialog still drawn, replies "done: answer <text>" and
+# fires Stop; with several it moves on to the next tab. Key 4, "Chat about this",
+# rejects the call, as Claude Code does, asks what to clarify and fires Stop.
 FAKE_AGENT = r"""#!/usr/bin/env python3
-import json, os, socket, subprocess, sys, time, uuid
+import json, os, socket, subprocess, sys, termios, time, tty, uuid
 HARNESS = os.path.basename(sys.argv[0])
 args = sys.argv[1:]
 if args[:1] == ["--version"]:
@@ -96,9 +99,10 @@ QUESTIONS = {
                "options": [{"label": "Cat", "description": ""},
                            {"label": "Dog", "description": ""}]},
 }
-DIALOGS = {"dialog": ["colour"], "dialog2": ["colour", "animal"], "deaf": ["colour"]}
+DIALOGS = {"dialog": ["colour"], "dialog2": ["colour", "animal"], "deaf": ["colour"],
+           "dialogm": ["colour"], "nochat": ["colour", "animal"]}
 
-def draw(questions):
+def draw(questions, chat=True):
     first = questions[0]
     print("─" * 40)
     if len(questions) > 1:
@@ -110,7 +114,8 @@ def draw(questions):
         print(("❯ " if n == 1 else "  ") + f"{n}. {option['label']}")
     print("  3. Type something.")
     print("─" * 40)
-    print("  4. Chat about this")
+    if chat:
+        print("  4. Chat about this")
     nav = "Tab/Arrow keys" if len(questions) > 1 else "↑/↓"
     print(f"Enter to select · {nav} to navigate · Esc to cancel", flush=True)
 
@@ -129,7 +134,8 @@ if HARNESS == "claude":
             for rec in records:
                 f.write(json.dumps(rec) + "\n")
     def ask(line):
-        questions = [QUESTIONS[k] for k in DIALOGS[line]]
+        questions = [dict(QUESTIONS[k], multiSelect=line == "dialogm")
+                     for k in DIALOGS[line]]
         tool_id = "toolu_" + uuid.uuid4().hex
         write({"type": "user", "message": {"content": line}},
               {"type": "assistant", "message": {"content": [
@@ -141,12 +147,54 @@ if HARNESS == "claude":
         with open(os.path.join(sub, "agent-1.jsonl"), "a") as f:
             f.write(json.dumps({"type": "assistant", "message": {"content": [
                 {"type": "text", "text": "subagent at work"}]}}) + "\n")
-        draw(questions)
+        draw(questions, chat=line != "nochat")
         return tool_id, questions
     def answer(tool_id, questions, text):
         write({"type": "user", "message": {"content": [
             {"type": "tool_result", "tool_use_id": tool_id,
              "content": f'User has answered your questions: "{questions[0]["question"]}"="{text}".'}]}})
+    def key():
+        return os.read(0, 1).decode(errors="replace")
+    def dialog(line):
+        # Keys as they come from the moment the dialog shows, keeping any typed early.
+        saved = termios.tcgetattr(0)
+        tty.setcbreak(0, termios.TCSANOW)
+        tool_id, questions = ask(line)
+        try:
+            while True:
+                pressed = key()
+                if not pressed:
+                    sys.exit()
+                if line == "deaf":
+                    continue
+                if pressed == "3":
+                    given = ""
+                    while (c := key()) not in ("\r", "\n", ""):
+                        given += c
+                    if len(questions) > 1:
+                        draw(questions[1:])
+                        continue
+                    answer(tool_id, questions, given)
+                    # fixed sleep: the agent works on while the answered dialog is still drawn
+                    time.sleep(1.5)
+                    text = "done: answer " + given
+                elif pressed == "4" and line != "nochat":
+                    write({"type": "user", "message": {"content": [
+                        {"type": "tool_result", "tool_use_id": tool_id, "is_error": True,
+                         "content": "The user doesn't want to proceed with this tool use. "
+                                    "The user wants to clarify these questions."}]}})
+                    print("User declined to answer questions")
+                    text = "What would you like to clarify?"
+                else:
+                    continue
+                write({"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": text}]}})
+                print(text)
+                turn_end(line, text)
+                print("❯ ", end="", flush=True)
+                return
+        finally:
+            termios.tcsetattr(0, termios.TCSADRAIN, saved)
     def turn_end(line, text):
         settings = json.load(open(os.path.join(os.environ["HOME"], ".claude", "settings.json")))
         for hook in settings["hooks"]["Stop"][0]["hooks"]:
@@ -195,31 +243,12 @@ if os.path.exists(os.path.join(os.environ["HOME"], "trust-late")):
         print("dropped: " + line.strip(), flush=True)
     print("? for shortcuts")
     print("❯ ", end="", flush=True)
-pending = None
 for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
-    if pending:
-        tool_id, questions, kind = pending
-        if kind == "deaf" or not line.startswith("3"):
-            draw(questions)
-            continue
-        pending = None
-        given = line[1:]
-        answer(tool_id, questions, given)
-        # fixed sleep: the agent works on while the answered dialog is still drawn
-        time.sleep(1.5)
-        text = "done: answer " + given
-        with open(transcript, "a") as f:
-            f.write(json.dumps({"type": "assistant", "message": {"content": [
-                {"type": "text", "text": text}]}}) + "\n")
-        print(text)
-        turn_end(line, text)
-        print("❯ ", end="", flush=True)
-        continue
     if HARNESS == "claude" and line in DIALOGS:
-        pending = (*ask(line), line)
+        dialog(line)
         continue
     text = reply(line)
     seen()
@@ -603,10 +632,37 @@ def test_a_condition_after_a_restart_is_judged_on_nothing_of_the_old_session(
     assert "## Turn 3: skipped, no agent message to judge" in log
 
 
-def test_several_questions_in_one_dialog_fail_the_run_loudly(tmp_path, env):
+@pytest.mark.parametrize(
+    ("kind", "count", "questions"),
+    [
+        ("dialog2", 2, ["Which colour do you prefer?", "Which animal do you prefer?"]),
+        ("dialogm", 1, ["Which colour do you prefer?"]),
+    ],
+)
+def test_a_dialog_of_several_or_multi_select_questions_is_left_for_the_chat(
+    tmp_path, env, kind, count, questions
+):
     # jason82 and jason85: the answer went into the first tab and the dialog moved
     # on to the next, which the driver took for a turn end; nothing was submitted.
-    path = scenario(tmp_path, turns=["dialog2", "Yes, both.", "after"])
+    # A person answering in their own words picks "Chat about this" and types there.
+    path = scenario(tmp_path, turns=[kind, "Yes, both.", "after"])
+    out = tmp_path / "out"
+    drive(env, "run", path, "--harness", "claude", "--name", "jason32", "--out", out)
+    (records,) = transcript_records(out).values()
+    answers = dialog_answers(records)
+    assert len(answers) == 1 and "clarify" in answers[0]
+    assert typed(records) == [kind, "Yes, both.", "after"]
+    assert "done: Yes, both." in (out / "screen-02.txt").read_text()
+    turn2 = (out / "turns.md").read_text().split("## Turn 2")[1].split("## Turn 3")[0]
+    assert f"Left a dialog of {count} question" in turn2
+    assert '"Chat about this"' in turn2 and "What would you like to clarify?" in turn2
+    for question in questions:
+        assert question in turn2
+    assert json.loads((out / "run.json").read_text())["outcome"] == "done"
+
+
+def test_a_dialog_of_several_questions_with_no_chat_option_fails_the_run(tmp_path, env):
+    path = scenario(tmp_path, turns=["nochat", "Yes, both.", "after"])
     out = tmp_path / "out"
     done = drive(
         env,
@@ -615,20 +671,19 @@ def test_several_questions_in_one_dialog_fail_the_run_loudly(tmp_path, env):
         "--harness",
         "claude",
         "--name",
-        "jason32",
+        "jason35",
         "--out",
         out,
         check=False,
     )
     assert done.returncode == 1
     assert json.loads((out / "run.json").read_text())["outcome"] == (
-        "multi-question-dialog"
+        "dialog-unanswered"
     )
     log = (out / "turns.md").read_text()
-    assert "Which colour do you prefer?" in log and "Which animal" in log
-    assert "Sent: Yes, both." not in log and "## Turn 3" not in log
+    assert "Chat about this" in log and "## Turn 3" not in log
     (records,) = transcript_records(out).values()
-    assert typed(records) == ["dialog2"] and not dialog_answers(records)
+    assert typed(records) == ["nochat"] and not dialog_answers(records)
 
 
 def test_a_dialog_that_never_takes_the_answer_fails_the_run(tmp_path, env):

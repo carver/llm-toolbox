@@ -21,9 +21,10 @@ its home, its state folder and its iptables rule, on any exit.
 When Claude Code asks through its question dialog (AskUserQuestion), that ends the
 agent's turn: the next turn is typed into the dialog's free-text option ("Type
 something") and submitted, as a person would type their own answer, and turns.md
-names the question. A dialog that doesn't take the answer within
-DRIVE_AGENT_ANSWER_LIMIT, or one that asks several questions at once (tabs), fails
-the run there.
+names the question. A dialog of several questions (tabs) or a multi-select one is
+left through its "Chat about this" option instead, and once the agent's reply to
+that ends, the turn is sent as an ordinary message. A dialog that offers no such
+option, or doesn't close within DRIVE_AGENT_ANSWER_LIMIT, fails the run there.
 
 SCENARIO is JSON:
   turns       the human's messages, in order. A string is sent as it is; {NAME} in it
@@ -103,8 +104,7 @@ Needs tmux, and for isolation, passwordless sudo, bwrap (the bubblewrap package)
 iptables. Exit status: 0 the run ended, 1 it failed (harness not ready, a turn
 timed out, a question dialog it couldn't answer, a setup error), 2 usage error.
 run.json's outcome then says which: failed, not-ready, timeout, auth, rate-limit,
-dialog (a turn stopped on some other dialog), dialog-unanswered,
-multi-question-dialog.
+dialog (a turn stopped on some other dialog), dialog-unanswered.
 """
 
 import argparse
@@ -1265,25 +1265,54 @@ class Session:
         time.sleep(min(1.5, SETTLE + 0.2))
         self.tmux("send-keys", "-t", self.name, "Enter")
 
-    def answer(self, text: str, question: dict) -> str | None:
-        """Types `text` into the question dialog's free-text option and submits it.
-        Returns why it failed, or None once the transcript holds the answer."""
+    def choose(self, question: dict, option: str) -> str | None:
+        """Presses the number of the dialog's option `option`, which Claude Code
+        takes at once, with no Enter. Returns why it couldn't."""
         shown = self.asking()
         if not shown or shown["id"] != question["id"]:
-            return "the dialog closed before the answer was typed"
-        choice = re.findall(r"(\d+)\. Type something", self.screen())
+            return "the dialog closed before drive-agent answered it"
+        choice = re.findall(rf"(\d+)\. {re.escape(option)}", self.screen())
         if not choice:
-            return "the dialog shows no free-text option (Type something)"
+            return f'the dialog shows no "{option}" option'
         self.tmux("send-keys", "-t", self.name, choice[-1])
-        time.sleep(1)
-        self.send(text)
+        return None
+
+    def taken(self, question: dict) -> str | None:
+        """Waits for the transcript to hold the dialog's tool_result. Returns why
+        it didn't."""
         deadline = time.time() + ANSWER_LIMIT
         while time.time() < deadline:
             pending = self.harness.pending_question()
             if not pending or pending["id"] != question["id"]:
                 return None
             time.sleep(0.2)
-        return f"the dialog didn't take the answer within {ANSWER_LIMIT:g} s"
+        return f"the dialog didn't close within {ANSWER_LIMIT:g} s"
+
+    def answer(self, text: str, question: dict) -> str | None:
+        """Types `text` into the question dialog's free-text option and submits it.
+        Returns why it failed, or None once the transcript holds the answer."""
+        failed = self.choose(question, "Type something")
+        if failed:
+            return failed
+        time.sleep(1)
+        self.send(text)
+        return self.taken(question)
+
+    def leave(self, question: dict) -> str | None:
+        """Leaves the dialog through "Chat about this", as a person who would
+        answer in their own words: Claude Code rejects the call, and the agent asks
+        what to clarify and ends its turn. Returns why that failed, or None once the
+        turn has ended and the prompt takes a message."""
+        before = self.turns_seen()
+        failed = self.choose(question, "Chat about this") or self.taken(question)
+        if failed:
+            return failed
+        ended, again = self.wait_turn(before)
+        if again:
+            return 'the agent asked in a dialog again after "Chat about this"'
+        if not ended:
+            return 'the agent\'s turn after "Chat about this" never ended'
+        return None
 
 
 def trust_dialog_open(screen: str) -> bool:
@@ -1358,18 +1387,6 @@ def interactive(
                 f.write(f"## Turn {n}: new session\n\n")
             continue
         turn = {"text": turn} if isinstance(turn, str) else turn
-        if asked and len(asked["questions"]) > 1:
-            why = (
-                f"the agent asked {len(asked['questions'])} questions in one dialog, "
-                "which drive-agent can't answer"
-            )
-            with log.open("a") as f:
-                f.write(
-                    f"## Turn {n}: FAILED, {why}\n\nScripted: {json.dumps(turn)}\n\n"
-                    f"Questions:\n{questions_text(asked)}\n\n"
-                )
-            print(f"drive-agent: turn {n}: {why}; see turns.md", file=sys.stderr)
-            return "multi-question-dialog"
         last = session.harness.last_message() if history else ""
         text, note = human_turn(turn, scenario, persona, last, history)
         if text is None:
@@ -1383,28 +1400,37 @@ def interactive(
         # approves nothing later.
         history.append(text)
         before = session.turns_seen()
-        answered = (
-            f"Answered in the question dialog, to:\n{questions_text(asked)}\n\n"
-            if asked
-            else ""
-        )
-        if asked:
+        answered, failed = "", None
+        if asked and leave_for_chat(asked):
+            count = len(asked["questions"])
+            answered = (
+                f"Left a dialog of {count} question{'s' if count > 1 else ''} "
+                f'through "Chat about this", to:\n{questions_text(asked)}\n\n'
+            )
+            failed = session.leave(asked)
+            if not failed:
+                answered += f"The agent replied: {session.harness.last_message()}\n\n"
+                before = session.turns_seen()
+                session.send(fill(text, values))
+        elif asked:
+            answered = (
+                f"Answered in the question dialog, to:\n{questions_text(asked)}\n\n"
+            )
             failed = session.answer(fill(text, values), asked)
-            if failed:
-                (session.out / f"screen-{n:02}.txt").write_text(session.screen())
-                with log.open("a") as f:
-                    f.write(
-                        f"## Turn {n}: FAILED, {failed}\n\n"
-                        f"Scripted: {json.dumps(turn)}\n\n{answered}Typed: {text}\n\n"
-                    )
-                print(
-                    f"drive-agent: turn {n}: {failed}; see turns.md and "
-                    f"screen-{n:02}.txt",
-                    file=sys.stderr,
-                )
-                return "dialog-unanswered"
         else:
             session.send(fill(text, values))
+        if failed:
+            (session.out / f"screen-{n:02}.txt").write_text(session.screen())
+            with log.open("a") as f:
+                f.write(
+                    f"## Turn {n}: FAILED, {failed}\n\n"
+                    f"Scripted: {json.dumps(turn)}\n\n{answered}Message: {text}\n\n"
+                )
+            print(
+                f"drive-agent: turn {n}: {failed}; see turns.md and screen-{n:02}.txt",
+                file=sys.stderr,
+            )
+            return "dialog-unanswered"
         ended, asked = session.wait_turn(before)
         (session.out / f"screen-{n:02}.txt").write_text(session.screen())
         status = "asks in a dialog" if asked else "ended" if ended else "NO END SEEN"
@@ -1428,6 +1454,14 @@ def interactive(
         if not ended:
             return why_stuck(session.screen())
     return "done"
+
+
+def leave_for_chat(asked: dict) -> bool:
+    """Whether a dialog's answer goes through "Chat about this" rather than its
+    free-text option: one typed answer fills only the first of several questions'
+    tabs, and a multi-select question waits for a submit."""
+    questions = asked["questions"]
+    return len(questions) > 1 or any(q.get("multiSelect") for q in questions)
 
 
 def questions_text(asked: dict) -> str:

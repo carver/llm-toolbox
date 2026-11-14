@@ -3,9 +3,11 @@
 import base64
 import json
 import os
+import re
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -122,21 +124,33 @@ def config(tmp_path: Path) -> Path:
     return tmp_path / "claude"
 
 
-def digest(
-    config: Path, *args: str, cwd: str = "/work/repo", session_env: str | None = None
-) -> str:
+def ran(
+    config: Path,
+    *args: str,
+    cwd: str | None = "/work/repo",
+    session_env: str | None = None,
+    run_from: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """A successful run with --cwd `cwd`, or without --cwd for None, from the folder
+    `run_from`, in the session `session_env` or outside one."""
     env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config)}
     if session_env is not None:
         env["CLAUDE_CODE_SESSION_ID"] = session_env
     proc = subprocess.run(
-        [str(SCRIPT), "--cwd", cwd, *args],
+        [str(SCRIPT), *(["--cwd", cwd] if cwd else []), *args],
         text=True,
         capture_output=True,
         check=False,
+        cwd=run_from,
         env=env,
     )
     assert proc.returncode == 0, proc.stderr
-    return proc.stdout
+    return proc
+
+
+def digest(config: Path, *args: str, **how: Any) -> str:
+    """What a run prints: see ran()."""
+    return ran(config, *args, **how).stdout
 
 
 def test_bulky_output_is_sized_not_printed(config: Path) -> None:
@@ -240,6 +254,70 @@ def test_no_argument_reads_the_newest_when_its_own_session_is_another_projects(
         [user("A session of another project")],
     )
     assert "Another session's turn" in digest(config, session_env="elsewhere")
+
+
+@pytest.fixture
+def here(config: Path, tmp_path: Path) -> Path:
+    """A folder with a project of its own, holding another session, written last.
+    Returns that session's log."""
+    project = config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(tmp_path))
+    write_jsonl(project / "here.jsonl", [user("The session of this folder")])
+    later = (config / "projects" / "-work-repo" / "sess1.jsonl").stat().st_mtime + 60
+    os.utime(project / "here.jsonl", (later, later))
+    return project / "here.jsonl"
+
+
+def test_no_argument_reads_the_session_it_runs_in_from_another_projects_folder(
+    config: Path, tmp_path: Path, here: Path
+) -> None:
+    proc = ran(config, cwd=None, session_env="sess1", run_from=tmp_path)
+    assert "USER Fix the flaky test" in proc.stdout
+    assert "The session of this folder" not in proc.stdout
+    assert proc.stderr == ""
+
+
+@pytest.mark.parametrize("holders", [0, 2])
+def test_falling_back_to_the_newest_log_names_it_on_stderr(
+    config: Path, tmp_path: Path, here: Path, holders: int
+) -> None:
+    for n in range(holders):
+        write_jsonl(
+            config / "projects" / f"-work-other{n}" / "lost.jsonl",
+            [user("A log with this session's id")],
+        )
+    proc = ran(config, cwd=None, session_env="lost", run_from=tmp_path)
+    assert "The session of this folder" in proc.stdout
+    (line,) = proc.stderr.splitlines()
+    assert line.startswith("session-digest: ")
+    assert "lost" in line and str(here) in line
+    assert ("no project" if holders == 0 else "2 projects") in line
+
+
+def test_the_newest_log_outside_a_session_is_read_without_a_warning(
+    config: Path, tmp_path: Path, here: Path
+) -> None:
+    proc = ran(config, cwd=None, run_from=tmp_path)
+    assert "The session of this folder" in proc.stdout
+    assert proc.stderr == ""
+
+
+def test_an_explicit_cwd_reads_that_projects_newest_not_another_projects_session(
+    config: Path, tmp_path: Path, here: Path
+) -> None:
+    out = digest(config, cwd=str(tmp_path), session_env="sess1", run_from=tmp_path)
+    assert "The session of this folder" in out
+    assert "USER Fix the flaky test" not in out
+
+
+def test_a_session_id_in_two_other_projects_reads_the_folders_newest(
+    config: Path, tmp_path: Path, here: Path
+) -> None:
+    write_jsonl(
+        config / "projects" / "-work-other" / "sess1.jsonl",
+        [user("A second log with the same id")],
+    )
+    out = digest(config, cwd=None, session_env="sess1", run_from=tmp_path)
+    assert "The session of this folder" in out
 
 
 def test_unknown_session_fails(config: Path) -> None:

@@ -65,10 +65,14 @@ misread. Claude Code's own notices (Shell cwd was reset, and the like) are left
 out, and file and agent tools (Read, Write, Edit, Agent and the like) get no
 tail, since theirs is a file's last lines or a confirmation.
 
-The session defaults to the one this runs in ($CLAUDE_CODE_SESSION_ID), when its
-log is in the current directory's project, or its nearest parent directory's;
-otherwise to that project's newest. The newest alone could be another session
-still running beside this one.
+The session defaults to the one this runs in ($CLAUDE_CODE_SESSION_ID), from
+whatever directory: its log is looked for in the current directory's project (or
+its nearest parent directory's), then in every project, where exactly one must
+hold it. With no such log it defaults to the current directory's project's
+newest, which could be another session still running beside this one; when
+$CLAUDE_CODE_SESSION_ID is set, a line on stderr names the log it read. With
+--cwd DIR only DIR's project is searched: this session's log when it is there,
+else that project's newest.
 Logs live under $CLAUDE_CONFIG_DIR (default ~/.claude) in
 projects/<project>/<session>.jsonl, with subagents in
 projects/<project>/<session>/subagents/agent-<id>.jsonl and workflow agents in
@@ -639,23 +643,36 @@ def project_dir(config: Path, cwd: str) -> Path:
     return config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
 
 
-def find_session(config: Path, cwd: str, session: str | None) -> Path | None:
+def find_session(config: Path, cwd: str | None, session: str | None) -> Path | None:
+    """The session's log. cwd is --cwd's folder, or None when it wasn't given."""
     if session and Path(session).is_file():
         return Path(session)
-    project = project_dir(config, cwd)
+    project = project_dir(config, cwd or os.getcwd())
     if session:
         path = project / f"{session}.jsonl"
         if path.is_file():
             return path
         matches = list((config / "projects").glob(f"*/{session}.jsonl"))
         return matches[0] if len(matches) == 1 else None
-    # The session this runs in, when it's one of the project's: the newest log may be
-    # another session's, still running beside it.
-    if (own_id := os.environ.get("CLAUDE_CODE_SESSION_ID")) and (
-        own := project / f"{own_id}.jsonl"
-    ).is_file():
-        return own
+    # The session this runs in: the newest log may be another session's, still running
+    # beside it. The shell may be in another project's folder than the one the session
+    # started in, so without --cwd its log may be in any project.
+    held_by = None
+    if own_id := os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        if (own := project / f"{own_id}.jsonl").is_file():
+            return own
+        if cwd is None:
+            matches = list((config / "projects").glob(f"*/{own_id}.jsonl"))
+            if len(matches) == 1:
+                return matches[0]
+            held_by = f"{len(matches)} projects" if matches else "no project"
     logs = sorted(project.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    if logs and held_by:
+        print(
+            f"session-digest: this session's log, {own_id}.jsonl, is in {held_by} "
+            f"under {config}; reading the current directory's newest, {logs[-1]}",
+            file=sys.stderr,
+        )
     return logs[-1] if logs else None
 
 
@@ -808,12 +825,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "session",
         nargs="?",
-        help="session id or path to its .jsonl (default: this session's, else the newest for --cwd)",
+        help="session id or path to its .jsonl (default: this session's, else the newest "
+        "for the current directory, or for --cwd)",
     )
     parser.add_argument(
         "--cwd",
-        default=os.getcwd(),
-        help="project directory whose sessions to search (default: current)",
+        help="search only this project directory's sessions (default: the current "
+        "directory's, and every project's for this session's log)",
     )
     form = parser.add_mutually_exclusive_group()
     form.add_argument(
@@ -848,7 +866,8 @@ def main(argv: list[str] | None = None) -> int:
     session = find_session(config, args.cwd, args.session)
     if session is None:
         print(
-            f"session-digest: no session {args.session or ''} for {args.cwd} under {config}",
+            f"session-digest: no session {args.session or ''} for "
+            f"{args.cwd or os.getcwd()} under {config}",
             file=sys.stderr,
         )
         return 1

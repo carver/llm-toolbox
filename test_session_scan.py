@@ -192,6 +192,54 @@ def scan(
     )
 
 
+def test_no_cwd_scans_the_session_it_runs_in_from_another_projects_folder(
+    env: dict, tmp_path: Path
+) -> None:
+    config = Path(env["CLAUDE_CONFIG_DIR"])
+    session(config, busy("main", 2))
+    here = tmp_path / "elsewhere"
+    here.mkdir()
+    project = config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(here))
+    write_jsonl(project / "s2.jsonl", [user("The session of this folder")])
+    later = (config / "projects" / "-work-repo" / "s1.jsonl").stat().st_mtime + 60
+    os.utime(project / "s2.jsonl", (later, later))
+    out = tmp_path / "scan"
+    proc = subprocess.run(
+        [str(SCRIPT), "--out", str(out), "--candidates-only"],
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=here,
+        env={**env, "CLAUDE_CODE_SESSION_ID": "s1"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    digest = (out / "digest.txt").read_text()
+    assert "Brief for main" in digest
+    assert "The session of this folder" not in digest
+
+
+def test_the_digests_warning_that_it_read_another_log_reaches_stderr(
+    env: dict, tmp_path: Path
+) -> None:
+    config = Path(env["CLAUDE_CONFIG_DIR"])
+    here = tmp_path / "elsewhere"
+    here.mkdir()
+    project = config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(here))
+    write_jsonl(project / "s2.jsonl", [user("The session of this folder")])
+    proc = subprocess.run(
+        [str(SCRIPT), "--out", str(tmp_path / "scan"), "--candidates-only"],
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=here,
+        env={**env, "CLAUDE_CODE_SESSION_ID": "lost"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert f"reading the current directory's newest, {project / 's2.jsonl'}" in (
+        proc.stderr
+    )
+
+
 def calls(env: dict) -> dict[str, dict]:
     """What the fake was given, by its log file's name, one per call."""
     log = Path(env["FAKE_LOG"])

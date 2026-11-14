@@ -605,6 +605,20 @@ minutes, and 17 in subagents (a five-minute cache), most after a few `waitone`
 calls of about three minutes in a row. A request that wrote that much but read
 more, such as after a big tool output, kept its cache and isn't one.
 
+### session-digest finds the running session from any folder (2026-11-13)
+
+With no session argument and no `--cwd`, `$CLAUDE_CODE_SESSION_ID`'s log is read
+from whichever project holds it, when exactly one does. Before, it was read only
+from the project of the current folder: a session started in
+`ai-career-plan/fellows-assessment-prep` ran `session-digest --errors` from
+`ai-career-plan`, which has a project of its own, and got that project's newest
+log, another session's; session-scan scanned it too. An explicit `--cwd DIR`
+still searches only DIR's project, since it asks for that project, and
+session-scan passes `--cwd` on only when it was given one. When two projects hold
+the id, neither is picked, and the current folder's newest is read as before. Then,
+and when no project holds it, a line on stderr names the log that was read, since it
+may be another session's; session-scan passes the line on.
+
 ### Rejected: a rebuild only after 40 idle minutes (2026-11-09)
 
 The first rule. It caught all four of the main session's rebuilds, but only one

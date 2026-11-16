@@ -30,7 +30,9 @@ TOOL = Path(__file__).resolve().parent / "bin" / "drive-agent"
 # The fake Claude Code also asks in a question dialog, as AskUserQuestion does:
 # "dialog" asks one question, "dialog2" two in one dialog (tabs), "dialogm" one
 # multi-select question, "deaf" one it never takes an answer to, "nochat" two with no
-# "Chat about this". The dialog writes its tool_use to the transcript and fires no
+# "Chat about this"; "late" and "late2" are "dialog" and "dialog2" whose tool_use
+# reaches the transcript only with its answer, as Claude Code 2.1.325 sometimes
+# writes it. The dialog writes its tool_use to the transcript and fires no
 # Stop hook, and reads keys as they come, as Claude Code does. Key 3, its free-text
 # option, takes a typed line: for a single question it writes the tool_result, works
 # a while with the answered dialog still drawn, replies "done: answer <text>" and
@@ -100,18 +102,23 @@ QUESTIONS = {
                            {"label": "Dog", "description": ""}]},
 }
 DIALOGS = {"dialog": ["colour"], "dialog2": ["colour", "animal"], "deaf": ["colour"],
-           "dialogm": ["colour"], "nochat": ["colour", "animal"]}
+           "dialogm": ["colour"], "nochat": ["colour", "animal"],
+           "late": ["colour"], "late2": ["colour", "animal"]}
 
-def draw(questions, chat=True):
+def draw(questions, chat=True, boxed=False):
+    # boxed: the question in a box's left edge, with each option described, as
+    # Claude Code 2.1.325 draws it.
     first = questions[0]
     print("─" * 40)
     if len(questions) > 1:
         print("←  " + "  ".join("☐ " + q["header"] for q in questions) + "  ✔ Submit  →")
     else:
         print(" ☐ " + first["header"])
-    print(first["question"])
+    print(("│ " if boxed else "") + first["question"])
     for n, option in enumerate(first["options"], 1):
         print(("❯ " if n == 1 else "  ") + f"{n}. {option['label']}")
+        if boxed:
+            print("     Picks " + option["label"].lower() + ".")
     print("  3. Type something.")
     print("─" * 40)
     if chat:
@@ -137,19 +144,26 @@ if HARNESS == "claude":
         questions = [dict(QUESTIONS[k], multiSelect=line == "dialogm")
                      for k in DIALOGS[line]]
         tool_id = "toolu_" + uuid.uuid4().hex
-        write({"type": "user", "message": {"content": line}},
-              {"type": "assistant", "message": {"content": [
-                  {"type": "tool_use", "id": tool_id, "name": "AskUserQuestion",
-                   "input": {"questions": questions}}]}})
+        asked = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": tool_id, "name": "AskUserQuestion",
+             "input": {"questions": questions}}]}}
+        write({"type": "user", "message": {"content": line}})
+        if line.startswith("late"):
+            unwritten.append(asked)
+        else:
+            write(asked)
         # A subagent's transcript, written after the question, is the newest file.
         sub = os.path.join(proj, session, "subagents")
         os.makedirs(sub, exist_ok=True)
         with open(os.path.join(sub, "agent-1.jsonl"), "a") as f:
             f.write(json.dumps({"type": "assistant", "message": {"content": [
                 {"type": "text", "text": "subagent at work"}]}}) + "\n")
-        draw(questions, chat=line != "nochat")
+        draw(questions, chat=line != "nochat", boxed=line.startswith("late"))
         return tool_id, questions
+    unwritten = []
     def answer(tool_id, questions, text):
+        write(*unwritten)
+        unwritten.clear()
         write({"type": "user", "message": {"content": [
             {"type": "tool_result", "tool_use_id": tool_id,
              "content": f'User has answered your questions: "{questions[0]["question"]}"="{text}".'}]}})
@@ -179,6 +193,8 @@ if HARNESS == "claude":
                     time.sleep(1.5)
                     text = "done: answer " + given
                 elif pressed == "4" and line != "nochat":
+                    write(*unwritten)
+                    unwritten.clear()
                     write({"type": "user", "message": {"content": [
                         {"type": "tool_result", "tool_use_id": tool_id, "is_error": True,
                          "content": "The user doesn't want to proceed with this tool use. "
@@ -250,6 +266,16 @@ for line in sys.stdin:
     if HARNESS == "claude" and line in DIALOGS:
         dialog(line)
         continue
+    if HARNESS == "claude" and line == "permission":
+        # A permission prompt: the question dialog's footer, and no question.
+        print("─" * 40)
+        print("Do you want to proceed?")
+        print("❯ 1. Yes")
+        print("  2. No")
+        print("Enter to select · ↑/↓ to navigate · Esc to cancel", flush=True)
+        while os.read(0, 1):
+            pass
+        sys.exit()
     text = reply(line)
     seen()
     record(line, text)
@@ -660,6 +686,62 @@ def test_a_dialog_of_several_or_multi_select_questions_is_left_for_the_chat(
     for question in questions:
         assert question in turn2
     assert json.loads((out / "run.json").read_text())["outcome"] == "done"
+
+
+def test_a_dialog_the_transcript_gets_late_is_read_from_the_screen_and_answered(
+    tmp_path, env
+):
+    # jason121 and jason141: the dialog stood on screen for the whole turn limit
+    # while the transcript held no AskUserQuestion call, so the driver never answered.
+    path = scenario(tmp_path, turns=["late", "Yes, both.", "after"])
+    out = tmp_path / "out"
+    drive(
+        {**env, "DRIVE_AGENT_DIALOG_GRACE": "5"},
+        *("run", path, "--harness", "claude", "--name", "jason36", "--out", out),
+    )
+    (records,) = transcript_records(out).values()
+    answers = dialog_answers(records)
+    assert len(answers) == 1 and '="Yes, both."' in answers[0]
+    assert typed(records) == ["late", "after"]
+    log = (out / "turns.md").read_text()
+    turn1, turn2 = log.split("## Turn 2")[0], log.split("## Turn 2")[1]
+    assert "asks in a dialog" in turn1 and "read from the screen" in turn1
+    assert "Which colour do you prefer?" in turn1
+    assert "Answered in the question dialog" in turn2
+    assert json.loads((out / "run.json").read_text())["outcome"] == "done"
+
+
+def test_a_dialog_of_several_questions_the_transcript_gets_late_is_left_for_the_chat(
+    tmp_path, env
+):
+    path = scenario(tmp_path, turns=["late2", "Yes, both.", "after"])
+    out = tmp_path / "out"
+    drive(
+        {**env, "DRIVE_AGENT_DIALOG_GRACE": "5"},
+        *("run", path, "--harness", "claude", "--name", "jason37", "--out", out),
+    )
+    (records,) = transcript_records(out).values()
+    answers = dialog_answers(records)
+    assert len(answers) == 1 and "clarify" in answers[0]
+    assert typed(records) == ["late2", "Yes, both.", "after"]
+    turn2 = (out / "turns.md").read_text().split("## Turn 2")[1].split("## Turn 3")[0]
+    assert "Left a dialog of 2 questions" in turn2
+    assert "Colour" in turn2 and "Animal" in turn2
+    assert json.loads((out / "run.json").read_text())["outcome"] == "done"
+
+
+def test_a_dialog_that_is_no_question_is_never_answered(tmp_path, env):
+    path = scenario(tmp_path, turns=["permission", "Yes, both."])
+    out = tmp_path / "out"
+    done = drive(
+        {**env, "DRIVE_AGENT_DIALOG_GRACE": "1", "DRIVE_AGENT_TURN_LIMIT": "6"},
+        *("run", path, "--harness", "claude", "--name", "jason38", "--out", out),
+        check=False,
+    )
+    assert done.returncode == 1
+    assert json.loads((out / "run.json").read_text())["outcome"] == "dialog"
+    log = (out / "turns.md").read_text()
+    assert "NO END SEEN" in log and "## Turn 2" not in log
 
 
 def test_a_dialog_of_several_questions_with_no_chat_option_fails_the_run(tmp_path, env):

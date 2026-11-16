@@ -25,6 +25,9 @@ names the question. A dialog of several questions (tabs) or a multi-select one i
 left through its "Chat about this" option instead, and once the agent's reply to
 that ends, the turn is sent as an ordinary message. A dialog that offers no such
 option, or doesn't close within DRIVE_AGENT_ANSWER_LIMIT, fails the run there.
+Claude Code sometimes writes the question to its transcript only with its answer;
+a dialog that has shown for DRIVE_AGENT_DIALOG_GRACE with no question there is
+read from the screen, and turns.md says so.
 
 SCENARIO is JSON:
   turns       the human's messages, in order. A string is sent as it is; {NAME} in it
@@ -112,6 +115,9 @@ Environment:
                              dialog after it before the first turn (4)
   DRIVE_AGENT_ANSWER_LIMIT   seconds Claude Code's question dialog has to take a
                              typed answer (30)
+  DRIVE_AGENT_DIALOG_GRACE   seconds a question dialog shows before drive-agent
+                             reads it from the screen, when Claude Code hasn't
+                             written it to its transcript (20)
   HTTPS_PROXY, https_proxy   the proxy drive-agent's own proxy forwards through
 
 Needs tmux, and for isolation, passwordless sudo, bwrap (the bubblewrap package) and
@@ -207,6 +213,10 @@ TRUST_GRACE = number("DRIVE_AGENT_TRUST_GRACE", 4)
 # How long Claude Code's question dialog has to take a typed answer, which it writes
 # to the transcript at once.
 ANSWER_LIMIT = number("DRIVE_AGENT_ANSWER_LIMIT", 30)
+# How long a question dialog must show, with no question in the transcript, before
+# it is read from the screen: Claude Code 2.1.325 sometimes writes the question only
+# with its answer, and an answered dialog stays drawn a moment, which is no question.
+DIALOG_GRACE = number("DRIVE_AGENT_DIALOG_GRACE", 20)
 
 
 class Usage(Exception):
@@ -831,6 +841,10 @@ class Harness:
         """The question dialog waiting for the human: {"id", "questions"}."""
         return None
 
+    def answered_questions(self) -> int:
+        """How many question dialogs the transcript holds an answer to."""
+        return 0
+
     def transcripts(self) -> list[Path]:
         """The session transcripts, oldest first."""
         folder = self.box.home / self.transcript_dir
@@ -953,9 +967,9 @@ class Claude(Harness):
                 found.append(rec)
         return found
 
-    def pending_question(self) -> dict | None:
-        """The last AskUserQuestion call with no answer yet: Claude Code writes the
-        call when it opens the dialog, and the answer as its tool_result."""
+    def question_calls(self) -> tuple[list[dict], set]:
+        """The transcript's AskUserQuestion calls, and the IDs of every tool call it
+        holds a result for."""
         calls, answered = [], set()
         for rec in self.records():
             for p in rec["message"].get("content") or []:
@@ -965,11 +979,22 @@ class Claude(Harness):
                     calls.append(p)
                 elif p.get("type") == "tool_result":
                     answered.add(p.get("tool_use_id"))
+        return calls, answered
+
+    def pending_question(self) -> dict | None:
+        """The last AskUserQuestion call with no answer yet: Claude Code mostly
+        writes the call when it opens the dialog, and the answer as its
+        tool_result."""
+        calls, answered = self.question_calls()
         for p in reversed(calls):
             if p.get("id") not in answered:
                 questions = (p.get("input") or {}).get("questions") or []
                 return {"id": p.get("id"), "questions": questions}
         return None
+
+    def answered_questions(self) -> int:
+        calls, answered = self.question_calls()
+        return sum(p.get("id") in answered for p in calls)
 
     def last_message(self) -> str:
         """The agent's last text to the human in this session."""
@@ -1201,6 +1226,8 @@ class Session:
         self.env_file = env_file
         self.project = project
         self.launches = 0
+        # Since when a dialog has shown with no question in the transcript.
+        self.unexplained_dialog: float | None = None
         self.socket = f"drive-agent-{box.name}"
         self.name = "agent"
 
@@ -1270,9 +1297,25 @@ class Session:
     def asking(self) -> dict | None:
         """Claude Code's question dialog, when it waits for the human: a question
         the transcript holds no answer to, with the dialog on screen. The screen
-        alone can't tell: an answered dialog stays drawn a moment after Enter."""
+        alone can't tell: an answered dialog stays drawn a moment after Enter. So
+        a dialog the transcript holds no question for is read from the screen only
+        once it has shown for DIALOG_GRACE."""
         # The screen first: reading the transcript costs a find and a cat.
-        return self.harness.pending_question() if self.dialog_open() else None
+        if not self.dialog_open():
+            self.unexplained_dialog = None
+            return None
+        pending = self.harness.pending_question()
+        if pending:
+            self.unexplained_dialog = None
+            return pending
+        if self.unexplained_dialog is None:
+            self.unexplained_dialog = time.time()
+        if time.time() - self.unexplained_dialog < DIALOG_GRACE:
+            return None
+        shown = question_on_screen(self.screen())
+        if shown:
+            shown["answered"] = self.harness.answered_questions()
+        return shown
 
     def wait_turn(self, before: int) -> tuple[bool, dict | None]:
         """Waits for the agent's turn to end (the turn-end hook fired after
@@ -1306,7 +1349,8 @@ class Session:
         """Presses the number of the dialog's option `option`, which Claude Code
         takes at once, with no Enter. Returns why it couldn't."""
         shown = self.asking()
-        if not shown or shown["id"] != question["id"]:
+        # A question read from the screen has no ID, and is the one that shows.
+        if not shown or (question["id"] and shown["id"] != question["id"]):
             return "the dialog closed before drive-agent answered it"
         choice = re.findall(rf"(\d+)\. {re.escape(option)}", self.screen())
         if not choice:
@@ -1319,8 +1363,18 @@ class Session:
         it didn't."""
         deadline = time.time() + ANSWER_LIMIT
         while time.time() < deadline:
-            pending = self.harness.pending_question()
-            if not pending or pending["id"] != question["id"]:
+            if question["id"] is None:
+                # Read from the screen: its call reaches the transcript with its
+                # answer, or the dialog goes.
+                taken = (
+                    self.harness.answered_questions() > question["answered"]
+                    or not self.dialog_open()
+                )
+            else:
+                pending = self.harness.pending_question()
+                taken = not pending or pending["id"] != question["id"]
+            if taken:
+                self.unexplained_dialog = None
                 return None
             time.sleep(0.2)
         return f"the dialog didn't close within {ANSWER_LIMIT:g} s"
@@ -1350,6 +1404,40 @@ class Session:
         if not ended:
             return 'the agent\'s turn after "Chat about this" never ended'
         return None
+
+
+def question_on_screen(screen: str) -> dict | None:
+    """Claude Code's question dialog as `screen` shows it, {"id": None, "questions"},
+    for one its transcript doesn't hold: a question per tab of the dialog's tab line,
+    or one, with the dialog's text, when it has no tabs. None when the screen's last
+    dialog offers neither "Type something" nor "Chat about this": another dialog,
+    such as a permission prompt, has the same footer."""
+    lines = [line.rstrip() for line in screen.splitlines() if line.strip()]
+    rules = [i for i, line in enumerate(lines) if line.lstrip().startswith("─" * 10)]
+    first = [i for i, line in enumerate(lines) if re.match(r"\s*(❯\s*)?1\. ", line)]
+    if not first or not rules or rules[0] > first[-1]:
+        return None
+    top = max(i for i in rules if i < first[-1])
+    dialog = lines[top + 1 :]
+    if not re.search(r"\d+\. (Type something|Chat about this)", "\n".join(dialog)):
+        return None
+    head = [line.strip(" │") for line in lines[top + 1 : first[-1]]]
+    if head and head[0].startswith("←"):
+        tabs = [
+            tab.strip()
+            for tab in re.split(r"[☐☑☒✔✓]", head[0].strip("←→ "))
+            if tab.strip() and tab.strip() != "Submit"
+        ]
+        questions = [{"question": tab} for tab in tabs]
+        if questions:
+            questions[0]["question"] += ": " + " ".join(head[1:])
+    else:
+        # A single question's first line may be its header, "☐ Install".
+        text = re.sub(r"^[☐☑☒✔✓]\s*\S+\s*", "", " ".join(head))
+        questions = [{"question": text}]
+    for q in questions:
+        q["question"] = "(read from the screen) " + q["question"]
+    return {"id": None, "questions": questions}
 
 
 def trust_dialog_open(screen: str) -> bool:
@@ -1401,7 +1489,8 @@ STUCK = (
 
 
 def why_stuck(screen: str) -> str:
-    tail = "\n".join(screen.splitlines()[-15:])
+    # Without the blank rows a pane ends in, which would push a dialog out of reach.
+    tail = "\n".join([line for line in screen.splitlines() if line.strip()][-15:])
     for outcome, pattern in STUCK:
         if pattern.search(tail):
             return outcome

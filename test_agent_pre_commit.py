@@ -134,10 +134,10 @@ def ran_tests(repo):
     return {arg for arg in runs[0] if arg.endswith(".py")} or SUITE
 
 
-def check(repo, base="HEAD", queue_exit=None, env=None):
+def check(repo, base="HEAD", queue_exit=None, env=None, args=()):
     """Run the hook in `repo` as the gate does: CHECK_BASE set to `base` as `git
     rev-parse` gives it (None: unset), and CHECK_QUEUE_EXIT to `queue_exit` (None:
-    unset)."""
+    unset). `args`: the hook's own, as the commit check's --commit."""
     extra = dict(env or {})
     if base is not None:
         extra["CHECK_BASE"] = git(repo, "rev-parse", base)
@@ -145,7 +145,7 @@ def check(repo, base="HEAD", queue_exit=None, env=None):
         extra["CHECK_QUEUE_EXIT"] = str(queue_exit)
     (repo.parent / "calls").unlink(missing_ok=True)
     done = subprocess.run(
-        [str(repo / ".githooks" / "agent-pre-commit")],
+        [str(repo / ".githooks" / "agent-pre-commit"), *args],
         cwd=repo,
         env=env_for(repo, extra),
         capture_output=True,
@@ -455,13 +455,93 @@ def test_a_code_commit_runs_the_suite_in_heavys_queue(repo):
     assert ran_tests(repo) == SUITE
 
 
-def test_the_commit_check_runs_no_test_and_never_waits_in_the_queue():
-    """What agent-commit-gate runs at an agent's commit in agent-pre-commit's place:
-    ruff ran in the pre-commit hook, and wt-ship runs the suite when the commit lands.
-    It names CHECK_QUEUE_EXIT, so the gate runs it outside heavy's queue."""
-    check = Path(__file__).resolve().parent / ".githooks" / "agent-commit-check"
+def commit_check(repo, **kwargs):
+    """The hook as .githooks/agent-commit-check runs it at an agent's commit, with
+    the queue's exit status on offer, as the gate's first run has it."""
+    return check(repo, queue_exit=QUEUE_EXIT, args=["--commit"], **kwargs)
 
-    done = subprocess.run([str(check)], capture_output=True, text=True, check=False)
+
+def test_the_commit_check_runs_the_hook_in_its_commit_mode(repo):
+    """.githooks/agent-commit-check itself, beside the hook as it is in this repo. It
+    names CHECK_QUEUE_EXIT, so the gate runs it outside heavy's queue."""
+    wrapper = repo / ".githooks" / "agent-commit-check"
+    shutil.copy(ROOT / ".githooks" / "agent-commit-check", wrapper)
+    change(repo, "bin/tool")
+    env = env_for(
+        repo,
+        {"CHECK_BASE": git(repo, "rev-parse", "HEAD"), "CHECK_QUEUE_EXIT": "75"},
+    )
+
+    done = subprocess.run(
+        [str(wrapper)], cwd=repo, env=env, capture_output=True, text=True, check=False
+    )
 
     assert done.returncode == 0, done.stderr
-    assert "CHECK_QUEUE_EXIT" in check.read_text()
+    assert ran_tests(repo) == {"test_readme_env.py", "test_env_documented.py"}
+    assert "pre-commit" not in calls(repo)
+    assert "CHECK_QUEUE_EXIT" in wrapper.read_text()
+
+
+def test_the_commit_check_of_a_tool_runs_the_tests_of_its_help_and_readme_entry(repo):
+    # A new variable in drive-agent's -h, missing from README.md, passed at its
+    # commit and would have failed test_readme_env.py only at landing.
+    change(repo, "bin/tool")
+
+    run = commit_check(repo)
+
+    assert run.code == 0, run.err
+    assert run.tests == {"test_readme_env.py", "test_env_documented.py"}
+    assert not run.linted
+
+
+def test_the_commit_check_runs_the_tests_the_map_names_for_a_path(repo):
+    change(repo, "README.md", "skills/coding/SKILL.md")
+
+    run = commit_check(repo)
+
+    assert run.code == 0, run.err
+    assert run.tests == {"test_readme_env.py", "test_skill_refs.py"}
+
+
+@pytest.mark.parametrize(
+    "names", [["test_tool.py"], ["lib/shared.py"], ["notes/plan.txt"], ["docs/x.md"]]
+)
+def test_the_commit_check_of_any_other_path_runs_no_test(repo, names):
+    change(repo, *names)
+
+    run = commit_check(repo)
+
+    assert (run.code, run.tests) == (0, None), run.err
+
+
+@pytest.mark.parametrize(
+    ("base", "env", "why"),
+    [
+        (None, {}, "no CHECK_BASE"),
+        ("HEAD~0", {}, "nothing changed"),
+        (None, {"CHECK_BASE": "0" * 40}, "can't diff"),
+    ],
+)
+def test_the_commit_check_never_runs_the_suite_or_asks_for_the_queue(
+    repo, base, env, why
+):
+    """Where the full check runs every test, the commit check runs none, and says
+    why in a line."""
+    change(repo, "bin/tool")
+    if why == "nothing changed":
+        git(repo, "reset", "-q", "--hard")
+
+    run = commit_check(repo, base=base, env=env)
+
+    assert (run.code, run.tests) == (0, None), run.err
+    assert "heavy's queue" not in run.err
+    last = run.err.splitlines()[-1]
+    assert why in last and last.endswith("so no test ran")
+
+
+def test_the_commit_check_fails_when_a_test_it_runs_fails(repo):
+    change(repo, "bin/tool")
+
+    run = commit_check(repo, env={"FAKE_UV_EXIT": "1"})
+
+    assert run.code == 1

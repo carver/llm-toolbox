@@ -10,7 +10,13 @@
 # This file names $CHECK_QUEUE_EXIT, so the gate runs it first outside heavy's queue,
 # on one core, with that variable set. The check then exits with it before it starts
 # the whole suite, after saying why, and the gate runs it again in the queue.
+# --commit, which agent-commit-check passes, is the check of an agent's commit: only
+# the tests the map names for the staged paths, plus commit_tests_for's, outside the
+# queue; no pre-commit hook, which the commit ran already, and never the suite, so a
+# path that would run it, or no usable CHECK_BASE, runs nothing and passes.
 set -e
+commit=
+[ "${1:-}" != --commit ] || commit=1
 # So the pre-commit hook does not run this script again.
 export AGENT_PRE_COMMIT=1
 
@@ -33,6 +39,15 @@ tests_for() {
   esac
 }
 
+# The tests an agent's commit runs for a path the map sends to the whole suite: a
+# tool's -h and its README entry are held together by two tests that take seconds,
+# and a commit that changed one without the other failed only when it landed.
+commit_tests_for() {
+  case $1 in
+    bin/*) echo test_readme_env.py test_env_documented.py ;;
+  esac
+}
+
 every=
 tests=
 if [ -z "${CHECK_BASE:-}" ]; then
@@ -44,8 +59,11 @@ elif [ -z "$changed" ]; then
 else
   while IFS= read -r path; do
     if ! more=$(tests_for "$path"); then
-      every="$path changed"
-      break
+      if [ -z "$commit" ]; then
+        every="$path changed"
+        break
+      fi
+      more=$(commit_tests_for "$path")
     fi
     for test in $more; do
       case " $tests " in *" $test "*) ;; *) tests="$tests $test" ;; esac
@@ -53,6 +71,12 @@ else
   done <<EOF
 $changed
 EOF
+fi
+
+# A commit never runs the suite, whatever would have asked for it.
+if [ -n "$commit" ] && [ -n "$every" ]; then
+  echo "agent-pre-commit --commit: $every, so no test ran" >&2
+  every=
 fi
 
 # Only an exit status from 1 to 255 asks for the queue; any other value counts as
@@ -66,7 +90,7 @@ if [ -n "$every" ] && [ -n "$queue_exit" ]; then
 fi
 unset CHECK_BASE CHECK_QUEUE_EXIT
 
-"$(dirname "$0")/pre-commit"
+[ -n "$commit" ] || "$(dirname "$0")/pre-commit"
 [ -n "$every" ] || [ -n "$tests" ] || exit 0
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

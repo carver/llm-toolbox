@@ -231,7 +231,9 @@ the gate's own tests under an agent's commit would fool.
 
 filedrawer opted in with clippy (its pre-commit hook has no Rust lint); llm-toolbox
 and sandbox-setup, whose pre-commit hooks run ruff, with a commit check that runs no
-test (2026-11-08).
+test (2026-11-08). llm-toolbox's has since run the seconds-long tests a staged path
+names, outside the queue (2026-11-16): a tool's -h gained a variable its README entry
+lacked, which only the landing's suite would have refused.
 
 ### Checks run without secret-named variables (2026-11-09)
 

@@ -913,9 +913,11 @@ through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.
 
 An agent's commit runs `.githooks/agent-commit-check` in `agent-pre-commit`'s
-place: no tests, since `pre-commit` ran ruff, and the agent runs the tests it
-wrote or touched before committing. `wt-ship` runs `agent-pre-commit` on each
-commit when it lands, where `agent-commit-gate` hands it a `CHECK_BASE`,
+place, which is `agent-pre-commit --commit`: only the tests that take seconds
+and that a staged path names, so a `bin/` file runs the two that hold a tool's
+`-h` and its README entry together, and never the suite. `pre-commit` ran ruff,
+and the agent runs the tests it wrote or touched before committing. `wt-ship`
+runs `agent-pre-commit` on each commit when it lands, where `agent-commit-gate` hands it a `CHECK_BASE`,
 and the hook runs only the tests the change since then can affect. A change to
 `README.md`, `GLOBAL_CLAUDE.md`, `skills/` or `skill-patches/` runs the one to three
 tests that read those files, under two seconds on one core, so the landing doesn't

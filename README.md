@@ -707,7 +707,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   after the commit, a later `fixup!` naming it, or the commit already pushed.
   `sweep TERM...` searches the workspace for text a change made stale (/build
   step 2), with rg from the workspace root as fixed strings, skipping cache/,
-  keep/, the worktrees beside repos, .git and the root's own dot-files, this
+  keep/, the worktrees beside repos, .git, the root's own dot-files and files
+  nobody wrote by hand (`*_files/`, `node_modules/`, `*.min.*`, `*.map`), this
   repo's hits taken from the worktree and listed first, at most 5 lines a file
   and 60 in all; it records the terms and HEAD in the build's state. `finish`
   and `review-prompt` warn of each commit, fixes aside, after the last sweep,

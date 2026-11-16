@@ -177,11 +177,14 @@ Each TERM is a fixed string, not a regex; put `--` before a TERM that starts wit
 dash (`build-state sweep -- --local`). It runs, from the workspace root,
 
     rg --no-config -n --hidden --fixed-strings -g '!{cache,keep}/**' -g '!*-wt-*/**'
-       -g '!.git/' -g '!/.*' -e TERM... .
+       -g '!.git/' -g '!/.*' -g '!**/*_files/**' -g '!**/node_modules/**'
+       -g '!*.min.*' -g '!*.map' -e TERM... .
 
 so it skips cache/ and keep/ (over a million files), every worktree beside a repo
 (*-wt-*), .git folders, and the root's own dot-files and dot-folders, where
-credentials live; inside a repo, rg skips what its .gitignore names. rg matches those
+credentials live, and files nobody wrote by hand (*_files/, as a browser names a saved
+page's scripts, node_modules/, *.min.*, *.map); inside a repo, rg skips what its
+.gitignore names. rg matches those
 globs against paths relative to the path it searches, which is why it searches `.`
 from the root. In a linked worktree, the repo's own hits come from the worktree, with
 its edits, rather than from its main tree, which the search above then skips. Its
@@ -211,6 +214,9 @@ is open, so nothing was recorded.
 SWEEP_CAP = 60
 SWEEP_PER_FILE = 5
 SWEEP_WIDTH = 300
+# Files nobody wrote by hand, wherever they lie; a page a browser saved keeps its
+# scripts in NAME_files/. Their hits would crowd out the ones a person can act on.
+NOT_SOURCE = ["!**/*_files/**", "!**/node_modules/**", "!*.min.*", "!*.map"]
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -644,14 +650,14 @@ def rg(where: Path, prefix: str, globs: list[str], terms: list[str]) -> Search:
 
 def search_workspace(root: Path, terms: list[str]) -> Search:
     """Every hit in the workspace's repos as landed, skipping cache/, keep/, the
-    worktrees beside them, .git and the root's own dot-files (credentials live
-    there), except that this repo's hits come from this worktree, not its main
-    tree."""
-    globs = ["!{cache,keep}/**", "!*-wt-*/**", "!.git/", "!/.*"]
+    worktrees beside them, .git, the root's own dot-files (credentials live
+    there) and files nobody wrote by hand (NOT_SOURCE), except that this repo's
+    hits come from this worktree, not its main tree."""
+    globs = ["!{cache,keep}/**", "!*-wt-*/**", "!.git/", "!/.*", *NOT_SOURCE]
     top, main = work_tree(), main_tree()
     in_worktree = Search()
     if top != main:
-        in_worktree = rg(top, shown_from(root, top), ["!.git"], terms)
+        in_worktree = rg(top, shown_from(root, top), ["!.git", *NOT_SOURCE], terms)
         if main.is_relative_to(root):
             globs.append(f"!/{main.relative_to(root)}/**")
     rest = rg(root, ".", globs, terms)

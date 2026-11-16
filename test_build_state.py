@@ -1958,8 +1958,8 @@ def test_fold_refuses_fixups_it_would_need_folded_first(worktree):
 
 def workspace(tmp_path):
     """A workspace root with one stale line in a doc, and copies of it where the sweep
-    never looks: cache/, keep/, a worktree beside a repo, a .git folder, and the
-    root's own dot-folders, where credentials live."""
+    never looks: cache/, keep/, a worktree beside a repo, a .git folder, the root's
+    own dot-folders, where credentials live, and files nobody wrote by hand."""
     root = tmp_path / "workspace"
     for path in (
         "notes/README.md",
@@ -1969,6 +1969,11 @@ def workspace(tmp_path):
         "proj/.git/description",
         ".sofa/credentials.json",
         ".env",
+        # A page a browser saved, with its scripts, and built or vendored files.
+        "notes/article_files/app.js",
+        "proj/static/site.min.js",
+        "proj/static/site.js.map",
+        "proj/node_modules/dep/README.md",
     ):
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_text("Nothing records a search.\n")
@@ -2133,6 +2138,7 @@ def test_sweep_searches_the_folder_holding_the_main_tree_and_this_worktree_first
     git(main, "worktree", "add", "-q", "--detach", str(linked))
     (linked / "doc.md").write_text("A log records each search.\n")
     (linked / "new.md").write_text("Nothing records a search, yet.\n")
+    (linked / "site.min.js").write_text("Nothing records a search.\n")
     build_state(linked, "start")
     env = {k: v for k, v in os.environ.items() if k != "BUILD_STATE_WORKSPACE"}
 

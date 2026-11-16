@@ -607,7 +607,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   command, and so do help as the first argument (`wt-ship -h | head`), `git
   commit --dry-run`, a pipe into `git commit`, `||`, and a `|` in quotes, a
   heredoc's body or a comment. It reads the command as heavy-gate does, through
-  `lib/shellparse.py`, nested scripts included.
+  `lib/shellparse.py`, nested scripts included. It also refuses a check whose
+  status a pipe hides when the script then records the result, as in `pytest -q
+  | tail -3 && git commit ...`: a failing test got into a commit that way. A
+  check is pytest, a cargo test, build or lint, `ruff check`, mutate-check, the
+  commit checks and a few more its `-h` lists, as the command itself and not a
+  word among its arguments; what records is `git commit`, `wt-ship` or
+  `build-state finish`. A script that reads `PIPESTATUS` passes.
 - **gh-body-gate**: a Claude Code hook, which `install.py` registers, that
   refuses a `gh issue` or `gh pr` `create`, `comment` or `edit` whose body
   `slop-lint` flags, before the text is public, with slop-lint's lines and the

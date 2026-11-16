@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A Claude Code PreToolUse hook that refuses a Bash command piping git commit, wt-ship or
-bgrun --wait into another command.
+bgrun --wait into another command, or piping a check and then committing.
 
 A pipeline exits with its last command's status. In `git commit -q -F MSG 2>&1 | tail -2`
 that's tail's, so a commit its hook refused reads as a success, and the agent builds on
@@ -24,6 +24,20 @@ whatever it sets inside. A new shell starts without pipefail, and a $(...) gets
 the pipefail its script has at its end. Help as the first argument (`wt-ship -h |
 head`) and `git commit --dry-run` pass, as do a pipe into git commit (`echo msg |
 git commit -F -`), `||`, and a `|` in quotes, a heredoc's body or a comment.
+
+It also refuses a check whose status a pipe hides when the same script goes on to
+record the result: in `pytest -q | tail -3 && git commit -q --fixup=HEAD`, a failing
+test exits as tail did, and the commit goes ahead on it. A check is pytest (also as
+the command of `heavy --`, `uv run` or uvx, or as python -m pytest or unittest), cargo
+test, nextest, clippy, check, build or mutants, ruff check, mutate-check,
+agent-pre-commit, agent-quick-check, pre-commit, pre-commit-run, npm or make test or
+check, or ./t; one asked for its help, its version or --collect-only decides nothing
+and is none. What records is git commit, wt-ship or `build-state finish`, also under
+bgrun, joined by `&&` or `;` alike. Any other piped command before a commit passes
+(`git diff --cached --stat | tail -5 && git commit ...`), and so do a check whose
+pipeline has pipefail on and a script that reads PIPESTATUS. Only the script's own
+commands are read for this rule, not those inside a bash -c, an eval, a $(...) or a
+heredoc.
 
 It catches a mistake, not an agent set on getting past it: an alias, a variable that
 holds `git`, a function or a script that commits all pass.
@@ -62,6 +76,131 @@ REFUSAL = (
     "into tail, not head (its early exit can fail the command), or redirect to a file "
     "and read it in the next call."
 )
+
+
+UNSEEN_CHECK = (
+    "Refused: {check}'s status is hidden by the pipe after it, and {record} follows: "
+    "a failing check would read as a pass and {record} would go ahead on it.\n"
+    "Put `set -o pipefail;` first, or run the check in a call of its own and read "
+    "what it printed before the next one."
+)
+
+# The options of uv run and uvx that take a value, which is no command.
+UV_VALUES = frozenset(
+    {
+        "--with",
+        "--with-requirements",
+        "--with-editable",
+        "--from",
+        "-p",
+        "--python",
+        "--project",
+        "--directory",
+        "--extra",
+        "--group",
+        "--index",
+        "--env-file",
+    }
+)
+CARGO_CHECKS = {"nextest", "test", "clippy", "check", "build", "mutants"}
+CHECKS = {
+    "pytest",
+    "mutate-check",
+    "agent-pre-commit",
+    "agent-quick-check",
+    "pre-commit",
+    "pre-commit-run",
+}
+# Arguments with which a check decides nothing.
+NO_RUN = {"-h", "--help", "--version", "-V", "--collect-only", "--co"}
+
+
+def first_word(words: list[str], values: frozenset[str] = frozenset()) -> int | None:
+    """Where the first word of `words` that is no option, and no value of one of
+    `values`, lies."""
+    skip = False
+    for at, word in enumerate(words):
+        if skip:
+            skip = False
+        elif word in values:
+            skip = True
+        elif not word.startswith(("-", "+")):
+            return at
+    return None
+
+
+def check_name(words: list[str]) -> str | None:
+    """The check one simple command runs, as the refusal names it, or None: a
+    command that only names one in an argument, or asks one for its help, runs
+    none."""
+    words, _ = command_of(words)
+    if not words or NO_RUN & set(words):
+        return None
+    name, args = Path(words[0]).name, words[1:]
+    if name == "heavy":
+        return check_name(args[args.index("--") + 1 :]) if "--" in args else None
+    if name in ("uv", "uvx"):
+        if name == "uv":
+            if args[:1] != ["run"]:
+                return None
+            args = args[1:]
+        at = first_word(args, UV_VALUES)
+        return None if at is None else check_name(args[at:])
+    if name in ("python", "python3"):
+        module = args[args.index("-m") + 1 :][:1] if "-m" in args else []
+        return module[0] if module in (["pytest"], ["unittest"]) else None
+    if name == "cargo":
+        at = first_word(args)
+        found = args[at] if at is not None else None
+        return f"cargo {found}" if found in CARGO_CHECKS else None
+    if name == "ruff":
+        return "ruff" if args[:1] == ["check"] else None
+    if name in ("npm", "make"):
+        return f"{name} test" if args[:1] in (["test"], ["check"]) else None
+    # llm-toolbox's own test command, by the path it is run with.
+    if words[0] == "./t":
+        return "./t"
+    return name if name in CHECKS else None
+
+
+def record_name(words: list[str]) -> str | None:
+    """What one simple command records a result with, or None: git commit, wt-ship
+    or build-state finish, also as the command bgrun runs, not asked for help or a
+    dry run."""
+    words, _ = command_of(words)
+    if not words:
+        return None
+    name, args = Path(words[0]).name, words[1:]
+    if name == "bgrun":
+        parsed = bgrun_command(args)
+        return record_name(parsed[1]) if parsed else None
+    if name == "wt-ship":
+        return None if asks_help(args) else "wt-ship"
+    if name == "build-state":
+        finishes = args[:1] == ["finish"] and not asks_help(args[1:])
+        return "build-state finish" if finishes else None
+    commit = commit_args(args) if name == "git" else None
+    if commit is None or asks_help(commit) or "--dry-run" in commit:
+        return None
+    return "git commit"
+
+
+def unseen_check(command: str) -> tuple[str, str] | None:
+    """(a check whose status a pipe hides, what the script records after it), for
+    the first such pair among the script's own commands, or None."""
+    # A script that reads PIPESTATUS takes the check's own status.
+    if "PIPESTATUS" in command:
+        return None
+    pipefail, check = False, None
+    for simple in commands(prepare(command)[0]):
+        record = record_name(simple.words)
+        if check and record:
+            return check, record
+        if simple.piped and not pipefail:
+            check = check or check_name(simple.words)
+        if not simple.grouped:
+            pipefail = pipefail_after(simple.words, pipefail)
+    return None
 
 
 def hidden_failures(
@@ -160,9 +299,15 @@ def main(argv=None) -> int:
         return 1
     if event.get("tool_name") != "Bash":
         return 0
-    found = hidden_failures((event.get("tool_input") or {}).get("command") or "")
+    command = (event.get("tool_input") or {}).get("command") or ""
+    found = hidden_failures(command)
     if found:
         print(f"{REFUSAL.format(name=found[0])} {NOTHING_RAN}", file=sys.stderr)
+        return 2
+    unseen = unseen_check(command)
+    if unseen:
+        refusal = UNSEEN_CHECK.format(check=unseen[0], record=unseen[1])
+        print(f"{refusal} {NOTHING_RAN}", file=sys.stderr)
         return 2
     return 0
 

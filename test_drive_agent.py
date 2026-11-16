@@ -15,6 +15,7 @@ passwordless sudo and bwrap are there.
 
 import json
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -1437,7 +1438,16 @@ def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
     runtime = f"/run/user/{seen['uid']}"
     assert seen["env"]["XDG_RUNTIME_DIR"] == runtime
     mount_points = [line.split()[4] for line in seen["mounts"].splitlines()]
-    assert [p for p in mount_points if p.startswith("/run/user")] == [
+    # A machine whose users have login sessions, as GitHub's runner does, mounts
+    # each one's /run/user/<uid>; the box's empty /run/user covers them, and the
+    # mount table still lists them, as it does any other user's on such a machine.
+    in_a_session = re.compile(r"/run/user/\d+(/.*)?")
+    own = (runtime, f"{runtime}/bus")
+    assert [
+        p
+        for p in mount_points
+        if p.startswith("/run/user") and (p in own or not in_a_session.fullmatch(p))
+    ] == [
         "/run/user",
         runtime,
         f"{runtime}/bus",

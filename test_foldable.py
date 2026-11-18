@@ -311,11 +311,16 @@ def test_the_upstream_need_not_be_an_ancestor(repo):
 
 def test_a_repos_blame_ignore_revs_file_is_not_applied(repo):
     branch(repo)
+    # The feature rewrites a line of main's, which blame would put back on main's
+    # commit if it skipped the feature.
     feature = write_commit(
-        repo, "Add the feature", {"app.py": MAIN_CODE + feature_lines("feature")}
+        repo,
+        "Add the feature",
+        {"app.py": MAIN_CODE.replace("main line 5\n", "feature part 2\n")},
     )
-    (repo / ".ignore-revs").write_text(f"{feature}\n")
-    git(repo, "config", "blame.ignoreRevsFile", ".ignore-revs")
+    ignore_revs = repo / ".git" / "ignore-revs"
+    ignore_revs.write_text(f"{feature}\n")
+    git(repo, "config", "blame.ignoreRevsFile", str(ignore_revs))
     refine = write_commit(
         repo,
         "Tidy the feature",

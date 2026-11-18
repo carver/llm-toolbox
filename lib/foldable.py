@@ -233,11 +233,12 @@ def blame(
     """The commit of each non-blank line in ranges; a line from before base gets the
     boundary commit's name, which is never one of the batch."""
     spans = [arg for low, high in ranges for arg in ("-L", f"{low},{high}")]
+    # An empty --ignore-revs-file clears the repo's list; `-c blame.ignoreRevsFile=`
+    # doesn't (git 2.53).
     out = git(
-        "-c",
-        "blame.ignoreRevsFile=",
         "blame",
         "--porcelain",
+        "--ignore-revs-file=",
         *spans,
         f"{base}..{parent}",
         "--",

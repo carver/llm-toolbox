@@ -708,9 +708,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `sweep TERM...` searches the workspace for text a change made stale (/build
   step 2), with rg from the workspace root as fixed strings, skipping cache/,
   keep/, the worktrees beside repos, .git, the root's own dot-files and files
-  nobody wrote by hand (`*_files/`, `node_modules/`, `*.min.*`, `*.map`), this
-  repo's hits taken from the worktree and listed first, at most 5 lines a file
-  and 60 in all; it records the terms and HEAD in the build's state. `finish`
+  nobody wrote by hand (`*_files/`, `node_modules/`, `*.min.*`, `*.map`), and
+  what a repo's `.sweepignore` names (paths relative to the repo, such as
+  applied migrations), this repo's hits taken from the worktree and listed
+  first, at most 5 lines a file and 60 in all; it records the terms and HEAD in
+  the build's state. `finish`
   and `review-prompt` warn of each commit, fixes aside, after the last sweep,
   or of a build with none (a build that changes no described behaviour may
   ignore it). `$BUILD_STATE_WORKSPACE` sets the workspace root, by default the

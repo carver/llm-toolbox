@@ -184,7 +184,12 @@ so it skips cache/ and keep/ (over a million files), every worktree beside a rep
 (*-wt-*), .git folders, and the root's own dot-files and dot-folders, where
 credentials live, and files nobody wrote by hand (*_files/, as a browser names a saved
 page's scripts, node_modules/, *.min.*, *.map); inside a repo, rg skips what its
-.gitignore names. rg matches those
+.gitignore names, and the sweep skips what its .sweepignore names: a file at the
+repo's top, one path or glob a line, anchored at the repo's top (`*.sql` matches
+only there; `**/*.sql` anywhere in it), for text a build mustn't or needn't fix,
+such as applied migrations (blank lines,
+`#` comments and `!` lines, which would re-include, are skipped; in a linked
+worktree, the worktree's own copy counts). rg matches those
 globs against paths relative to the path it searches, which is why it searches `.`
 from the root. In a linked worktree, the repo's own hits come from the worktree, with
 its edits, rather than from its main tree, which the search above then skips. Its
@@ -648,16 +653,37 @@ def rg(where: Path, prefix: str, globs: list[str], terms: list[str]) -> Search:
     return search
 
 
+def sweep_ignored(repo: Path, under: str) -> list[str]:
+    """rg globs skipping what `repo`'s .sweepignore names, each line a path or glob
+    relative to the repo, anchored under `under` (`/` or `/REPO/`). Blank lines,
+    `#` comments and `!` lines, which would re-include, are skipped."""
+    try:
+        lines = (repo / ".sweepignore").read_text().splitlines()
+    except OSError:
+        return []
+    return [
+        f"!{under}{line.strip().lstrip('/')}"
+        for line in lines
+        if line.strip() and not line.strip().startswith(("#", "!"))
+    ]
+
+
 def search_workspace(root: Path, terms: list[str]) -> Search:
     """Every hit in the workspace's repos as landed, skipping cache/, keep/, the
     worktrees beside them, .git, the root's own dot-files (credentials live
-    there) and files nobody wrote by hand (NOT_SOURCE), except that this repo's
-    hits come from this worktree, not its main tree."""
+    there), files nobody wrote by hand (NOT_SOURCE) and what each repo's
+    .sweepignore names, except that this repo's hits, and its .sweepignore, come
+    from this worktree, not its main tree."""
     globs = ["!{cache,keep}/**", "!*-wt-*/**", "!.git/", "!/.*", *NOT_SOURCE]
+    # A linked worktree's main tree is skipped whole below, so its globs do nothing.
+    for repo in sorted(root.iterdir()):
+        if not repo.name.startswith("."):
+            globs += sweep_ignored(repo, f"/{repo.name}/")
     top, main = work_tree(), main_tree()
     in_worktree = Search()
     if top != main:
-        in_worktree = rg(top, shown_from(root, top), ["!.git", *NOT_SOURCE], terms)
+        own = ["!.git", *NOT_SOURCE, *sweep_ignored(top, "/")]
+        in_worktree = rg(top, shown_from(root, top), own, terms)
         if main.is_relative_to(root):
             globs.append(f"!/{main.relative_to(root)}/**")
     rest = rg(root, ".", globs, terms)

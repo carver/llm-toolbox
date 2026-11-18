@@ -2159,6 +2159,81 @@ def test_sweep_searches_the_folder_holding_the_main_tree_and_this_worktree_first
     ]
 
 
+def test_sweep_skips_what_a_repos_sweepignore_names(repo, tmp_path):
+    # Stale text in an applied migration can't be fixed, so its repo names it there.
+    root = workspace(tmp_path)
+    for path in ("proj/migrations/0001.sql", "proj/docs/prior.md", "proj/docs/now.md"):
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text("Nothing records a search.\n")
+    (root / "proj/.sweepignore").write_text(
+        "# can't change once applied\nmigrations/\n\n/docs/prior.md\n!docs/now.md\n"
+    )
+    # The same path in another repo, which names nothing, is still searched.
+    (root / "notes/migrations").mkdir()
+    (root / "notes/migrations/0001.sql").write_text("Nothing records a search.\n")
+    build_state(repo, "start")
+
+    swept = sweep(repo, root, "Nothing records")
+
+    assert swept.returncode == 0, swept.stderr
+    assert swept.stdout.splitlines() == [
+        "./notes/README.md:1:Nothing records a search.",
+        "./notes/migrations/0001.sql:1:Nothing records a search.",
+        "./proj/docs/now.md:1:Nothing records a search.",
+    ]
+
+
+def test_sweep_from_a_main_tree_reads_its_sweepignore(template, tmp_path):
+    root = tmp_path / "workspace"
+    main = root / "proj"
+    shutil.copytree(template, main, symlinks=True)
+    commit(main, "old.md", "Nothing records a search.")
+    commit(main, ".sweepignore", "old.md")
+    (main / "new.md").write_text("Nothing records a search.\n")
+    build_state(main, "start")
+    env = {k: v for k, v in os.environ.items() if k != "BUILD_STATE_WORKSPACE"}
+
+    swept = subprocess.run(
+        [str(SCRIPT), "sweep", "Nothing records"],
+        cwd=main,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert swept.returncode == 0, swept.stderr
+    assert swept.stdout.splitlines() == ["./proj/new.md:1:Nothing records a search."]
+
+
+def test_sweep_reads_a_linked_worktrees_own_sweepignore(template, tmp_path):
+    root = tmp_path / "workspace"
+    main = root / "proj"
+    shutil.copytree(template, main, symlinks=True)
+    commit(main, "old.md", "Nothing records a search.")
+    linked = root / "proj-wt-topic"
+    git(main, "worktree", "add", "-q", "--detach", str(linked))
+    # Added in the worktree, by the build that needs it: the main tree has none.
+    (linked / ".sweepignore").write_text("old.md\n")
+    (linked / "new.md").write_text("Nothing records a search.\n")
+    build_state(linked, "start")
+    env = {k: v for k, v in os.environ.items() if k != "BUILD_STATE_WORKSPACE"}
+
+    swept = subprocess.run(
+        [str(SCRIPT), "sweep", "Nothing records"],
+        cwd=linked,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert swept.returncode == 0, swept.stderr
+    assert swept.stdout.splitlines() == [
+        "./proj-wt-topic/new.md:1:Nothing records a search."
+    ]
+
+
 def unswept_warning(output):
     return "build-state sweep" in output
 

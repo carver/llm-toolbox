@@ -266,7 +266,10 @@ subagents`), where a fresh agent briefed with the landed commit would start \
 small. An agent spending many turns on task notifications that changed nothing it \
 did (the summary's `wakes`, its `idle wakes`): each such turn resends the whole \
 context, so 25 of them at 300k tokens cost millions. A subagent that ends its \
-turn to wait for a job, rather than blocking on it with `waitone`.
+turn to wait for a job, rather than blocking on it with `waitone`. The main \
+agent's own context grown very large over one long build (the main row's \
+`peak-in` past 200k, the mark `big subagents` uses), where handing a later step \
+to a fresh subagent would have kept each call small.
 - Repetition: the same command sequence, lookup or explanation done more than \
 once, in one agent or across the agents you see.
 - Missing context: anything an agent learned by trial, by asking the user or by \
@@ -280,7 +283,13 @@ skipped or run out of order, such as a review run after the next commit's work \
 had started, or a sweep or bookkeeping command the skill names never run. When \
 a skill names steps to run once per commit, as `/build` does for each commit of \
 a build, check each commit separately: a step run for the last commit but not \
-the first is skipped for the first.
+the first is skipped for the first. A tool's warning or refusal the agent \
+overrode by hand rather than acting on it: a `Fold-check: keep` trailer, before \
+or after build-state or wt-ship asked to fold, `SKIP=` on a hook, a flag that \
+silences a check. Report each: either the tool judged wrong, to fix there; or \
+the agent talked its way past a check; or the repo's own rules call for it, as \
+`SKIP=lychee` offline or a split /build keeps on purpose, which the checker \
+dismisses.
 
 Report every `HOOK ERROR` as a candidate, even one followed by a correct retry: \
 the checker dismisses those, and the retrospective must account for each \

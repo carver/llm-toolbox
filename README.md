@@ -701,7 +701,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   earlier commit since the branch it lands on into that commit, in one rebase,
   leaving a commit that uses a name defined after its target, one with a
   `Fold-check: keep` trailer, and the tree as they were; on a conflict it
-  aborts and names the commits it would have moved past.
+  aborts and names the commits it would have moved past. Lines a commit adds in
+  new files count against its share.
   `reword SHA [FILE]` replaces a commit's message (FILE, or stdin), keeping
   every tree; it refuses during a rebase, with uncommitted changes, with merges
   after the commit, a later `fixup!` naming it, or the commit already pushed.

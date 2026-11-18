@@ -202,6 +202,16 @@ over 50%, a session-scan feature built on the commit before it. A refinement tha
 also fixes a line of main's folds with it, which the owner accepted: it lands
 checked either way.
 
+Each non-blank line a commit adds in a file it creates counts too, as a judged line
+from outside the landing (2026-11-18). Hunk blame weighs only old lines, so
+filedrawer's c93e791, which added 518 lines in three new files and reworded one
+line of an earlier commit's, scored 100% and needed a `Fold-check: keep` by hand.
+Over filedrawer's last 60 commits taken as one batch, the old rule flagged 14 and
+this one 11; the three it drops each added a tool and its tests, 465 to 1271 lines.
+llm-toolbox's last 60 flagged the same 15 either way. A rule that any new file
+makes a commit stand alone was passed over: a review fix that adds a small fixture
+still only refines.
+
 A fold moves a commit back past those between it and its target. A conflict there
 shows in the rebase, which `build-state fold` aborts; a use of a name a commit in
 between defines doesn't, and would fail only the folded commit's full check. So a

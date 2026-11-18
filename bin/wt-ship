@@ -43,9 +43,10 @@ In order, it:
    the order listed. This runs after every rebase, so before any check, and with
    --local before the wait. After the first rebase only, it then warns of each
    commit that only refines an earlier commit of the landing (lib/foldable.py: 75%
-   or more of the lines it changes came from one), a full check that folding would
-   save, and names `build-state fold --upstream UPSTREAM`, which folds them, and the
-   trailer `Fold-check: keep`, which keeps a commit out; then it lands them as they
+   or more of the lines it changes came from one, lines added in new files counting
+   against it), a full check that folding would save, and names `build-state fold
+   --upstream UPSTREAM`, which folds them, and the trailer `Fold-check: keep`, which
+   keeps a commit out; then it lands them as they
    are. A judgement that fails says so in a line and the landing goes on;
 4. checks every commit it would push with the repo's agent-pre-commit hook, else none,
    and says so: each commit whose tree has no pass of the check, as its bytes are now,

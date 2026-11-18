@@ -8,8 +8,10 @@ deletes, and, for a hunk that only inserts, the lines either side of it. C is fo
 when at least THRESHOLD of those lines that aren't blank were last changed by an
 earlier commit of the batch (git blame). Never judged: the first commit, a merge, a
 fixup!/squash!/amend! commit, which folds already, and a commit whose message carries
-the trailer `Fold-check: keep`, a split kept on purpose. A commit with no old line to
-judge, as one that only adds files, isn't foldable.
+the trailer `Fold-check: keep`, a split kept on purpose. Each non-blank line C adds in
+a file it creates counts as a judged line from outside the batch, so a commit that
+mostly adds new files stands on its own, however few old lines it changes. A commit
+with no old line to judge, as one that only adds files, isn't foldable.
 
 C's target is the latest batch commit those lines blame to, and when that one is
 foldable too, its own target, so every fold lands on a commit that stays. Folding C
@@ -83,7 +85,7 @@ def foldable(upstream: str) -> list[Fold]:
         if not blamed:
             continue
         inside = [sha for sha in blamed if sha in earlier]
-        share = len(inside) / len(blamed)
+        share = len(inside) / (len(blamed) + new_file_lines(parent, commit.sha))
         if share < THRESHOLD:
             continue
         latest = max(set(inside), key=order.__getitem__)
@@ -170,10 +172,9 @@ def judge(base: str, parent: str, sha: str) -> tuple[list[str], set[bytes], set[
             new,
             text=False,
         ).stdout
-        for line in diff.split(b"\n"):
-            if line.startswith(b"+") and not line.startswith(b"+++"):
-                added.update(WORD.findall(line[1:]))
-                defined.update(definitions(line[1:]))
+        for line in added_lines(diff):
+            added.update(WORD.findall(line))
+            defined.update(definitions(line))
         lines = line_count(
             git("cat-file", "blob", f"{parent}:{old}", text=False).stdout
         )
@@ -181,6 +182,37 @@ def judge(base: str, parent: str, sha: str) -> tuple[list[str], set[bytes], set[
         if ranges:
             blamed += blame(base, parent, old, ranges)
     return blamed, added, defined
+
+
+def new_file_lines(parent: str, sha: str) -> int:
+    """The non-blank lines the commit adds in the files it creates."""
+    diff = git(
+        "diff",
+        "-U0",
+        "--no-color",
+        "--no-ext-diff",
+        "-M",
+        "--diff-filter=A",
+        parent,
+        sha,
+        text=False,
+    ).stdout
+    return sum(1 for line in added_lines(diff) if line.strip())
+
+
+def added_lines(diff: bytes) -> list[bytes]:
+    """The lines a diff adds, without their `+`: a file's header lines come before
+    its first hunk, so an added `++i;`, shown as `+++i;`, is still one."""
+    lines = []
+    in_hunk = False
+    for line in diff.split(b"\n"):
+        if line.startswith(b"diff "):
+            in_hunk = False
+        elif line.startswith(b"@@"):
+            in_hunk = True
+        elif in_hunk and line.startswith(b"+"):
+            lines.append(line[1:])
+    return lines
 
 
 def changed_files(parent: str, sha: str) -> list[tuple[str, str]]:
@@ -263,9 +295,8 @@ def defined_between(target: str, parent: str) -> set[bytes]:
         "diff", "-U0", "--no-color", "--no-ext-diff", target, parent, text=False
     ).stdout
     names = set()
-    for line in diff.split(b"\n"):
-        if line.startswith(b"+") and not line.startswith(b"+++"):
-            names |= definitions(line[1:])
+    for line in added_lines(diff):
+        names |= definitions(line)
     return names
 
 

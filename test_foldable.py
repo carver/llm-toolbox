@@ -199,6 +199,42 @@ def test_a_commit_that_only_adds_files_is_not_foldable(repo):
     assert flagged() == {}
 
 
+@pytest.mark.parametrize("new_lines, foldable_expected", [(10, False), (1, True)])
+def test_lines_a_commit_adds_in_a_new_file_count_against_its_share(
+    repo, new_lines, foldable_expected
+):
+    branch(repo)
+    write_commit(repo, "Add the feature", {"app.py": MAIN_CODE + feature_lines("f")})
+    # Three of the feature's lines against the new file's non-blank lines: with 10
+    # (3 of 13) the commit stands on its own, as filedrawer's c93e791 did, adding
+    # 518 lines in new files beside one line of an earlier commit's; with 1 (3 of 4)
+    # it still only refines.
+    text = (repo / "app.py").read_text()
+    for n in (2, 3, 4):
+        text = text.replace(f"f part {n}\n", f"f part {n}!\n")
+    new_file = "\n" + feature_lines("new", new_lines)
+    change = write_commit(repo, "Add a tool", {"app.py": text, "tool.py": new_file})
+
+    found = flagged()
+
+    assert (change in found) is foldable_expected
+    if foldable_expected:
+        assert found[change].share == 0.75
+
+
+def test_a_new_files_line_that_starts_with_plus_signs_is_counted(repo):
+    branch(repo)
+    write_commit(repo, "Add the feature", {"app.py": MAIN_CODE + feature_lines("f")})
+    # Three of the feature's lines against two new ones (3 of 5) stand alone; the
+    # diff shows `++i;` as `+++i;`, like a file header.
+    text = (repo / "app.py").read_text()
+    for n in (2, 3, 4):
+        text = text.replace(f"f part {n}\n", f"f part {n}!\n")
+    write_commit(repo, "Add a tool", {"app.py": text, "tool.c": "++i;\n++j;\n"})
+
+    assert flagged() == {}
+
+
 def test_a_commit_with_the_keep_trailer_is_not_foldable(repo):
     branch(repo)
     write_commit(repo, "Add the feature", {"app.py": MAIN_CODE + feature_lines("f")})

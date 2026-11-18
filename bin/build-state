@@ -99,7 +99,8 @@ moves them, are counted. A fix commit left unfolded (its target is older than th
 base) also fails finish. It does not push.
 
 After its fold, finish warns of the commits that only refine an earlier commit of the
-landing (lib/foldable.py: 75% or more of the lines they change came from one), since
+landing (lib/foldable.py: 75% or more of the lines they change came from one, lines
+added in new files counting against it), since
 the merge base with the branch it lands on, each a full check wt-ship would run, and
 says which of them fold leaves in place, as each uses a name defined after its target.
 The branch it lands on is the main tree's, or origin's copy when that is ahead.

@@ -71,6 +71,11 @@ unmerged, a symlink or a submodule there, or marked skip-worktree or assume-unch
 flags a new entry would clear. The mode is kept, and the index takes every file's new
 copy in one write, or none.
 
+After writing, it checks each shell script (a .sh or .bash name, or a #! line that
+runs bash or sh) with `bash -n` or `sh -n`, and each Python file with Python's parser.
+When one parsed before the edit and doesn't now, it says so on stderr, `apply-edits:
+warning: PATH no longer parses: ERROR`, and still exits 0: the edit stays written.
+
 Exit status: 0 applied, 1 a block didn't apply (nothing written), 2 usage error (bad
 input, a missing or unreadable file, or with --cached, a path with no staged copy to
 edit).
@@ -277,6 +282,56 @@ def is_python(path: Path, text: str) -> bool:
     return first.startswith("#!") and (
         "python" in first or ("uv run" in first and "--script" in first)
     )
+
+
+def shell_of(path: Path, text: str) -> str | None:
+    """The shell that parses the file, bash or sh, or None when it's no such script:
+    a .sh or .bash name, or a #! line that runs bash or sh, directly or through env."""
+    first = text.split("\n", 1)[0]
+    if first.startswith("#!"):
+        words = first[2:].split()
+        if words and Path(words[0]).name == "env":
+            words = [w for w in words[1:] if not w.startswith("-")]
+        name = Path(words[0]).name if words else ""
+        if name in ("bash", "sh"):
+            return name
+    return "bash" if path.suffix in (".sh", ".bash") else None
+
+
+def parse_error(path: Path, text: str) -> str | None:
+    """Why the text doesn't parse as the shell or Python script it is, in one line, or
+    None when it parses or is neither."""
+    if is_python(path, text):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ast.parse(text)
+        except SyntaxError as e:
+            return f"line {e.lineno}: {e.msg}"
+        return None
+    shell = shell_of(path, text)
+    if shell is None:
+        return None
+    try:
+        run = subprocess.run(
+            [shell, "-n"], input=text, capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
+    if run.returncode == 0:
+        return None
+    lines = run.stderr.strip().splitlines()
+    return lines[0].split(": ", 1)[-1] if lines else f"{shell} -n failed"
+
+
+def newly_broken(path: Path, before: str, after: str) -> str | None:
+    """A warning when the edit left a script that no longer parses, having parsed."""
+    if parse_error(path, before) is not None:
+        return None
+    error = parse_error(path, after)
+    if error is None:
+        return None
+    return f"apply-edits: warning: {path} no longer parses: {error}"
 
 
 @dataclass
@@ -963,6 +1018,10 @@ def main() -> int:
     for edits, _, note in results:
         count = len(edits.blocks)
         print(f"{edits.path}: {count} edit{'' if count == 1 else 's'}{note}")
+    for (edits, new_text, _), old_text in zip(results, texts, strict=True):
+        warning = newly_broken(edits.path, old_text, new_text)
+        if warning:
+            print(warning, file=sys.stderr)
     return 0
 
 

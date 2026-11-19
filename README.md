@@ -141,6 +141,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   blocks turn the staged text into the part to commit. It refuses a path with no
   index entry of its own, an unmerged one, a symlink or submodule, and one marked
   skip-worktree or assume-unchanged.
+  After writing, it warns on stderr about a shell script (`bash -n`, `sh -n`) or
+  Python file that parsed before the edit and doesn't now, such as a `'` inside
+  `"${x:+...}"`; the edit stays, and it exits 0.
   `apply-edits -h` shows the format.
 - **slop-lint**: flags the tells from the unslop skill that a regex can catch,
   in markdown and text files: em and en dashes, curly quotes, and fixed AI

@@ -1396,3 +1396,116 @@ def test_an_unknown_argument_is_a_usage_error(git_repo: Path) -> None:
     assert result.returncode == 2
     assert git(git_repo, "ls-files", "--stage") == index
     assert (git_repo / "notes.md").read_text() == NOTES
+
+
+# A warning when an edit leaves a file that no longer parses
+
+
+@pytest.mark.parametrize(
+    ("name", "before", "old", "new"),
+    [
+        ("run.sh", "echo hi\n", "echo hi", "echo (hi"),
+        ("tool", "#!/usr/bin/env bash\necho hi\n", "echo hi", "if then"),
+        ("tool", "#!/bin/sh\necho hi\n", "echo hi", "if then"),
+        ("a.py", "x = 1\n", "x = 1", "x = (1"),
+        ("tool", "#!/usr/bin/env python3\nx = 1\n", "x = 1", "def ("),
+    ],
+)
+def test_an_edit_that_breaks_the_files_syntax_is_written_with_a_warning(
+    tmp_path: Path, name: str, before: str, old: str, new: str
+) -> None:
+    (tmp_path / name).write_text(before)
+    result = apply(
+        tmp_path,
+        f"--- {name}\n<<<<<<< SEARCH\n{old}\n=======\n{new}\n>>>>>>> REPLACE\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert new in (tmp_path / name).read_text()
+    assert f"apply-edits: warning: {name} no longer parses: " in result.stderr
+    assert result.stderr.count("\n") == 1, "one line a file"
+
+
+def test_an_apostrophe_in_a_default_expansion_is_caught(tmp_path: Path) -> None:
+    # The slip that started this: bash reads the ' inside "${...}" as a quote.
+    (tmp_path / "w").write_text('#!/usr/bin/env bash\nwhy=x\necho "$why"\n')
+    result = apply(
+        tmp_path,
+        '--- w\n<<<<<<< SEARCH\necho "$why"\n=======\n'
+        'echo "${why:+; can\'t reach}"\n>>>>>>> REPLACE\n',
+    )
+    assert "w no longer parses" in result.stderr
+
+
+def test_a_file_that_didnt_parse_before_gets_no_warning(tmp_path: Path) -> None:
+    (tmp_path / "t.sh").write_text("echo (\nold\n")
+    result = apply(
+        tmp_path, "--- t.sh\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("name", "before"),
+    # "(new" in markdown is no code; inside a Python string it still parses.
+    [("notes.md", "old\n"), ("a.py", "x = 'old'\n"), ("run.sh", "echo 'old'\n")],
+)
+def test_an_edit_that_still_parses_or_isnt_code_gets_no_warning(
+    tmp_path: Path, name: str, before: str
+) -> None:
+    (tmp_path / name).write_text(before)
+    result = apply(
+        tmp_path, f"--- {name}\n<<<<<<< SEARCH\nold\n=======\n(new\n>>>>>>> REPLACE\n"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+
+
+def test_cached_warns_about_the_staged_copy(git_repo: Path) -> None:
+    (git_repo / "run.sh").write_text("echo hi\n")
+    git(git_repo, "add", "run.sh")
+    result = apply(
+        git_repo,
+        "--- run.sh\n<<<<<<< SEARCH\necho hi\n=======\necho (hi\n>>>>>>> REPLACE\n",
+        "--cached",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "run.sh no longer parses" in result.stderr
+    assert (git_repo / "run.sh").read_text() == "echo hi\n"
+
+
+@pytest.mark.parametrize(
+    ("shebang", "warns"),
+    [
+        ("#!/bin/sh", True),
+        ("#!/usr/bin/env bash", False),
+        ("#!/usr/bin/env -S bash -e", False),
+    ],
+)
+def test_a_bash_array_breaks_only_an_sh_script(
+    tmp_path: Path, shebang: str, warns: bool
+) -> None:
+    (tmp_path / "s").write_text(f"{shebang}\necho hi\n")
+    result = apply(
+        tmp_path, "--- s\n<<<<<<< SEARCH\necho hi\n=======\na=(1 2)\n>>>>>>> REPLACE\n"
+    )
+    assert result.returncode == 0, result.stderr
+    assert ("no longer parses" in result.stderr) == warns
+
+
+def test_an_env_dash_s_shebang_is_checked_with_its_shell(tmp_path: Path) -> None:
+    (tmp_path / "s").write_text("#!/usr/bin/env -S bash -e\necho hi\n")
+    result = apply(
+        tmp_path, "--- s\n<<<<<<< SEARCH\necho hi\n=======\nif then\n>>>>>>> REPLACE\n"
+    )
+    assert "s no longer parses" in result.stderr
+
+
+def test_pythons_own_warnings_dont_reach_stderr(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x = 1\n")
+    result = apply(
+        tmp_path,
+        '--- a.py\n<<<<<<< SEARCH\nx = 1\n=======\nx = "\\d"\n>>>>>>> REPLACE\n',
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""

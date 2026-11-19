@@ -1,0 +1,243 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""Upgrade llm-toolbox's copy of a File Drawer skill from its git tag, and land it.
+
+    filedrawer-skill-upgrade NAME VERSION
+
+skills/filedrawer-search and skills/filedrawer-submit are copies of File Drawer's
+skills (https://filedrawer.dev), each as its tag skill-NAME-vVERSION of
+github.com/filedrawer-dev/filedrawer holds it, but for references/upgrade.sh. The
+skill's SKILL.md runs that script with the version the site names, and here it is a
+shim that runs this tool. File Drawer's own script would swap ~/.agents/skills/NAME
+for a folder of its own, cutting the link install.py made.
+
+The tool fetches the tag's SKILL.md and each file its metadata.files lists from
+GitHub, never from the site, and checks the name and version. It then adds the
+worktree ../llm-toolbox-wt-NAME-vVERSION at HEAD, puts the files in skills/NAME there
+with the shim back in place, commits, and lands the commit with `wt-ship --local
+--remove`, started through bgrun so the agent's turn goes on meanwhile. Its last
+lines tell the agent what it did and what to do next: tell the human in one line,
+read the new SKILL.md now from a copy in the cache, and before finishing the task,
+wait for the landing with waitone and say whether it landed.
+
+It installs only in auto mode, File Drawer's default: when the first line of
+~/.config/filedrawer/upgrade says anything else, it changes nothing and says so.
+An existing worktree for any version of the skill means an upgrade is landing, or
+failed to land: the tool names it and changes nothing.
+
+Environment:
+  FILEDRAWER_SKILL_UPGRADE_TAGS  where the tags' files are, default
+                                 https://raw.githubusercontent.com/filedrawer-dev/filedrawer/refs/tags
+                                 (tests point it at a file:// folder)
+
+Files: the landing's log and the readable copy go in
+$XDG_CACHE_HOME/filedrawer-skill-upgrade/ (default ~/.cache).
+
+Exit status: 0 upgraded, or nothing to do; 1 failed, having changed nothing.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SKILLS = ("filedrawer-search", "filedrawer-submit")
+TAGS = "https://raw.githubusercontent.com/filedrawer-dev/filedrawer/refs/tags"
+TAG_PAGE = "https://github.com/filedrawer-dev/filedrawer/tree"
+
+
+class Failed(Exception):
+    pass
+
+
+def metadata(text: str, key: str) -> str | None:
+    """The value of key in SKILL.md's front matter metadata, `  key: "value"`."""
+    found = re.search(rf'^  {key}: "([^"\n]*)"$', text, re.MULTILINE)
+    return found and found.group(1)
+
+
+def fetch(url: str) -> bytes:
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            return response.read()
+    except (OSError, ValueError) as error:
+        raise Failed(f"couldn't fetch {url}: {error}") from error
+
+
+def fetch_tag(name: str, version: str, into: Path) -> None:
+    """Fetches the tag's files of the skill into the folder `into`, or fails."""
+    base = os.environ.get("FILEDRAWER_SKILL_UPGRADE_TAGS", TAGS)
+    source = f"{base}/skill-{name}-v{version}/skills/{name}"
+    raw = fetch(f"{source}/SKILL.md")
+    try:
+        text = raw.decode()
+    except UnicodeDecodeError as error:
+        raise Failed(f"{source}/SKILL.md isn't UTF-8 text") from error
+    if f"\nname: {name}\n" not in text or metadata(text, "version") != version:
+        raise Failed(f"{source}/SKILL.md isn't {name} version {version}")
+    files = (metadata(text, "files") or "").split()
+    for path in files:
+        if path.startswith("/") or ".." in path:
+            raise Failed(f"refused path in the tag's files: {path}")
+    into.mkdir(parents=True)
+    (into / "SKILL.md").write_bytes(raw)
+    for path in files:
+        if path != "SKILL.md":
+            (into / path).parent.mkdir(parents=True, exist_ok=True)
+            (into / path).write_bytes(fetch(f"{source}/{path}"))
+
+
+def mode() -> str:
+    """The upgrade mode, read as File Drawer's script reads it: auto without a file,
+    and otherwise the file's first line, so an empty file chose ask."""
+    config = Path.home() / ".config" / "filedrawer" / "upgrade"
+    try:
+        lines = config.read_text().splitlines()
+    except FileNotFoundError:
+        return "auto"
+    return lines[0] if lines else ""
+
+
+def run(*command: str | Path, cwd: Path) -> str:
+    done = subprocess.run(
+        [str(part) for part in command],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if done.returncode != 0:
+        said = (done.stdout + done.stderr).strip().splitlines()
+        raise Failed(f"{command[0]} {command[1]} said: {said[-1] if said else '-'}")
+    return done.stdout
+
+
+def cache_dir() -> Path:
+    cache = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    return Path(cache) / "filedrawer-skill-upgrade"
+
+
+def landing_log(name: str, version: str) -> Path:
+    return cache_dir() / f"{name}-v{version}.wt-ship.log"
+
+
+def pending(name: str) -> bool:
+    """Whether an upgrade of the skill is landing or failed to land, which it says."""
+    for worktree in sorted(REPO.parent.glob(f"{REPO.name}-wt-{name}-v*")):
+        was = worktree.name.rsplit("-v", 1)[1]
+        print(f"An upgrade of {name} to version {was} is landing, or didn't land:")
+        print(f"its worktree {worktree} is still there; the landing's log is")
+        print(f"{landing_log(name, was)}.")
+        print("Nothing was changed. Tell your human that in one line, and go on with")
+        print("your task on the version you have.")
+        return True
+    return False
+
+
+def commit_and_land(name: str, version: str, fetched: Path) -> tuple[str, str]:
+    """Commits the fetched skill in a worktree of its own and starts its landing,
+    giving the commit and the landing's PID, or fails having removed the worktree."""
+    worktree = REPO.parent / f"{REPO.name}-wt-{name}-v{version}"
+    # git worktree add refuses a path that exists, so of two sessions upgrading at
+    # once, one gets past it.
+    run("git", "worktree", "add", "--detach", "-q", worktree, "HEAD", cwd=REPO)
+    try:
+        target = worktree / "skills" / name
+        shutil.rmtree(target)
+        shutil.copytree(fetched, target)
+        run("git", "add", "-A", "--", f"skills/{name}", cwd=worktree)
+        message = (
+            f"{name}: upgrade to version {version} from its tag\n\n"
+            f"{TAG_PAGE}/skill-{name}-v{version}/skills/{name}, fetched by\n"
+            "bin/filedrawer-skill-upgrade, with the toolbox's upgrade.sh kept.\n"
+        )
+        run("git", "commit", "-q", "-m", message, cwd=worktree)
+        sha = run("git", "rev-parse", "--short", "HEAD", cwd=worktree).strip()
+        log = landing_log(name, version)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        land = ("wt-ship", "-C", worktree, "--local", "--remove")
+        pid = run("bgrun", "-o", log, "--", *land, cwd=REPO).strip()
+    except BaseException:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(worktree)],
+            cwd=REPO,
+            capture_output=True,
+            check=False,
+        )
+        raise
+    return sha, pid
+
+
+def upgrade(name: str, version: str) -> None:
+    folder = REPO / "skills" / name
+    have = metadata((folder / "SKILL.md").read_text(), "version")
+    if have is None:
+        raise Failed(f"{folder}/SKILL.md names no version")
+    if int(version) <= int(have):
+        print(f"{name} is at version {have} already, so there is nothing to upgrade.")
+        print("Go on with your task.")
+        return
+    if mode() != "auto":
+        print(f"{name} version {version} is out, but the upgrade mode in")
+        print("~/.config/filedrawer/upgrade isn't auto, and llm-toolbox's copy")
+        print("upgrades only in auto mode, so nothing was changed. Tell your human")
+        print("that in one line, and go on with your task.")
+        return
+    if pending(name):
+        return
+    with tempfile.TemporaryDirectory() as work:
+        fetched = Path(work) / name
+        fetch_tag(name, version, fetched)
+        (fetched / "references").mkdir(exist_ok=True)
+        shim = folder / "references" / "upgrade.sh"
+        shutil.copy2(shim, fetched / "references" / "upgrade.sh")
+        sha, pid = commit_and_land(name, version, fetched)
+        # The worktree goes once it lands, so the agent reads the new version here.
+        readable = cache_dir() / f"{name}-v{version}"
+        shutil.rmtree(readable, ignore_errors=True)
+        shutil.copytree(fetched, readable)
+    print(f"upgraded {name} from version {have} to {version} in llm-toolbox, commit")
+    print(f"{sha}, from {TAG_PAGE}/skill-{name}-v{version}/skills/{name}.")
+    print(f"wt-ship is landing it in the background, PID {pid},")
+    print(f"log {landing_log(name, version)}.")
+    print("Tell your human that in one line, without asking. Then read")
+    print(f"{readable}/SKILL.md before you go on: your task follows the new version.")
+    print(f"Before you finish your task, run `waitone --pid {pid}`, then tell your")
+    print("human in one line whether it landed, as the log's last lines say.")
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    name = argv[0] if argv else "the skill"
+    try:
+        if len(argv) == 3:
+            raise Failed("llm-toolbox's copy upgrades only in auto mode: no yes or no")
+        if len(argv) != 2:
+            raise Failed("give the skill's name and the version")
+        version = argv[1]
+        if name not in SKILLS:
+            raise Failed(f"not a File Drawer skill kept here: {name}")
+        if not re.fullmatch(r"[0-9]{1,9}", version):
+            raise Failed(f"not a version: {version}")
+        upgrade(name, version)
+    except (Failed, OSError) as error:
+        print(
+            f"Upgrading {name} failed ({error}) and changed nothing: keep the version"
+            " you have, tell your human in one line what failed, and go on.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

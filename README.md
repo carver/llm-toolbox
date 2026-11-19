@@ -83,6 +83,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **upskill**: run by hand (`/upskill`) near the end of a session, or on an
   earlier one. Reviews it for mistakes, waste, repeated work and missing
   guardrails, subagents included, then pitches fixes before making any.
+- **filedrawer-search**, **filedrawer-submit**: File Drawer's skills
+  (https://filedrawer.dev), for searching and posting AI safety results that won't
+  become papers, copied from their git tags but for `references/upgrade.sh`, a
+  shim that runs `filedrawer-skill-upgrade`.
 - **todone**: run by hand (`/todone`) to do a coding to-do from the knowledge-dump
   vault. The commit message gets the to-do's Why and source, and the to-do gets
   ticked with the commit and what was learned doing it.
@@ -734,6 +738,17 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   upstream change makes a patch no longer fit, redo the edit on the new
   version and save again.
 
+- **filedrawer-skill-upgrade**: `filedrawer-skill-upgrade NAME VERSION` upgrades
+  this repo's copy of a File Drawer skill, which its `references/upgrade.sh` shim
+  runs when the skill finds a newer version. It fetches the tag
+  `skill-NAME-vVERSION` from GitHub (`$FILEDRAWER_SKILL_UPGRADE_TAGS` points tests
+  elsewhere), commits it in the worktree `../llm-toolbox-wt-NAME-vVERSION` with
+  the shim kept, and lands it with `wt-ship --local --remove` through bgrun, then
+  tells the agent to say so in a line, read the new SKILL.md from
+  `$XDG_CACHE_HOME/filedrawer-skill-upgrade/`, and wait on the landing before it
+  finishes. Only in File Drawer's auto mode: another mode in
+  `~/.config/filedrawer/upgrade` changes nothing. File Drawer's own script would
+  replace the link `install.py` makes in `~/.agents/skills` with a folder.
 - **skills-news**: fetches the sources in `install.py`'s `THIRD_PARTY_SKILLS`,
   diffs each installed skill against upstream, and reports which changed
   upstream (summarized by Claude, with file stats beside each summary), which

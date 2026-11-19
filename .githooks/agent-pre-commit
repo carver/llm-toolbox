@@ -32,6 +32,9 @@ tests_for() {
     # What the whole suite collects wherever it lies: Python, and doctests.
     *.py | */test*.txt) return 1 ;;
     README.md) echo test_readme_env.py test_skill_refs.py ;;
+    # The shim's tests run the tool against git worktrees, about ten seconds; an
+    # upgrade's commit keeps the shim, so only an edit to the shim runs them.
+    skills/filedrawer-*/references/upgrade.sh) echo test_skill_refs.py test_filedrawer_skill_upgrade.py ;;
     GLOBAL_CLAUDE.md | skills/*) echo test_skill_refs.py ;;
     skill-patches/*) echo test_install.py test_skill_refs.py ;;
     CLAUDE.md | CODING_STANDARDS.md | docs/*) ;;

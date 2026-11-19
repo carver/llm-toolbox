@@ -8,6 +8,9 @@ import install
 ROOT = Path(__file__).resolve().parent
 OWN = {p.name for p in (ROOT / "skills").iterdir() if (p / "SKILL.md").is_file()}
 INSTALLED = OWN | {n for names in install.THIRD_PARTY_SKILLS.values() for n in names}
+# Copies of File Drawer's skills (bin/filedrawer-skill-upgrade), whose `/search` and
+# the like are the site's routes, not skills.
+VENDORED = ("filedrawer-search", "filedrawer-submit")
 # Claude Code's own slash commands, which docs may name beside skills.
 BUILTIN = {"clear", "compact", "config", "help", "init", "memory", "resume"}
 
@@ -48,7 +51,11 @@ def docs() -> list[Path]:
     return [
         ROOT / "GLOBAL_CLAUDE.md",
         ROOT / "README.md",
-        *sorted((ROOT / "skills").rglob("*.md")),
+        *sorted(
+            doc
+            for doc in (ROOT / "skills").rglob("*.md")
+            if doc.relative_to(ROOT / "skills").parts[0] not in VENDORED
+        ),
         *sorted((ROOT / "skill-patches").glob("*.patch")),
     ]
 

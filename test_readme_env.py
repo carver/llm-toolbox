@@ -18,20 +18,29 @@ ENV_TABLE = re.compile(r"^Environment[^\n]*:\n((?:[ \t]+\S[^\n]*\n?)+)", re.MULT
 ENV_ROW = re.compile(r"([ \t]+)([A-Z][A-Z0-9_]+)\b")
 
 
-def env_vars(docstring: str) -> set[str]:
-    """The variables a docstring names: as `$NAME`, or opening a line of its
-    Environment table (a line starting `Environment` and ending in `:`, then indented
-    lines) at the table's first indentation. A wrapped description, indented deeper,
-    names none."""
-    found = set(ENV_VAR.findall(docstring))
+def env_rows(docstring: str) -> list[tuple[str, str]]:
+    """The rows of a docstring's Environment tables (a line starting `Environment`
+    and ending in `:`, then indented lines), as (variable, description): a row opens
+    at the table's first indentation, and a line indented deeper continues its
+    description."""
+    rows: list[tuple[str, str]] = []
     for block in ENV_TABLE.findall(docstring):
         lines = block.splitlines()
         indent = len(lines[0]) - len(lines[0].lstrip())
         for line in lines:
             listed = ENV_ROW.match(line)
             if listed and len(listed.group(1)) == indent:
-                found.add(listed.group(2))
-    return found
+                rows.append((listed.group(2), line[listed.end() :].strip()))
+            elif rows:
+                name, description = rows[-1]
+                rows[-1] = (name, f"{description} {line.strip()}")
+    return rows
+
+
+def env_vars(docstring: str) -> set[str]:
+    """The variables a docstring names: as `$NAME`, or opening a row of its
+    Environment table. A wrapped description names none."""
+    return set(ENV_VAR.findall(docstring)) | {name for name, _ in env_rows(docstring)}
 
 
 def readme_entry(name: str) -> str:

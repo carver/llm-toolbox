@@ -1,4 +1,6 @@
 """Every environment variable a bin/ tool or lib/ module reads, its docstring names.
+A variable its Environment table describes as for the tests is named after the tool
+or a lib/ module (CODING_STANDARDS.md, Tools).
 
 A tool's docstring is its -h, and test_readme_env.py holds its README entry to that,
 so a variable the code reads but the docstring leaves out is one nobody can find.
@@ -12,6 +14,8 @@ import re
 from pathlib import Path
 
 import pytest
+
+from test_readme_env import env_rows
 
 ROOT = Path(__file__).resolve().parent
 SOURCES = sorted(
@@ -146,6 +150,9 @@ def passed_through(name):
 
 TREES = {path: parse(path) for path in SOURCES}
 WRAPPERS = wrappers(tree for tree in TREES.values() if tree is not None)
+TOOLS_WITH_DOCS = [
+    p for p, tree in TREES.items() if tree is not None and p.parent.name == "bin"
+]
 
 
 @pytest.mark.parametrize("source", SOURCES, ids=lambda p: str(p.relative_to(ROOT)))
@@ -213,3 +220,61 @@ def test_reads_finds_each_form_and_reads_through_a_helper():
         "N_METHOD",
     }
     assert {name for name in found if passed_through(name)} == {"PATH", "GIT_DIR"}
+
+
+# Modules and packages, such as lib/paperkit/.
+LIB_MODULES = sorted(
+    p.stem
+    for p in (ROOT / "lib").iterdir()
+    if p.suffix == ".py" or (p / "__init__.py").is_file()
+)
+
+
+def misnamed_test_knobs(tool: str, doc: str, lib_modules: list[str]) -> list[str]:
+    """The variables doc's Environment table describes as for the tests whose names
+    start with neither the tool's name nor a lib/ module's, upper case with - as _
+    (CODING_STANDARDS.md, Tools)."""
+    prefixes = tuple(
+        name.upper().replace("-", "_") + "_" for name in [tool, *lib_modules]
+    )
+    return [
+        name
+        for name, description in env_rows(doc)
+        if re.search(r"\btests?\b", description) and not name.startswith(prefixes)
+    ]
+
+
+KNOBS_SAMPLE = """Do a thing.
+
+Environment:
+  MY_TOOL_GRACE    seconds to wait (tests set it short)
+  FIFO_LOCK_SECONDS  seconds for the lock (default 5; the tests
+                   set it short)
+  SHORT_WAIT       seconds between looks, which the
+                   tests set to 0
+  WAIT_PID         the process to wait for, by its
+                   PID (tests)
+  OPENAI_API_KEY   the key it sends
+"""
+
+
+def test_a_test_knob_must_be_named_after_its_tool_or_a_lib_module():
+    assert misnamed_test_knobs("my-tool", KNOBS_SAMPLE, ["fifo"]) == [
+        "SHORT_WAIT",
+        "WAIT_PID",
+    ]
+
+
+def test_lib_packages_count_as_modules():
+    assert "paperkit" in LIB_MODULES
+
+
+@pytest.mark.parametrize("source", TOOLS_WITH_DOCS, ids=lambda p: p.name)
+def test_each_test_knob_is_named_after_its_tool(source):
+    doc = ast.get_docstring(TREES[source]) or ""
+    # A link, such as claude-json to claude-fresh, prints its target's docstring.
+    misnamed = misnamed_test_knobs(source.resolve().name, doc, LIB_MODULES)
+    assert not misnamed, (
+        f"{source.name}'s test knobs {misnamed} aren't named after it: "
+        "CODING_STANDARDS.md, Tools"
+    )

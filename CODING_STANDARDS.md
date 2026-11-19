@@ -17,7 +17,7 @@ The rules a reviewer holds this repo's code to. The global standards in `~/.agen
 - The module docstring is the help: `-h` prints it, and it says what the tool does, its options, its environment variables and its exit statuses. The tool's README entry says the same in brief. Every environment variable `-h` names, the README entry names too (`test_readme_env.py`).
 - Agents read the output, and every character costs tokens. The default output is the short form: a summary line, the few lines that matter, never a whole log. A longer form goes behind a flag.
 - A failure prints one line saying what failed and what to do, on stderr, and exits non-zero. Distinct outcomes get distinct exit statuses, listed in the docstring, so a caller can branch without parsing text.
-- A knob that exists for the tests, such as a shorter grace period, is an environment variable named after the tool (`MUTATE_CHECK_GRACE`), and the docstring says so.
+- A knob that exists for the tests, such as a shorter grace period, is an environment variable named after the tool (`MUTATE_CHECK_GRACE`), or after a lib/ module (`FIFO_LOCK_SECONDS`, which lib/fifo.py reads), and the docstring says so. `test_env_documented.py` refuses a docstring Environment row that mentions tests and names neither.
 - A tool that starts processes stops what it started, its children's children included, when it times out or is stopped, and puts back anything it changed. It never matches processes by command line with `pkill -f`; it uses `safekill`, `safeps` or a PID it holds.
 - Some tools are copied into other repos, such as `pre-commit-run` and `slop-lint`. A change to one names the copies in its commit message, so the owner can copy it out.
 

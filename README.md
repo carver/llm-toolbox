@@ -370,7 +370,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `DRIVE_AGENT_HOME_ROOT`) and shorten `DRIVE_AGENT_TURN_LIMIT`,
   `DRIVE_AGENT_SETTLE`, `DRIVE_AGENT_LAUNCH_LIMIT`, `DRIVE_AGENT_TRUST_GRACE`,
   `DRIVE_AGENT_ANSWER_LIMIT` and `DRIVE_AGENT_DIALOG_GRACE`; the proxy forwards
-  through `HTTPS_PROXY`. Needs tmux, passwordless sudo, bwrap and iptables.
+  through `HTTPS_PROXY`. A tmux command that doesn't return within
+  `DRIVE_AGENT_TMUX_LIMIT` seconds fails the run, and SIGUSR1 prints where each
+  thread is. Needs tmux, passwordless sudo, bwrap and iptables.
 - **pre-commit-run**: runs the pre-commit framework from a repo's pre-commit
   hook. A person sees its output as it runs; an agent (`AI_AGENT` set) sees it
   only on a failure, and every refusal ends with `COMMIT REFUSED`. It refuses

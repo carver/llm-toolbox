@@ -118,17 +118,22 @@ Environment:
   DRIVE_AGENT_DIALOG_GRACE   seconds a question dialog shows before drive-agent
                              reads it from the screen, when Claude Code hasn't
                              written it to its transcript (20)
+  DRIVE_AGENT_TMUX_LIMIT     seconds a tmux command has to return before the run
+                             fails, naming it (30)
   HTTPS_PROXY, https_proxy   the proxy drive-agent's own proxy forwards through
 
 Needs tmux, and for isolation, passwordless sudo, bwrap (the bubblewrap package) and
 iptables. Exit status: 0 the run ended, 1 it failed (harness not ready, a turn
-timed out, a question dialog it couldn't answer, a setup error), 2 usage error.
+timed out, a question dialog it couldn't answer, a tmux command that didn't
+return, a setup error), 2 usage error. SIGUSR1 prints where each of its threads
+is to stderr, for a run that seems stuck; SIGTERM stops it and cleans up.
 run.json's outcome then says which: failed, not-ready, timeout, auth, rate-limit,
 dialog (a turn stopped on some other dialog), dialog-unanswered.
 """
 
 import argparse
 import atexit
+import faulthandler
 import ipaddress
 import json
 import os
@@ -217,10 +222,40 @@ ANSWER_LIMIT = number("DRIVE_AGENT_ANSWER_LIMIT", 30)
 # it is read from the screen: Claude Code 2.1.325 sometimes writes the question only
 # with its answer, and an answered dialog stays drawn a moment, which is no question.
 DIALOG_GRACE = number("DRIVE_AGENT_DIALOG_GRACE", 20)
+# How long a tmux command has to return: a client stuck on its server, as when
+# another run with the same name took the socket, would otherwise hang the run.
+TMUX_LIMIT = number("DRIVE_AGENT_TMUX_LIMIT", 30)
 
 
 class Usage(Exception):
     """A usage error: exit 2."""
+
+
+def kill_tmux_server(pid: int | None) -> list[int]:
+    """SIGKILLs the tmux server `pid` and its panes' processes, its children, and
+    returns the pids killed. By pid, not socket name: a name repeats in every
+    TMUX_TMPDIR, another run's included."""
+    if pid is None:
+        return []
+    victims = [pid]
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            # The parent pid is the field after the command, which may hold spaces.
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if fields[1:2] == [str(pid)]:
+            victims.append(int(entry.name))
+    killed = []
+    for victim in victims:
+        try:
+            os.kill(victim, signal.SIGKILL)
+            killed.append(victim)
+        except OSError:
+            pass
+    return killed
 
 
 class Failed(Exception):
@@ -1226,18 +1261,37 @@ class Session:
         self.env_file = env_file
         self.project = project
         self.launches = 0
+        # The tmux server's pid, for a kill-server that doesn't return.
+        self.server_pid: int | None = None
         # Since when a dialog has shown with no question in the transcript.
         self.unexplained_dialog: float | None = None
         self.socket = f"drive-agent-{box.name}"
         self.name = "agent"
 
     def tmux(self, *args, check=True) -> subprocess.CompletedProcess:
-        return run("tmux", "-L", self.socket, *args, check=check)
+        try:
+            return run(
+                "tmux", "-L", self.socket, *args, check=check, timeout=TMUX_LIMIT
+            )
+        except subprocess.TimeoutExpired:
+            raise Failed(
+                f"`tmux {args[0]}` on the socket {self.socket} didn't return within "
+                f"{TMUX_LIMIT:g} s: is another run with this --name going? Next time, "
+                "kill -USR1 drive-agent's pid while it waits, to see where it is"
+            ) from None
 
     def screen(self) -> str:
         return self.tmux(
             "capture-pane", "-p", "-J", "-S", "-5000", "-t", self.name, check=False
         ).stdout
+
+    def last_screen(self) -> str:
+        """The screen to save beside an outcome already decided, which a tmux that
+        no longer answers mustn't turn into another."""
+        try:
+            return self.screen()
+        except Failed as error:
+            return f"(no screen: {error})\n"
 
     def alive(self) -> bool:
         """Whether the harness still runs. A pane whose program exited stays open
@@ -1268,6 +1322,8 @@ class Session:
             *argv,
         )
         self.tmux("set-option", "-t", self.name, "remain-on-exit", "on", check=False)
+        found = self.tmux("display-message", "-p", "#{pid}", check=False).stdout.strip()
+        self.server_pid = int(found) if found.isdigit() else None
         deadline = time.time() + LAUNCH_LIMIT
         ready_since = None
         while time.time() < deadline:
@@ -1280,11 +1336,20 @@ class Session:
                 ready_since = ready_since or time.time()
                 if time.time() - ready_since >= TRUST_GRACE:
                     return
-        (self.out / "screen-launch.txt").write_text(self.screen())
+        (self.out / "screen-launch.txt").write_text(self.last_screen())
         raise NotReady
 
     def stop(self) -> None:
-        self.tmux("kill-server", check=False)
+        try:
+            self.tmux("kill-server", check=False)
+        except Failed:
+            # A stuck server can't stop the cleanup after it, nor outlive the run.
+            killed = kill_tmux_server(self.server_pid)
+            print(
+                f"drive-agent: tmux kill-server on {self.socket} didn't return; "
+                f"killed its processes instead ({', '.join(map(str, killed)) or 'none found'})",
+                file=sys.stderr,
+            )
 
     def turns_seen(self) -> int:
         data = self.box.read(self.harness.turns_file)
@@ -1546,7 +1611,7 @@ def interactive(
         else:
             session.send(fill(text, values))
         if failed:
-            (session.out / f"screen-{n:02}.txt").write_text(session.screen())
+            (session.out / f"screen-{n:02}.txt").write_text(session.last_screen())
             with log.open("a") as f:
                 f.write(
                     f"## Turn {n}: FAILED, {failed}\n\n"
@@ -1578,7 +1643,7 @@ def interactive(
             flush=True,
         )
         if not ended:
-            return why_stuck(session.screen())
+            return why_stuck(session.last_screen())
     return "done"
 
 
@@ -2103,6 +2168,7 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGHUP, stop)
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     try:
         if args.command == "run":
             return drive(args)

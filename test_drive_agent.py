@@ -16,9 +16,13 @@ passwordless sudo and bwrap are there.
 import json
 import os
 import re
+import shutil
+import signal
 import socket
 import subprocess
+import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -311,7 +315,29 @@ else:
 
 @pytest.fixture
 def env(tmp_path):
-    """The driver's environment: fakes first on PATH, no isolation, fast waits."""
+    e = make_env(tmp_path)
+    yield e
+    remove_tmux_folder(e["TMUX_TMPDIR"])
+
+
+def remove_tmux_folder(folder: str) -> None:
+    """Ends each tmux server left in `folder`, as a drive-agent killed before its
+    cleanup leaves one, then removes it: with its socket gone it could be reached
+    no more."""
+    for sock in Path(folder).glob("tmux-*/*"):
+        subprocess.run(
+            ["tmux", "-S", str(sock), "kill-server"],
+            env={"PATH": "/usr/local/bin:/usr/bin:/bin"},
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+def make_env(tmp_path):
+    """The driver's environment: fakes first on PATH, no isolation, fast waits, and a
+    tmux socket folder of its own, which the caller removes (TMUX_TMPDIR)."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for name in ("claude", "codex"):
@@ -365,6 +391,10 @@ def env(tmp_path):
         DRIVE_AGENT_LAUNCH_LIMIT="10",
         DRIVE_AGENT_TRUST_GRACE="0.5",
         FAKE_HUMAN_LOG=str(tmp_path / "human.log"),
+        # tmux's socket folder is one per user, shared by every test and session, so
+        # two runs with one name took each other's server. Under /tmp, since a
+        # socket's path holds at most about 100 bytes and tmp_path's runs longer.
+        TMUX_TMPDIR=tempfile.mkdtemp(prefix="drive-agent-test-", dir="/tmp"),
     )
     return e
 
@@ -375,15 +405,39 @@ def scenario(tmp_path, **keys):
     return path
 
 
-def drive(env, *args, check=True):
-    done = subprocess.run(
-        [str(TOOL), *map(str, args)],
+def drive(env, *args, check=True, timeout=100, tool=TOOL):
+    """Runs drive-agent. Past `timeout`, under pytest's 120 s, it lists drive-agent's
+    child processes, asks it where each thread is (SIGUSR1), stops it, and fails with
+    both, so a hang says where it hung."""
+    process = subprocess.Popen(
+        [str(tool), *map(str, args)],
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=120,
-        check=False,
     )
+    try:
+        out, err = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        children = subprocess.run(
+            ["ps", "-o", "pid,etimes,args", "--ppid", str(process.pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        process.send_signal(signal.SIGUSR1)
+        # SIGTERM after the dump, so drive-agent cleans up as it stops.
+        process.terminate()
+        try:
+            out, err = process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            out, err = process.communicate()
+        pytest.fail(
+            f"drive-agent ran past {timeout:g} s.\nIts child processes:\n{children}\n"
+            f"Its stdout:\n{out}\nIts stderr, each thread's stack included:\n{err}"
+        )
+    done = subprocess.CompletedProcess(process.args, process.returncode, out, err)
     if check:
         assert done.returncode == 0, done.stderr
     return done
@@ -972,7 +1026,7 @@ def test_config_is_saved_with_the_given_values_and_keys_blanked(tmp_path, env):
 def test_print_mode_sends_the_first_turn_once(tmp_path, env):
     path = scenario(tmp_path, turns=["just this"], print_mode=True)
     out = tmp_path / "out"
-    drive(env, "run", path, "--harness", "codex", "--name", "jason12", "--out", out)
+    drive(env, "run", path, "--harness", "codex", "--name", "jason43", "--out", out)
     assert "done: just this" in (out / "print-mode.jsonl").read_text()
 
 
@@ -1471,3 +1525,227 @@ def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
         check=False,
     ).stdout
     assert f"drive-agent-{name}" not in rules
+
+
+def hanging_tmux(env, tmp_path, subcommand):
+    """A tmux first on PATH that runs the real one, except `subcommand`, which notes
+    it began and then never returns, as a tmux client stuck on its server would."""
+    real = subprocess.run(
+        ["sh", "-c", "command -v tmux"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    began = tmp_path / "tmux-hung"
+    fake = Path(env["PATH"].split(":")[0]) / "tmux"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$3" = {subcommand} ]; then echo $$ > {began}; exec sleep 3600; fi\n'
+        f'exec {real} "$@"\n'
+    )
+    fake.chmod(0o755)
+    return began
+
+
+def end_hung_tmux(began: Path) -> None:
+    """Kills the hung fake tmux, which no limit ends when the tool has none."""
+    if began.exists() and began.read_text().strip():
+        try:
+            os.kill(int(began.read_text()), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_a_tmux_call_that_never_returns_fails_the_run_and_names_it(tmp_path, env):
+    began = hanging_tmux(env, tmp_path, "capture-pane")
+    try:
+        done = drive(
+            {**env, "DRIVE_AGENT_TMUX_LIMIT": "1"},
+            "run",
+            scenario(tmp_path, turns=["hi"]),
+            "--harness",
+            "claude",
+            "--name",
+            "jason40",
+            "--out",
+            tmp_path / "out",
+            check=False,
+            timeout=60,
+        )
+    finally:
+        end_hung_tmux(began)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "tmux capture-pane" in done.stderr and "1 s" in done.stderr
+
+
+def test_sigusr1_prints_where_each_thread_is(tmp_path, env):
+    began = hanging_tmux(env, tmp_path, "capture-pane")
+    stderr = tmp_path / "stderr"
+    process = subprocess.Popen(
+        [
+            str(TOOL),
+            "run",
+            str(scenario(tmp_path, turns=["hi"])),
+            "--harness",
+            "claude",
+            "--name",
+            "jason41",
+            "--out",
+            str(tmp_path / "out"),
+        ],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=(errors := stderr.open("w")),
+    )
+    errors.close()
+    try:
+        deadline = time.time() + 30
+        while not began.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert began.exists(), "drive-agent never called tmux capture-pane"
+        process.send_signal(signal.SIGUSR1)
+        # The dump first, then the stuck tmux ended, so the stop that follows has
+        # nothing to wait out.
+        deadline = time.time() + 30
+        while "most recent call first" not in stderr.read_text():
+            if time.time() > deadline:
+                break
+            time.sleep(0.05)
+        end_hung_tmux(began)
+        process.terminate()
+        process.wait(timeout=60)
+        err = stderr.read_text()
+    finally:
+        process.kill()
+        process.wait()
+        end_hung_tmux(began)
+    assert "most recent call first" in err, err
+    assert " in tmux\n" in err, err
+
+
+def test_two_runs_with_one_name_at_once_each_get_a_tmux_of_their_own(tmp_path):
+    """As two tests, or two sessions' test runs, that use one name do: tmux's socket
+    folder is one per user, so they once took each other's server (duplicate
+    session, a turn that timed out)."""
+    envs = []
+    for side in ("a", "b"):
+        (tmp_path / side).mkdir()
+        envs.append(make_env(tmp_path / side))
+
+    def args(side):
+        return [
+            str(TOOL),
+            "run",
+            str(scenario(tmp_path / side, turns=["one", "two"])),
+            "--harness",
+            "claude",
+            "--name",
+            "jason42",
+            "--out",
+            str(tmp_path / side / "out"),
+        ]
+
+    removed = [e["TMUX_TMPDIR"] for e in envs]
+    first = subprocess.Popen(
+        args("a"),
+        env=envs[0],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        # The second starts once the first's tmux server answers. The limits add up
+        # to under pytest's 120 s, so drive()'s dump comes first.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            probe = subprocess.run(
+                ["tmux", "-L", "drive-agent-jason42-1", "has-session"],
+                env=envs[0],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            if probe.returncode == 0:
+                break
+            time.sleep(0.05)
+        assert probe.returncode == 0, "the first run's tmux server never answered"
+        second = drive(envs[1], *args("b")[1:], check=False, timeout=50)
+        _, first_err = first.communicate(timeout=50)
+    finally:
+        first.kill()
+        first.wait()
+        for folder in removed:
+            remove_tmux_folder(folder)
+    assert first.returncode == 0, first_err
+    assert second.returncode == 0, second.stderr
+
+
+def test_a_run_past_drives_limit_fails_saying_where_it_was(tmp_path, env):
+    """So a hang under the full suite says where it hung, before pytest's own limit
+    kills the test with no word of drive-agent's state."""
+    stuck = tmp_path / "stuck"
+    stuck.write_text(
+        "#!/usr/bin/env python3\n"
+        "import faulthandler, signal, sys, time\n"
+        "faulthandler.register(signal.SIGUSR1, all_threads=True)\n"
+        "signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))\n"
+        "def waiting_here():\n"
+        "    time.sleep(3600)\n"
+        "waiting_here()\n"
+    )
+    stuck.chmod(0o755)
+    with pytest.raises(pytest.fail.Exception) as failed:
+        drive(env, "run", tool=stuck, timeout=1)
+    message = str(failed.value)
+    assert "ran past 1 s" in message
+    assert "waiting_here" in message
+
+
+def test_a_kill_server_that_never_returns_still_ends_the_server_and_says_so(
+    tmp_path, env
+):
+    began = hanging_tmux(env, tmp_path, "kill-server")
+    # Another run's server, of the same name in a socket folder of its own, which
+    # the fallback must leave alone.
+    other = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "TMUX_TMPDIR": tempfile.mkdtemp(prefix="drive-agent-test-", dir="/tmp"),
+    }
+    subprocess.run(
+        ["tmux", "-L", "drive-agent-jason44-1", "new-session", "-d", "sleep", "300"],
+        env=other,
+        check=True,
+        timeout=10,
+    )
+    try:
+        done = drive(
+            {**env, "DRIVE_AGENT_TMUX_LIMIT": "2"},
+            "run",
+            scenario(tmp_path, turns=["hi"]),
+            "--harness",
+            "claude",
+            "--name",
+            "jason44",
+            "--out",
+            tmp_path / "out",
+            check=False,
+            timeout=60,
+        )
+        bystander = subprocess.run(
+            ["tmux", "-L", "drive-agent-jason44-1", "has-session"],
+            env=other,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    finally:
+        end_hung_tmux(began)
+        remove_tmux_folder(other["TMUX_TMPDIR"])
+    assert bystander.returncode == 0, "another socket folder's server was killed"
+    assert "drive-agent-jason44-1" in done.stderr and "killed" in done.stderr, (
+        done.stderr
+    )
+    alive = subprocess.run(
+        ["tmux", "-L", "drive-agent-jason44-1", "has-session"],
+        env={**env, "PATH": "/usr/local/bin:/usr/bin:/bin"},
+        capture_output=True,
+        check=False,
+    )
+    assert alive.returncode != 0, "the run's tmux server outlived it"

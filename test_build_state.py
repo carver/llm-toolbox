@@ -2373,3 +2373,30 @@ def test_a_sweep_of_uncommitted_work_amended_in_still_warns_of_later_work(
 
     assert "after the last sweep" in done.stdout, done.stdout
     assert "  Later work" in done.stdout
+
+
+@pytest.mark.parametrize("stage", [True, False])
+def test_refactor_refuses_while_tracked_files_have_changes(repo, stage):
+    # A spec fix whose commit a hook refused stays in the tree; a refactor base at
+    # HEAD would then leave it out of the review's fixes.
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    (repo / "parser.py").write_text("fixed\n")
+    if stage:
+        git(repo, "add", "parser.py")
+
+    done = build_state(repo, "refactor")
+
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "commit" in done.stderr and "parser.py" in done.stderr, done.stderr
+    assert "refactor base" not in build_state(repo, "show").stdout
+
+
+def test_refactor_ignores_untracked_files(repo):
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    (repo / "warm.log").write_text("build output\n")
+
+    done = build_state(repo, "refactor")
+
+    assert done.returncode == 0, done.stdout + done.stderr

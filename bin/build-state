@@ -4,7 +4,8 @@
     build-state start [--base REV]
                             record the base (HEAD, or an earlier REV) and the repo's
                             fingerprint
-    build-state refactor    record the refactor base (HEAD), before applying review fixes
+    build-state refactor    record the refactor base (HEAD), before applying review
+                            fixes; refuses while tracked files have changes
     build-state show        print the recorded bases
     build-state finish      fold fixups into the commits they fix, check the fingerprint,
                             print the commits since the base and the test files
@@ -581,11 +582,28 @@ def refactor(args: argparse.Namespace) -> int:
     path = state_file()
     if (state := load(path)) is None:
         return 1
+    # A spec fix whose commit a hook refused is still in the tree, and a base at HEAD
+    # would count it among the refactor's changes, unreviewed.
+    if changed := tracked_changes():
+        names = ", ".join(line[3:] for line in changed[:5])
+        more = f" and {len(changed) - 5} more" if len(changed) > 5 else ""
+        print(
+            f"build-state: tracked files have changes ({names}{more}): commit the"
+            " review's spec fixes, as fixup! commits, then run refactor",
+            file=sys.stderr,
+        )
+        return 1
     state["refactor_base"] = head()
     state["refactor_tree"] = tree_of("HEAD")
     save(path, state)
     print(f"refactor base {state['refactor_base']}")
     return 0
+
+
+def tracked_changes() -> list[str]:
+    """`git status --porcelain` lines for tracked files with changes, staged or not;
+    untracked files, such as build logs, don't count."""
+    return git("status", "--porcelain", "--untracked-files=no").stdout.splitlines()
 
 
 def show(args: argparse.Namespace) -> int:
@@ -760,9 +778,7 @@ def sweep(args: argparse.Namespace) -> int:
             "tree": tree_of("HEAD"),
             "subject": git("log", "-1", "--format=%s").stdout.strip(),
             # The work it covers isn't committed yet: the next commit holds it.
-            "uncommitted": bool(
-                git("status", "--porcelain", "--untracked-files=no").stdout
-            ),
+            "uncommitted": bool(tracked_changes()),
         }
     )
     save(path, state)
@@ -1573,9 +1589,9 @@ def main(argv: list[str] | None = None) -> int:
         "--base", metavar="REV", help="record REV as the base instead of HEAD"
     )
     start_command.set_defaults(run=start)
-    commands.add_parser("refactor", help="record the refactor base").set_defaults(
-        run=refactor
-    )
+    commands.add_parser(
+        "refactor", help="record the refactor base; refuses uncommitted changes"
+    ).set_defaults(run=refactor)
     commands.add_parser("show", help="print the recorded bases").set_defaults(run=show)
     commands.add_parser(
         "finish", help="fold fixups, check the fingerprint, list the commits"

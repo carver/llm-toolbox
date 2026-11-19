@@ -65,7 +65,7 @@ Done when every finding has a bucket, every spec gap is fixed with checks green,
 
 ## 5. Refactor
 
-Run `build-state refactor` to record the **refactor base**. Apply the Fix list, nothing else. Behaviour stays the same: the tests pass unchanged unless a finding is about a test. Commit each as a `fixup!` of the commit it tidies, so `build-state finish` folds it in. Reason: wt-ship runs the full check on each commit it lands, so a separate refactor commit costs a full check run of its own.
+Run `build-state refactor` to record the **refactor base**, once the spec fixes are committed: it refuses while tracked files have changes, since a fix still in the tree would count as a refactor no review saw. Apply the Fix list, nothing else. Behaviour stays the same: the tests pass unchanged unless a finding is about a test. Commit each as a `fixup!` of the commit it tidies, so `build-state finish` folds it in. Reason: wt-ship runs the full check on each commit it lands, so a separate refactor commit costs a full check run of its own.
 
 ## 6. Verify
 

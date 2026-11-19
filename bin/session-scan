@@ -298,7 +298,9 @@ refusal, since the same hook refusing several times points to a habit to fix.
 Not findings: one long call that did its job; a `user` wait; a subagent reading \
 its brief, a skill, a standards file or a tool's `-h` once; a test that fails \
 first on purpose (test-driven work) or a review finding a problem (the review \
-doing its job); the main session ending a turn to wait for a notification \
+doing its job), unless a mechanical check (a lint, a hook, a test, or a tool \
+such as mutate-check) could have caught it before the review, which is a \
+finding; the main session ending a turn to wait for a notification \
 (though a `CACHE REBUILT` after the wait is still its cost); a check the user \
 made light on purpose (see their turns).
 
@@ -342,7 +344,10 @@ Not findings, so trivial: one long call that did its job; a `user` wait; a hook 
 refusal followed by a correct retry (the hook working as designed); a subagent \
 reading its brief, a skill, a standards file or a tool's `-h` once; a test that \
 fails first on purpose; a mutant caught by mutate-check (the check working); a \
-review finding problems (the review working); the main session ending a turn to \
+review finding problems (the review working), unless a mechanical check (a lint, \
+a hook, a test, or a tool such as mutate-check) could have caught one before the \
+review: that one is real, a check to build or run, while what only a reviewer's \
+judgement finds stays trivial; the main session ending a turn to \
 wait for a notification; a check the user made light on purpose (see their \
 turns); an exit status other than 0 that isn't a failure (grep finding nothing, a \
 check reporting). The main session's wait is right, but a `CACHE REBUILT` after \

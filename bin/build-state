@@ -152,6 +152,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -196,7 +197,10 @@ globs against paths relative to the path it searches, which is why it searches `
 from the root. In a linked worktree, the repo's own hits come from the worktree, with
 its edits, rather than from its main tree, which the search above then skips. Its
 own repo's hits come first, then the rest by path: at most 5 lines a file and 60 in
-all, each cut at 300 characters, then a line saying how many more it cut. When rg
+all, each cut at 300 characters, then a line saying how many more it cut. Other
+repos' hits print as lines only while, at 5 a file, they come to 20 or fewer; past
+that they print as one line a file, `PATH: N hits`, for 20 files by path, then a
+line saying how many files more, so a common term costs a few lines. When rg
 can't read some files, it says so on stderr and still records the sweep.
 
 The sweep is recorded in the build's state (`build-state show`): its terms, and HEAD's
@@ -221,6 +225,10 @@ is open, so nothing was recorded.
 SWEEP_CAP = 60
 SWEEP_PER_FILE = 5
 SWEEP_WIDTH = 300
+# Other repos' hits print as lines while, capped a file, they come to at most
+# SWEEP_OTHERS_LINES; past that, as one count a file, for SWEEP_OTHERS_FILES files.
+SWEEP_OTHERS_LINES = 20
+SWEEP_OTHERS_FILES = 20
 # Files nobody wrote by hand, wherever they lie; a page a browser saved keeps its
 # scripts in NAME_files/. Their hits would crowd out the ones a person can act on.
 NOT_SOURCE = ["!**/*_files/**", "!**/node_modules/**", "!*.min.*", "!*.map"]
@@ -646,6 +654,18 @@ def shown_from(root: Path, path: Path) -> str:
 class Search:
     hits: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # How this repo's hits begin (`./REPO/`), which set them apart from other repos'.
+    own_prefix: str = ""
+
+    def is_own(self, hit: str) -> bool:
+        return hit.startswith(self.own_prefix)
+
+    def order(self, hit: str) -> tuple[bool, str, int]:
+        """This repo's hits first, then by path and line number (rg's
+        `path:line:text`)."""
+        path, _, rest = hit.partition(":")
+        number = rest.partition(":")[0]
+        return not self.is_own(hit), path, int(number) if number.isdigit() else 0
 
 
 def rg(where: Path, prefix: str, globs: list[str], terms: list[str]) -> Search:
@@ -706,32 +726,57 @@ def search_workspace(root: Path, terms: list[str]) -> Search:
         if main.is_relative_to(root):
             globs.append(f"!/{main.relative_to(root)}/**")
     rest = rg(root, ".", globs, terms)
-    own_prefix = shown_from(root, top) + "/"
-    hits = sorted(
-        in_worktree.hits + rest.hits, key=lambda hit: sweep_key(hit, own_prefix)
-    )
-    return Search(hits, in_worktree.errors + rest.errors)
+    # A workspace root that is the repo itself, as $BUILD_STATE_WORKSPACE may set it.
+    own_prefix = "./" if top == root else shown_from(root, top) + "/"
+    found = Search(in_worktree.hits + rest.hits, in_worktree.errors + rest.errors)
+    found.own_prefix = own_prefix
+    found.hits.sort(key=found.order)
+    return found
 
 
-def sweep_key(hit: str, own_prefix: str) -> tuple[bool, str, int]:
-    """This repo's hits first, then by path and line number (rg's `path:line:text`)."""
-    path, _, rest = hit.partition(":")
-    number = rest.partition(":")[0]
-    return not hit.startswith(own_prefix), path, int(number) if number.isdigit() else 0
+def print_hits(search: Search) -> None:
+    """This repo's hits, then other repos': as lines while those are few, else as a
+    count a file, so a common term's hits in other repos' long files cost little."""
+    own = [hit for hit in search.hits if search.is_own(hit)]
+    others = [hit for hit in search.hits if not search.is_own(hit)]
+    if len(capped_a_file(others)) <= SWEEP_OTHERS_LINES:
+        print_lines(own + others)
+        return
+    print_lines(own)
+    print_counts(others)
 
 
-def print_hits(hits: list[str]) -> None:
-    """At most SWEEP_PER_FILE hits of each file, and SWEEP_CAP in all."""
-    shown, cut, per_file = 0, 0, {}
+def path_of(hit: str) -> str:
+    return hit.partition(":")[0]
+
+
+def capped_a_file(hits: list[str]) -> list[str]:
+    """The hits that remain at SWEEP_PER_FILE a file."""
+    per_file: dict[str, int] = {}
+    kept = []
     for hit in hits:
-        path = hit.partition(":")[0]
-        per_file[path] = per_file.get(path, 0) + 1
-        if per_file[path] > SWEEP_PER_FILE or shown == SWEEP_CAP:
-            cut += 1
-            continue
+        per_file[path_of(hit)] = per_file.get(path_of(hit), 0) + 1
+        if per_file[path_of(hit)] <= SWEEP_PER_FILE:
+            kept.append(hit)
+    return kept
+
+
+def print_counts(hits: list[str]) -> None:
+    """How many hits each file has, for SWEEP_OTHERS_FILES files, by path."""
+    counts = Counter(path_of(hit) for hit in hits)
+    print(f"{len(hits)} hits in {len(counts)} files of other repos, by file:")
+    for path, count in list(counts.items())[:SWEEP_OTHERS_FILES]:
+        print(f"{path}: {count} hit{'' if count == 1 else 's'}")
+    if (more := len(counts) - SWEEP_OTHERS_FILES) > 0:
+        print(f"{more} more files not shown: narrow the terms to see them.")
+
+
+def print_lines(hits: list[str]) -> None:
+    """At most SWEEP_PER_FILE hits of each file, and SWEEP_CAP in all."""
+    shown = capped_a_file(hits)[:SWEEP_CAP]
+    for hit in shown:
         print(hit)
-        shown += 1
-    if cut:
+    if cut := len(hits) - len(shown):
         print(
             f"{cut} more hits not shown (at most {SWEEP_PER_FILE} a file,"
             f" {SWEEP_CAP} in all): narrow the terms, or read those files."
@@ -757,7 +802,7 @@ def sweep(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         print("rg isn't installed: install ripgrep, then sweep again.", file=sys.stderr)
         return 3
-    print_hits(search.hits)
+    print_hits(search)
     if search.errors:
         print(
             "rg reported errors, so files it couldn't read went unsearched:",

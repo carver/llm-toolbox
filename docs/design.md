@@ -494,6 +494,11 @@ the owner's):
   amend the fixes in.
 - rg exiting 2 for an unreadable file still records the sweep, saying so; a root that
   is $HOME or / is refused, as a clone straight in the home folder would walk it all.
+- Other repos' hits print as lines only while they come to 20 or fewer, at 5 a file;
+  past that, as a count a file for 20 files (2026-11-19). A sweep for `Strict` from
+  filedrawer printed 60 lines of 300 characters, about 5.7k tokens, nearly all from
+  another repo's paper texts and a generated .jsonl, and cut 175 more; the counts
+  still name the files a stale copy may sit in, for the cost of a line each.
 - Fix commits after the sweep don't count, though a spec-gap fix may change described
   behaviour: counting them would make nearly every build warn, through its review's
   fixes and refactor.

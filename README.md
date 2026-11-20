@@ -723,9 +723,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   nobody wrote by hand (`*_files/`, `node_modules/`, `*.min.*`, `*.map`), and
   what a repo's `.sweepignore` names (paths relative to the repo, such as
   applied migrations), this repo's hits taken from the worktree and listed
-  first, at most 5 lines a file and 60 in all; it records the terms and HEAD in
-  the build's state. `finish`
-  and `review-prompt` warn of each commit, fixes aside, after the last sweep,
+  first, at most 5 lines a file and 60 in all; other repos' hits print as lines
+  only while they come to 20 or fewer, else as a count a file for 20 files; it
+  records the terms and HEAD in the build's state. `finish` and `review-prompt`
+  warn of each commit, fixes aside, after the last sweep,
   or of a build with none (a build that changes no described behaviour may
   ignore it). `$BUILD_STATE_WORKSPACE` sets the workspace root, by default the
   folder that holds the repo's main tree.

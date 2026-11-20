@@ -2051,24 +2051,81 @@ def test_sweep_that_finds_nothing_is_recorded_too(repo, tmp_path):
     assert "swept" in build_state(repo, "show").stdout
 
 
-def test_sweep_caps_its_hits_a_file_and_in_all_and_says_how_many_it_cut(repo, tmp_path):
+def test_sweep_caps_its_repos_hits_a_file_and_in_all_and_says_how_many_it_cut(
+    template, tmp_path
+):
     root = tmp_path / "workspace"
-    root.mkdir()
-    (root / "a.md").write_text("stale\n" * 10)
+    proj = own_repo(template, root)
+    (proj / "a.md").write_text("stale\n" * 10)
     for number in range(70):
-        (root / f"f{number:02}.md").write_text("x" * 1000 + " stale\n")
-    build_state(repo, "start")
+        (proj / f"f{number:02}.md").write_text("x" * 1000 + " stale\n")
 
-    swept = sweep(repo, root, "stale")
+    swept = sweep(proj, root, "stale")
 
     lines = swept.stdout.splitlines()
-    assert lines[:5] == [f"./a.md:{n}:stale" for n in range(1, 6)]
-    assert lines[5].startswith("./f00.md:1:")
-    assert lines[59].startswith("./f54.md:1:")
+    assert lines[:5] == [f"./proj/a.md:{n}:stale" for n in range(1, 6)]
+    assert lines[5].startswith("./proj/f00.md:1:")
+    assert lines[59].startswith("./proj/f54.md:1:")
     # 5 cut from a.md, f55 to f69 past the cap of 60.
     assert lines[60].startswith("20 more hits not shown")
     assert len(lines) == 61
     assert max(len(line) for line in lines) < 400
+
+
+def own_repo(template, root):
+    """A repo of the workspace at root/proj, with a build open in it."""
+    proj = root / "proj"
+    shutil.copytree(template, proj, symlinks=True)
+    build_state(proj, "start")
+    return proj
+
+
+def test_sweep_lists_other_repos_hits_as_lines_while_they_are_few(template, tmp_path):
+    root = tmp_path / "workspace"
+    proj = own_repo(template, root)
+    (proj / "doc.md").write_text("stale\n")
+    (root / "other").mkdir()
+    # 10 hits a file, 5 of each shown: 20 lines, which still print as lines.
+    for number in range(4):
+        (root / f"other/f{number}.md").write_text("stale\n" * 10)
+
+    swept = sweep(proj, root, "stale")
+
+    lines = swept.stdout.splitlines()
+    assert lines[0] == "./proj/doc.md:1:stale"
+    assert lines[1:21] == [
+        f"./other/f{n}.md:{line}:stale" for n in range(4) for line in range(1, 6)
+    ]
+    assert lines[21].startswith("20 more hits not shown")
+
+
+def test_sweep_of_a_workspace_that_is_the_repo_counts_every_hit_as_its_own(repo):
+    for number in range(25):
+        (repo / f"f{number:02}.md").write_text("stale\n")
+    build_state(repo, "start")
+
+    swept = sweep(repo, repo, "stale")
+
+    lines = swept.stdout.splitlines()
+    assert lines[:25] == [f"./f{n:02}.md:1:stale" for n in range(25)]
+
+
+def test_sweep_counts_other_repos_hits_by_file_once_they_are_many(template, tmp_path):
+    root = tmp_path / "workspace"
+    proj = own_repo(template, root)
+    (proj / "doc.md").write_text("stale\n" * 3)
+    (root / "other").mkdir()
+    for number in range(25):
+        (root / f"other/f{number:02}.md").write_text("x" * 250 + " stale\n" * 2)
+
+    swept = sweep(proj, root, "stale")
+
+    lines = swept.stdout.splitlines()
+    assert lines[:3] == [f"./proj/doc.md:{n}:stale" for n in range(1, 4)]
+    assert lines[3] == "50 hits in 25 files of other repos, by file:"
+    assert lines[4:24] == [f"./other/f{n:02}.md: 2 hits" for n in range(20)]
+    assert lines[24].startswith("5 more files not shown")
+    assert len(lines) == 25
 
 
 def test_sweep_without_a_build_searches_but_records_nothing(repo, tmp_path):

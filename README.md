@@ -616,7 +616,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   command, and so do help as the first argument (`wt-ship -h | head`), `git
   commit --dry-run`, a pipe into `git commit`, `||`, and a `|` in quotes, a
   heredoc's body or a comment. It reads the command as heavy-gate does, through
-  `lib/shellparse.py`, nested scripts included. It also refuses a check whose
+  `lib/shellparse.py`, nested scripts included. Since Claude Code shows one
+  hook's refusal at a time, its refusal adds heavy-gate's reason when heavy-gate
+  would refuse the same call too. It also refuses a check whose
   status a pipe hides when the script then records the result, as in `pytest -q
   | tail -3 && git commit ...`: a failing test got into a commit that way. A
   check is pytest, a cargo test, build or lint, `ruff check`, mutate-check, the

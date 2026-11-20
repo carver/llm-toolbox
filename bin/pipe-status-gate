@@ -39,6 +39,11 @@ pipeline has pipefail on and a script that reads PIPESTATUS. Only the script's o
 commands are read for this rule, not those inside a bash -c, an eval, a $(...) or a
 heredoc.
 
+Claude Code shows one hook's refusal at a time, so when this hook refuses, it also
+asks heavy-gate, beside it, about the same call, and adds heavy-gate's reason when that
+would refuse the call too: a foreground `bgrun --wait -- heavy -- CMD | tail` would
+otherwise be refused once for the pipe and again, with the pipe gone, for the wait.
+
 It catches a mistake, not an agent set on getting past it: an alias, a variable that
 holds `git`, a function or a script that commits all pass.
 
@@ -49,6 +54,7 @@ nothing in the command ran), 1 input that isn't JSON.
 """
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -283,6 +289,32 @@ def shell_pipefail(words: list[str]) -> bool:
     return set_pipefail(words[1:], False)
 
 
+HEAVY_GATE = Path(__file__).resolve().parent / "heavy-gate"
+# Well under the 10 s install.py gives this hook, so a stalled heavy-gate costs only
+# its own reason, never this hook's refusal.
+HEAVY_GATE_TIMEOUT = 4
+
+
+def heavy_gate_reason(event: dict) -> str | None:
+    """heavy-gate's reason for refusing the same call, without its `Refused: ` and its
+    closing sentence, or None when it allows the call or can't be run."""
+    try:
+        verdict = subprocess.run(
+            [sys.executable, HEAVY_GATE],
+            input=json.dumps(event),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=HEAVY_GATE_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if verdict.returncode != 2:
+        return None
+    reason = verdict.stderr.strip().removeprefix("Refused: ").removesuffix(NOTHING_RAN)
+    return reason.strip() or None
+
+
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if any(arg in ("-h", "--help") for arg in argv):
@@ -302,14 +334,15 @@ def main(argv=None) -> int:
     command = (event.get("tool_input") or {}).get("command") or ""
     found = hidden_failures(command)
     if found:
-        print(f"{REFUSAL.format(name=found[0])} {NOTHING_RAN}", file=sys.stderr)
-        return 2
-    unseen = unseen_check(command)
-    if unseen:
+        refusal = REFUSAL.format(name=found[0])
+    elif unseen := unseen_check(command):
         refusal = UNSEEN_CHECK.format(check=unseen[0], record=unseen[1])
-        print(f"{refusal} {NOTHING_RAN}", file=sys.stderr)
-        return 2
-    return 0
+    else:
+        return 0
+    if heavy := heavy_gate_reason(event):
+        refusal += f"\nheavy-gate would refuse this call too: {heavy}"
+    print(f"{refusal} {NOTHING_RAN}", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

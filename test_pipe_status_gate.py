@@ -14,8 +14,9 @@ SCRIPT = Path(__file__).resolve().parent / "bin" / "pipe-status-gate"
 NOTHING_RAN = "Nothing in this command ran, the parts before the refused one included."
 
 
-def run_hook(command, tool="Bash"):
-    """The hook's exit status and stderr for one call, its input shaped as Claude Code sends it."""
+def run_hook(command, tool="Bash", **extra):
+    """The hook's exit status and stderr for one call, its input shaped as Claude Code
+    sends it; `extra` goes into tool_input, except agent_id, which goes on the event."""
     event = {
         "session_id": "s",
         "transcript_path": "/t.jsonl",
@@ -25,6 +26,9 @@ def run_hook(command, tool="Bash"):
         "tool_name": tool,
         "tool_input": {"command": command, "description": "Run it"},
     }
+    if "agent_id" in extra:
+        event["agent_id"] = extra.pop("agent_id")
+    event["tool_input"] |= extra
     result = subprocess.run(
         [SCRIPT], input=json.dumps(event), capture_output=True, text=True, check=False
     )
@@ -243,7 +247,9 @@ def test_a_piped_check_that_a_commit_follows_is_refused_naming_both(
     first = err.splitlines()[0]
     assert f"{check}'s status" in first and record in first
     assert "set -o pipefail" in err and "call of its own" in err
-    assert len(err.splitlines()) <= 2
+    # Its own reason; heavy-gate's, added for a check run under heavy, comes after.
+    own = err.partition("\nheavy-gate would refuse")[0]
+    assert len(own.splitlines()) <= 2
     assert err.rstrip().endswith(NOTHING_RAN)
 
 
@@ -314,6 +320,43 @@ def test_a_piped_command_that_decides_nothing_or_is_no_check_passes(command):
 )
 def test_odd_shell_never_crashes_the_hook(command):
     assert run_hook(command)[0] in (0, 2)
+
+
+HEAVY_PIPED = "bgrun --wait -o log -- heavy -- cargo build 2>&1 | tail -5"
+
+
+def test_a_refusal_also_names_what_heavy_gate_would_refuse_once_the_pipe_is_gone():
+    code, err = run_hook(HEAVY_PIPED)
+
+    assert code == 2
+    assert "Drop the pipe" in err
+    assert "run_in_background: true" in err
+    assert err.count(NOTHING_RAN) == 1
+    assert err.rstrip().endswith(NOTHING_RAN)
+
+
+def test_a_hidden_check_before_a_commit_also_names_heavy_gates_reason():
+    code, err = run_hook("heavy -- pytest -q | tail -3 && git commit -m x")
+
+    assert code == 2
+    assert "set -o pipefail" in err
+    assert "run_in_background: true" in err
+    assert err.count(NOTHING_RAN) == 1
+
+
+def test_a_subagents_refusal_names_heavy_gates_blocking_form():
+    code, err = run_hook(HEAVY_PIPED, agent_id="a1")
+
+    assert code == 2
+    assert "waitone --pid PID" in err
+
+
+def test_a_background_call_gets_only_the_pipes_refusal():
+    code, err = run_hook(HEAVY_PIPED, run_in_background=True)
+
+    assert code == 2
+    assert "Drop the pipe" in err
+    assert "heavy waits its turn" not in err
 
 
 def test_other_tools_pass():

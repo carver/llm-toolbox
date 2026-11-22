@@ -4,10 +4,12 @@ import http.server
 import importlib.machinery
 import importlib.util
 import json
+import os
 import re
 import socket
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -808,3 +810,70 @@ def test_cookies_need_an_http_page(tmp_path):
     )
     assert run.returncode == 2
     assert "http(s)" in run.stderr
+
+
+def aged(path, hours):
+    """Sets path's mtime `hours` back from now."""
+    when = time.time() - hours * 3600
+    os.utime(path, (when, when))
+
+
+@needs_chromium
+def test_a_run_removes_its_output_folders_last_written_over_72_hours_ago(tmp_path):
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    folders = {}
+    # name: (the folder's age, its file's age), in hours
+    for name, (folder_age, file_age) in {
+        "web-shot-old": (73, 73),
+        "web-shot-recent": (71, 71),
+        "web-shot-touched": (73, 1),  # a later shot replaced a file inside
+        "other-old": (73, 73),
+    }.items():
+        folder = tmp / name
+        folder.mkdir()
+        (folder / "final.png").write_bytes(b"x")
+        aged(folder / "final.png", file_age)
+        aged(folder, folder_age)
+        folders[name] = folder
+    page = tmp_path / "p.html"
+    page.write_text("<!doctype html><p>hi</p>")
+    run = subprocess.run(
+        [str(SCRIPT), str(page)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+        env={**os.environ, "TMPDIR": str(tmp)},
+    )
+    assert run.returncode == 0, run.stderr
+    assert not folders["web-shot-old"].exists()
+    assert all(
+        folders[n].exists()
+        for n in ["web-shot-recent", "web-shot-touched", "other-old"]
+    )
+    (shot,) = run.stdout.split()
+    assert Path(shot).parent.parent == tmp
+
+
+@needs_chromium
+def test_a_run_keeps_the_old_output_folder_it_is_told_to_write_to(tmp_path):
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    out = tmp / "web-shot-reused"
+    out.mkdir()
+    (out / "before.png").write_bytes(b"x")
+    aged(out / "before.png", 73)
+    aged(out, 73)
+    page = tmp_path / "p.html"
+    page.write_text("<!doctype html><p>hi</p>")
+    run = subprocess.run(
+        [str(SCRIPT), "--out", str(out), str(page)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+        env={**os.environ, "TMPDIR": str(tmp)},
+    )
+    assert run.returncode == 0, run.stderr
+    assert (out / "before.png").exists()

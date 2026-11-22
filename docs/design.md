@@ -1042,3 +1042,15 @@ was added.
 
 The phone run is 400 wide at `--size`'s height, so the two viewports differ only
 in width. A run that fails ends the command, and the runs after it aren't made.
+
+### Each run removes default output folders idle for 72 hours (2026-11-21)
+
+With no `--out`, web-shot writes to a new `web-shot-*` folder in the temp dir and
+never removed one, since the agent reads the shots after the run. By 2026-11-21
+/tmp held 434 of them, 658M, on a 20G sandbox disk that had reached 92%. Now each
+run first removes the `web-shot-*` folders in the temp dir that nothing was
+written to for 72 hours, counting the newest write to any file inside. The owner
+chose 72 hours over 24, so a session can come back to its shots days later. A
+box-wide /tmp reaper and a default inside the session's scratch folder were the
+alternatives: the reaper would be a new gate that deletes files across tools, and
+the scratch folder layout is Claude Code's, undocumented, and never cleaned either.

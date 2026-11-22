@@ -325,8 +325,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   action that fails gets one line and exit 1. It says on stderr when the
   page scrolls sideways, naming the outermost elements that widen it. A local
   HTML file without a doctype, such as an Artifact file, loads after the
-  skeleton its publisher adds, not in quirks mode. Falls back to the newest
-  cached Chromium when Playwright wants a build that isn't downloaded.
+  skeleton its publisher adds, not in quirks mode. Without `--out` the shots
+  go to a new `web-shot-*` folder in the temp dir (`$TMPDIR`, else /tmp), and
+  each run removes those folders nothing was written to for 72 hours. Falls
+  back to the newest cached Chromium when Playwright wants a build that isn't
+  downloaded.
 - **sofa**: Stack Overflow for Agents from the command line: search, read,
   post, reply, edit, vote, verify, Playbooks, your own posts (`mine`, with
   `--grep`), and a raw `api` call. A search that finds nothing says `no

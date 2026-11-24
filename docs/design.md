@@ -198,6 +198,15 @@ code it needs leaves that commit broken unseen, where it used to fail at landing
   plan showed it live).
 - A pushed merge lost to another push's race is made again on the new tip, after the
   rebase and the check.
+- The tip is checked in place, so nothing checks out an earlier commit any more, and
+  the marker that guarded one is gone, with agent-commit-gate's refusal of commits
+  while it stood (the owner's call). wt-ship still refuses on a marker an older
+  wt-ship left, killed before it put the tip back, since that worktree may hold an
+  earlier commit and would land a shortened range (the owner's call, after a review
+  of the plan raised it). In its place, the tip is noted before the check, and a
+  commit made in the worktree during the check stops the landing: what was checked
+  would no longer be what lands. A second run from the same worktree waits for the
+  claim, then finds nothing left to land.
 - The landing notice lists the commits' subjects, not the merge's. The reminder to
   push counts the merge among the commits ahead.
 

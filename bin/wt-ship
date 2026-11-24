@@ -12,7 +12,8 @@ the main tree's branch.
 In order, it:
 
 1. refuses uncommitted changes to tracked files, and a worktree whose earlier commits
-   another run is checking, or where one was killed before it put the tip back (step 4).
+   an older wt-ship is checking, or where one was killed before it put the tip back
+   (step 4).
    Then, unless there's nothing to push, it prints the line `ci-status` (`-h`) gives
    for each workflow failing on REMOTE/BRANCH on GitHub, so a landing on a red
    branch is a choice made knowingly. Only a warning: no ci-status, no answer within
@@ -61,12 +62,13 @@ In order, it:
    runs a check that needs no build or test, such as a docs-only landing's, outside
    heavy's queue; then, when it needs the queue, in a heavy job, at the queue's front
    with --local, which checks only under the main tree's claim. A failure stops it,
-   and says when the branch's tip it rebased onto has no pass either.
-   While the check runs, with the tip checked out here detached, a marker in the
-   worktree's git dir names the tip and this
-   run, and agent-commit-gate refuses commits there, which would be lost; the tip comes
-   back and the marker goes however the checks end, unless the run is killed outright,
-   and then the next run names the tip to put back. A repo that keeps the check in its
+   and says when the branch's tip it rebased onto has no pass either. The check runs in
+   place, in the worktree as it is, so a commit made here during it stops the landing
+   too (exit 5), since what was checked is then not what would land; otherwise any
+   change the check left in tracked files is reset away. A marker an older
+   wt-ship left in the worktree's git dir, one that checked each earlier commit
+   checked out in turn, stops it from step 1: while that run lives, and when it was
+   killed before it put the tip back, naming the tip. A repo that keeps the check in its
    tree (core.hooksPath inside it) fails a commit that drops it while the branch has
    it: the commit must hold an executable file there, or a link that leads to one in
    the commit's own tree;
@@ -154,7 +156,8 @@ Environment:
 Exit status: 0 shipped, landed or nothing to do; 1 a step failed (the message says
 what to do); 2 a usage error; with --local, 3 another session held the main tree's
 claim past the wait (tell the user what held it up and since when), 4 the main tree's
-uncommitted changes touch the files the landing changes (ask the user); 5 the tries
+uncommitted changes touch the files the landing changes (ask the user); 5 run it again
+later: HEAD moved during the check, or the tries
 ran out: another session's pushes winning each of 10, or with --local the branch
 moving under the claim each time (run it again later).
 """
@@ -307,12 +310,22 @@ def run_checks(upstream, mode):
     the tip it checked. One commit since upstream gets the check; of two or more, which
     land as a merge (`commit_to_land`), only the tip, whose tree the merge's is. Only a tree
     with no pass on record is checked, a check that needs heavy's queue in one job, at
-    its front when landing, which runs under the main tree's claim."""
-    check_the_tip(upstream, mode)
-    return out("rev-parse", "HEAD")
+    its front when landing, which runs under the main tree's claim. The check runs in
+    place, so a commit made here during it stops it: the tip it checked is no longer
+    what would land."""
+    tip = out("rev-parse", "HEAD")
+    check_the_tip(upstream, mode, tip)
+    if out("rev-parse", "HEAD") != tip:
+        raise Stop(
+            "HEAD moved during the check, so what was checked is no longer what would"
+            f" land, and nothing was {mode.done}. Run `{RERUN}` again once nothing"
+            " commits here.",
+            status=TRY_AGAIN,
+        )
+    return tip
 
 
-def check_the_tip(upstream, mode):
+def check_the_tip(upstream, mode, tip):
     hook = commitcheck.hook_path()
     if dropped := commitcheck.dropping_check(upstream, hook):
         raise Stop(
@@ -325,7 +338,6 @@ def check_the_tip(upstream, mode):
     if not commitcheck.runnable(hook):
         print(f"No check: the repo has no {CHECK} hook.")
         return
-    tip = out("rev-parse", "HEAD")
     if commitcheck.passed(tip, hook):
         print(f"{CHECK}: the tip, {named(tip)}, passed it already.")
         return
@@ -334,7 +346,12 @@ def check_the_tip(upstream, mode):
         " commit nothing here.",
         flush=True,
     )
-    if commitcheck.first_failing(hook, [tip], GATE, front=mode is LAND) is None:
+    passed = commitcheck.head_passes(hook, GATE, front=mode is LAND)
+    if out("rev-parse", "HEAD") == tip:
+        # Changes the check left in tracked files go, as the checkout of each commit
+        # checked used to drop them, so the worktree lands clean and can go.
+        git("reset", "-q", "--hard", tip)
+    if passed:
         return
     raise Stop(
         f"The repo's {CHECK} fails at HEAD, {named(tip)}. Fix it with a fixup! of the"
@@ -344,19 +361,20 @@ def check_the_tip(upstream, mode):
 
 
 def refuse_a_marked_worktree():
-    """Stop when another run is checking earlier commits here, or one was killed before
-    it put the tip back."""
+    """Stop on the marker of an older wt-ship, one that checked each earlier commit
+    checked out in turn: while it still runs, or when it was killed before it put the
+    tip back."""
     found = commitcheck.marker()
     if found is None:
         return
     if not found.holder.gone():
         raise Stop(
-            f"Another wt-ship ({found.holder}) is checking earlier commits in this"
-            f" worktree: wait for it to end, then run `{RERUN}` again. If none is"
-            f" running, delete {found.path}."
+            f"Another wt-ship ({found.holder}), an older one, is checking earlier"
+            f" commits in this worktree: wait for it to end, then run `{RERUN}` again."
+            f" If none is running, delete {found.path}."
         )
     raise Stop(
-        f"A wt-ship that was checking earlier commits here ({found.holder}) ended before"
+        f"An older wt-ship that was checking earlier commits here ({found.holder}) ended before"
         f" it put the tip, {found.tip[:12]}, back, so the work tree may hold one of them."
         f" Put the tip back with `{found.restore_command()}`, which discards changes to"
         f" tracked files, delete {found.path}, then run `{RERUN}` again."
@@ -1091,6 +1109,10 @@ def land(args):
     topic = topic_of(here, main_path)
     with claim(main_path, wait=not args.no_wait):
         rebase_onto(ref, LAND)
+        if is_ancestor("HEAD", ref):
+            # Another run from this worktree landed it while this one waited.
+            print(f"HEAD is already in {branch}: nothing to land.")
+            return 0
         # Before the checks, which everyone waiting for the claim waits through.
         refuse_overlap(main_path, ref)
         # Other sessions can't land now, so the tip is checked once.

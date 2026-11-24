@@ -268,9 +268,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   commit (`Merge TOPIC (N commits)`, TOPIC from the `REPO-wt-TOPIC` folder,
   the commits' subjects in its body) whose tree is the tip's, so the commits
   inside it get no check at landing, and `git bisect --first-parent` walks
-  only checked ones. While the check runs, a marker in
-  the worktree's git dir makes `agent-commit-gate` refuse commits there, and a
-  run killed before it put the tip back leaves the next one naming the tip. A
+  only checked ones. The check runs in place, and a commit made in the worktree
+  during it stops the landing. A marker an older `wt-ship`, which checked each
+  earlier commit checked out in turn, left in the worktree's git dir stops it
+  too, naming the tip to put back. A
   repo that keeps the check in its tree fails a commit that drops it, or keeps a
   link to it that leads to no executable file in that commit. Then it
   pushes with one retry when another push wins the race (rebasing, checking and

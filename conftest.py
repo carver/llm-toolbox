@@ -80,9 +80,8 @@ def path_without(tool, path=None):
 
 # Set when an agent commits; a test's pre-commit hook would rerun the suite. CHECK_BASE
 # names a commit of the repo being committed, which the gate hands the suite's own check,
-# and CHECK_QUEUE_EXIT asks that check to leave heavy's queue. wt-ship sets
-# CHECKING_EARLIER_COMMITS_PID for the checks it runs on earlier commits, which lets the
-# gate run while its marker stands, and the hook's line sets AGENT_CHECK_AT_COMMIT.
+# and CHECK_QUEUE_EXIT asks that check to leave heavy's queue. The hook's line sets
+# AGENT_CHECK_AT_COMMIT.
 # AGENT_SECRETS_FILE would have each gate a test runs read the machine's real secrets
 # file.
 AGENT_VARS = (
@@ -92,7 +91,6 @@ AGENT_VARS = (
     "AGENT_SECRETS_FILE",
     "CHECK_BASE",
     "CHECK_QUEUE_EXIT",
-    "CHECKING_EARLIER_COMMITS_PID",
 )
 
 

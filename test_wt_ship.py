@@ -1577,7 +1577,7 @@ def blocking_check():
 
 
 @pytest.mark.parametrize("branch", [None, "topic"])
-def test_a_stop_during_the_check_puts_the_tip_back(
+def test_a_stop_during_the_check_stops_it_and_leaves_the_tip(
     setup, background, blocking_check, branch
 ):
     _, main, wt, _ = setup
@@ -1607,78 +1607,96 @@ def test_a_stop_during_the_check_puts_the_tip_back(
     assert merge_of(main)[1] == tip
 
 
-def gate_commit(repo):
-    """Commit as an agent does, through the gate's line in the pre-commit hook, with
-    this checkout's gate first on PATH. The commit is empty: staging a file would
-    change the index under the check wt-ship is running, which the gate refuses. A
-    commit the gate lets through waits for heavy's lane behind that check, so the
-    timeout fails it rather than hang, and stops the gate with git: they run in a
-    process group of their own."""
-    env = os.environ | {
-        "AI_AGENT": "test-agent",
-        "PATH": os.pathsep.join([str(GATE.parent), os.environ["PATH"]]),
-    }
-    proc = subprocess.Popen(
-        ["git", "commit", "-q", "--allow-empty", "-m", "Meanwhile"],
-        cwd=repo,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        out, err = proc.communicate(timeout=20)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.communicate()
-        raise
-    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
-
-
-def test_a_commit_while_the_tip_is_checked_is_refused(
-    setup, background, blocking_check
-):
+def test_the_check_runs_in_place_with_the_worktree_on_its_branch(setup):
     _, main, wt, _ = setup
-    started, go = blocking_check(main, "Add b")
-    installed = subprocess.run(
-        [str(GATE), "--install", str(main)], capture_output=True, check=False
-    )
-    assert installed.returncode == 0, installed.stderr
+    seen = main.parent / "seen"
+    install_hook(main, "agent-pre-commit", f'git symbolic-ref -q HEAD >> "{seen}"')
+    git(wt, "checkout", "-q", "-b", "feature")
     commit(wt, "a.py", "x = 1\n", "Add a")
-    tip = commit(wt, "b.py", "y = 2\n", "Add b")
+    commit(wt, "b.py", "y = 2\n", "Add b")
 
-    shipping = background(wt, "--local")
-    wait_until(started.exists, "the tip's check to start")
-    refused = gate_commit(wt)
-    go.touch()
-    status, _, err = finish(shipping)
+    done = ship(wt, "--local")
 
-    assert refused.returncode != 0
-    assert "COMMIT REFUSED" in refused.stderr and "wt-ship" in refused.stderr
-    assert status == 0, err
-    assert merge_of(main)[1] == tip
+    assert done.returncode == 0, done.stderr
+    assert seen.read_text().split() == ["refs/heads/feature"]
 
 
-def test_a_run_killed_mid_check_leaves_the_next_one_naming_the_tip(
-    setup, background, blocking_check
-):
+@pytest.mark.parametrize("branch", [None, "feature"])
+def test_a_commit_made_during_the_check_stops_the_landing(setup, branch):
     _, main, wt, _ = setup
-    started, go = blocking_check(main, "Add b")
+    if branch:
+        git(wt, "checkout", "-q", "-b", branch)
+    made = main.parent / "made"
+    logging_check(
+        main,
+        f'[ -e "{made}" ] && exit 0\ntouch "{made}"\n'
+        "unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX\n"
+        f'git -C "{wt}" commit -q --allow-empty -m Sneaked',
+    )
     commit(wt, "a.py", "x = 1\n", "Add a")
-    tip = commit(wt, "b.py", "y = 2\n", "Add b")
+    commit(wt, "b.py", "y = 2\n", "Add b")
     before = main_head(main)
-    shipping = background(wt, "--local")
-    wait_until(started.exists, "the tip's check to start")
-    shipping.kill()  # SIGKILL: no chance to put the tip back
-    shipping.wait()
-    go.touch()
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 5, done.stdout
+    assert "moved during the check" in done.stderr, done.stderr
+    assert "nothing was landed" in done.stderr
+    assert main_head(main) == before
+    # The commit made meanwhile stays where it was made.
+    assert git(wt, "log", "-1", "--format=%s") == "Sneaked"
+
+
+def test_a_check_that_writes_tracked_files_leaves_a_clean_worktree(setup):
+    _, main, wt, _ = setup
+    logging_check(main, "echo dirty >> a.py")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    commit(wt, "b.py", "y = 2\n", "Add b")
+
+    done = ship(wt, "--local", "--remove")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not wt.exists()
+    assert (main / "a.py").read_text() == "x = 1\n"
+
+
+def old_marker(wt, holder_line, tip, branch=""):
+    """The marker an older wt-ship wrote while it checked earlier commits, the work
+    tree on one of them."""
+    path = Path(git(wt, "rev-parse", "--absolute-git-dir")) / "checking-earlier-commits"
+    path.write_text(f"{holder_line}tip={tip}\nbranch={branch}\n")
+    return path
+
+
+def test_a_marker_an_older_killed_run_left_names_the_tip_to_put_back(setup):
+    _, main, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    tip = commit(wt, "b.py", "y = 2\n", "Add b")
+    git(wt, "checkout", "-q", "--detach", "HEAD~1")  # where it was killed
+    old_marker(
+        wt,
+        f"s-old 2026-11-20T00:00:00+00:00 host={socket.gethostname()}"
+        " pid=999999999 start=1\n",
+        tip,
+    )
+    before = main_head(main)
 
     done = ship(wt, "--local")
 
     assert done.returncode == 1, done.stderr
     assert tip[:12] in done.stderr and "git checkout --force" in done.stderr
     assert main_head(main) == before
+
+
+def test_a_marker_of_an_older_run_still_checking_is_waited_on(setup, holder):
+    _, _, wt, _ = setup
+    tip = commit(wt, "a.py", "x = 1\n", "Add a")
+    old_marker(wt, holder_flag(holder()), tip)
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1, done.stderr
+    assert "Another wt-ship" in done.stderr, done.stderr
 
 
 def keep_the_check_in_the_tree(main):
@@ -1818,7 +1836,7 @@ def test_commits_that_passed_are_not_checked_out_again(setup):
     assert not log.exists()
 
 
-def test_a_second_run_waits_for_one_checking_the_same_worktree(
+def test_a_second_run_in_the_same_worktree_finds_nothing_left_to_land(
     setup, background, blocking_check
 ):
     _, main, wt, _ = setup
@@ -1828,14 +1846,17 @@ def test_a_second_run_waits_for_one_checking_the_same_worktree(
     shipping = background(wt, "--local")
     wait_until(started.exists, "the tip's check to start")
 
-    second = ship(wt, "--local")
+    second = background(wt, "--local")
+    waits_to_land(second)
     go.touch()
     status, _, err = finish(shipping)
+    second_status, second_out, second_err = finish(second)
 
-    assert second.returncode == 1
-    assert "Another wt-ship" in second.stderr, second.stderr
     assert status == 0, err
+    assert second_status == 0, second_err
+    assert "nothing to land" in second_out, second_out
     assert merge_of(main)[1] == tip
+    assert first_parents(main) == ["Merge topic (2 commits)", "start"]
 
 
 def test_the_tips_check_gets_the_branchs_tip_as_check_base(setup):

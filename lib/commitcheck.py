@@ -1,17 +1,14 @@
-"""Check the commits of a branch before its tip with the repo's agent check, each
-checked out in turn in the worktree, as wt-ship does before it lands or pushes, and keep
-the worktree safe while it does.
+"""Check the tip of a branch with the repo's agent check, in place, as wt-ship does
+before it lands or pushes.
 
-While the work tree holds an earlier commit, a marker in the worktree's own git dir
-names the branch's tip and the process checking (lib/fifo.py's Holder: host, PID and
-start time). agent-commit-gate refuses a commit there while that process lives, since
-the commit would go on the earlier commit and be lost when the tip comes back; the
-checks that process starts carry its PID in CHECKING_EARLIER_COMMITS_PID, and the gate
-runs them. A marker whose process has ended means a run was killed before it put the
-tip back: the next run finds it and says how to put the tip back.
+An older wt-ship checked each earlier commit too, checked out in turn, and wrote a
+marker in the worktree's own git dir naming the branch's tip and the process checking
+(lib/fifo.py's Holder: host, PID and start time). Nothing writes one now, but one an
+older run left, killed before it put the tip back, still means the work tree may hold
+an earlier commit: `marker` reads it, and wt-ship refuses to land until the tip is back.
 
-The caller makes a stop unwind through the checks (wt-ship turns SIGTERM, SIGHUP and
-SIGINT into SystemExit), so the tip comes back and the marker goes. A git command that
+The caller makes a stop unwind through the check (wt-ship turns SIGTERM, SIGHUP and
+SIGINT into SystemExit), which stops the check's process group too. A git command that
 fails raises GitError, whose message says which and what git said; wt-ship uses this
 module's git() for its own commands too.
 """
@@ -20,11 +17,9 @@ import os
 import signal
 import subprocess
 from contextlib import ExitStack, suppress
-from functools import partial
 from pathlib import Path
 from typing import NamedTuple
 
-import fifo
 import heavyqueue
 import passrecord
 from fifo import Holder
@@ -184,6 +179,8 @@ QUEUE_EXIT = 75
 
 
 class Marker(NamedTuple):
+    """The marker an older wt-ship wrote while the work tree held an earlier commit."""
+
     path: Path
     holder: Holder
     tip: str
@@ -217,62 +214,20 @@ def marker():
     )
 
 
-def blocking_commits():
-    """The marker of another process checking earlier commits in this worktree, while
-    that process may still run; None otherwise. For agent-commit-gate, which refuses
-    a commit then. The checks that process starts name it in OWNER_ENV."""
-    found = marker()
-    if found is None or found.holder.gone():
-        return None
-    owner = os.environ.get("CHECKING_EARLIER_COMMITS_PID")
-    if found.holder.pid is not None and found.holder.pid == owner:
-        return None
-    return found
-
-
-def first_failing(hook, commits, gate, front=False):
-    """Check out each of `commits` in turn, oldest first, index and work tree, forced,
-    since some checks read the work tree, and run the agent check at `hook` through
-    `gate --run`; return the first that fails, or None. Two rounds: each commit first
-    with --no-queue, which runs a check that needs no build or test, such as a
-    docs-only commit's, outside heavy's queue; then those whose check needs the queue
-    all in one heavy job, `front` putting it at the queue's front, so no other job
-    runs between them. The oldest commit that fails is the one returned, whichever
-    round finds it. A commit without the hook has nothing to check (dropping_check
-    catches one that should have it). The worktree's marker stands for the whole run,
-    and HEAD comes back to where it was, on its branch, however the run ends; the
-    marker goes once it has. The caller made sure no tracked file has changes."""
+def head_passes(hook, gate, front=False):
+    """Run the agent check at `hook` on HEAD, in place, through `gate --run`, at the
+    top of the work tree, as git runs a hook; whether it passed. First with
+    --no-queue, which runs a check that needs no build or test, such as a docs-only
+    change's, outside heavy's queue; then, when it needs the queue, in a heavy job,
+    `front` putting it at the queue's front. The caller made sure no tracked file has
+    changes, and that HEAD has the hook."""
     top = out("rev-parse", "--show-toplevel")
-    ref = git("symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
-    branch = ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else ""
-    tip = out("rev-parse", "HEAD")
-    path = marker_path()
-    me = Holder.mine()
-    # Whole, so a run killed mid-write can't leave a marker nobody can read.
-    fifo.write_whole(path, f"{me.line()}tip={tip}\nbranch={branch}\n")
-    env = gate_env() | {"CHECKING_EARLIER_COMMITS_PID": me.pid}
-    # The check runs at the top of the work tree, as git runs a hook.
+    env = gate_env()
     argv = [str(gate), "--run", str(hook)]
-    try:
-        queued = []
-        rest = partial(in_one_job, argv=argv, env=env, top=top, front=front)
-        for sha in commits:
-            check_out(sha, say=False)
-            if not runnable(hook):
-                print(
-                    f"  {named(sha)}: no {HOOK_NAME} at this commit, so nothing to check"
-                )
-                continue
-            code = run_stoppable([*argv, "--no-queue"], env, cwd=top)
-            if code == QUEUE_EXIT:
-                queued.append(sha)
-            elif code != 0:
-                # An older commit set aside for the queue may fail too: it goes first.
-                return (rest(queued) if queued else None) or sha
-        return rest(queued) if queued else None
-    finally:
-        git("checkout", "-q", "--force", *([branch] if branch else ["--detach", tip]))
-        path.unlink(missing_ok=True)
+    code = run_stoppable([*argv, "--no-queue"], env, cwd=top)
+    if code == QUEUE_EXIT:
+        return passes_in_a_job(argv, env, top, front)
+    return code == 0
 
 
 def named(sha):
@@ -280,19 +235,12 @@ def named(sha):
     return out("log", "-1", "--format=%h %s", "--abbrev=12", sha)
 
 
-def check_out(sha, say=True):
-    if say:
-        print(f"  {named(sha)}", flush=True)
-    git("checkout", "-q", "--force", "--detach", sha)
-
-
-def in_one_job(commits, argv, env, top, front):
-    """Run the check `argv` on each of `commits`, checked out in turn, inside one heavy
-    job, where each gate run starts at once; the first that fails, or None. A queue
-    that can't be used leaves each check to queue for itself, as the gate does."""
+def passes_in_a_job(argv, env, top, front):
+    """Run the check `argv` inside a heavy job, where the gate's run starts at once;
+    whether it passed. A queue that can't be used leaves the check to queue for
+    itself, as the gate does."""
     print(
-        f"Checking the {len(commits)} that need heavy's queue in one job"
-        f"{' at its front' if front else ''}:",
+        f"It needs heavy's queue, so it runs in a job{' at its front' if front else ''}.",
         flush=True,
     )
     cores = os.sched_getaffinity(0)
@@ -302,7 +250,7 @@ def in_one_job(commits, argv, env, top, front):
             turn = heavyqueue.turn(command="wt-ship's checks", hint=False, front=front)
             job = stack.enter_context(turn)
         except heavyqueue.QueueError as error:
-            print(f"heavy: can't use its queue ({error}), so each check queues alone.")
+            print(f"heavy: can't use its queue ({error}), so the check queues alone.")
             job = None
         if job is not None:
             job.pin()
@@ -311,15 +259,10 @@ def in_one_job(commits, argv, env, top, front):
                 for key in ("HEAVY_SLOT", "CARGO_BUILD_JOBS")
                 if key in job.env
             }
-        for sha in commits:
-            check_out(sha)
-            if run_stoppable(argv, env, cwd=top) != 0:
-                if job is not None:
-                    job.exited(1)
-                return sha
+        passed = run_stoppable(argv, env, cwd=top) == 0
         if job is not None:
-            job.exited(0)  # a passing run goes into heavy's history
-        return None
+            job.exited(0 if passed else 1)  # a passing run goes into heavy's history
+        return passed
 
 
 def restore_cores(cores):

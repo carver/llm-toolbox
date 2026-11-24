@@ -163,7 +163,8 @@ commit to them does start it: 0.05 s with uv's cache warm, PyPI with it cold.
 
 ## wt-ship and the commit checks
 
-The owner's rule: every commit that reaches remote main passes the full check.
+The owner's rule until 2026-11-24 was that every commit that reaches remote main
+passes the full check. Since then, only each landing's tip does (below, issue #7).
 In sessions from 2026-11-04 to 11-08 on filedrawer, agents spent about 35 to 40 of
 104 hours blocked on checks. heavy's queue usually held one to five jobs ahead, nearly
 all `agent-pre-commit`, and a landing ran the full check at each commit, again in
@@ -171,16 +172,45 @@ all `agent-pre-commit`, and a landing ran the full check at each commit, again i
 rebase. wt-ship's recheck failed none of 34 logged landings, and most refusals at a
 commit came from tests of the code it changed.
 
-### wt-ship checks every commit it lands (03bc4c8, 2026-11-08)
+### A landing of several commits lands as a merge, checked once at its tip (#7, 2026-11-24)
 
-Each commit with no pass on agent-commit-gate's record, oldest first, each checked
-out in turn in the worktree, then HEAD. Before, it checked only HEAD, so after a
-rebase the commits before it reached main checked only on the base they were made on.
+In filedrawer, a check of a commit that touches a crate takes about 260 s, so a
+landing of 6 commits on 2026-11-23 spent 26 minutes checking, under the main tree's
+claim, and the next session's landing waited behind it. Now a landing of one commit
+lands as before. A landing of two or more, counted after the last rebase, lands as a
+merge commit: first parent the branch's tip, second the rebased tip, tree the tip's,
+made with `git commit-tree`, which runs no hook. Only the tip is checked, and only when
+its tree has no pass on record, so the tip's pass, keyed by tree, is the merge's. The
+owner's choices: the default in every repo, with no setting and no opt-out; and the
+subject `Merge TOPIC (N commits)`, with the commits' subjects in the body, TOPIC from
+the worktree folder `REPO-wt-TOPIC`, else its branch, else the tip's short ID.
+
+What it gives up: the commits inside a merge carry only the checks they had when they
+were made (in filedrawer clippy and the rule tests, in llm-toolbox the seconds-long
+tests a path names), and on trees the rebase and the folds may since have changed,
+which nothing checks. So `git bisect --first-parent` walks only checked commits, and a
+plain `git bisect` can stop on an unchecked one. A fix folded into a commit before the
+code it needs leaves that commit broken unseen, where it used to fail at landing.
+
+- After landing, the worktree's HEAD, and its branch, moves to the merge, same tree,
+  so the worktree's next landing finds its fork point in the branch's reflog. Left at
+  the tip, which the reflog never holds, `--fork-point` finds nothing (a review of the
+  plan showed it live).
+- A pushed merge lost to another push's race is made again on the new tip, after the
+  rebase and the check.
+- The landing notice lists the commits' subjects, not the merge's. The reminder to
+  push counts the merge among the commits ahead.
+
+Before: wt-ship checked every commit it landed, each with no pass on record, oldest
+first, each checked out in turn (03bc4c8, 2026-11-08), since checking only HEAD left
+the commits before it checked only on the base they were made on. Measured cost: see
+above.
 
 ### wt-ship --local checks only while it holds the main tree (2026-11-08)
 
 It rebases before it waits, so a conflict shows without holding anyone up, but checks
-nothing until it holds the claim, then checks each commit once. Checking first threw
+nothing until it holds the claim, then checks once (each commit then, the tip alone
+since #7). Checking first threw
 the round away whenever another session landed during the wait, which with several
 sessions landing was often. Other landings wait longer for the claim, but they'd wait
 the same for heavy's one lane, and a wait for the claim costs no CPU. The wait limit,
@@ -197,17 +227,20 @@ docs-only landing never waits for the lane, and the checks that need it run toge
 in one heavy job that joins the queue ahead of every ordinary waiter (the owner's
 design). The running job isn't stopped. The front goes only to a landing under the
 claim and, since 2026-11-09, to a `heavy --quick` job (above), and works on trust, as
-the queue does.
+the queue does. Since #7 a landing has one check, the tip's, so the job holds one.
 
 ### build-state finish only folds (8f13e99, 2026-11-08)
 
-wt-ship checks a fold's new trees when it lands them, so finish's own run of the
-full check on each rewritten commit was a second one.
+wt-ship checked a fold's new trees when it landed them, so finish's own run of the
+full check on each rewritten commit was a second one. Since #7 wt-ship checks only a
+landing's tip, so a fold's earlier trees get no full check at all, an accepted gap
+(above).
 
 ### Commits that only refine an earlier one of the landing get folded (2026-11-09)
 
-The owner's rule: every commit gets the full suite before it lands, and none after,
-so the give is in commit isolation. The mutate-check landing of 2026-11-09 checked 8
+The owner's rule then: every commit gets the full suite before it lands, and none
+after, so the give is in commit isolation. Since #7 only a landing's tip gets the
+suite, so folding no longer saves checks. The mutate-check landing of 2026-11-09 checked 8
 commits, 96 to 160 seconds each, of which 5 only refined the `--diff` code an earlier
 one added: review fixes, the owner's asks after a first run, two refactors. /build
 now makes its refactor and those asks `fixup!`s, and `lib/foldable.py` finds the rest.
@@ -255,8 +288,8 @@ owner's choice): it lasts through rebases and says which split is on purpose.
 ### A repo may run a lighter check at each commit (fe1aad9, 2026-11-08)
 
 A repo's `agent-commit-check` runs at each commit in the full check's place, with
-passes on a record of their own, so wt-ship runs the full check on each such commit
-when it lands. The hook's line marks a commit's run with AGENT_CHECK_AT_COMMIT=1
+passes on a record of their own, so wt-ship runs the full check when it lands such a
+commit at the tip (since #7, the tip alone). The hook's line marks a commit's run with AGENT_CHECK_AT_COMMIT=1
 rather than the gate finding `git commit` among its parents, which a check that runs
 the gate's own tests under an agent's commit would fool.
 

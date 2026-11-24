@@ -10,8 +10,8 @@ A fix commit (fixup!, squash!, amend!) that is small, at most 20 lines changed i
 files it only modifies in place, none binary and none a test, runs the optional
 `agent-quick-check`
 beside it instead, the repo's fast static checks, or nothing when the repo has
-none: wt-ship runs the full check on each commit it lands that has no pass on the
-record below. Any other fix commit runs the full check, or the commit check where
+none: wt-ship runs the full check on the tip of each landing, when its tree has no
+pass on the record below. Any other fix commit runs the full check, or the commit check where
 the repo keeps one. The gate knows a fix commit by --fixup or --squash, or by its
 subject, given with -m or in the file -F names; not with `-F -`, since git reads
 stdin only after the hook has run.
@@ -20,7 +20,8 @@ The commit check: a repo that keeps an executable `agent-commit-check` beside
 `agent-pre-commit` runs it at each commit that isn't a small fix, in the full
 check's place, with its passes on a record of their own,
 `agent-commit-check-passed`, beside the full one. wt-ship reads only the full
-record, so it runs `agent-pre-commit` on each such commit when it lands. The line
+record, so it runs `agent-pre-commit` on a landing's tip that only passed the
+commit check. The line
 --install writes says its run is a commit's by setting AGENT_CHECK_AT_COMMIT=1; the
 gate takes it out of the environment of every check, and a run without it, such as
 wt-ship's recheck or a hook still on an older line, runs the full check. At a
@@ -48,8 +49,8 @@ at once, and prints heavy's waiting lines; one that needs no build or test can
 skip the queue, as below.
 wt-ship rechecks through `--run` too, first with `--no-queue`: a check that would wait
 in heavy's queue then doesn't run there, and --run exits 75, recording nothing, for
-wt-ship to run it in one job with the landing's other such checks. While wt-ship checks a
-worktree's commits before its tip, each checked out there in turn, a marker in the
+wt-ship to run it in a heavy job of its own. While wt-ship checks a
+worktree's tip, checked out there detached, a marker in the
 worktree's git dir names the run, and `--run` refuses a commit in that worktree, which
 would be lost when the tip comes back. The checks wt-ship starts carry its PID in
 CHECKING_EARLIER_COMMITS_PID, and run (`wt-ship -h`).
@@ -107,9 +108,9 @@ recheck, when the index matches the commit being checked. Add -z for paths git
 would quote, --no-renames to list both sides of a rename, and run it before
 unsetting git's variables or changing directory: `commit -a` and `commit
 PATHS` stage into an index of their own, which GIT_INDEX_FILE names. On
-wt-ship's recheck the base is usually the commit before, or for the first
-commit it checks, the main branch's tip, which passed when it landed. A check that
-ignores
+wt-ship's recheck of a landing's tip the base is usually the tip of the branch it
+lands on, which passed when it landed, so the check covers the whole landing. A
+check that ignores
 CHECK_BASE runs in full, as does any check when no base is found. The pass line
 names the base it was given. agent-quick-check gets CHECK_BASE too: the nearest
 commit that passed agent-pre-commit, whose checks include the quick ones.
@@ -375,7 +376,7 @@ FIX_SUBJECT = ("fixup!", "squash!", "amend!")
 # The optional fast check a small fix commit runs instead of HOOK_NAME, beside it.
 QUICK_NAME = "agent-quick-check"
 # The optional check every other commit runs instead of HOOK_NAME, beside it, when the
-# line says the run is a commit's; wt-ship runs HOOK_NAME on the commit when it lands.
+# line says the run is a commit's; wt-ship runs HOOK_NAME on a landing's tip.
 COMMIT_CHECK_NAME = "agent-commit-check"
 # A check that names this variable runs first outside heavy's queue, with it set to
 # QUEUE_EXIT, the exit status that asks for the queue (sysexits' EX_TEMPFAIL).
@@ -413,7 +414,7 @@ def is_small_fix():
     every file modified in place (none added, deleted, renamed or copied, no mode
     changed, no submodule or symlink), none binary and none a test. Such a fix is
     likely a lint or syntax repair, which the full check can wait for until
-    wt-ship lands it. An empty change, as in a reword, is small. -z keeps paths as
+    wt-ship checks the landing's tip. An empty change, as in a reword, is small. -z keeps paths as
     they are: without it git quotes one with a tab, a quote or a non-ASCII letter."""
     raw = git_out("diff", "--cached", "--raw", "-z", "-M", "HEAD")
     counts = git_out("diff", "--cached", "--numstat", "-z", "-M", "HEAD")
@@ -913,7 +914,7 @@ def run_check(path, queue=True):
     check that counts. A check that passes but leaves what's staged changed refuses
     the commit. Without queue (--no-queue), a check that would wait in heavy's queue
     doesn't run there: --run exits with QUEUE_EXIT, recording nothing, for the caller to
-    run it in a job of its own, as wt-ship does with a landing's checks."""
+    run it in a job of its own, as wt-ship does with a landing's check."""
     hook = Path(path)
     if (busy := commitcheck.blocking_commits()) is not None:
         print(
@@ -947,8 +948,8 @@ def run_check(path, queue=True):
                 code = run_quiet(quick, QUICK_NAME, base, queue=False)
             return refuse_if_staged_changed(code, before, QUICK_NAME)
         print(
-            f"{HOOK_NAME}: skipped for a small fix commit; wt-ship runs it on each "
-            "commit it lands with no pass on record",
+            f"{HOOK_NAME}: skipped for a small fix commit; wt-ship runs it on the tip "
+            "of the landing",
             file=sys.stderr,
         )
         return 0
@@ -966,7 +967,7 @@ def run_check(path, queue=True):
     clean = no_unstaged_changes()
     if heavyqueue.inside_job():
         # The job holds the lane already, so a run outside the queue would be a
-        # second one: wt-ship's job for a landing's checks.
+        # second one: wt-ship's job for a landing's check.
         code = run_quiet(check.path, check.name, base)
     elif names_queue_exit(check.content):
         code = run_outside_first(check.path, check.name, base, queue=queue)

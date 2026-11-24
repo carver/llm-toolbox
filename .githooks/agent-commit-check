@@ -3,8 +3,8 @@
 # agent-pre-commit's place, when the pre-commit hook's line sets AGENT_CHECK_AT_COMMIT
 # (`agent-commit-gate -h`). It is agent-pre-commit --commit: the tests that take
 # seconds and that a staged path names, such as the two that hold a tool's -h and its
-# README entry together, and never the suite, which wt-ship runs on each commit when
-# it lands; the agent runs the tests it wrote or touched before it commits. It names
+# README entry together, and never the suite, which wt-ship runs on the tip of each
+# landing; the agent runs the tests it wrote or touched before it commits. It names
 # $CHECK_QUEUE_EXIT, so the gate runs it outside heavy's queue, which it never asks
 # for.
 exec "$(dirname "$0")/agent-pre-commit" --commit

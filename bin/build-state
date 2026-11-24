@@ -13,7 +13,7 @@
                             with no review (review-prompt) recorded, no refactor
                             base after it, or a commit between the two that isn't
                             a fixup!, squash! or amend!. It runs no
-                            agent-pre-commit: wt-ship checks each commit when it
+                            agent-pre-commit: wt-ship checks the tip of what it
                             lands
     build-state review-prompt BRIEF
                             record HEAD as the commit the review covers, write
@@ -26,7 +26,7 @@
                             SKILL.md (fails when they can't be found there); on stderr,
                             a nudge to write a CODING_STANDARDS.md when the repo has none.
                             When the repo has an agent-pre-commit, which wt-ship runs
-                            on every commit when it lands, the file tells the
+                            on the tip of what it lands, the file tells the
                             reviewer to run only the tests a finding needs, not the
                             whole suite
     build-state fold [--upstream REV]
@@ -64,9 +64,9 @@ fix at it with reword.
 
 finish runs no check. A fold, finish's own or one done by hand, puts each fix into an
 earlier commit, and a fix folded into an earlier commit than the code it needs leaves
-that commit broken while HEAD passes; wt-ship finds it, since it checks every commit it
-lands that has no pass on agent-commit-gate's record (`wt-ship -h`), and a fold's new
-tree has none.
+that commit broken while HEAD passes. wt-ship doesn't find it: it checks only the tip
+of a landing, and lands two or more commits as a merge whose tree is the tip's
+(`wt-ship -h`), so only a `git bisect` without `--first-parent` meets the broken one.
 
 The fingerprint is every ref except the work branch and its upstream, the stash, and the
 branches checked out in other linked worktrees at start or at finish, which other sessions
@@ -1222,8 +1222,8 @@ follow it. Report only: edit no files and make no commits.
 """
 # In the review prompt when the repo has an agent check.
 CHECKED_AT_LANDING = """
-wt-ship runs the repo's agent check, agent-pre-commit, on every commit it lands that \
-has no pass on record, so don't run the whole test suite: run the tests a finding \
+wt-ship runs the repo's agent check, agent-pre-commit, on the tip of what it lands, \
+so don't run the whole test suite: run the tests a finding \
 needs, and `mutate-check` to see whether a test catches a break.
 """
 REVIEW_PROMPT = """\

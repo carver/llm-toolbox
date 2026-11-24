@@ -632,7 +632,7 @@ def test_a_small_fix_commit_without_a_quick_check_skips_the_agent_check(
     assert run.returncode == 0, run.stderr
     assert (
         "skipped for a small fix commit" in run.stderr
-        and "wt-ship runs it on each commit it lands" in run.stderr
+        and "wt-ship runs it on the tip of the landing" in run.stderr
     )
     assert ran(installed) == ["fast", "agent", "fast"]
 
@@ -2064,7 +2064,7 @@ def test_a_rechecks_base_counts_only_full_passes(installed):
     assert bases(installed) == ["none"]
 
 
-# --no-queue: wt-ship's first round of a landing's checks, outside heavy's queue.
+# --no-queue: wt-ship's first round of a landing's check, outside heavy's queue.
 
 
 def run_no_queue(repo, env=None):

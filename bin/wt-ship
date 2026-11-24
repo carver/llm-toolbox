@@ -48,30 +48,41 @@ In order, it:
    --upstream UPSTREAM`, which folds them, and the trailer `Fold-check: keep`, which
    keeps a commit out; then it lands them as they
    are. A judgement that fails says so in a line and the landing goes on;
-4. checks every commit it would push with the repo's agent-pre-commit hook, else none,
-   and says so: each commit whose tree has no pass of the check, as its bytes are now,
-   on agent-commit-gate's record, HEAD included, oldest first, each checked out in
-   turn here, forced. Each runs through agent-commit-gate --run, which hands the check
-   CHECK_BASE, usually the commit before or the main branch's tip (`agent-commit-gate
-   -h`), so it can run only what that commit changed. Two rounds: first each commit
-   with --no-queue, which runs a check that needs no build or test, such as a
-   docs-only commit's, outside heavy's queue; then the commits whose check needs the
-   queue, all in one heavy job, so no other session's job runs between them, at the
-   queue's front with --local, which checks only under the main tree's claim. The
-   first failure stops it, naming the commit to fix with a fixup!, and
-   says when the branch's tip it rebased onto has no pass either. While the work tree
-   holds an earlier commit, a marker in the worktree's git dir names the tip and this
+4. checks the tip, HEAD, with the repo's agent-pre-commit hook, else nothing, and says
+   so, unless HEAD's tree already has a pass of the check, as its bytes are now, on
+   agent-commit-gate's record. The commits before HEAD get no check here: a landing
+   of two or more lands as a merge whose tree is HEAD's (step 5), so HEAD's check is
+   the merge's, and the commits inside it carry only the checks they had when they
+   were made, on trees the rebase may have changed since. So `git bisect
+   --first-parent` walks only checked commits, and a plain `git bisect` can stop on an
+   unchecked one. The check runs through agent-commit-gate --run, which hands it
+   CHECK_BASE, usually the branch's tip it rebased onto (`agent-commit-gate -h`), so it
+   can run only what the whole landing changed. It runs first with --no-queue, which
+   runs a check that needs no build or test, such as a docs-only landing's, outside
+   heavy's queue; then, when it needs the queue, in a heavy job, at the queue's front
+   with --local, which checks only under the main tree's claim. A failure stops it,
+   and says when the branch's tip it rebased onto has no pass either.
+   While the check runs, with the tip checked out here detached, a marker in the
+   worktree's git dir names the tip and this
    run, and agent-commit-gate refuses commits there, which would be lost; the tip comes
    back and the marker goes however the checks end, unless the run is killed outright,
    and then the next run names the tip to put back. A repo that keeps the check in its
    tree (core.hooksPath inside it) fails a commit that drops it while the branch has
    it: the commit must hold an executable file there, or a link that leads to one in
    the commit's own tree;
-5. pushes HEAD to REMOTE/BRANCH. When another session's push wins the race (a
-   non-fast-forward rejection), it fetches, rebases, checks and pushes again, up to
-   10 tries in all, then stops saying to run it again;
-6. fetches again and confirms the remote branch holds HEAD;
-7. prints the range it pushed, a notice for other sessions (which it doesn't send),
+5. pushes to REMOTE/BRANCH what lands: one commit as it is; two or more as a merge
+   commit, made with `git commit-tree` (no hook runs), whose first parent is the
+   branch's tip and second HEAD. Its subject is `Merge TOPIC (N commits)`, TOPIC from
+   a worktree folder named REPO-wt-TOPIC (REPO the main tree's folder), else the
+   worktree's branch, else HEAD's short ID; its body lists each commit's subject,
+   oldest first. When another session's push wins the race (a non-fast-forward
+   rejection), it fetches, rebases, checks and makes the merge again, then pushes, up
+   to 10 tries in all, then stops saying to run it again;
+6. fetches again and confirms the remote branch holds what it pushed, then moves the
+   worktree's HEAD (and its branch) to the merge, whose tree is the same, so a later
+   landing from here forks from a commit the branch held;
+7. prints the range it pushed, a notice for other sessions (which it doesn't send,
+   and which lists the commits' subjects, not the merge's),
    and whether the main tree's branch is now behind the remote. For each issue a
    commit's message closes with one of GitHub's keywords ("Closes #46", "fixes:
    #43"), it lists the issue's task-list items still unticked, from `issue-todo
@@ -99,8 +110,9 @@ plain rebase would. It checks nothing yet: another landing may move the branch w
 it waits. Then it claims the main tree with its CLAUDE_WORKING flag, which
 records $CLAUDE_CODE_SESSION_ID, the time, and this host and process (an old-style
 flag of this session's, one without a process, is kept), rebases again if the branch
-moved while it waited, checks each commit as in step 4, once, and fast-forwards the
-main tree with `git merge --ff-only`. A failing check releases the claim, merging
+moved while it waited, checks the tip as in step 4, once, and fast-forwards the main
+tree with `git merge --ff-only` to what lands, the tip or a merge as in step 5, then
+moves the worktree to it as in step 6. A failing check releases the claim, merging
 nothing. While another run holds the flag, this session's other runs (a subagent's)
 included, it waits its turn in a first-come-first-served queue in the repo's common
 git dir, printing a line when whom it waits on changes, and gives up after
@@ -291,10 +303,16 @@ def upstream_note(upstream, hook):
 
 
 def run_checks(upstream, mode):
-    """Check every commit since upstream with the repo's agent check, if it has one:
-    each with no pass on record, oldest first, each checked out here in turn, those
-    that need heavy's queue in one job (at its front when landing, which runs under the
-    main tree's claim); the first failure stops it."""
+    """Check what lands with the repo's agent check, if it has one, and return HEAD,
+    the tip it checked. One commit since upstream gets the check; of two or more, which
+    land as a merge (`commit_to_land`), only the tip, whose tree the merge's is. Only a tree
+    with no pass on record is checked, a check that needs heavy's queue in one job, at
+    its front when landing, which runs under the main tree's claim."""
+    check_the_tip(upstream, mode)
+    return out("rev-parse", "HEAD")
+
+
+def check_the_tip(upstream, mode):
     hook = commitcheck.hook_path()
     if dropped := commitcheck.dropping_check(upstream, hook):
         raise Stop(
@@ -307,32 +325,21 @@ def run_checks(upstream, mode):
     if not commitcheck.runnable(hook):
         print(f"No check: the repo has no {CHECK} hook.")
         return
-    needed = commitcheck.unchecked(upstream, hook)
-    if not needed:
-        print(f"{CHECK}: every commit since {short(upstream)} passed it already.")
-        return
     tip = out("rev-parse", "HEAD")
-    count = f"{len(needed)} commit{'' if len(needed) == 1 else 's'}"
+    if commitcheck.passed(tip, hook):
+        print(f"{CHECK}: the tip, {named(tip)}, passed it already.")
+        return
     print(
-        f"Checking with {CHECK} the {count} with no pass on record, each checked out"
-        " here in turn: until wt-ship ends, the work tree holds that commit, not the"
-        " tip, so change or commit nothing in it.",
+        f"Checking the tip, {named(tip)}, with {CHECK}: until wt-ship ends, change or"
+        " commit nothing here.",
         flush=True,
     )
-    failed = commitcheck.first_failing(hook, needed, GATE, front=mode is LAND)
-    if failed is None:
+    if commitcheck.first_failing(hook, [tip], GATE, front=mode is LAND) is None:
         return
-    note = upstream_note(upstream, hook) if failed == needed[0] else ""
-    if failed == tip:
-        raise Stop(
-            f"The repo's {CHECK} fails at HEAD, {named(failed)}. Fix it, commit, then"
-            f" run `{RERUN}` again; nothing was {mode.done}.{note}"
-        )
     raise Stop(
-        f"The repo's {CHECK} fails at {named(failed)}, a commit before HEAD. Fix it"
-        f" with `git commit --fixup={failed[:12]}`, or move the code it needs into it,"
-        f" then run `{RERUN}` again; nothing was {mode.done}, and the branch stays at"
-        f" its tip.{note}"
+        f"The repo's {CHECK} fails at HEAD, {named(tip)}. Fix it with a fixup! of the"
+        f" commit it belongs to, then run `{RERUN}` again; nothing was"
+        f" {mode.done}.{upstream_note(upstream, hook)}"
     )
 
 
@@ -405,9 +412,48 @@ def not_replayed(upstream):
 
 
 def prepare(upstream, mode):
-    """Rebase onto upstream as rebase_onto does; check."""
+    """Rebase onto upstream as rebase_onto does; check; return the tip checked."""
     rebase_onto(upstream, mode)
-    run_checks(upstream, mode)
+    return run_checks(upstream, mode)
+
+
+def commit_to_land(upstream, tip, topic):
+    """The commit to land on upstream: `tip` when it's the one commit since upstream;
+    else a merge whose first parent is the commit `tip` was rebased onto, and second
+    `tip`, so the merge's tree is the tip's and the tip's check is the merge's. That
+    base, not upstream's tip now: a fetch anywhere moves a remote-tracking ref every
+    worktree shares, and a merge on a newer tip with the tip's tree would revert what
+    came since; on the old base the push is refused as a race instead. Its subject
+    names `topic` (`topic_of`), else the tip's short ID, its body each commit's
+    subject, oldest first. Made with commit-tree, which runs no hook and needs no
+    checkout."""
+    base = out("merge-base", upstream, tip)
+    subjects = out("log", "--format=%s", "--reverse", f"{base}..{tip}").splitlines()
+    if len(subjects) < 2:
+        return tip
+    name = topic or out("rev-parse", "--short", tip)
+    message = f"Merge {name} ({len(subjects)} commits)\n\n" + "\n".join(subjects)
+    return out("commit-tree", f"{tip}^{{tree}}", "-p", base, "-p", tip, "-m", message)
+
+
+def topic_of(here, main_path):
+    """What a landing's merge is named for: TOPIC of a worktree folder named
+    REPO-wt-TOPIC, REPO the main tree's folder; else the worktree's branch; else
+    None."""
+    prefix = f"{Path(main_path).name}-wt-"
+    name = Path(here).name
+    if name.startswith(prefix) and name != prefix:
+        return name.removeprefix(prefix)
+    branch = git("symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+    return branch or None
+
+
+def move_to(landed, tip):
+    """Move this worktree's HEAD, and its branch with it, from the tip to the merge
+    that landed it, whose tree is the same, so a later landing from here forks from a
+    commit in the branch's reflog."""
+    if landed != tip:
+        git("reset", "-q", "--soft", landed)
 
 
 class Citation(NamedTuple):
@@ -608,9 +654,7 @@ def warn_of_folds(upstream):
 def rebase_and_check(remote, branch):
     """Fetch, rebase onto the remote branch, refuse markers, check."""
     git("fetch", "-q", remote, branch)
-    upstream = f"{remote}/{branch}"
-    prepare(upstream, PUSH)
-    return upstream
+    return prepare(f"{remote}/{branch}", PUSH)
 
 
 def locate():
@@ -649,10 +693,12 @@ def ship(args):
     # Once, before any check: a verdict that changed after a retry's rebase would come
     # too late to act on.
     warn_of_folds(upstream)
-    run_checks(upstream, PUSH)
+    topic = topic_of(here, main_path)
+    tip = run_checks(upstream, PUSH)
     for attempt in range(1, TRIES + 1):
-        old = out("rev-parse", upstream)
-        pushed = git("push", "-q", remote, f"HEAD:{branch}", check=False)
+        old = out("merge-base", upstream, tip)
+        new = commit_to_land(upstream, tip, topic)
+        pushed = git("push", "-q", remote, f"{new}:refs/heads/{branch}", check=False)
         if pushed.returncode == 0:
             break
         if not any(sign in pushed.stderr for sign in REJECTED):
@@ -668,11 +714,11 @@ def ship(args):
             f" (try {attempt + 1} of {TRIES}):\n{pushed.stderr.strip()}",
             flush=True,
         )
-        rebase_and_check(remote, branch)
+        tip = rebase_and_check(remote, branch)
     git("fetch", "-q", remote, branch)
-    new = out("rev-parse", "HEAD")
     if not is_ancestor(new, upstream):
         raise Stop(f"{upstream} doesn't hold {new[:12]} after the push.")
+    move_to(new, tip)
     report(old, new, PUSH.done, branch, f"to {upstream}", remote)
     if main_branch == branch:
         local = out("rev-parse", f"refs/heads/{branch}")
@@ -828,7 +874,9 @@ def warn_unticked(old, new, remote):
 
 
 def report(old, new, verb, branch, where, remote="origin"):
-    subjects = out("log", "--format=%s", "--reverse", f"{old}..{new}").splitlines()
+    subjects = out(
+        "log", "--no-merges", "--format=%s", "--reverse", f"{old}..{new}"
+    ).splitlines()
     files = out("diff", "--name-only", old, new).splitlines()
     print(f"{verb.capitalize()} {old[:7]}..{new[:7]} {where}.")
     warn_unticked(old, new, remote)
@@ -1040,12 +1088,13 @@ def land(args):
     # yet, since another landing may move the branch meanwhile.
     rebase_onto(ref, LAND)
     warn_of_folds(ref)
+    topic = topic_of(here, main_path)
     with claim(main_path, wait=not args.no_wait):
         rebase_onto(ref, LAND)
         # Before the checks, which everyone waiting for the claim waits through.
         refuse_overlap(main_path, ref)
-        # Other sessions can't land now, so each commit is checked once.
-        run_checks(ref, LAND)
+        # Other sessions can't land now, so the tip is checked once.
+        tip = run_checks(ref, LAND)
         # The owner, or a tool that doesn't read the flag, may still move the
         # branch: rebase until HEAD holds it, checking each time, at most TRIES
         # checks in all.
@@ -1066,12 +1115,13 @@ def land(args):
                 f" (try {attempt} of {TRIES}).",
                 flush=True,
             )
-            prepare(ref, LAND)
-        old = out("merge-base", ref, "HEAD")
-        new = out("rev-parse", "HEAD")
+            tip = prepare(ref, LAND)
+        old = out("merge-base", ref, tip)
+        new = commit_to_land(ref, tip, topic)
         merge(main_path, new)
         if not is_ancestor(new, ref):
             raise Stop(f"{branch} doesn't hold {new[:12]} after the merge.")
+        move_to(new, tip)
     report(old, new, LAND.done, branch, f"on {branch} in the main tree ({main_path})")
     try:
         push_reminder(branch)

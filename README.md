@@ -258,22 +258,24 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   since a rebase changes an unlanded commit's ID (`build-state reword SHA`
   rewords it), warns once, before any check, of each commit that only refines
   an earlier one of the landing (`build-state fold` folds them; a
-  `Fold-check: keep` trailer silences it), and checks every commit it would
-  push with the repo's `agent-pre-commit`, through `agent-commit-gate --run`,
-  which hands each the
-  `CHECK_BASE` of the commit before or the main branch's tip: each commit with
-  no pass on record, oldest first, checked out in turn in the worktree, first
-  outside `heavy`'s queue (`--no-queue`), so a docs-only commit never waits,
-  then those that need the queue in one `heavy` job, at the queue's front when
-  it lands under the main tree's claim, so no other job comes between them. The
-  first failure stops it, naming the commit to fix with a fixup. While the work
-  tree holds an earlier commit, a marker in
+  `Fold-check: keep` trailer silences it), and checks the tip, HEAD, with the
+  repo's `agent-pre-commit` when its tree has no pass on record, through
+  `agent-commit-gate --run`, which hands it the `CHECK_BASE` of the branch's
+  tip, so the check covers the whole landing: first outside `heavy`'s queue
+  (`--no-queue`), so a docs-only landing never waits, then, when it needs the
+  queue, in a `heavy` job, at the queue's front when it lands under the main
+  tree's claim. A failure stops it. One commit lands as it is; two or more land as a merge
+  commit (`Merge TOPIC (N commits)`, TOPIC from the `REPO-wt-TOPIC` folder,
+  the commits' subjects in its body) whose tree is the tip's, so the commits
+  inside it get no check at landing, and `git bisect --first-parent` walks
+  only checked ones. While the check runs, a marker in
   the worktree's git dir makes `agent-commit-gate` refuse commits there, and a
   run killed before it put the tip back leaves the next one naming the tip. A
   repo that keeps the check in its tree fails a commit that drops it, or keeps a
   link to it that leads to no executable file in that commit. Then it
-  pushes with one retry when another push wins the race, and confirms the
-  remote holds HEAD. Then it prints the range, a notice for other sessions,
+  pushes with one retry when another push wins the race (rebasing, checking and
+  making the merge again), confirms the remote holds it, and moves the
+  worktree to the merge. Then it prints the range, a notice for other sessions,
   whether the main tree is behind, and the unticked task-list items of each
   issue a commit closes ("Closes #46"), to tick before the issue closes, all
   looked up within `$WT_SHIP_UNTICKED_TIMEOUT` seconds (default 30);
@@ -282,8 +284,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   that doesn't push, `--local` lands the commits on the main tree's branch
   instead: it rebases before it waits, checking nothing, then claims the main
   tree with the `CLAUDE_WORKING` flag, recording `CLAUDE_CODE_SESSION_ID`, the
-  host and its PID, rebases again if the branch moved meanwhile, checks each
-  commit once under the claim, and fast-forwards the main tree; a failing
+  host and its PID, rebases again if the branch moved meanwhile, checks the
+  tip once under the claim, and fast-forwards the main tree to the tip or the
+  merge; a failing
   check releases the claim. Should the branch move under the claim anyway,
   from the owner or a tool that ignores the flag, it rebases and checks again,
   up to 10 times. While another session holds the flag it waits its
@@ -431,7 +434,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   fixup!, squash! or amend! commit (found from the running `git commit`'s
   arguments) runs `agent-quick-check` instead, when the repo keeps one beside
   `agent-pre-commit`, and otherwise skips the check, since `wt-ship` checks
-  each commit it lands with no pass on record. Small means at most 20 lines
+  what it lands with the full check. Small means at most 20 lines
   changed, in
   files it only modifies in place (no mode change, no binary, symlink or
   submodule), none of them a test: a lint or syntax repair. Any
@@ -439,7 +442,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   its fast static checks, such as a linter or a type checker, and no tests. A
   repo that keeps an `agent-commit-check` beside them runs it at each commit
   that isn't a small fix, in the full check's place, with its passes on a record of their own,
-  so `wt-ship` runs the full check on each such commit when it lands; the line
+  so `wt-ship`'s full check at the landing's tip is the one it gets; the line
   marks a commit's run with `AGENT_CHECK_AT_COMMIT=1`, and a hook on an older
   line runs the full check, as before.
   `--install` also puts a line first in the post-commit hook. After an agent's
@@ -486,7 +489,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   4 GiB of memory are free, it runs at once outside the queue, whoever holds
   the lane (but never beside `--alone`), first in line for the OOM killer;
   otherwise it waits at the queue's front, after earlier front entries such as
-  a landing's checks and ahead of every other waiter, until the
+  a landing's check and ahead of every other waiter, until the
   cores go that quiet or it heads the lane, where it starts at the first quiet
   sample. One that ran past `$HEAVY_QUICK_MAX` (60) seconds hears, as it ends,
   to drop `--quick` for runs like it. It goes with none of `--long`, `--alone`
@@ -687,9 +690,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   folds `fixup!` commits into the commits they fix, leaving every other commit
   separate and the tree as it was (a fix that conflicts gets the later commit
   it was made on top of and the `reword` command that points it there). It
-  runs no check: a fold's new tree has no pass on the gate's record, so
-  `wt-ship` checks it when it lands, and a fix folded into a commit before the
-  code it needs fails there, naming that commit. Then it lists the commits since the
+  runs no check: `wt-ship` checks the landing's tip, and a fold's new trees
+  inside a landing of several commits get no check, so a fix folded into a
+  commit before the code it needs leaves that commit broken unseen, which only
+  a `git bisect` without `--first-parent` meets. Then it lists the commits since the
   base and the test files changed since the refactor base, warns of the
   commits that only refine an earlier one of the landing, each a full check
   for `wt-ship` (`fold` folds them), and fails naming
@@ -708,8 +712,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   dir, with `/code-review`'s two briefs and its standards section copied from
   its SKILL.md, and prints a short prompt pointing at that file, to pass to the
   subagent; it says on stderr when the repo has no `CODING_STANDARDS.md`. When
-  the repo has an `agent-pre-commit`, which `wt-ship` runs on every commit
-  when it lands, the prompt tells the reviewer to run only the tests a finding
+  the repo has an `agent-pre-commit`, which `wt-ship` runs on the tip of what
+  it lands, the prompt tells the reviewer to run only the tests a finding
   needs rather than the whole suite.
   `fold` folds each commit whose changed lines came mostly (75%) from an
   earlier commit since the branch it lands on into that commit, in one rebase,
@@ -937,7 +941,7 @@ test that passes in the repo but reads its git state fails there. `install.py` p
 `pre-commit` runs `pipefail-lint` on the staged files that name pipefail, then the two ruff checks on what's staged. When only formatting fails, it formats each staged file that has no unstaged changes,
 stages the result and names the file; any other unformatted file refuses the commit, as does every
 file of a `git commit PATH`. `agent-pre-commit` adds the tests (about half a minute, most of it build-paper's builds);
-`wt-ship` runs it on each commit when it lands. Both run the tools
+`wt-ship` runs it on the tip of each landing. Both run the tools
 through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.
 
@@ -946,7 +950,7 @@ place, which is `agent-pre-commit --commit`: only the tests that take seconds
 and that a staged path names, so a `bin/` file runs the two that hold a tool's
 `-h` and its README entry together, and never the suite. `pre-commit` ran ruff,
 and the agent runs the tests it wrote or touched before committing. `wt-ship`
-runs `agent-pre-commit` on each commit when it lands, where `agent-commit-gate` hands it a `CHECK_BASE`,
+runs `agent-pre-commit` on the tip of each landing, where `agent-commit-gate` hands it a `CHECK_BASE`,
 and the hook runs only the tests the change since then can affect. A change to
 `README.md`, `GLOBAL_CLAUDE.md`, `skills/` or `skill-patches/` runs the one to three
 tests that read those files, under two seconds on one core, so the landing doesn't

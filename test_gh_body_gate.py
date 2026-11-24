@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import saved_command
+
 SCRIPT = Path(__file__).resolve().parent / "bin" / "gh-body-gate"
 DASH = "\N{EN DASH}"
 SLOP = f"Fixed it {DASH} mostly.\n"
@@ -61,7 +63,7 @@ class Gate:
         fake.chmod(0o755)
         return str(fake)
 
-    def run(self, command, tool="Bash", cwd="work", env=None):
+    def run(self, command, tool="Bash", cwd="work", env=None, session=None):
         """The hook's exit status and stderr for one call, its input shaped as Claude
         Code sends it. ``cwd``: "work" for the work folder, None for no cwd field;
         ``env``: variables to set for the hook."""
@@ -75,6 +77,7 @@ class Gate:
         }
         if cwd is not None:
             event["cwd"] = str(self.work) if cwd == "work" else cwd
+        event |= session or {}
         path = f"{self.bin}{os.pathsep}{os.environ['PATH']}"
         result = subprocess.run(
             [SCRIPT],
@@ -139,6 +142,15 @@ def test_a_body_file_slop_lint_flags_is_refused(gate, command):
     assert WAY_OUT in lines[-1] and "Fix the text" in lines[-1]
     assert lines[-1].endswith(NOTHING_RAN)
     assert len(lines) == 3
+
+
+def test_a_refused_post_is_saved_with_its_body(gate, refused_session):
+    fields, folder = refused_session
+    command = f"gh issue comment 5 -F - <<'EOF'\nIntro.\n\n{SLOP}\nEOF"
+    code, err = gate.run(command, session=fields)
+    assert code == 2
+    assert saved_command(err, folder) == command
+    assert err.splitlines()[-1].endswith("beside it.")
 
 
 def test_an_absolute_or_home_path_is_read_wherever_the_command_runs(gate):

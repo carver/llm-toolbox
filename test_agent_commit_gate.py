@@ -16,7 +16,13 @@ from pathlib import Path
 
 import pytest
 
-from conftest import path_without, wait_or_warn, wait_until, without_repo_vars
+from conftest import (
+    path_without,
+    saved_command,
+    wait_or_warn,
+    wait_until,
+    without_repo_vars,
+)
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "agent-commit-gate"
 loader = importlib.machinery.SourceFileLoader("agent_commit_gate", str(SCRIPT))
@@ -27,11 +33,23 @@ import fifo  # from lib/, which loading the gate put on the path
 import passrecord
 
 
-def run_hook(monkeypatch, capsys, command, tool="Bash"):
+def run_hook(monkeypatch, capsys, command, tool="Bash", session=None):
     event = {"tool_name": tool, "tool_input": {"command": command}, "cwd": "/r"}
+    event |= session or {}
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
     code = gate.main([])
     return code, capsys.readouterr().err
+
+
+def test_a_refused_commit_is_saved_for_the_next_call(
+    monkeypatch, capsys, refused_session
+):
+    fields, folder = refused_session
+    command = "git commit --no-verify -F - <<'MSG'\nSubject\n\nBody.\nMSG"
+    code, err = run_hook(monkeypatch, capsys, command, session=fields)
+    assert code == 2
+    assert saved_command(err, folder) == command
+    assert err.rstrip().endswith("beside it.")
 
 
 @pytest.mark.parametrize(

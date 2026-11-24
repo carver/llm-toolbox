@@ -109,6 +109,39 @@ def no_inherited_repo():
 
 
 @pytest.fixture(autouse=True)
+def private_scratch_root(tmp_path_factory, monkeypatch):
+    """Each test gets a Claude Code temp root of its own, so a gate's refusal in a test
+    neither saves a command into a real session's scratchpad nor prunes real ones
+    (lib/refused.py)."""
+    monkeypatch.setenv("REFUSED_SCRATCH_ROOT", str(tmp_path_factory.mktemp("scratch")))
+
+
+@pytest.fixture
+def refused_session():
+    """A session folder under the private scratch root, for a gate's refusal to save
+    the command in: (the event fields that name it, the folder refused/ files land in)."""
+    session = "5e55a0d-test"
+    project = "-home-u-code-repo"
+    root = Path(os.environ["REFUSED_SCRATCH_ROOT"]) / f"claude-{os.getuid()}"
+    (root / project / session).mkdir(parents=True)
+    fields = {
+        "session_id": session,
+        "transcript_path": f"/home/u/.claude/projects/{project}/{session}.jsonl",
+    }
+    return fields, root / project / session / "scratchpad" / "refused"
+
+
+def saved_command(err, folder):
+    """The saved file a refusal's stderr names, which must lie in folder: its text."""
+    match = re.search(r"the command is in (\S+?\.txt)\b", err)
+    assert match, err
+    path = Path(match[1])
+    assert path.parent == folder
+    assert path.stat().st_mode & 0o777 == 0o600
+    return path.read_text()
+
+
+@pytest.fixture(autouse=True)
 def private_heavy_queue(tmp_path_factory, monkeypatch):
     """Each test gets a heavy queue of its own whose cores are always quiet, so a test
     that commits through agent-commit-gate neither joins the VM's real queue (behind

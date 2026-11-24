@@ -181,6 +181,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import commitcheck
 import heavyqueue
 import passrecord
+import refused
 import shellparse
 
 HOOK_NAME = "agent-pre-commit"
@@ -1221,7 +1222,7 @@ def main(argv=None):
             "Commit blocked: --no-verify (-n) skips the pre-commit hook, which runs "
             f"this repo's checks, {HOOK_NAME} included. Fix what they report and "
             "commit without it. An amend that changes only the message already skips "
-            f"the agent check, since its tree passed it. {shellparse.NOTHING_RAN}",
+            f"the agent check, since its tree passed it. {refused.ending(event)}",
             file=sys.stderr,
         )
         return 2

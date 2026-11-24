@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import saved_command
+
 SCRIPT = Path(__file__).resolve().parent / "bin" / "heavy-gate"
 
 
@@ -13,7 +15,9 @@ SCRIPT = Path(__file__).resolve().parent / "bin" / "heavy-gate"
 NOTHING_RAN = "Nothing in this command ran, the parts before the refused one included."
 
 
-def run_hook(command, background=None, tool="Bash", timeout=None, agent=None):
+def run_hook(
+    command, background=None, tool="Bash", timeout=None, agent=None, session=None
+):
     """The hook's exit status and stderr for one call, its input shaped as Claude Code sends it.
     ``timeout`` is the Bash call's own, in ms; ``agent`` a subagent's id, when it made the call."""
     tool_input = {"command": command, "description": "Run it"}
@@ -32,6 +36,7 @@ def run_hook(command, background=None, tool="Bash", timeout=None, agent=None):
     }
     if agent:
         event |= {"agent_id": agent, "agent_type": "general-purpose"}
+    event |= session or {}
     result = subprocess.run(
         [SCRIPT], input=json.dumps(event), capture_output=True, text=True, check=False
     )
@@ -83,6 +88,21 @@ WAITS_ON_HEAVY = [
     "flock /tmp/lock heavy -- make",
     'echo "unclosed; heavy -- cargo test',
 ]
+
+
+def test_a_refused_call_is_saved_for_the_next_call(refused_session):
+    fields, folder = refused_session
+    code, err = run_hook(WAITS_ON_HEAVY[0], session=fields)
+    assert code == 2
+    assert NOTHING_RAN + " To reuse its text" in err
+    assert saved_command(err, folder) == WAITS_ON_HEAVY[0]
+
+
+def test_an_allowed_call_saves_nothing(refused_session):
+    fields, folder = refused_session
+    code, err = run_hook(WAITS_ON_HEAVY[0], background=True, session=fields)
+    assert (code, err) == (0, "")
+    assert not folder.parent.exists()
 
 
 @pytest.mark.parametrize("command", WAITS_ON_HEAVY)

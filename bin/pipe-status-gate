@@ -59,6 +59,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import refused
 from shellparse import (
     NOTHING_RAN,
     SHELLS,
@@ -301,7 +302,8 @@ def heavy_gate_reason(event: dict) -> str | None:
     try:
         verdict = subprocess.run(
             [sys.executable, HEAVY_GATE],
-            input=json.dumps(event),
+            # Without the session, so it saves nothing: this gate's refusal does.
+            input=json.dumps({k: v for k, v in event.items() if k != "session_id"}),
             capture_output=True,
             text=True,
             check=False,
@@ -341,7 +343,7 @@ def main(argv=None) -> int:
         return 0
     if heavy := heavy_gate_reason(event):
         refusal += f"\nheavy-gate would refuse this call too: {heavy}"
-    print(f"{refusal} {NOTHING_RAN}", file=sys.stderr)
+    print(f"{refusal} {refused.ending(event)}", file=sys.stderr)
     return 2
 
 

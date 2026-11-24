@@ -68,9 +68,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import refused
 from shellparse import (
     MARK,
-    NOTHING_RAN,
     SHELLS,
     Command,
     bgrun_command,
@@ -594,7 +594,7 @@ def main(argv=None) -> int:
     command = (event.get("tool_input") or {}).get("command") or ""
     reason = refusal(command, event.get("cwd"))
     if reason:
-        print(f"{reason} {NOTHING_RAN}", file=sys.stderr)
+        print(f"{reason} {refused.ending(event)}", file=sys.stderr)
         return 2
     return 0
 

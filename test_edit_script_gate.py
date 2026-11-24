@@ -4,9 +4,12 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import re
 from pathlib import Path
 
 import pytest
+
+from conftest import saved_command
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "edit-script-gate"
 loader = importlib.machinery.SourceFileLoader("edit_script_gate", str(SCRIPT))
@@ -23,8 +26,9 @@ READ_REPLACE_WRITE = (
 NOTHING_RAN = "Nothing in this command ran, the parts before the refused one included."
 
 
-def run_hook(monkeypatch, capsys, command, tool="Bash"):
+def run_hook(monkeypatch, capsys, command, tool="Bash", session=None):
     event = {"tool_name": tool, "tool_input": {"command": command}, "cwd": "/r"}
+    event |= session or {}
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
     code = gate.main([])
     return code, capsys.readouterr().err
@@ -50,6 +54,19 @@ def test_an_inline_read_replace_write_script_is_refused(monkeypatch, capsys, com
     assert code == 2
     assert "apply-edits" in err
     assert err.rstrip().endswith(NOTHING_RAN)
+
+
+def test_a_refused_script_is_saved_with_its_heredoc_body(
+    monkeypatch, capsys, refused_session
+):
+    fields, folder = refused_session
+    command = f"python3 - <<'EOF'\n{READ_REPLACE_WRITE}EOF"
+    code, err = run_hook(monkeypatch, capsys, command, session=fields)
+    assert code == 2
+    assert NOTHING_RAN + " To reuse its text" in err
+    assert saved_command(err, folder) == command
+    body = re.search(r"heredoc body in (\S+?\.txt)", err)[1]
+    assert (folder / body).read_text() == READ_REPLACE_WRITE
 
 
 @pytest.mark.parametrize(

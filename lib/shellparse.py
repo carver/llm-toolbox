@@ -14,9 +14,10 @@ such as `if` and `do`, and wrappers such as timeout, nice, env, sudo and xargs, 
 options it reads with split_options(). Then SHELLS names the shells: shell_script()
 finds the script one runs with -c, reads_stdin() says whether it reads its script
 from stdin, and set_pipefail() whether set's or a shell's options turn pipefail on.
-commit_args() finds the arguments of a `git commit`, bgrun_command() reads
-bgrun's, and is_help() spots an option that asks for help. exports() lists the names
-a script's `export` commands name.
+heredocs() lists the heredoc bodies bash would hand on, each with the delimiter that
+delimiter_of() reads from the word naming it. commit_args() finds the arguments of a
+`git commit`, bgrun_command() reads bgrun's, and is_help() spots an option that asks
+for help. exports() lists the names a script's `export` commands name.
 """
 
 import re
@@ -24,17 +25,25 @@ import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# What every gate's refusal ends with. A refused Bash call runs none of its parts, and
-# an agent once took a refusal of an inline edit to cover only that part, so a heredoc
-# before it that wrote a file was never redone.
+# How every gate's refusal ends, before lib/refused.py's sentence naming where it saved
+# the command. A refused Bash call runs none of its parts, and an agent once took a
+# refusal of an inline edit to cover only that part, so a heredoc before it that wrote
+# a file was never redone.
 NOTHING_RAN = "Nothing in this command ran, the parts before the refused one included."
 
 # Characters shlex returns as operator tokens: separators and redirections.
 OPERATORS = ";&|()<>\n`"
 # Where a `#` starts a comment: at a word's start.
 WORD_BREAK = " \t\n;&|()<>"
-# A heredoc's opener, not a here-string's `<<<`; the delimiter is a name, maybe quoted.
-HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# A heredoc's opener, not a here-string's `<<<`: group 1 its dash, group 2 the delimiter
+# word as written, quotes and all. The word starts with a quote, a backslash or a name's
+# first character, so arithmetic's `1<<2` opens none.
+_QUOTED = r"'[^'\n]*'|\"[^\"\n]*\"|\\."
+_WORD_PART = r"[^\s;&|()<>'\"\\`]"
+HEREDOC = re.compile(
+    rf"(?<!<)<<(?!<)(-?)[ \t]*((?:{_QUOTED}|[A-Za-z_])(?:{_QUOTED}|{_WORD_PART})*)"
+)
+QUOTE_PART = re.compile(r"'([^']*)'|\"([^\"]*)\"|\\(.)")
 VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ASSIGNMENT = re.compile(rf"^{VARIABLE_NAME.pattern}=")
 # Words of a quote left open, for a command shlex can't parse.
@@ -212,8 +221,42 @@ def prepare(
     (MARK) numbered from it, the substitutions in order. A quoted word of operator
     characters alone, such as '|', becomes underscores, since shlex drops the quotes and
     would return it as an operator."""
-    out, substitutions, heredocs = [], [], []
-    delimiters, line_start, quote, i = [], 0, None, 0
+    cleaned, substitutions, found = _scan(text, first_mark)
+    return cleaned, substitutions, [(h.opener, "\n".join(h.lines)) for h in found]
+
+
+def heredocs(text: str) -> list[tuple[str, str]]:
+    """Each top-level heredoc of ``text`` that bash would close: (its delimiter, its
+    body as bash hands it on, the final newline kept and, for <<-, the leading tabs
+    stripped). One left open, or with an empty body, is left out."""
+    found = []
+    for heredoc in _scan(text, None)[2]:
+        lines = heredoc.lines
+        if heredoc.dash:
+            lines = [line.lstrip("\t") for line in lines]
+        if heredoc.closed and lines:
+            found.append((heredoc.delimiter, "".join(line + "\n" for line in lines)))
+    return found
+
+
+def delimiter_of(word: str) -> str:
+    """A heredoc's delimiter as bash reads it: the word with its quoting removed."""
+    return QUOTE_PART.sub(lambda part: "".join(g or "" for g in part.groups()), word)
+
+
+@dataclass
+class _Heredoc:
+    opener: str  # the line that opened it
+    delimiter: str
+    dash: bool  # <<-, whose body bash hands on without its leading tabs
+    lines: list[str]  # its body's lines, as written
+    closed: bool  # whether its closing line came
+
+
+def _scan(text, first_mark):
+    """prepare()'s cleaned text and substitutions, then each heredoc, in order."""
+    out, substitutions, found = [], [], []
+    opened, line_start, quote, i = [], 0, None, 0
     while i < len(text):
         char = text[i]
         if quote == "'":
@@ -234,15 +277,18 @@ def prepare(
             while i < len(text) and text[i] != "\n":
                 i += 1
             continue
-        elif quote is None and char == "\n" and delimiters:
+        elif quote is None and char == "\n" and opened:
             opener = text[line_start:i]
-            bodies, i = heredoc_bodies(text, i + 1, delimiters)
-            heredocs += [(opener, body) for body in bodies]
-            delimiters, line_start = [], i
+            read, i = heredoc_bodies(text, i + 1, [d for d, _ in opened])
+            found += [
+                _Heredoc(opener, d, dash, lines, closed)
+                for (d, dash), (lines, closed) in zip(opened, read)
+            ]
+            opened, line_start = [], i
             out.append("\n")
             continue
         elif quote is None and (heredoc := HEREDOC.match(text, i)):
-            delimiters.append(heredoc.group(2))
+            opened.append((delimiter_of(heredoc.group(2)), bool(heredoc.group(1))))
             out.append(heredoc.group(0))
             i = heredoc.end()
             continue
@@ -274,28 +320,31 @@ def prepare(
             line_start = i + 1
         out.append(char)
         i += 1
-    heredocs += [(text[line_start:], "") for _ in delimiters]  # opened on the last line
-    return "".join(out), substitutions, heredocs
+    # Opened on the last line, so no body follows.
+    found += [_Heredoc(text[line_start:], d, dash, [], False) for d, dash in opened]
+    return "".join(out), substitutions, found
 
 
 def heredoc_bodies(
     text: str, start: int, delimiters: list[str]
-) -> tuple[list[str], int]:
-    """(the bodies of the heredocs one line opened, read from ``start`` on; where the text
-    after the last one's closing line starts). A heredoc left open takes the rest."""
-    bodies, body, i = [], [], start
-    while i < len(text) and len(bodies) < len(delimiters):
+) -> tuple[list[tuple[list[str], bool]], int]:
+    """(each heredoc one line opened, read from ``start`` on: its body's lines and
+    whether its closing line came; where the text after the last one's closing line
+    starts). A heredoc left open takes the rest."""
+    read, body, i = [], [], start
+    while i < len(text) and len(read) < len(delimiters):
         end = text.find("\n", i)
         end = len(text) if end == -1 else end
         line, i = text[i:end], end + 1
-        if line.strip() == delimiters[len(bodies)]:
-            bodies.append("\n".join(body))
+        if line.strip() == delimiters[len(read)]:
+            read.append((body, True))
             body = []
         else:
             body.append(line)
-    if len(bodies) < len(delimiters):
-        bodies.append("\n".join(body))
-    return bodies, min(i, len(text))
+    while len(read) < len(delimiters):
+        read.append((body, False))
+        body = []
+    return read, min(i, len(text))
 
 
 def ansi_end(text: str, start: int) -> int:
@@ -323,7 +372,7 @@ def substitution_end(text: str, start: int, opener: str) -> int:
             delimiters = []
             continue
         elif heredoc := HEREDOC.match(text, i):
-            delimiters.append(heredoc.group(2))
+            delimiters.append(delimiter_of(heredoc.group(2)))
             i = heredoc.end()
             continue
         elif opener == "`":

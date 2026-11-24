@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import saved_command
+
 SCRIPT = Path(__file__).resolve().parent / "bin" / "pipe-status-gate"
 
 
@@ -26,8 +28,9 @@ def run_hook(command, tool="Bash", **extra):
         "tool_name": tool,
         "tool_input": {"command": command, "description": "Run it"},
     }
-    if "agent_id" in extra:
-        event["agent_id"] = extra.pop("agent_id")
+    for name in ("agent_id", "session_id", "transcript_path"):
+        if name in extra:
+            event[name] = extra.pop(name)
     event["tool_input"] |= extra
     result = subprocess.run(
         [SCRIPT], input=json.dumps(event), capture_output=True, text=True, check=False
@@ -235,6 +238,18 @@ CHECK_THEN_RECORD = [
         "git commit",
     ),
 ]
+
+
+def test_a_refused_call_is_saved_once_and_named_once(refused_session):
+    fields, folder = refused_session
+    command = "heavy -- pytest -q | tail -1 && git commit -m x"
+    code, err = run_hook(command, **fields)
+    assert code == 2
+    assert "heavy-gate would refuse this call too" in err
+    assert err.count("To reuse its text") == 1
+    assert err.count(NOTHING_RAN) == 1
+    assert saved_command(err, folder) == command
+    assert len(list(folder.iterdir())) == 1
 
 
 @pytest.mark.parametrize(("command", "check", "record"), CHECK_THEN_RECORD)

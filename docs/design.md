@@ -787,6 +787,32 @@ so loads are kept per agent, or a subagent's load would send its parent a note
 about a skill the parent never read. PreToolUse `additionalContext` reached the
 model on both Bash and Agent calls.
 
+## The gates' refusals
+
+### A refused command is saved, with its heredocs, in the session's scratchpad (2026-11-23)
+
+A refused Bash call runs none of its parts, so an agent types it all again. In a
+filedrawer session on 2026-11-23, edit-script-gate refused an inline script of about
+6,000 characters of edits, which the agent rewrote as apply-edits blocks, and
+pipe-status-gate refused a call that began with an apply-edits heredoc of about 8,000
+characters, which the agent sent again unchanged; the global rule to write large
+content in a call of its own held neither time. So every gate's refusal ends with
+`lib/refused.py`'s ending: NOTHING_RAN, then the files it saved the command in
+(`<h>.txt`) and each heredoc body (`<h>-<n>-<delimiter>.txt`), to copy from, or
+`apply-edits < FILE`. The files are text, not scripts: a saved script would let `bash
+FILE` run what a gate refused, since no gate reads inside it.
+
+They go in the session's scratchpad, the folder named like the transcript's, else the
+only one holding the session's id, under Claude Code's temp root (`CLAUDE_CODE_TMPDIR`,
+else `TMPDIR`, `TMP`, `TEMP`, `/tmp`). That layout is Claude Code's and undocumented,
+which ruled it out as web-shot's default (above); here a save that finds no folder
+saves nothing and the refusal reads as before, so nothing depends on it. A command may
+hold a secret typed inline, as its transcript does; the files are 600 in 700 folders.
+Claude Code never cleans these folders but sweeps transcripts after 30 days, so each
+save removes saved files older than 30 days from every session's `refused/` folder
+(the owner's choice over pruning only the session's own), and only the names it
+writes, never through a link.
+
 ## subagent-wait-gate
 
 ### A subagent blocks on its job; a SubagentStop hook refuses a stop to wait (2026-11-13)

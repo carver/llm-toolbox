@@ -1,0 +1,25 @@
+# Why: Run first the cheapest check that could end the task, such as the arithmetic a cost claim rests on: a filedrawer session built a measurement harness for a saving whose prices, in hand from the start, showed a quarter of what the owner expected.
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -45,7 +45,9 @@
+ 1. **What a top professional would do that wasn't asked for.** The two or
+    three moves that separate expert work from competent work here, such as
+    stating the decision the work serves, checking base rates, reproducing
+-   before fixing, or writing the counter-argument.
++   before fixing, or writing the counter-argument. In any field, look for the
++   cheapest check that could end the task, such as the arithmetic a cost
++   claim rests on, and put it before the work it would make pointless.
+ 2. **The rawest material.** The primary sources they would start from instead
+    of summaries: the dataset, not the chart; the filing, not the article; the
+    logs and the code, not the bug report; the paper's methods section, not the
+@@ -66,7 +68,9 @@
+ Then write the rewritten prompt in a single fenced block the user can copy.
+ It should ask for exactly what the four answers describe: start from the raw
+ material, use the named methods, and end with the external check and its pass
+-criterion. Keep it about as long as it needs to be, and in the user's voice.
++criterion. When a cheap check could end the task, the prompt asks for it
++first, with the result that would stop the work. Keep it about as long as it
++needs to be, and in the user's voice.
+ 
+ Stop after the rewrite. Offer in one line to run it now; don't start the task
+ unless the user says so.

@@ -249,7 +249,9 @@ landing's tip, so a fold's earlier trees get no full check at all, an accepted g
 
 The owner's rule then: every commit gets the full suite before it lands, and none
 after, so the give is in commit isolation. Since #7 only a landing's tip gets the
-suite, so folding no longer saves checks. The mutate-check landing of 2026-11-09 checked 8
+suite, so folding no longer saves checks. The owner kept the warnings, reworded: folding
+still keeps each change in one commit, with no fixups landing after it, so that, for one,
+a change can be reverted whole. The mutate-check landing of 2026-11-09 checked 8
 commits, 96 to 160 seconds each, of which 5 only refined the `--diff` code an earlier
 one added: review fixes, the owner's asks after a first run, two refactors. /build
 now makes its refactor and those asks `fixup!`s, and `lib/foldable.py` finds the rest.
@@ -277,7 +279,8 @@ still only refines.
 
 A fold moves a commit back past those between it and its target. A conflict there
 shows in the rebase, which `build-state fold` aborts; a use of a name a commit in
-between defines doesn't, and would fail only the folded commit's full check. So a
+between defines doesn't, and would leave the folded commit broken, which only its own
+full check would find, and since #7 none runs there. So a
 commit whose added lines use a name a line added since its target defines (def,
 class, const, `NAME =` and the like), which the target's tree lacks, is left in
 place, and wt-ship lands it with a warning (the owner's call, after a side agent

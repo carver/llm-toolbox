@@ -696,8 +696,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   commit before the code it needs leaves that commit broken unseen, which only
   a `git bisect` without `--first-parent` meets. Then it lists the commits since the
   base and the test files changed since the refactor base, warns of the
-  commits that only refine an earlier one of the landing, each a full check
-  for `wt-ship` (`fold` folds them), and fails naming
+  commits that only refine an earlier one of the landing, each a detour that
+  a revert of the change would need too (`fold` folds them), and fails naming
   any ref or config key that moved (a tag only when it points at a commit the
   fold may rewrite); `core.hooksPath`, another branch's settings, the work
   branch's remote and merge, each when it wasn't set at start and the upstream

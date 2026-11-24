@@ -1,6 +1,6 @@
 """Find the commits of a landing that only refine code an earlier commit of it added,
-so they can be folded into that commit before wt-ship checks each one with the full
-suite.
+so they can be folded into that commit before they land as a detour, which reverting
+that commit would need too.
 
 The batch is the commits from upstream's merge base with HEAD, oldest first. For each
 commit C after the first, take the lines of C's parent that each hunk of C replaces or

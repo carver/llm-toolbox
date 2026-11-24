@@ -1847,7 +1847,8 @@ def test_finish_warns_of_commits_that_only_refine_and_keeps_them(worktree):
 
     assert done.returncode == 0, done.stderr
     assert "Refine a" in done.stdout and "build-state fold" in done.stdout
-    assert "wt-ship" in done.stdout
+    # Why folding pays: a change reverts in one commit; wt-ship checks only the tip.
+    assert "revert" in done.stdout and "full check" not in done.stdout
     assert subjects(worktree, "main") == ["Add a", "Add b", "Refine a"]
 
 

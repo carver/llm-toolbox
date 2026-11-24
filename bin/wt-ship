@@ -45,7 +45,8 @@ In order, it:
    --local before the wait. After the first rebase only, it then warns of each
    commit that only refines an earlier commit of the landing (lib/foldable.py: 75%
    or more of the lines it changes came from one, lines added in new files counting
-   against it), a full check that folding would save, and names `build-state fold
+   against it), a detour in the history that a revert of the change would have to
+   take whole, and names `build-state fold
    --upstream UPSTREAM`, which folds them, and the trailer `Fold-check: keep`, which
    keeps a commit out; then it lands them as they
    are. A judgement that fails says so in a line and the landing goes on;
@@ -637,7 +638,8 @@ def rebase_onto(upstream, mode):
 
 def warn_of_folds(upstream):
     """Warn of the commits that only refine an earlier commit of this landing, each a
-    full check that folding would save; land them as they are."""
+    detour in the history, which a revert of the change it refines would need too;
+    land them as they are."""
     try:
         folds = foldable.foldable(upstream)
     except (commitcheck.GitError, ValueError) as error:
@@ -651,8 +653,9 @@ def warn_of_folds(upstream):
     trailer = f"`{foldable.KEEP_TRAILER}: {foldable.KEEP_VALUE}`"
     if movable := [f for f in folds if not f.relies_on]:
         print(
-            "These commits only refine an earlier commit of this landing, so each"
-            " costs a full check. Landing them as they are; next time fold them first"
+            "These commits only refine an earlier commit of this landing, so the"
+            " history shows a detour, and reverting that change would take both."
+            " Landing them as they are; next time fold them first"
             f" with `build-state fold --upstream {upstream}`, or give one that stands"
             f" on its own the trailer {trailer} (`build-state reword SHA`):",
             *foldable.describe(movable),

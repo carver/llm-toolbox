@@ -2574,6 +2574,9 @@ def test_a_commit_that_only_refines_an_earlier_one_is_warned_of_and_lands(setup,
     warning = done.stdout.index("only refine an earlier commit")
     assert warning < done.stdout.index("Notice for other sessions:")
     assert "Refine the feature" in done.stdout[warning:].splitlines()[1]
+    # Why folding pays: a change reverts in one commit; only the tip is checked.
+    said = done.stdout[warning:].splitlines()[0]
+    assert "revert" in said and "full check" not in said
     upstream = "refs/heads/main" if local else "origin/main"
     assert f"build-state fold --upstream {upstream}" in done.stdout
     landed = main if local else origin

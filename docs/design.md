@@ -96,6 +96,27 @@ quick jobs that yield to an ordinary head they've passed for a minute; a limit o
 wait that gives up the place; the HEAVY_QUICK_* knobs honoured only with a private
 HEAVY_DIR; landings ahead of quick jobs that joined the front before them.
 
+### A queue entry whose first line isn't whole is cleared (2026-11-23)
+
+After a VM crash on 2026-11-23, `/tmp/heavy/normal/` held a waiter's entry of 0 bytes
+from the boot before. `heavy status` showed it as `waiting for ?`, and every job, in
+two sessions, waited behind it for 28 minutes with the cores idle, until the file was
+removed by hand. `fifo.join` writes an entry whole, by a rename, so a reader never
+finds one half written; but a crash can leave the renamed file with its text never
+flushed. `fifo.ahead` cleared only an entry whose process had certainly ended, and a
+holder with no PID "may be alive", so this one stayed for good.
+
+An entry whose first line isn't whole, as `join` writes it (a host, a PID, a start
+time and the newline that ends it), is now removed like an ended one, in both queues
+built on `lib/fifo.py`; so is one that isn't text. Only `join` writes entries, and it
+always writes that line, so a cut anywhere in it, in the middle of the PID included,
+is a crash's. Slots keep the old rule outside heavy, since a flag such as wt-ship's
+may be written by other means; heavy's own slots already counted a holder with no PID
+as dead.
+
+Not done: an fsync in `write_whole`. It would slow every join, many a second across
+the VM, for a case the clearing now covers.
+
 ### Rejected: a second job on the holder's cores at nice 10 (53e60a8, 6a76738, 2026-11-08)
 
 heavy let one more job start beside a holder that left cores idle, on the same cores

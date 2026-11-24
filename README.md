@@ -290,7 +290,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   turn in a queue in the git dir, for up to `$WT_SHIP_WAIT` seconds behind one
   holder (30 minutes, starting again when the holder changes; `--no-wait`
   stops at once), looking every `$WT_SHIP_POLL` seconds, and clears a flag or entry
-  whose process on this host has ended. A wait of `$FIFO_LOCK_SECONDS` (5) for
+  whose process on this host has ended, and an entry a crash left cut short. A wait of `$FIFO_LOCK_SECONDS` (5) for
   the queue folder's lock names the process holding it, and how to continue it
   when it's stopped. It stops before any check on uncommitted changes, or
   untracked files, in the main tree that touch the same files. Once landed, it

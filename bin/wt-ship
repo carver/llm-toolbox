@@ -107,7 +107,8 @@ git dir, printing a line when whom it waits on changes, and gives up after
 WT_SHIP_WAIT seconds behind one holder, naming what held it up: the wait starts again
 each time the holder changes, so a queue that moves never times out. --no-wait gives
 up at once when the flag is held or anyone is queued. Under a lock in the queue folder,
-it clears a flag, or an entry, whose process ran on this host and has ended; a wait of
+it clears a flag, or an entry, whose process ran on this host and has ended, and an
+entry a crash left cut short; a wait of
 FIFO_LOCK_SECONDS for that lock names the process holding it, and when that process is
 stopped, how to continue it. A flag it can't judge, an old-style one or one from
 another host, it only waits on.
@@ -876,7 +877,7 @@ def claim(main_path, wait):
     With wait, join the queue and take the flag on this session's turn, giving up
     after WT_SHIP_WAIT seconds behind one holder, the wait starting again whenever the
     holder changes; without, stop when it's held or anyone is queued. A
-    flag or entry whose process has ended is cleared."""
+    flag or entry whose process has ended is cleared, and an entry cut short."""
     exclude_flag(main_path)
     path = Path(main_path) / FLAG
     me = Holder.mine()
@@ -904,7 +905,7 @@ def claim(main_path, wait):
 
 def waiters_ahead(folder, entry):
     """The live waiters that joined before entry (all of them, without one), oldest
-    first, as (entry path, holder); ended ones are removed."""
+    first, as (entry path, holder); ended and cut-short ones are removed."""
     return [(path, Holder.parse(text)) for path, text in fifo.ahead(folder, entry)]
 
 

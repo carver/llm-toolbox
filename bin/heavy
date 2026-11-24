@@ -75,7 +75,8 @@ failure looks odd.
 A heavy started inside a job (HEAVY_SLOT names the job's slot, or a --quick job run
 outside the queue while its heavy lives) runs at once, so a check that calls heavy
 never waits on itself. A job whose process has ended is
-cleared from the queue. Stopping heavy (SIGINT, SIGTERM, SIGHUP) stops CMD's process
+cleared from the queue, and so is an entry whose first line isn't whole, as a crash
+can leave one. Stopping heavy (SIGINT, SIGTERM, SIGHUP) stops CMD's process
 group, with SIGKILL after HEAVY_GRACE seconds, and frees its place; CMD also gets
 SIGTERM should heavy die.
 

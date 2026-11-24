@@ -5,7 +5,8 @@ Each entry and each slot names the process holding it, on its first line:
 `<session> <since> host=<host> pid=<pid> start=<start time>`. One whose process ran
 on this host and has ended is cleared, under a lock in the queue's folder, so two
 waiters never clear the same dead slot and delete the next holder's. Lines after the
-first are the tool's own (heavy keeps the job's folder and command there).
+first are the tool's own (heavy keeps the job's folder and command there). An entry
+whose first line isn't whole is cleared too: what a crash left of it (docs/design.md).
 
 The lock is held briefly, many times a second across the VM, so its holder must never
 stop while it holds it: the stop signals a terminal sends (Ctrl-Z's SIGTSTP, SIGTTIN,
@@ -259,19 +260,36 @@ def write_whole(path, text):
         part.unlink(missing_ok=True)
 
 
+def left_over(text):
+    """Whether nobody waits at a queue entry with this text: its first line isn't
+    whole, as join writes it (host, a PID and a start time, ended by a newline), or
+    names a process that has ended."""
+    first, newline, _ = text.partition("\n")
+    holder = Holder.parse(first)
+    whole = (
+        newline
+        and None not in (holder.host, holder.pid, holder.start)
+        and holder.pid.isdigit()
+    )
+    return not whole or holder.gone()
+
+
 def ahead(folder, entry):
     """The live waiters that joined before entry (all of them, when entry is None),
-    oldest first, as (entry path, its text); ended ones are removed."""
+    oldest first, as (entry path, its text); ended and cut-short ones are removed."""
     found = []
     for other in sorted(folder.iterdir()):
         if entry is not None and other.name >= entry.name:
             break
         if not ENTRY.fullmatch(other.name) or not other.is_file():
             continue
-        text = read(other)
+        try:
+            text = read(other)
+        except UnicodeDecodeError:  # not text: nothing join wrote whole
+            text = ""
         if text is None:
             continue
-        if Holder.parse(text).gone():
+        if left_over(text):
             other.unlink(missing_ok=True)
         else:
             found.append((other, text))

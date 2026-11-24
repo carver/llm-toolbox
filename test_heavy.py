@@ -1987,3 +1987,18 @@ def test_a_quick_heavy_inside_a_job_runs_at_once(box, background):
 
     assert status == 0, err
     assert inner.exists()
+
+
+def test_an_empty_entry_a_crash_left_holds_no_job_up(box):
+    """After a VM crash the queue held a waiter's entry of 0 bytes, and every job
+    waited behind it with the cores idle."""
+    tmp_path, _, env = box
+    folder = lane(tmp_path)
+    folder.mkdir(parents=True)
+    leftover = folder / f"{1:020d}-1795595"
+    leftover.write_text("")
+
+    done = heavy(env, "--", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert not leftover.exists()

@@ -299,3 +299,52 @@ def test_a_front_entry_goes_ahead_of_ordinary_ones_after_earlier_front_ones(tmp_
     assert fifo.ahead(folder, front) == []
     assert [path for path, _ in fifo.ahead(folder, later_front)] == [front]
     assert [path for path, _ in fifo.ahead(folder, first)] == [front, later_front]
+
+
+# A waiter's first line, as join writes it for a process that is running: this one.
+WHOLE = fifo.Holder.mine().line().encode()
+
+
+@pytest.mark.parametrize(
+    "left",
+    [
+        b"",
+        WHOLE[: WHOLE.index(b" host=") + 6],
+        WHOLE[: WHOLE.index(b" pid=") + 5],
+        # Cut inside the PID, where what is left names a process that is running.
+        WHOLE[: WHOLE.index(b" pid=") + 6],
+        WHOLE[: WHOLE.index(b" start=")],
+        WHOLE[:-1],
+        b"\x00" * 40,
+        b"\xff\xfe not text \xff\n",
+    ],
+    ids=[
+        "empty",
+        "no host",
+        "no pid",
+        "part of a pid",
+        "no start",
+        "no newline",
+        "NULs",
+        "not UTF-8",
+    ],
+)
+def test_an_entry_a_crash_left_cut_short_is_cleared(tmp_path, left):
+    """join writes an entry whole, so one whose first line isn't whole is what a
+    crash left of it: nobody waits there, and it holds nobody up."""
+    folder = tmp_path / "queue"
+    folder.mkdir()
+    leftover = folder / f"{1:020d}-1795595"
+    leftover.write_bytes(left)
+    mine = fifo.join(folder, fifo.Holder.mine())
+
+    assert fifo.ahead(folder, mine) == []
+    assert not leftover.exists()
+
+
+def test_a_whole_entry_of_a_running_process_keeps_its_place(tmp_path):
+    folder = tmp_path / "queue"
+    first = fifo.join(folder, fifo.Holder.mine(), "cwd=/x\n")
+    mine = fifo.join(folder, fifo.Holder.mine())
+
+    assert [path for path, _ in fifo.ahead(folder, mine)] == [first]

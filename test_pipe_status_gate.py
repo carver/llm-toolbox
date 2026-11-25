@@ -231,7 +231,7 @@ CHECK_THEN_RECORD = [
     ("( set -o pipefail ); pytest | tail && git commit -m x", "pytest", "git commit"),
     ("./t test_x.py | tail -3 && git commit -m x", "./t", "git commit"),
     (
-        "heavy --quick -- ./t test_x.py | tail -3 && git commit -m x",
+        "heavy --few-seconds -- ./t test_x.py | tail -3 && git commit -m x",
         "./t",
         "git commit",
     ),
@@ -304,7 +304,7 @@ def test_a_piped_check_that_a_commit_follows_is_refused_naming_both(
         "pytest -q | tail; build-state show",
         "pytest -q > log 2>&1; tail log; git commit -m x",
         "bash -c 'pytest -q | tail'; git commit -m x",
-        "heavy --quick -- ls | head && git commit -m x",
+        "heavy --few-seconds -- ls | head && git commit -m x",
         # A check named in an argument, not run.
         "cargo run --bin build | head && git commit -m x",
         "uv pip install pytest | tail && git commit -m x",

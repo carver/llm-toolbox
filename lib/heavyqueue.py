@@ -10,8 +10,8 @@ holder once its cores have stayed under half busy at every sample for
 HEAVY_QUIET_SECONDS, or at the first sample when it arrived to a free lane with nobody
 waiting.
 
-A `--quick` job, seconds of work, runs at once outside the queue, taking no slot, at
-nice SHARE_NICE, when its lane's cores have averaged under HEAVY_QUICK_BUSY busy for
+A `--few-seconds` job, seconds of work, runs at once outside the queue, taking no slot,
+at nice SHARE_NICE, when its lane's cores have averaged under HEAVY_QUICK_BUSY busy for
 HEAVY_QUICK_SECONDS and SHARE_MEMORY is free (Lull); otherwise it joins the queue's
 front, keeps watching, and starts at its first quiet sample once it heads the lane.
 
@@ -72,8 +72,8 @@ SHARE_MEMORY_AGAIN = SHARE_MEMORY + 2**29
 # that long.
 SHARE_PATIENCE = 5.0
 SHARE_PATIENCE_POLLS = 5
-# What HEAVY_SLOT starts with for a --quick job run outside the queue, before the line
-# naming its heavy: a heavy inside it runs at once while that heavy lives.
+# What HEAVY_SLOT starts with for a --few-seconds job run outside the queue, before the
+# line naming its heavy: a heavy inside it runs at once while that heavy lives.
 OUTSIDE = "outside "
 PR_HINT = (
     "heavy: the queue is busy. For build and test results without the wait, you can"
@@ -340,8 +340,8 @@ def lane_cores(lane, cpus):
 
 
 def inside_job():
-    """Whether this process runs inside a job: one holding a slot, or a --quick job
-    run outside the queue whose heavy lives (HEAVY_SLOT names either)."""
+    """Whether this process runs inside a job: one holding a slot, or a --few-seconds
+    job run outside the queue whose heavy lives (HEAVY_SLOT names either)."""
     token = os.environ.get("HEAVY_SLOT")
     if token and token.startswith(OUTSIDE):
         return not stale(Holder.parse(token.removeprefix(OUTSIDE)))
@@ -388,7 +388,7 @@ def turn(
             yield lull.job()
             return
         if slot_text(lane) is not None:  # else nothing it waits on needs a word
-            note(f"heavy: {why}, so this --quick job waits at the queue's front.")
+            note(f"heavy: {why}, so this --few-seconds job waits at the queue's front.")
     folder = lane_folder(lane)
     me = Holder.mine()
     known_as = heavyhistory.key(os.getcwd(), command)
@@ -421,7 +421,7 @@ def turn(
             share,
             lull,
         ).wait()
-        if started is None:  # a --quick job whose cores went quiet
+        if started is None:  # a --few-seconds job whose cores went quiet
             entry.unlink(missing_ok=True)
             yield lull.job()
             return
@@ -480,8 +480,8 @@ class Watch:
 
 
 class Lull:
-    """A --quick job's watch on its lane's cores, a sample a poll: it may run outside
-    the queue once they have averaged under HEAVY_QUICK_BUSY busy over the last
+    """A --few-seconds job's watch on its lane's cores, a sample a poll: it may run
+    outside the queue once they have averaged under HEAVY_QUICK_BUSY busy over the last
     HEAVY_QUICK_SECONDS, whoever holds the lane, with SHARE_MEMORY free, since a
     holder's quiet moment may hold gigabytes."""
 
@@ -682,7 +682,7 @@ class Bid:
 
 class Waiter:
     """One job's wait: to head its lane's queue with the slot free and its cores
-    quiet, or for room beside the lane's holder, or, for a --quick job (lull), for
+    quiet, or for room beside the lane's holder, or, for a --few-seconds job (lull), for
     its cores to go quiet enough to run outside the queue."""
 
     def __init__(self, lane, folder, text, entry, hint, cpus, alone, share, lull=None):
@@ -692,8 +692,8 @@ class Waiter:
         self.bid = Bid(lane, folder, text, entry, cpus, self.say) if share else None
 
     def wait(self):
-        """The Start of the job, once it has taken a slot; or None for a --quick job
-        whose cores went quiet enough to run outside the queue."""
+        """The Start of the job, once it has taken a slot; or None for a --few-seconds
+        job whose cores went quiet enough to run outside the queue."""
         quiet_for = knob("HEAVY_QUIET_SECONDS", 10)
         stall_after = knob("HEAVY_STALL_SECONDS", 600)
         crowd = self.crowd()
@@ -726,7 +726,7 @@ class Waiter:
             share = busy_now(measured)
             if share < QUIET_SHARE:
                 quiet_since = quiet_since or time.monotonic()
-                # A --quick job runs for less than the window would cost it.
+                # A --few-seconds job runs for less than the window would cost it.
                 window = waited and self.lull is None
                 if not window or time.monotonic() - quiet_since >= quiet_for:
                     started = self.start()
@@ -861,7 +861,7 @@ def status():
         for place, (_, text) in enumerate(fifo.ahead(lane_folder(lane), None), 1):
             holder, about = Holder.parse(text), fields(text)
             where = ", at the front" if about.get("front") else ""
-            where += " as --quick" if about.get("quick") else ""
+            where += " as --few-seconds" if about.get("quick") else ""
             lines.append(
                 f"  {place}. waiting for {ago(holder)}{where}: {doing(text)},"
                 f" {holder.session}{usual(text)}"

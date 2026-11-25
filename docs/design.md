@@ -58,6 +58,16 @@ landings are fewer full checks per landing and cheaper ones, not more at once.
 The script and its raw results (hyperfine JSON, vmstat logs) are in
 `/home/carver/code/claudedev/keep/heavy-lane-exp/` on the host disk, outside git.
 
+### heavy's `--quick` is named `--few-seconds` (2026-11-24)
+
+Agents ran `heavy --quick` for runs of minutes: in one session, a whole test file of
+306 s and two mutate-checks of about 2 minutes each, each time hearing at the end that
+`--quick` is for seconds. The warning comes after the cost; the name is read as the
+command is typed. The user proposed `--few-seconds` as the only documented name, and
+the agent agreed: the limit is in the word. `--quick` stays as an alias that `-h`
+doesn't list, so frozen repos, older docs and habit keep working, and heavy-gate takes
+both. The `HEAVY_QUICK_*` settings keep their names.
+
 ### `heavy --quick`: seconds of work runs at once on quiet cores, else next (2026-11-09)
 
 The user's design, in their words: "If load is low enough, run outside heavy,

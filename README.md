@@ -16,7 +16,7 @@ cache. There's no `.venv`: this repo is shared between the host and a sandbox,
 and a venv works for only one machine's Python.
 
 `./t` runs the tests with those pins, from the repo root wherever it's called:
-`heavy --quick -- ./t test_wt_ship.py -k push` for a few, in one process, and
+`heavy --few-seconds -- ./t test_wt_ship.py -k push` for a few, in one process, and
 `bgrun --wait -o LOG -- heavy -- ./t` for the whole suite, in parallel.
 
 ## Install
@@ -488,8 +488,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   runner (pytest-timeout, nextest's slow-timeout) or in the tests, and commit
   checks never share. A command's usual cores come from its last runs that
   exited 0, shared by every worktree of its repo. Nothing shares beside a
-  `heavy --alone` job, for timings. `heavy --quick` marks seconds of work, such
-  as a few tests after an edit, on trust: when the normal lane's cores average
+  `heavy --alone` job, for timings. `heavy --few-seconds` marks seconds of work,
+  such as a few tests after an edit, on trust: when the normal lane's cores average
   under `$HEAVY_QUICK_BUSY` (0.25) busy over `$HEAVY_QUICK_SECONDS` (2) and
   4 GiB of memory are free, it runs at once outside the queue, whoever holds
   the lane (but never beside `--alone`), first in line for the OOM killer;
@@ -497,15 +497,15 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   a landing's check and ahead of every other waiter, until the
   cores go that quiet or it heads the lane, where it starts at the first quiet
   sample. One that ran past `$HEAVY_QUICK_MAX` (60) seconds hears, as it ends,
-  to drop `--quick` for runs like it. It goes with none of `--long`, `--alone`
-  and `--share`, and may run as a foreground Bash call, with a 600000 ms
+  to drop `--few-seconds` for runs like it. It goes with none of `--long`,
+  `--alone` and `--share`, and may run as a foreground Bash call, with a 600000 ms
   timeout; heavy-gate refuses the call without it. Stopped, it stops CMD's
   process group,
   with SIGKILL after `$HEAVY_GRACE` seconds. `heavy status` shows each lane's
   holder, sharer, waiters, their usual cores and how busy the lane's cores
   are. A third job in a lane, or a head stalled for `$HEAVY_STALL_SECONDS`
   (600), gets a hint to push a topic branch and open a PR for CI's results
-  instead. A heavy inside a job (`$HEAVY_SLOT`), or inside a `--quick` run
+  instead. A heavy inside a job (`$HEAVY_SLOT`), or inside a `--few-seconds` run
   outside the queue, runs at once. The queue and
   its history live in `$HEAVY_DIR`
   (`/tmp/heavy`). A Ctrl-Z while heavy holds the queue's lock, a moment at each
@@ -595,8 +595,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   refuses a Bash call running `heavy -- CMD` unless it was made with
   `run_in_background: true`, since heavy's queue has no time limit and the
   Bash tool kills a call at its own; the refusal names `bgrun --wait -o LOG --
-  heavy -- CMD` as a background call, and `heavy --quick -- CMD` for a run of
-  seconds, which passes in the foreground only when the call's own timeout is
+  heavy -- CMD` as a background call, and `heavy --few-seconds -- CMD` for a run
+  of seconds, which passes in the foreground only when the call's own timeout is
   600000 ms (a `timeout` command doesn't count), since it may wait minutes for
   the running job. Background or not,
   it refuses heavy around bgrun, git commit or wt-ship. It reads the command as

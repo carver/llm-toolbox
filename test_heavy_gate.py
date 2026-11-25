@@ -111,7 +111,7 @@ def test_a_foreground_call_that_waits_on_heavy_is_refused(command):
 
     assert code == 2
     assert "bgrun --wait -o" in err and "run_in_background: true" in err
-    assert "heavy --quick -- CMD" in err
+    assert "heavy --few-seconds -- CMD" in err
     assert len(err.splitlines()) <= 2
     assert err.rstrip().endswith(NOTHING_RAN)
 
@@ -120,7 +120,7 @@ def test_a_foreground_call_that_waits_on_heavy_is_refused(command):
     "command",
     [
         "heavy -- cargo test",
-        "heavy --quick -- pytest -q test_x.py",
+        "heavy --few-seconds -- pytest -q test_x.py",
         "heavy -- bgrun -o log -- make",
     ],
 )
@@ -138,18 +138,24 @@ def test_a_subagent_is_told_to_wait_in_the_foreground(command):
 
 def test_a_subagents_quick_run_with_the_longest_timeout_passes():
     assert (
-        run_hook("heavy --quick -- pytest -q test_x.py", timeout=600000, agent="a1")[0]
+        run_hook(
+            "heavy --few-seconds -- pytest -q test_x.py", timeout=600000, agent="a1"
+        )[0]
         == 0
     )
 
 
 WAITS_ON_QUICK = [
-    "heavy --quick -- cargo nextest run --cargo-quiet -p server -E 'test(/^read::/)'",
-    "cd crates/server && heavy --quick -- cargo nextest run -E 'test(x)'",
+    "heavy --few-seconds -- pytest -q test_x.py",
+    "heavy --few -- make t",
+    # The old name, which -h no longer lists.
+    "heavy --quick -- make t",
+    "heavy --few-seconds -- cargo nextest run --cargo-quiet -p server -E 'test(/^read::/)'",
+    "cd crates/server && heavy --few-seconds -- cargo nextest run -E 'test(x)'",
     "heavy --qu -- pytest -q test_x.py",
-    "timeout 600 heavy --quick -- make t",
-    "bgrun --wait -o log -- heavy --quick -- pytest -q test_x.py",
-    "bash -c 'heavy --quick -- pytest -q test_x.py'",
+    "timeout 600 heavy --few-seconds -- make t",
+    "bgrun --wait -o log -- heavy --few-seconds -- pytest -q test_x.py",
+    "bash -c 'heavy --few-seconds -- pytest -q test_x.py'",
 ]
 
 
@@ -172,19 +178,25 @@ def test_a_quick_run_in_the_foreground_without_a_timeout_is_refused(command):
     assert_refused_for_its_timeout(*run_hook(command))
 
 
+def test_a_refusal_names_few_seconds_not_the_old_quick():
+    _, err = run_hook("heavy --quick -- make t")
+
+    assert "heavy --few-seconds" in err and "--quick" not in err, err
+
+
 @pytest.mark.parametrize(
     "timeout", [120000, 599999, "ten minutes", "²", [600000], True, 10**400]
 )
 def test_a_quick_run_with_a_shorter_or_unreadable_timeout_is_refused(timeout):
     assert_refused_for_its_timeout(
-        *run_hook("heavy --quick -- make t", timeout=timeout)
+        *run_hook("heavy --few-seconds -- make t", timeout=timeout)
     )
 
 
 @pytest.mark.parametrize("timeout", [None, 600000])
 def test_a_plain_heavy_beside_a_quick_one_gets_the_plain_refusal(timeout):
     code, err = run_hook(
-        "heavy --quick -- make t && heavy -- make all", timeout=timeout
+        "heavy --few-seconds -- make t && heavy -- make all", timeout=timeout
     )
 
     assert code == 2
@@ -206,7 +218,7 @@ WRONG_ORDER = [
     "heavy -- bgrun -o log -- cargo test",
     "heavy --long -- bgrun --wait -o log -- cargo test",
     "heavy -- timeout 5 /usr/local/bin/bgrun -o log -- make",
-    "heavy --quick -- bgrun -o log -- make",
+    "heavy --few-seconds -- bgrun -o log -- make",
 ]
 
 
@@ -223,8 +235,8 @@ RUN_BARE = [
     "heavy -- wt-ship -C ../x --local --remove",
     "heavy -- git -C repo commit -m x",
     "heavy -- git --config-env x=Y commit -m x",
-    "heavy --quick -- git commit -m x",
-    "heavy --quick -- wt-ship -C ../x --local --remove",
+    "heavy --few-seconds -- git commit -m x",
+    "heavy --few-seconds -- wt-ship -C ../x --local --remove",
 ]
 
 
@@ -258,7 +270,7 @@ def test_heavy_around_a_self_queueing_command_is_refused_anywhere(command, backg
         "ls ~/.local/bin/heavy",
         "command -v heavy",
         "bgrun -o log -- heavy -- cargo test",
-        "bgrun -o log -- heavy --quick -- pytest -q test_x.py",
+        "bgrun -o log -- heavy --few-seconds -- pytest -q test_x.py",
         "pid=$(bgrun -o log -C ~/x -- heavy -- cargo test) && echo $pid",
         "HEAVY_DIR=$(mktemp -d) HEAVY_BUSY=b bin/heavy -- true",
         "env HEAVY_SLOT=x heavy -- true",

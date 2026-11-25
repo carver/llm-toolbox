@@ -472,3 +472,38 @@ def test_a_piped_wait_given_a_heredoc_names_both_problems_at_once():
     )
     assert code == 2
     assert "piped into another command" in err and "--stdin" in err
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A comment's apostrophe inside $(...) opened a quote that ran to the end,
+        # so the rest of the script read as part of the substitution.
+        "x=$(true # don't\n)\npytest -q | tail -3 && git commit -m x",
+        "diff <(sort a # it's sorted\n) b; pytest -q | tail && git commit -m x",
+        "x=$(# don't\ntrue); pytest -q | tail && git commit -m x",
+        # A subshell's ) ends a word, so a # right after it starts a comment.
+        "x=$( (true)# don't\n); pytest -q | tail && git commit -m x",
+    ],
+)
+def test_a_comment_inside_a_substitution_hides_nothing_after_it(command):
+    code, err = run_hook(command)
+    assert code == 2, err
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "n=$(echo ${#list[@]} $#); pytest -q | tail && git commit -m x",
+        "x=`echo a # b`; pytest -q | tail && git commit -m x",
+        "x=$(echo a#b); pytest -q | tail && git commit -m x",
+        # A substitution's ) doesn't end the word, so a # after it is a letter.
+        "x=$(echo $(echo a)#b); pytest -q | tail && git commit -m x",
+        "echo $(echo a)#b; pytest -q | tail && git commit -m x",
+        "echo <(sort a)#b; pytest -q | tail && git commit -m x",
+        "x=$(echo 'a # b' \"c # d\"); pytest -q | tail && git commit -m x",
+    ],
+)
+def test_a_hash_that_starts_no_comment_inside_a_substitution_hides_nothing(command):
+    code, err = run_hook(command)
+    assert code == 2 and "pytest's status" in err, err

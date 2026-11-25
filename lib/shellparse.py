@@ -263,6 +263,7 @@ def _scan(text, first_mark):
     """prepare()'s cleaned text and substitutions, then each heredoc, in order."""
     out, substitutions, found = [], [], []
     opened, line_start, quote, i = [], 0, None, 0
+    closed_at = -1  # where the last substitution closed
     while i < len(text):
         char = text[i]
         if quote == "'":
@@ -279,9 +280,8 @@ def _scan(text, first_mark):
             out.append("'" + body + text[end : end + 1])
             i = end + 1
             continue
-        elif quote is None and char == "#" and (i == 0 or text[i - 1] in WORD_BREAK):
-            while i < len(text) and text[i] != "\n":
-                i += 1
+        elif quote is None and char == "#" and comment_starts(text, i, 0, closed_at):
+            i = line_end(text, i)
             continue
         elif quote is None and char == "\n" and opened:
             opener = text[line_start:i]
@@ -320,7 +320,7 @@ def _scan(text, first_mark):
             else:
                 out.append(MARK_FORMAT.format(first_mark + len(substitutions)))
             substitutions.append(text[start:end])
-            i = end + 1
+            closed_at, i = end, end + 1
             continue
         if char == "\n":
             line_start = i + 1
@@ -361,11 +361,28 @@ def ansi_end(text: str, start: int) -> int:
     return min(i, len(text))
 
 
+def comment_starts(text: str, i: int, start: int, closed_at: int) -> bool:
+    """Whether the # at ``i`` starts a comment: it is the first character from
+    ``start`` on, or follows a word break. A `)` that closes a substitution, at
+    ``closed_at``, breaks no word: `$(echo a)#b` is the word a#b."""
+    return i == start or text[i - 1] in WORD_BREAK and i - 1 != closed_at
+
+
+def line_end(text: str, i: int) -> int:
+    """Where the line holding ``i`` ends: its newline, or len(text)."""
+    end = text.find("\n", i)
+    return len(text) if end == -1 else end
+
+
 def substitution_end(text: str, start: int, opener: str) -> int:
     """Where the substitution ($(, <(, >( or a backtick) whose body starts at ``start``
     closes: len(text) if it doesn't. Heredoc bodies inside it are skipped, so a quote in
-    one, as in a commit message's "Don't", opens nothing."""
-    depth, quote, delimiters, i = 1, None, [], start
+    one, as in a commit message's "Don't", opens nothing, and so are comments in a $(,
+    <( or >(, where a "don't" or a ")" would otherwise open a quote or close it early.
+    Bash finds a backtick's close before reading comments, so there a # skips nothing."""
+    # For each ( open inside the body, whether it opens a substitution: $(, <( or >(.
+    opened: list[bool] = []
+    quote, delimiters, closed_at, i = None, [], -1, start
     while i < len(text):
         char = text[i]
         if char == "\\" and quote != "'":
@@ -384,12 +401,18 @@ def substitution_end(text: str, start: int, opener: str) -> int:
         elif opener == "`":
             if char == "`":
                 return i
+        elif char == "#" and comment_starts(text, i, start, closed_at):
+            i = line_end(text, i)
+            continue
         elif char in "'\"":
             quote = char
-        elif char in "()":
-            depth += 1 if char == "(" else -1
-            if depth == 0:
+        elif char == "(":
+            opened.append(i > start and text[i - 1] in "$<>")
+        elif char == ")":
+            if not opened:
                 return i
+            if opened.pop():
+                closed_at = i
         i += 1
     return len(text)
 

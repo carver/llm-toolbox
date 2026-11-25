@@ -57,8 +57,49 @@ def parents(pid: int) -> Iterator[int]:
         pid = parent
 
 
+def clock(seconds: float) -> str:
+    """Like ps's etime: MM:SS, H:MM:SS, or D-HH:MM:SS."""
+    rest = int(seconds)
+    days, rest = divmod(rest, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days}-{hours:02}:{minutes:02}:{secs:02}"
+    if hours:
+        return f"{hours}:{minutes:02}:{secs:02}"
+    return f"{minutes:02}:{secs:02}"
+
+
 def ancestors(pid: int) -> set[int]:
     return {pid, *parents(pid)}
+
+
+def running_in(folder: Path) -> dict[int, str]:
+    """pid -> command line of each process we can read whose current directory or
+    executable is `folder` or inside it, even after that was deleted. Never the
+    caller, its ancestors, or its pipeline siblings (`wt-ship | tee`): processes in
+    the caller's group whose parent is one of its ancestors."""
+    folder = folder.resolve()
+    mine = ancestors(os.getpid())
+    group = os.getpgrp()
+    found = {}
+    for pid, (_, cmdline) in processes().items():
+        fields = _stat_fields(pid)
+        if pid in mine or fields is None:
+            continue
+        if int(fields[2]) == group and int(fields[1]) in mine:  # stat's pgrp, ppid
+            continue
+        if any(_link_inside(PROC / str(pid) / link, folder) for link in ("cwd", "exe")):
+            found[pid] = cmdline
+    return found
+
+
+def _link_inside(link: Path, folder: Path) -> bool:
+    try:
+        target = os.readlink(link)
+    except OSError:  # another user's, exited mid-scan, or a kernel thread
+        return False
+    return Path(target.removesuffix(" (deleted)")).is_relative_to(folder)
 
 
 def processes() -> dict[int, tuple[str, str]]:

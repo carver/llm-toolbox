@@ -24,25 +24,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from procmatch import (
+    clock,
     elapsed,
     matches,
     none_matched,
     shortened,
     started_by_notes,
 )
-
-
-def clock(seconds: float) -> str:
-    """Like ps's etime: MM:SS, H:MM:SS, or D-HH:MM:SS."""
-    rest = int(seconds)
-    days, rest = divmod(rest, 86400)
-    hours, rest = divmod(rest, 3600)
-    minutes, secs = divmod(rest, 60)
-    if days:
-        return f"{days}-{hours:02}:{minutes:02}:{secs:02}"
-    if hours:
-        return f"{hours}:{minutes:02}:{secs:02}"
-    return f"{minutes:02}:{secs:02}"
 
 
 def main(argv: list[str] | None = None) -> int:

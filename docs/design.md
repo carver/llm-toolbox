@@ -470,6 +470,26 @@ the builds it opens (`checks_steps`), and finish checks the steps only of a mark
 build, so a build another session opened before this landed, whose review an older
 `review-prompt` never recorded, finishes as before (the owner's call, 2026-11-09).
 
+### wt-ship --remove keeps a worktree that processes still run in (2026-11-25)
+
+In a filedrawer session the agent stopped `bin/live-preview`, which it had started in
+the worktree, by hand before `wt-ship --local --remove`; a session that forgot would
+leave a server running from a deleted folder. git removes a worktree whatever runs in
+it. The owner's call: `--remove` keeps the worktree when a process of the user's has
+its current folder or executable inside it, lists each one with the command that
+removes the worktree once they're stopped, kills nothing, and exits 0, since the
+landing worked. A nonzero exit would make that landing look failed and invite a rerun;
+stopping the processes would kill what a session or the user still wants.
+
+- The caller's ancestors and its pipeline siblings (in its process group, with an
+  ancestor for parent: `wt-ship --remove | tee log`) don't count: they end with it.
+- Another user's processes can't be read and don't count; a count of them would print
+  on every run, root's being always unreadable.
+- Open files and arguments aren't read, so an editor with a file open there doesn't
+  keep it, and a program run through a symlink in the tree (a `.venv` python) whose
+  folder is elsewhere is missed.
+- A failed look keeps the worktree and says so, still exiting 0.
+
 ### wt-ship refuses a message naming an unlanded commit by its ID (2026-11-09)
 
 In a filedrawer session, commit messages cited `cc417d7`, a commit of the same

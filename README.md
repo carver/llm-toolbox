@@ -283,7 +283,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   whether the main tree is behind, and the unticked task-list items of each
   issue a commit closes ("Closes #46"), to tick before the issue closes, all
   looked up within `$WT_SHIP_UNTICKED_TIMEOUT` seconds (default 30);
-  `--remove` removes the worktree, and `-C DIR` runs it on the worktree DIR from
+  `--remove` removes the worktree, or keeps it and names the processes of yours
+  still running there, and `-C DIR` runs it on the worktree DIR from
   outside, so the call's shell isn't left in the folder it removed. In a repo
   that doesn't push, `--local` lands the commits on the main tree's branch
   instead: it rebases before it waits, checking nothing, then claims the main

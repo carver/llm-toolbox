@@ -98,7 +98,12 @@ In order, it:
 
 BRANCH defaults to the branch the main worktree has checked out. Nothing to push is a
 clean exit. --remove runs `git worktree remove` from the main tree once the push is
-confirmed. A shell that started the run inside the worktree is left in a deleted
+confirmed, unless a process of yours still runs in the worktree, by its current
+folder or its executable: then it keeps the worktree, lists each process (PID, age,
+command) and the command that removes it once they're stopped, and still exits 0,
+since the landing worked. It skips its own shell and the commands piped with it, and
+misses a program run through a symlink in the tree (a `.venv` python) whose folder is
+elsewhere. A shell that started the run inside the worktree is left in a deleted
 folder, where Claude Code's Bash tool reports exit 1 after a landing that worked; -C
 DIR, which runs wt-ship as if started in DIR (as `git -C` does), lets the call start
 outside it.
@@ -179,6 +184,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import commitcheck
 import fifo
 import foldable
+import procmatch
 from commitcheck import git, named, out
 from fifo import Holder
 
@@ -757,6 +763,28 @@ def ship(args):
 
 def remove(main_path, here):
     os.chdir(main_path)
+    keep = (
+        f"git -C {shlex.quote(str(main_path))} worktree remove {shlex.quote(str(here))}"
+    )
+    # The landing is done: a failed look mustn't fail it.
+    try:
+        busy = [
+            (pid, procmatch.elapsed(pid), cmdline)
+            for pid, cmdline in sorted(procmatch.running_in(Path(here)).items())
+        ]
+    except (OSError, ValueError, IndexError) as error:
+        print(
+            f"\nKept the worktree {here}: couldn't look for processes in it ({error})."
+        )
+        print(f"Once nothing runs there: {keep}")
+        return
+    if busy:
+        print(f"\nKept the worktree {here}: {len(busy)} process(es) still run in it:")
+        for pid, age, cmdline in busy:
+            since = "?" if age is None else procmatch.clock(age)
+            print(f"{pid:>7}  {since:>10}  {procmatch.shortened(cmdline, '', False)}")
+        print(f"Stop them (kill PID, or safekill), then: {keep}")
+        return
     git("worktree", "remove", here)
     print(f"Removed the worktree {here}.")
 

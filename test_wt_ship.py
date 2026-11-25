@@ -403,6 +403,29 @@ def test_remove_removes_the_worktree_after_the_push(setup):
     assert str(wt) not in git(main, "worktree", "list")
 
 
+def sleeping_in(folder):
+    # A session of its own, as a server an earlier command started would be.
+    return subprocess.Popen(["sleep", "60"], cwd=folder, start_new_session=True)
+
+
+@pytest.mark.parametrize("mode", [[], ["--local"]], ids=["push", "local"])
+def test_remove_keeps_a_worktree_a_process_still_runs_in(setup, mode):
+    origin, main, wt, _ = setup
+    new = commit(wt, "a.py", "x = 1\n", "Add a")
+    server = sleeping_in(wt)
+    try:
+        done = ship(main, "-C", str(wt), *mode, "--remove")
+    finally:
+        server.kill()
+        server.wait()
+
+    assert done.returncode == 0, done.stderr
+    landed = main_head(main) if mode else remote_main(origin)
+    assert landed == new and wt.exists()
+    assert f"{server.pid} " in done.stdout and "sleep 60" in done.stdout, done.stdout
+    assert f"worktree remove {wt}" in done.stdout, done.stdout
+
+
 def test_remove_is_refused_in_the_main_tree(setup):
     _, main, _, _ = setup
     commit(main, "a.py", "x = 1\n", "Add a")

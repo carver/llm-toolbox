@@ -1174,6 +1174,22 @@ was added.
 The phone run is 400 wide at `--size`'s height, so the two viewports differ only
 in width. A run that fails ends the command, and the runs after it aren't made.
 
+### view, --sizes, several pages and --montage compare first screens (2026-11-25)
+
+To show an owner four versions of a page on two phone sizes, an agent ran web-shot
+eight times and wrote three PIL scripts to crop each full-page shot to the
+viewport, label it and paste the eight side by side; one failed on a font path.
+A shot was always the full page, since that is what a reader of a report wants,
+so nothing showed where a page's fold falls.
+
+`view NAME` shoots what the viewport shows. It is an action of its own, not a flag
+on `shot`, whose second word is already a selector that runs to the end of the
+line. `--sizes` names its runs by size, where `--variants` keeps its fixed pair of
+widths. Several pages get a run each, named for the page, because the comparison
+that prompted this was between pages, not between sizes of one. `--montage` takes
+no path: there is one montage for each shot name, saved beside the shots as every
+other output is. Its labels use Pillow's built-in font, so it needs no font file.
+
 ### Each run removes default output folders idle for 72 hours (2026-11-21)
 
 With no `--out`, web-shot writes to a new `web-shot-*` folder in the temp dir and

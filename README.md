@@ -320,10 +320,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `prefers-color-scheme` and `prefers-reduced-motion` media queries see, or
   `--variants` to run the actions four times, at `--size` and 400 wide, each
   light and dark, with shots named `NAME.<desktop|phone>-<light|dark>.png` and
-  each run's errors under its name), clicks
+  each run's errors under its name; `--sizes 360x640,390x664` runs them at each
+  size instead, and several pages get a run each, named for the page), clicks
   and runs scripts in it (`eval` prints the value as JSON), saves screenshots
-  of the page or of one element (a shot over 1500px tall also as pieces of at
-  most 1400px), prints a page's text or links (for JS-rendered forms and
+  of the page, of one element or, with `view`, of the first screen (a shot over
+  1500px tall also as pieces of at most 1400px; `--montage` lays the runs' shots
+  side by side under their names, as `NAME.montage.png`), prints a page's text or links (for JS-rendered forms and
   calendars; `scroll-all` loads endless feeds first), and reports the page's
   JavaScript errors (exit 3), repeats collapsed; a page that doesn't load or an
   action that fails gets one line and exit 1. It says on stderr when the

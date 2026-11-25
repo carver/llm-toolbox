@@ -877,3 +877,163 @@ def test_a_run_keeps_the_old_output_folder_it_is_told_to_write_to(tmp_path):
     )
     assert run.returncode == 0, run.stderr
     assert (out / "before.png").exists()
+
+
+def test_view_is_an_action_with_a_name():
+    assert web_shot.parse_action("view fold") == web_shot.Action("view", ("fold",))
+    with pytest.raises(web_shot.UsageError, match="view NAME"):
+        web_shot.parse_action("view")
+
+
+def test_a_local_path_keeps_its_fragment(tmp_path):
+    page = tmp_path / "p.html"
+    page.write_text("x")
+    assert web_shot.page_url(f"{page}#slip") == page.resolve().as_uri() + "#slip"
+    # A file whose own name holds a # is that file.
+    odd = tmp_path / "a#b.html"
+    odd.write_text("x")
+    assert web_shot.page_url(str(odd)) == odd.resolve().as_uri()
+
+
+def tall_page(path, color="rgb(200, 0, 0)"):
+    """A page 3000px tall that shows its hash, so a shot of the viewport differs from the page's."""
+    path.write_text(
+        f"<!doctype html><style>body {{ margin: 0; height: 3000px; background: {color} }}"
+        "p { margin: 0 }</style>"
+        "<p id=t></p><script>t.textContent = location.hash</script>"
+    )
+    return path
+
+
+@needs_chromium
+def test_view_shoots_what_the_viewport_shows_not_the_whole_page(tmp_path):
+    page = tall_page(tmp_path / "p.html")
+    out = tmp_path / "out"
+    run = cli("--out", out, "--size", "500x400", "--do", "view fold", page)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.split()[0] == str(out / "fold.png")
+    assert png_size(out / "fold.png") == (500, 400)
+    assert png_size(out / "final.png") == (500, 3000)
+
+
+@needs_chromium
+def test_sizes_runs_the_actions_once_at_each_size(tmp_path):
+    page = tall_page(tmp_path / "p.html")
+    out = tmp_path / "out"
+    run = cli(
+        *("--out", out, "--sizes", "360x640,390x664", "--montage"),
+        *("--do", "eval innerWidth", "--do", "view fold", page),
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.splitlines() == [
+        "== 360x640",
+        "360",
+        str(out / "fold.360x640.png"),
+        str(out / "final.360x640.png"),
+        str(out / "final.360x640.part1.png"),
+        str(out / "final.360x640.part2.png"),
+        str(out / "final.360x640.part3.png"),
+        "== 390x664",
+        "390",
+        str(out / "fold.390x664.png"),
+        str(out / "final.390x664.png"),
+        str(out / "final.390x664.part1.png"),
+        str(out / "final.390x664.part2.png"),
+        str(out / "final.390x664.part3.png"),
+        "== montage",
+        str(out / "fold.montage.png"),
+    ]
+    assert png_size(out / "fold.360x640.png") == (360, 640)
+    assert png_size(out / "fold.390x664.png") == (390, 664)
+    # One row: both tiles side by side, and no taller than the taller tile and its label.
+    width, height = png_size(out / "fold.montage.png")
+    assert 360 + 390 <= width <= 360 + 390 + 100, width
+    assert 664 <= height <= 664 + 100, height
+
+
+@needs_chromium
+def test_several_pages_make_a_montage_with_a_column_each_and_a_row_per_size(tmp_path):
+    """Each page's runs are named after it: its file's stem, or its #fragment."""
+    one = tall_page(tmp_path / "one.html")
+    two = tall_page(tmp_path / "two.html", "rgb(0, 0, 200)")
+    out = tmp_path / "out"
+    run = cli(
+        *("--out", out, "--sizes", "300x200,400x300", "--montage"),
+        *("--do", "text #t", "--do", "view fold", one, f"{two}#slip"),
+    )
+    assert run.returncode == 0, run.stderr
+    lines = run.stdout.splitlines()
+    assert [line for line in lines if line.startswith("==")] == [
+        "== one.300x200",
+        "== one.400x300",
+        "== slip.300x200",
+        "== slip.400x300",
+        "== montage",
+    ]
+    assert lines[lines.index("== slip.300x200") + 1] == "#slip"
+    assert lines[-1] == str(out / "fold.montage.png")
+    assert png_size(out / "fold.slip.400x300.png") == (400, 300)
+    # Two columns as wide as the widest tile, two rows as tall as theirs.
+    width, height = png_size(out / "fold.montage.png")
+    assert 800 <= width <= 800 + 100, width
+    assert 500 <= height <= 500 + 150, height
+    from PIL import Image
+
+    image = Image.open(out / "fold.montage.png").convert("RGB")
+    # The first page fills the left column and the second the right, in both rows.
+    reds = [x for x in range(width) if image.getpixel((x, height - 60)) == (200, 0, 0)]
+    blues = [x for x in range(width) if image.getpixel((x, height - 60)) == (0, 0, 200)]
+    assert len(reds) == len(blues) == 400 and max(reds) < min(blues)
+
+
+@pytest.mark.parametrize(
+    ("args", "says"),
+    [
+        (["--sizes", "300x200,400x300", "--variants"], "--sizes doesn't go with"),
+        (["--sizes", "300x200", "--size", "400x300"], "--sizes doesn't go with"),
+        (["--sizes", "300x200,wide"], "size is WxH"),
+        (["--montage", "--do", "view fold"], "--montage needs more than one run"),
+        (["--montage", "--variants"], "--montage needs a shot or view action"),
+    ],
+)
+def test_rejects_options_that_do_not_go_together(tmp_path, args, says):
+    run = cli(*args, tall_page(tmp_path / "p.html"))
+    assert run.returncode == 2, run.stdout
+    assert says in run.stderr
+
+
+def test_two_pages_that_would_share_a_name_are_refused(tmp_path):
+    (tmp_path / "a").mkdir()
+    run = cli(tall_page(tmp_path / "p.html"), tall_page(tmp_path / "a" / "p.html"))
+    assert run.returncode == 2, run.stdout
+    assert "share the name p" in run.stderr and "#fragment" in run.stderr
+
+
+@pytest.mark.parametrize(
+    ("page", "label"),
+    [
+        ("https://example.com/reports/old.html", "old"),
+        ("https://example.com/app#slip-lead", "slip-lead"),
+        ("https://example.com/", "example-com"),
+        # A label is part of a file's name, so it holds nothing a path could use.
+        ("https://example.com/app#/settings/../../up", "settings-up"),
+        ("https://example.com/app#/", "app"),
+    ],
+)
+def test_a_page_is_named_for_its_fragment_else_its_file_else_its_host(page, label):
+    assert web_shot.page_label(page) == label
+
+
+def test_a_size_given_twice_is_refused(tmp_path):
+    run = cli("--sizes", "300x200,300x200", tall_page(tmp_path / "p.html"))
+    assert run.returncode == 2, run.stdout
+    assert "300x200 twice" in run.stderr
+
+
+def test_a_page_named_montage_is_refused_where_its_shots_would_be_overwritten(
+    tmp_path,
+):
+    pages = [tall_page(tmp_path / "montage.html"), tall_page(tmp_path / "other.html")]
+    run = cli("--montage", "--do", "view fold", *pages)
+    assert run.returncode == 2, run.stdout
+    assert "montage" in run.stderr and "#fragment" in run.stderr

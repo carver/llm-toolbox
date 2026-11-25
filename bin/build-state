@@ -3,7 +3,10 @@
 
     build-state start [--base REV]
                             record the base (HEAD, or an earlier REV) and the repo's
-                            fingerprint
+                            fingerprint; refuses while a build is open (--force
+                            replaces it), unless that build holds no commit of its
+                            own, as after a rebase onto the branch it lands on, and
+                            recorded no review, refactor base or sweep
     build-state refactor    record the refactor base (HEAD), before applying review
                             fixes; refuses while tracked files have changes
     build-state show        print the recorded bases
@@ -181,12 +184,13 @@ dash (`build-state sweep -- --local`). It runs, from the workspace root,
 
     rg --no-config -n --hidden --fixed-strings -g '!{cache,keep}/**' -g '!*-wt-*/**'
        -g '!.git/' -g '!/.*' -g '!**/*_files/**' -g '!**/node_modules/**'
-       -g '!*.min.*' -g '!*.map' -e TERM... .
+       -g '!*.min.*' -g '!*.map' -g '!*.jsonl' -e TERM... .
 
 so it skips cache/ and keep/ (over a million files), every worktree beside a repo
 (*-wt-*), .git folders, and the root's own dot-files and dot-folders, where
 credentials live, and files nobody wrote by hand (*_files/, as a browser names a saved
-page's scripts, node_modules/, *.min.*, *.map); inside a repo, rg skips what its
+page's scripts, node_modules/, *.min.*, *.map, and *.jsonl, the session transcripts
+a repo may keep); inside a repo, rg skips what its
 .gitignore names, and the sweep skips what its .sweepignore names: a file at the
 repo's top, one path or glob a line, anchored at the repo's top (`*.sql` matches
 only there; `**/*.sql` anywhere in it), for text a build mustn't or needn't fix,
@@ -200,7 +204,12 @@ own repo's hits come first, then the rest by path: at most 5 lines a file and 60
 all, each cut at 300 characters, then a line saying how many more it cut. Other
 repos' hits print as lines only while, at 5 a file, they come to 20 or fewer; past
 that they print as one line a file, `PATH: N hits`, for 20 files by path, then a
-line saying how many files more, so a common term costs a few lines. When rg
+line saying how many files more, so a common term costs a few lines. When the lines
+it would list pass 60, a term that alone has more than 60 hits, such as a tool's
+name, is set aside, the most first, until the rest fit, the last term never: its
+hits are left out of the listing, but not those another term matches too, however
+long the line, and a line says `TERM: N hits in M files, not listed: too common to
+read`. When rg
 can't read some files, it says so on stderr and still records the sweep.
 
 The sweep is recorded in the build's state (`build-state show`): its terms, and HEAD's
@@ -231,7 +240,14 @@ SWEEP_OTHERS_LINES = 20
 SWEEP_OTHERS_FILES = 20
 # Files nobody wrote by hand, wherever they lie; a page a browser saved keeps its
 # scripts in NAME_files/. Their hits would crowd out the ones a person can act on.
-NOT_SOURCE = ["!**/*_files/**", "!**/node_modules/**", "!*.min.*", "!*.map"]
+NOT_SOURCE = [
+    "!**/*_files/**",
+    "!**/node_modules/**",
+    "!*.min.*",
+    "!*.map",
+    # Session transcripts a repo keeps, which quote every command ever run.
+    "!*.jsonl",
+]
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -546,14 +562,26 @@ def save(path: Path, state: dict) -> None:
 def start(args: argparse.Namespace) -> int:
     path = state_file()
     if path.exists() and not args.force:
-        base = load(path)["base"]
+        state = load(path)
+        base = state["base"]
+        recorded = [step for step in RESTART_KEEPS if state.get(step)]
+        lands_on = [
+            *state.get("targets", []),
+            *([short_ref(up)] if (up := start_upstream(state)) else []),
+        ]
+        if recorded or own_commits(base, lands_on):
+            print(
+                f"A build is already open, from base {base}: review its commit"
+                " (review-prompt), record the refactor base (refactor) and finish it"
+                " before starting the next, or start --force.",
+                file=sys.stderr,
+            )
+            return 1
         print(
-            f"A build is already open, from base {base}: review its commit"
-            " (review-prompt), record the refactor base (refactor) and finish it"
-            " before starting the next, or start --force.",
+            f"The open build from base {base[:12]} holds no commit of its own, only"
+            " the branch it lands on: started again.",
             file=sys.stderr,
         )
-        return 1
     work = work_refs()
     if args.base is None:
         base = head()
@@ -584,6 +612,30 @@ def start(args: argparse.Namespace) -> int:
     )
     print(f"base {base}")
     return 0
+
+
+# What a build records before its commits, which a restart would lose: so start
+# restarts only a build that recorded none of them.
+RESTART_KEEPS = ("reviewed", "refactor_base", "sweeps")
+
+
+def own_commits(base: str, targets: list[str]) -> list[str]:
+    """The commits since `base` that none of `targets`, the branches the build lands
+    on (a name, or remote/name for an upstream), holds, locally or on a remote: the
+    build's own. A rebase or fast-forward of a build with none onto its target leaves
+    this empty."""
+    held = [
+        ref
+        for name in targets
+        for ref in git(
+            "for-each-ref",
+            "--format=%(refname)",
+            f"refs/heads/{name}",
+            f"refs/remotes/*/{name}",
+            f"refs/remotes/{name}",
+        ).stdout.split()
+    ]
+    return git("rev-list", f"{base}..HEAD", "--not", *held, "--").stdout.split()
 
 
 def refactor(args: argparse.Namespace) -> int:
@@ -668,13 +720,21 @@ class Search:
         return not self.is_own(hit), path, int(number) if number.isdigit() else 0
 
 
-def rg(where: Path, prefix: str, globs: list[str], terms: list[str]) -> Search:
-    """rg's hits for `terms` under `where`, each path shown under `prefix`; raises
-    FileNotFoundError when rg is missing."""
+def rg(
+    where: Path, prefix: str, globs: list[str], terms: list[str], matches: bool = False
+) -> Search:
+    """rg's hits for `terms` under `where`, each path shown under `prefix`; with
+    `matches`, a hit for each match, its text the term it matched, from the whole line
+    however long; raises FileNotFoundError when rg is missing."""
+    shape = (
+        ["--only-matching"]
+        if matches
+        else ["--max-columns", str(SWEEP_WIDTH), "--max-columns-preview"]
+    )
     found = subprocess.run(
         [
             *("rg", "--no-config", "-n", "--hidden", "--fixed-strings"),
-            *("--max-columns", str(SWEEP_WIDTH), "--max-columns-preview"),
+            *shape,
             *(arg for glob in globs for arg in ("-g", glob)),
             *(arg for term in terms for arg in ("-e", term)),
             ".",
@@ -707,7 +767,7 @@ def sweep_ignored(repo: Path, under: str) -> list[str]:
     ]
 
 
-def search_workspace(root: Path, terms: list[str]) -> Search:
+def search_workspace(root: Path, terms: list[str], matches: bool = False) -> Search:
     """Every hit in the workspace's repos as landed, skipping cache/, keep/, the
     worktrees beside them, .git, the root's own dot-files (credentials live
     there), files nobody wrote by hand (NOT_SOURCE) and what each repo's
@@ -722,10 +782,10 @@ def search_workspace(root: Path, terms: list[str]) -> Search:
     in_worktree = Search()
     if top != main:
         own = ["!.git", *NOT_SOURCE, *sweep_ignored(top, "/")]
-        in_worktree = rg(top, shown_from(root, top), own, terms)
+        in_worktree = rg(top, shown_from(root, top), own, terms, matches)
         if main.is_relative_to(root):
             globs.append(f"!/{main.relative_to(root)}/**")
-    rest = rg(root, ".", globs, terms)
+    rest = rg(root, ".", globs, terms, matches)
     # A workspace root that is the repo itself, as $BUILD_STATE_WORKSPACE may set it.
     own_prefix = "./" if top == root else shown_from(root, top) + "/"
     found = Search(in_worktree.hits + rest.hits, in_worktree.errors + rest.errors)
@@ -783,6 +843,59 @@ def print_lines(hits: list[str]) -> None:
         )
 
 
+def hit_place(hit: str) -> str:
+    """A hit's `path:line`."""
+    return ":".join(hit.split(":", 2)[:2])
+
+
+def listed(search: Search) -> int:
+    """How many lines print_hits would list: this repo's capped hits, and other repos'
+    while they still print as lines rather than as a count a file."""
+    own = [hit for hit in search.hits if search.is_own(hit)]
+    others = capped_a_file([hit for hit in search.hits if not search.is_own(hit)])
+    return len(capped_a_file(own)) + (
+        len(others) if len(others) <= SWEEP_OTHERS_LINES else 0
+    )
+
+
+def set_aside_common(search: Search, terms: list[str], find_matches) -> list[str]:
+    """While the lines listed pass SWEEP_CAP, take out of `search` the hits of the
+    term with the most, when it alone has more than SWEEP_CAP, but not those another
+    term also matches, and so on down; return a line for each term set aside. A
+    tool's name, which a sweep searches beside the old phrases, can otherwise fill the
+    cap. `find_matches` gives a hit per match, its text the matched term, which tells
+    the terms of a line rg cut short apart."""
+    if listed(search) <= SWEEP_CAP:
+        return []
+    terms_at: dict[str, set[str]] = {}
+    for match in find_matches().hits:
+        place, _, text = match.rpartition(":")
+        terms_at.setdefault(place, set()).update(t for t in terms if t in text)
+    notes, left = [], list(dict.fromkeys(terms))
+    # The last term left stays listed, capped: setting it aside would list nothing.
+    while listed(search) > SWEEP_CAP and len(left) > 1:
+        matching = {
+            t: [h for h in search.hits if t in terms_at.get(hit_place(h), ())]
+            for t in left
+        }
+        term = max(left, key=lambda t: len(matching[t]))
+        if len(matching[term]) <= SWEEP_CAP:
+            break
+        left.remove(term)
+        files = len({path_of(hit) for hit in matching[term]})
+        notes.append(
+            f"{term}: {len(matching[term])} hits in {files} files, not listed:"
+            " too common to read"
+        )
+        search.hits = [
+            hit
+            for hit in search.hits
+            if term not in (found := terms_at.get(hit_place(hit), set()))
+            or found & set(left)
+        ]
+    return notes
+
+
 def sweep(args: argparse.Namespace) -> int:
     if any(not term for term in args.terms):
         print("build-state sweep: a TERM is empty.", file=sys.stderr)
@@ -802,7 +915,12 @@ def sweep(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         print("rg isn't installed: install ripgrep, then sweep again.", file=sys.stderr)
         return 3
+    common = set_aside_common(
+        search, args.terms, lambda: search_workspace(root, args.terms, matches=True)
+    )
     print_hits(search)
+    for line in common:
+        print(line)
     if search.errors:
         print(
             "rg reported errors, so files it couldn't read went unsearched:",
@@ -1247,7 +1365,9 @@ checks don't. To see whether a test catches a break, use `mutate-check -- CMD` \
 (`mutate-check -h`), which puts the code back, rather than a scripted edit. To see how \
 the code behaves on a case, run the tests that reach it, a few at a time, through \
 `heavy --few-seconds -- CMD` as a foreground call with the Bash timeout at 600000; judge a \
-case no test reaches from the code.
+case no test reaches from the code. {test_command}`--few-seconds` is for runs of seconds: \
+run a whole file, a property test or anything longer than a minute as \
+`bgrun -o LOG -- heavy -- CMD`, then `waitone --pid PID -t 170` until it exits.
 {checked_at_landing}
 Run two separate reviews and report them under the headings `## Standards` and `## Spec`. \
 Don't merge or rerank findings across the two.
@@ -1296,6 +1416,23 @@ def section(text: str, heading: str) -> str:
     return "\n".join(kept).strip()
 
 
+# A repo's test wrappers, which run its tests with its own pins, and how to name tests
+# to each.
+TEST_WRAPPERS = (
+    ("t", "`./t FILES`, which runs them in one process"),
+    ("bin/pytest", "`bin/pytest -n0 FILES`"),
+)
+
+
+def test_command(top: Path) -> str:
+    """The review prompt's line naming the repo's test wrapper, when it has one."""
+    for path, use in TEST_WRAPPERS:
+        wrapper = top / path
+        if wrapper.is_file() and os.access(wrapper, os.X_OK):
+            return f"This repo runs its tests with its own pins through {use}. "
+    return ""
+
+
 def review_prompt(args: argparse.Namespace) -> int:
     if (state := load(state_file())) is None:
         return 1
@@ -1338,6 +1475,7 @@ def review_prompt(args: argparse.Namespace) -> int:
             sha=sha,
             commits=git("log", "--oneline", "--reverse", f"{base}..{sha}").stdout,
             brief=args.brief.resolve(),
+            test_command=test_command(top),
             checked_at_landing=(
                 CHECKED_AT_LANDING
                 if commitcheck.runnable(commitcheck.hook_path())

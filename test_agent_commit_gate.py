@@ -821,8 +821,11 @@ def test_a_fixup_subject_in_a_message_file_given_from_a_subfolder_skips_the_agen
     assert ran(installed) == ["fast", "agent", "fast"]
 
 
-def run_hook_in(monkeypatch, capsys, command, cwd):
-    event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(cwd)}
+def run_hook_in(monkeypatch, capsys, command, cwd, background=False):
+    tool_input = {"command": command} | (
+        {"run_in_background": True} if background else {}
+    )
+    event = {"tool_name": "Bash", "tool_input": tool_input, "cwd": str(cwd)}
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
     code = gate.main([])
     return code, capsys.readouterr().err
@@ -2431,3 +2434,96 @@ def test_a_skipped_check_isnt_recorded(installed):
     run = recheck(installed)
     assert "skipped" in run.stderr, run.stderr
     assert len(timings_record(installed)) == 1
+
+
+# A repo's commit-needs-queue says when a commit's check will wait in heavy's queue,
+# so a foreground commit, which the Bash tool would kill at its limit, is refused.
+
+
+def predicting(repo, body):
+    """Give the repo a commit-needs-queue that runs `body`."""
+    hook(repo, "commit-needs-queue", body)
+
+
+def hook_on(repo, monkeypatch, capsys, command, background=False):
+    """Run the gate as Claude Code's PreToolUse hook on `command`, run in `repo`."""
+    return run_hook_in(monkeypatch, capsys, command, repo, background=background)
+
+
+def test_a_foreground_commit_whose_check_will_queue_is_refused(
+    repo, monkeypatch, capsys
+):
+    predicting(repo, "exit 0")
+    code, err = hook_on(repo, monkeypatch, capsys, "git commit -q -m x")
+    assert code == 2, err
+    assert "heavy's queue" in err and "bgrun --wait" in err, err
+
+
+def test_the_same_commit_as_a_background_call_runs(repo, monkeypatch, capsys):
+    predicting(repo, "exit 0")
+    code, _ = hook_on(repo, monkeypatch, capsys, "git commit -q -m x", background=True)
+    assert code == 0
+
+
+@pytest.mark.parametrize("body", ["exit 1", "exit 3", "echo broken >&2; exit 7"])
+def test_a_commit_the_predictor_clears_or_fails_on_runs(
+    repo, monkeypatch, capsys, body
+):
+    predicting(repo, body)
+    code, err = hook_on(repo, monkeypatch, capsys, "git commit -q -m x")
+    assert code == 0, err
+
+
+def test_a_repo_without_a_predictor_is_untouched(repo, monkeypatch, capsys):
+    code, _ = hook_on(repo, monkeypatch, capsys, "git commit -q -m x")
+    assert code == 0
+
+
+def test_the_predictor_runs_in_the_commits_own_repo(
+    repo, tmp_path, monkeypatch, capsys
+):
+    (tmp_path / "other").mkdir()
+    other = make_repo(tmp_path / "other")
+    predicting(other, "exit 0")
+    code, _ = hook_on(repo, monkeypatch, capsys, f"git -C {other} commit -q -m x")
+    assert code == 2
+
+
+def test_a_predictor_that_isnt_executable_is_ignored(repo, monkeypatch, capsys):
+    predicting(repo, "exit 0")
+    (repo / ".githooks" / "commit-needs-queue").chmod(0o644)
+    code, _ = hook_on(repo, monkeypatch, capsys, "git commit -q -m x")
+    assert code == 0
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bgrun --wait -o log -- git commit -q -m x",
+        "heavy -- git commit -q -m x",
+    ],
+)
+def test_a_wrapped_foreground_commit_whose_check_will_queue_is_refused(
+    repo, monkeypatch, capsys, command
+):
+    predicting(repo, "exit 0")
+    code, err = hook_on(repo, monkeypatch, capsys, command)
+    assert code == 2, err
+
+
+def test_a_commit_that_skips_the_hooks_isnt_asked_about(repo, monkeypatch, capsys):
+    # A repo with no agent check may skip its hooks, and then no check runs.
+    predicting(repo, "exit 0")
+    code, err = hook_on(repo, monkeypatch, capsys, "git commit -n -q -m x")
+    assert code == 0, err
+
+
+def test_a_predictor_past_its_time_limit_says_no_and_leaves_nothing_running(
+    repo, monkeypatch, capsys
+):
+    monkeypatch.setattr(gate, "PREDICTOR_SECONDS", 0.5)
+    # Its child outlives it unless the whole group is stopped, and conftest's
+    # leftover-process check then fails this test.
+    predicting(repo, "sleep 30 &\nsleep 30\nexit 0")
+    code, _ = hook_on(repo, monkeypatch, capsys, "git commit -q -m x")
+    assert code == 0

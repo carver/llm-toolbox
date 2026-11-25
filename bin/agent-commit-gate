@@ -172,6 +172,16 @@ around the check (`AI_AGENT= git commit`, `AGENT_PRE_COMMIT=1 git commit`, `git
 -c core.hooksPath=...`, or a line written into the pass record by hand, which
 every worktree then trusts).
 
+The same hook refuses a foreground `git commit` (a Bash call without
+run_in_background), run bare or through `bgrun ... --` or `heavy ... --`, that
+doesn't skip the hooks and whose check the repo says will wait in heavy's queue, since the
+Bash tool kills a call at its time limit and the check can wait minutes; it names
+the `bgrun --wait` background call to use instead. The repo says so through an
+executable `commit-needs-queue` beside its hooks, run in the commit's directory with
+no stdin: exit 0 means the check will queue, anything else, or a run past 5 s, that
+it won't, so a broken predictor never blocks a commit. A repo without one is
+untouched. filedrawer's runs its checks-needed on the paths that differ from HEAD.
+
     agent-commit-gate --install REPO...    # add the lines to each repo's hooks
     agent-commit-gate --run HOOK           # as the pre-commit line calls it
     agent-commit-gate --post-commit        # as the post-commit line calls it
@@ -183,6 +193,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -369,6 +380,10 @@ def commits(command):
             words = segment.split()
         while words and ASSIGNMENT.match(words[0]):
             words = words[1:]
+        # A command a wrapper runs, after its `--`: `bgrun --wait -o LOG -- git
+        # commit`, `heavy -- git commit`.
+        while words and Path(words[0]).name in WRAPPERS and "--" in words:
+            words = words[words.index("--") + 1 :]
         if len(words) == 2 and words[0] == "cd":
             directory = directory / words[1]
             continue
@@ -396,6 +411,12 @@ COMMIT_CHECK_NAME = "agent-commit-check"
 # QUEUE_EXIT, the exit status that asks for the queue (sysexits' EX_TEMPFAIL).
 QUEUE_EXIT_NAME = "CHECK_QUEUE_EXIT"
 QUEUE_EXIT = commitcheck.QUEUE_EXIT
+# A repo's optional script beside its hooks that says whether a commit's check will
+# wait in heavy's queue: exit 0 if so, 1 if not; past PREDICTOR_SECONDS, not.
+PREDICTOR_NAME = "commit-needs-queue"
+PREDICTOR_SECONDS = 5
+# Commands that run the command after their `--`, which commits() looks through.
+WRAPPERS = ("bgrun", "heavy")
 # The file a check may write its own parts' timings to, a `NAME SECONDS` line each.
 TIMINGS_NAME = "CHECK_TIMINGS"
 # A name of letters, digits, `_`, `.` and `-`, so the record's `name=seconds,...` stays
@@ -1329,9 +1350,10 @@ def main(argv=None):
         return 0
     command = event.get("tool_input", {}).get("command", "")
     cwd = Path(event.get("cwd") or ".")
+    found = list(commits(command))
     if any(
         skips_hooks(args) and has_agent_check(cwd / directory)
-        for args, directory in commits(command)
+        for args, directory in found
     ):
         print(
             "Commit blocked: --no-verify (-n) skips the pre-commit hook, which runs "
@@ -1341,7 +1363,52 @@ def main(argv=None):
             file=sys.stderr,
         )
         return 2
+    background = event.get("tool_input", {}).get("run_in_background") in (True, "true")
+    if not background and any(
+        check_will_queue(cwd / directory)
+        for args, directory in found
+        if not skips_hooks(args)
+    ):
+        print(
+            f"Commit blocked: this repo's {PREDICTOR_NAME} says the commit's check will"
+            " wait its turn in heavy's queue, for minutes, and a foreground Bash call"
+            " is killed at its time limit. Run the commit as a background call"
+            " (run_in_background: true): `bgrun --wait -o <scratchpad>/commit.log --"
+            f" git commit ...`, and read its log when it ends. {refused.ending(event)}",
+            file=sys.stderr,
+        )
+        return 2
     return 0
+
+
+def check_will_queue(directory):
+    """Whether the repo at `directory` says, through its PREDICTOR_NAME, that a commit
+    there will wait in heavy's queue. A repo without one, one that can't run (not
+    executable), fails, answers otherwise or runs past PREDICTOR_SECONDS says no, so
+    a broken predictor never blocks a commit."""
+    hooks = hooks_dir(directory) if directory.is_dir() else None
+    predictor = hooks / PREDICTOR_NAME if hooks else None
+    if predictor is None or not predictor.is_file():
+        return False
+    try:
+        # A group of its own, so a timeout stops what it started too.
+        proc = subprocess.Popen(
+            [str(predictor)],
+            cwd=directory,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return False
+    try:
+        return proc.wait(timeout=PREDICTOR_SECONDS) == 0
+    except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        return False
 
 
 def has_agent_check(directory):

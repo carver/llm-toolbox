@@ -460,7 +460,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   warns, never refuses, and prints nothing otherwise. A repo installed before
   this gets the line by running `--install` again.
   `install.py` also registers it as a Claude Code hook that refuses `git commit
-  --no-verify`, except in a repo with no agent check, such as a scratch repo.
+  --no-verify`, except in a repo with no agent check, such as a scratch repo, and
+  a foreground `git commit` whose check the repo's `commit-needs-queue`, beside
+  its hooks, says will wait in heavy's queue (exit 0), naming the `bgrun --wait`
+  background call to run it as instead.
   The check runs once it's its turn in `heavy`'s queue, whose waiting lines
   print as they come. A check whose change may need no build or test, such as
   filedrawer's for a docs-only commit, can skip the queue by naming

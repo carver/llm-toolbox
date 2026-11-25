@@ -1247,7 +1247,9 @@ checks don't. To see whether a test catches a break, use `mutate-check -- CMD` \
 (`mutate-check -h`), which puts the code back, rather than a scripted edit. To see how \
 the code behaves on a case, run the tests that reach it, a few at a time, through \
 `heavy --few-seconds -- CMD` as a foreground call with the Bash timeout at 600000; judge a \
-case no test reaches from the code.
+case no test reaches from the code. {test_command}`--few-seconds` is for runs of seconds: \
+run a whole file, a property test or anything longer than a minute as \
+`bgrun -o LOG -- heavy -- CMD`, then `waitone --pid PID -t 170` until it exits.
 {checked_at_landing}
 Run two separate reviews and report them under the headings `## Standards` and `## Spec`. \
 Don't merge or rerank findings across the two.
@@ -1296,6 +1298,23 @@ def section(text: str, heading: str) -> str:
     return "\n".join(kept).strip()
 
 
+# A repo's test wrappers, which run its tests with its own pins, and how to name tests
+# to each.
+TEST_WRAPPERS = (
+    ("t", "`./t FILES`, which runs them in one process"),
+    ("bin/pytest", "`bin/pytest -n0 FILES`"),
+)
+
+
+def test_command(top: Path) -> str:
+    """The review prompt's line naming the repo's test wrapper, when it has one."""
+    for path, use in TEST_WRAPPERS:
+        wrapper = top / path
+        if wrapper.is_file() and os.access(wrapper, os.X_OK):
+            return f"This repo runs its tests with its own pins through {use}. "
+    return ""
+
+
 def review_prompt(args: argparse.Namespace) -> int:
     if (state := load(state_file())) is None:
         return 1
@@ -1338,6 +1357,7 @@ def review_prompt(args: argparse.Namespace) -> int:
             sha=sha,
             commits=git("log", "--oneline", "--reverse", f"{base}..{sha}").stdout,
             brief=args.brief.resolve(),
+            test_command=test_command(top),
             checked_at_landing=(
                 CHECKED_AT_LANDING
                 if commitcheck.runnable(commitcheck.hook_path())

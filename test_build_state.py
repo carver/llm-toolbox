@@ -2458,3 +2458,53 @@ def test_refactor_ignores_untracked_files(repo):
     done = build_state(repo, "refactor")
 
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def prompt_text(repo, tmp_path):
+    """The whole review prompt review-prompt writes, for a build with one commit."""
+    commit(repo, "parser.py", "Parse dates")
+    review(repo, tmp_path)
+    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").strip())
+    return (git_dir / "build-review-prompt.md").read_text()
+
+
+@pytest.mark.parametrize(
+    "wrapper, says", [("t", "`./t FILES`"), ("bin/pytest", "`bin/pytest -n0 FILES`")]
+)
+def test_review_prompt_names_the_repos_test_wrapper(repo, tmp_path, wrapper, says):
+    build_state(repo, "start")
+    (repo / wrapper).parent.mkdir(parents=True, exist_ok=True)
+    (repo / wrapper).write_text('#!/bin/sh\nexec pytest "$@"\n')
+    (repo / wrapper).chmod(0o755)
+    git(repo, "add", wrapper)
+    git(repo, "commit", "-q", "-m", "A test wrapper")
+    assert says in prompt_text(repo, tmp_path)
+
+
+def test_review_prompt_names_no_wrapper_a_repo_lacks(repo, tmp_path):
+    build_state(repo, "start")
+    prompt = prompt_text(repo, tmp_path)
+    assert "./t FILES" not in prompt and "bin/pytest -n0" not in prompt
+
+
+def test_review_prompt_sends_a_long_run_through_bgrun_not_quick(repo, tmp_path):
+    build_state(repo, "start")
+    prompt = prompt_text(repo, tmp_path)
+    assert "bgrun" in prompt and "waitone" in prompt, prompt
+
+
+def test_review_prompt_names_no_wrapper_that_isnt_executable(repo, tmp_path):
+    build_state(repo, "start")
+    (repo / "t").write_text("not a script\n")
+    git(repo, "add", "t")
+    git(repo, "commit", "-q", "-m", "A file named t")
+    assert "./t FILES" not in prompt_text(repo, tmp_path)
+
+
+def test_review_prompt_says_t_runs_its_files_in_one_process(repo, tmp_path):
+    build_state(repo, "start")
+    (repo / "t").write_text("#!/bin/sh\n")
+    (repo / "t").chmod(0o755)
+    git(repo, "add", "t")
+    git(repo, "commit", "-q", "-m", "A test wrapper")
+    assert "`./t FILES`, which runs them in one process" in prompt_text(repo, tmp_path)

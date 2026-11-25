@@ -81,5 +81,7 @@ Run `build-state refactor` to record the **refactor base**, once the spec fixes 
 ## 7. Report
 
 Tell the user: the commits, the findings you skipped and why, and any new entries in `uncertainties.md`.
+For a change to text that people or agents read, quote the old and new lines.
+Reason: a report that said a skill's reply "no longer shows the delete command" left the user asking twice what had been removed, until the old and new lines were quoted.
 
 A change the user then asks for to these commits before they land is a `fixup!` of the commit it changes, made in a build of its own.

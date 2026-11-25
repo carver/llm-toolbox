@@ -9,13 +9,14 @@ without the body, so a to-do list split between them reads as two partial lists.
 `show` prints every item in one place; `tick` checks one off where it lives; `open`
 prints every open issue's open items, leaving out pull requests and ticked items.
 `open --titles` prints one line per open issue instead: its number, its title, how
-many open items it has, if any, and who claims it, if anyone. That is enough to find
-an issue by its subject, and to see which ones another session holds.
+many open items and sub-issues it has, if any, and who claims it, if anyone. That is
+enough to find an issue by its subject, and to see which ones another session holds.
 `unticked N...` prints each unticked item as `#N TEXT`, one a line, for a script:
 wt-ship lists them for each issue a landing closes.
 
     issue-todo open
     issue-todo open --titles          # "#16 Site design (3 open items) [claimed by f3f9b997]"
+                                      # "#142 Targets (5 sub-issues, 0 closed)"
     issue-todo show 42
     issue-todo read 42 43             # body and every comment, which gh splits in two
     issue-todo unticked 42 43         # each unticked item, as "#42 TEXT", one a line
@@ -33,10 +34,16 @@ and writes that body or comment back, unless it changed since it was read. No ma
 or several, writes nothing and lists the candidates. It calls `gh`, so it acts as
 gh's logged-in user, in the current directory's repo unless --repo names one.
 
-`show` and `read` end with a `--- mentions` section: each issue or pull request of the
-repo that the issue mentions as `#N` outside code, in order, with its state, its count
-of open items and its title, such as `#25 open, 1 open item: Agents offer to post`. One
-GraphQL call fetches them all, so a plan issue tells which of its steps are done.
+`show` and `read` end with the issue's relatives, each section only when it has a line:
+`--- parent`, the issue it is a sub-issue of; `--- sub-issues`, in GitHub's order; and
+`--- mentions`, each other issue or pull request of the repo that it mentions as `#N`
+outside code, in order. Each line gives the state, the count of open items, the title
+and any standing claim, such as
+`#25 open, 1 open item: Agents offer to post [claimed by f0436b8b]`; one in another
+repo is `OWNER/REPO#N state: title`, and a parent there just `OWNER/REPO#N`. No issue
+is listed twice. One GraphQL call fetches
+them all, and only an issue with sub-issues costs one REST call more, so a plan issue
+tells which of its steps are done.
 
 `claim` and `release` keep a claim in the issue's comments, each with a hidden marker
 `<!-- issue-todo claim ID -->` (or `release`), so two sessions don't both take one
@@ -177,7 +184,7 @@ def show(repo: str, number: int) -> int:
         print(part.label)
         for i, item in enumerate(listed, 1):
             print(f"  [{'x' if item.done else ' '}] {i}  {short(item.text)}")
-    print_mentions(repo, issue["number"], found)
+    print_related(repo, issue, found)
     return 0
 
 
@@ -194,10 +201,11 @@ def mentions(markdown: str) -> list[int]:
     return list(dict.fromkeys(int(n) for n in MENTION.findall(prose(markdown))))
 
 
-def mentioned(repo: str, numbers: list[int]) -> list[str] | None:
+def lookup(repo: str, numbers: list[int]) -> dict[int, str] | None:
     """A line for each of `numbers` that names an issue or pull request in `repo`: its
-    state, its open items if it has any, and its title. One GraphQL call fetches them
-    all. None when the call fails; a number that names nothing is left out."""
+    state, its open items if it has any, its title, and the claims standing on it. One
+    GraphQL call fetches them all. None when the call fails; a number that names
+    nothing is left out."""
     owner, name = repo.split("/", 1)
     fields = "state title body comments(first: 100) { nodes { body } }"
     asked = " ".join(
@@ -212,37 +220,86 @@ def mentioned(repo: str, numbers: list[int]) -> list[str] | None:
         found = json.loads(out)["data"]["repository"]
     except (ValueError, KeyError, TypeError):
         return None
-    lines = []
+    lines = {}
     for n in numbers:
         node = found.get(f"m{n}")
         if not node:
             continue
-        texts = [node.get("body") or ""] + [
-            c.get("body") or "" for c in node["comments"]["nodes"]
-        ]
+        comments = [c.get("body") or "" for c in node["comments"]["nodes"]]
+        texts = [node.get("body") or ""] + comments
         n_open = sum(not item.done for text in texts for item in items(text))
         count = f", {n_open} open item{'s' if n_open > 1 else ''}" if n_open else ""
-        lines.append(f"#{n} {node['state'].lower()}{count}: {node['title']}")
+        lines[n] = (
+            f"#{n} {node['state'].lower()}{count}: {node['title']}"
+            f"{claimed_by(comments)}"
+        )
     return lines
 
 
-def print_mentions(repo: str, number: int, found: list[Part]) -> None:
-    """The issues and pull requests that `found` mentions, under `--- mentions`."""
-    numbers = [
-        n for n in mentions("\n".join(part.markdown for part in found)) if n != number
+def repo_of(api_url: str) -> str:
+    """`OWNER/REPO` of a REST URL such as `https://api.github.com/repos/o/r/issues/4`."""
+    return "/".join(api_url.split("/repos/", 1)[1].split("/")[:2])
+
+
+def sub_issues(repo: str, issue: dict) -> list[dict]:
+    """The issue's sub-issues, in GitHub's order. Its summary says how many, so an
+    issue with none costs no call."""
+    number = issue["number"]
+    if not (issue.get("sub_issues_summary") or {}).get("total"):
+        return []
+    out = gh(
+        "api", "--paginate", f"repos/{repo}/issues/{number}/sub_issues", check=False
+    )
+    try:
+        return json.loads(out)
+    except ValueError:
+        print(f"issue-todo: couldn't list #{number}'s sub-issues", file=sys.stderr)
+        return []
+
+
+def print_related(repo: str, issue: dict, found: list[Part]) -> None:
+    """The issue's parent, its sub-issues, and the issues and pull requests `found`
+    mentions, each under its own heading, with no issue listed twice. One GraphQL call
+    looks up all of them in `repo`; one elsewhere gets the line REST gave."""
+    number = issue["number"]
+    parent_url = issue.get("parent_issue_url") or ""
+    parent = int(parent_url.rsplit("/", 1)[1]) if parent_url else None
+    parent_here = parent if parent and repo_of(parent_url) == repo else None
+    subs = sub_issues(repo, issue)
+    family = [parent_here] if parent_here else []
+    family += [s["number"] for s in subs if repo_of(s["repository_url"]) == repo]
+    mention = [
+        n
+        for n in mentions("\n".join(part.markdown for part in found))
+        if n != number and n not in family
     ]
-    if not numbers:
-        return
-    lines = mentioned(repo, numbers)
+    asked = family + mention
+    lines = lookup(repo, asked) if asked else {}
     if lines is None:
         print(
-            f"issue-todo: couldn't look up the issues #{number} mentions; "
+            f"issue-todo: couldn't look up the issues #{number} mentions, its parent "
+            "or its sub-issues; "
             "`gh auth status` checks gh's login, and the issue above is complete",
             file=sys.stderr,
         )
-    elif lines:
+        lines = {}
+    if parent:
+        print("--- parent")
+        prefix = "" if parent_here else repo_of(parent_url)
+        print(lines.get(parent, f"{prefix}#{parent}"))
+    if subs:
+        print("--- sub-issues")
+        for s in subs:
+            elsewhere = repo_of(s["repository_url"])
+            fallback = f"#{s['number']} {s['state']}: {s['title']}"
+            if elsewhere != repo:
+                print(elsewhere + fallback)
+            else:
+                print(lines.get(s["number"], fallback))
+    shown = [lines[n] for n in mention if n in lines]
+    if shown:
         print("--- mentions")
-        print("\n".join(lines))
+        print("\n".join(shown))
 
 
 def read(repo: str, numbers: list[int]) -> int:
@@ -259,7 +316,7 @@ def read(repo: str, numbers: list[int]) -> int:
         for part in found[1:]:
             print(f"--- {part.label}")
             print(part.markdown.rstrip())
-        print_mentions(repo, issue["number"], found)
+        print_related(repo, issue, found)
     return 0
 
 
@@ -451,7 +508,15 @@ def show_titles(repo: str) -> int:
     for issue in open_issues(repo):
         found = issue_parts(repo, issue)
         n = sum(not item.done for part in found for item in items(part.markdown))
-        count = f" ({n} open item{'s' if n > 1 else ''})" if n else ""
+        counts = [f"{n} open item{'s' if n > 1 else ''}"] if n else []
+        summary = issue.get("sub_issues_summary") or {}
+        if summary.get("total"):
+            total = summary["total"]
+            counts.append(
+                f"{total} sub-issue{'s' if total > 1 else ''}, "
+                f"{summary.get('completed', 0)} closed"
+            )
+        count = f" ({'; '.join(counts)})" if counts else ""
         who = claimed_by([part.markdown for part in found[1:]])
         print(f"#{issue['number']} {issue['title']}{count}{who}")
     return 0

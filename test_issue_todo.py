@@ -101,6 +101,7 @@ class FakeGh:
         }
         # The open issues as GraphQL's `issues(states: OPEN)` serves them, page by page.
         self.open_pages = [[]]
+        self.sub_issues = []  # issue 7's, as REST's issues/7/sub_issues lists them
         self.graphql_fails = False
         self.patched = []
         self.calls = []
@@ -141,6 +142,8 @@ class FakeGh:
             return json.dumps(self.issue)
         if path.endswith("/issues/7/comments"):
             return json.dumps(self.comments)
+        if path.endswith("/issues/7/sub_issues"):
+            return json.dumps(self.sub_issues)
         if "/issues?" in path:
             return json.dumps(self.listing)
         if path.endswith("/comments"):
@@ -623,3 +626,154 @@ def test_claims_reads_all_comments_of_an_issue_with_more_than_graphql_served(
 
     assert capsys.readouterr().out == "#7  late0001  4h  Long thread\n"
     assert fake.calls[-1][-1] == "repos/owner/repo/issues/7/comments"
+
+
+SUB_ISSUES = [  # issue 7's sub-issues, as GitHub's REST API lists them
+    {
+        "number": 25,
+        "title": "Agents offer to post",
+        "state": "open",
+        "repository_url": "https://api.github.com/repos/owner/repo",
+    },
+    {
+        "number": 46,
+        "title": "A beta stamp",
+        "state": "closed",
+        "repository_url": "https://api.github.com/repos/owner/repo",
+    },
+    {
+        "number": 3,
+        "title": "Upstream fix",
+        "state": "open",
+        "repository_url": "https://api.github.com/repos/else/where",
+    },
+]
+
+
+@pytest.fixture
+def family(fake):
+    """Issue 7 with parent 48 and the sub-issues above; 25 is claimed."""
+    fake.issue |= {
+        "sub_issues_summary": {"total": 3, "completed": 1, "percent_completed": 33},
+        "parent_issue_url": "https://api.github.com/repos/owner/repo/issues/48",
+    }
+    fake.sub_issues = SUB_ISSUES
+    fake.others[25]["comments"]["nodes"].append(
+        {"body": "Taking this.\n<!-- issue-todo claim f0436b8b -->"}
+    )
+    return fake
+
+
+@pytest.mark.parametrize("command", ["show", "read"])
+def test_an_issue_lists_its_parent_and_each_sub_issue_with_state_items_title_and_claim(
+    family, capsys, command
+):
+    assert tool.main([command, "7"]) == 0
+
+    out = capsys.readouterr().out
+    assert out.endswith(
+        "--- parent\n"
+        "#48 open: No items\n"
+        "--- sub-issues\n"
+        "#25 open, 2 open items: Agents offer to post [claimed by f0436b8b]\n"
+        "#46 closed: A beta stamp\n"
+        "else/where#3 open: Upstream fix\n"
+    )
+    graphql = [a for a in family.calls if a[:2] == ("api", "graphql")]
+    assert len(graphql) == 1  # the parent and this repo's sub-issues in one call
+
+
+def test_a_mentioned_sub_issue_or_parent_is_listed_once_and_the_mentions_follow(
+    family, capsys
+):
+    family.issue["body"] = "See #48, #25 and #7."
+    family.others[9] = {
+        "state": "OPEN",
+        "title": "Only mentioned",
+        "body": "",
+        "comments": {"nodes": [{"body": "<!-- issue-todo claim abc12345 -->"}]},
+    }
+    family.issue["body"] += " Also #9."
+
+    assert tool.main(["read", "7"]) == 0
+
+    out = capsys.readouterr().out
+    assert out.count("#25 open") == 1 and out.count("#48 open") == 1
+    assert out.endswith("--- mentions\n#9 open: Only mentioned [claimed by abc12345]\n")
+
+
+def test_sub_issues_are_read_through_every_page(family):
+    assert tool.main(["read", "7"]) == 0
+    (listing,) = [a for a in family.calls if a[-1].endswith("/issues/7/sub_issues")]
+    assert "--paginate" in listing
+
+
+def test_open_titles_counts_each_parents_sub_issues_and_how_many_are_closed(
+    fake, capsys
+):
+    fake.listing = [
+        {
+            "number": 142,
+            "title": "Targets",
+            "body": "",
+            "comments": 0,
+            "sub_issues_summary": {"total": 5, "completed": 0, "percent_completed": 0},
+        },
+        {
+            "number": 16,
+            "title": "Site design",
+            "body": "- [ ] a\n- [ ] b\n- [ ] c",
+            "comments": 0,
+            "sub_issues_summary": {"total": 5, "completed": 2, "percent_completed": 40},
+        },
+        {
+            "number": 8,
+            "title": "Plain",
+            "body": "",
+            "comments": 0,
+            "sub_issues_summary": {"total": 0, "completed": 0, "percent_completed": 0},
+        },
+    ]
+
+    assert tool.main(["open", "--titles"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "#142 Targets (5 sub-issues, 0 closed)",
+        "#16 Site design (3 open items; 5 sub-issues, 2 closed)",
+        "#8 Plain",
+    ]
+
+
+def test_a_failed_lookup_still_lists_the_parent_and_sub_issues_from_rest(
+    family, capsys
+):
+    family.graphql_fails = True
+
+    assert tool.main(["read", "7"]) == 0
+
+    assert capsys.readouterr().out.endswith(
+        "--- parent\n"
+        "#48\n"
+        "--- sub-issues\n"
+        "#25 open: Agents offer to post\n"
+        "#46 closed: A beta stamp\n"
+        "else/where#3 open: Upstream fix\n"
+    )
+
+
+def test_a_failed_sub_issue_listing_warns_and_reads_the_next_issue(
+    family, monkeypatch, capsys
+):
+    def failing(*args, stdin=None, check=True):
+        if args[-1].endswith("/sub_issues"):
+            assert not check, "a failed listing would end the command"
+            return ""
+        return family(*args, stdin=stdin, check=check)
+
+    monkeypatch.setattr(tool, "gh", failing)
+
+    assert tool.main(["read", "7"]) == 0
+
+    captured = capsys.readouterr()
+    assert "--- sub-issues" not in captured.out and "--- parent" in captured.out
+    assert "couldn't list #7's sub-issues" in captured.err

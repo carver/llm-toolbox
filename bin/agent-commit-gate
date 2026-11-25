@@ -179,8 +179,10 @@ Bash tool kills a call at its time limit and the check can wait minutes; it name
 the `bgrun --wait` background call to use instead. The repo says so through an
 executable `commit-needs-queue` beside its hooks, run in the commit's directory with
 no stdin: exit 0 means the check will queue, anything else, or a run past 5 s, that
-it won't, so a broken predictor never blocks a commit. A repo without one is
-untouched. filedrawer's runs its checks-needed on the paths that differ from HEAD.
+it won't, so a broken predictor never blocks a commit. It gets CHECK_BASE as the
+commit's check would, the nearest commit that passed it, or none, when every check
+runs. A repo without one is untouched. filedrawer's runs its checks-needed on the
+paths that differ from that base.
 
     agent-commit-gate --install REPO...    # add the lines to each repo's hooks
     agent-commit-gate --run HOOK           # as the pre-commit line calls it
@@ -198,7 +200,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, chdir, contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -1390,11 +1392,15 @@ def check_will_queue(directory):
     predictor = hooks / PREDICTOR_NAME if hooks else None
     if predictor is None or not predictor.is_file():
         return False
+    env = {k: v for k, v in os.environ.items() if k != "CHECK_BASE"}
+    if base := predicted_base(directory, hooks):
+        env["CHECK_BASE"] = base
     try:
         # A group of its own, so a timeout stops what it started too.
         proc = subprocess.Popen(
             [str(predictor)],
             cwd=directory,
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1409,6 +1415,24 @@ def check_will_queue(directory):
             os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
         return False
+
+
+def predicted_base(directory, hooks):
+    """The CHECK_BASE a commit's check in the repo at `directory` would get: the
+    nearest first-parent commit whose tree passed the agent check or the commit
+    check, as their bytes are now (check_base); None when there's none, and then
+    every check runs."""
+    # The records live in the repo's git dir, found from the current directory.
+    with chdir(directory):
+        checks = [
+            Check.at(str(hooks / name), name, record)
+            for name, record in (
+                (HOOK_NAME, passrecord.PASS_RECORD),
+                (COMMIT_CHECK_NAME, passrecord.COMMIT_CHECK_RECORD),
+            )
+            if (hooks / name).is_file()
+        ]
+        return check_base(checks) if checks else None
 
 
 def has_agent_check(directory):

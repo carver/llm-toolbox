@@ -2527,3 +2527,24 @@ def test_a_predictor_past_its_time_limit_says_no_and_leaves_nothing_running(
     predicting(repo, "sleep 30 &\nsleep 30\nexit 0")
     code, _ = hook_on(repo, monkeypatch, capsys, "git commit -q -m x")
     assert code == 0
+
+
+def test_the_predictor_gets_the_base_the_check_would(installed, monkeypatch, capsys):
+    # The commit check diffs against the nearest commit that passed it, as CHECK_BASE.
+    assert commit(installed).returncode == 0
+    passed = git(installed, "rev-parse", "HEAD").stdout.strip()
+    seen = installed / "seen-base"
+    predicting(installed, f'echo "${{CHECK_BASE-unset}}" > {seen}\nexit 1')
+    hook_on(installed, monkeypatch, capsys, "git commit -q -m x")
+    assert seen.read_text().strip() == passed
+
+
+def test_with_no_commit_that_passed_the_predictor_gets_no_base(
+    installed, monkeypatch, capsys
+):
+    # A CHECK_BASE the session inherited is no base of this repo's check.
+    monkeypatch.setenv("CHECK_BASE", "0" * 40)
+    seen = installed / "seen-base"
+    predicting(installed, f'echo "${{CHECK_BASE-unset}}" > {seen}\nexit 1')
+    hook_on(installed, monkeypatch, capsys, "git commit -q -m x")
+    assert seen.read_text().strip() == "unset"

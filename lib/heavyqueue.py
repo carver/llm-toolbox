@@ -10,10 +10,10 @@ holder once its cores have stayed under half busy at every sample for
 HEAVY_QUIET_SECONDS, or at the first sample when it arrived to a free lane with nobody
 waiting.
 
-A `--quick` job, seconds of work, runs at once outside the queue, taking no slot, when
-its lane's cores have averaged under HEAVY_QUICK_BUSY busy for HEAVY_QUICK_SECONDS and
-SHARE_MEMORY is free (Lull); otherwise it joins the queue's front, keeps watching, and
-starts at its first quiet sample once it heads the lane.
+A `--quick` job, seconds of work, runs at once outside the queue, taking no slot, at
+nice SHARE_NICE, when its lane's cores have averaged under HEAVY_QUICK_BUSY busy for
+HEAVY_QUICK_SECONDS and SHARE_MEMORY is free (Lull); otherwise it joins the queue's
+front, keeps watching, and starts at its first quiet sample once it heads the lane.
 
 A waiter that asks to (`--share`) starts beside the holder, as its lane's sharer,
 when the share slot is free, the holder doesn't run `--alone`, 4 GiB of memory are
@@ -526,14 +526,16 @@ class Lull:
 
     def job(self):
         """The Job of a run outside the queue: on the lane's cores, cargo's jobs to
-        match, first in line for the OOM killer, and a HEAVY_SLOT that names this
-        heavy, so a heavy inside it runs at once."""
+        match, at nice SHARE_NICE and first in line for the OOM killer, as a sharer
+        is, and a HEAVY_SLOT that names this heavy, so a heavy inside it runs at once.
+        Niced even when no job holds the lane now, since one may take it while this
+        runs, and only root can undo a nice."""
         cpus = lane_cores(self.lane, self.cpus)
         env = os.environ | {
             "HEAVY_SLOT": OUTSIDE + Holder.mine().line().strip(),
             "CARGO_BUILD_JOBS": str(len(cpus)),
         }
-        return Job(cpus, env, expendable=True)
+        return Job(cpus, env, nice=SHARE_NICE, expendable=True)
 
 
 class Bid:

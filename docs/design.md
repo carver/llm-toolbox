@@ -80,6 +80,13 @@ every session's full checks, sometimes tens of minutes.
   job shouldn't wait 10 s of quiet.
 - One that runs past 60 s hears, as it ends, to drop `--quick` for runs like it; a
   warning only.
+- Since 2026-11-24, a run outside the queue is niced to 10, as a sharer is, even on a
+  free lane, since a holder may take the lane while it runs and only root can undo a
+  nice. That day a ten-worker pytest, most likely a `--quick` run admitted while a
+  filedrawer landing sat between phases, ran beside the landing's nextest at full
+  priority for 12 minutes, and a test with nextest's 180 s limit ran past it (#8).
+  The owner picked this over running landings `--alone`, which would hold every
+  session's `--quick` runs behind each landing.
 - heavy-gate lets `heavy --quick -- CMD` run as a foreground Bash call only when the
   call's own timeout is 600000 ms, the tool's longest. Its wait for the running job
   can pass the tool's default limit of two minutes, and the call is then killed

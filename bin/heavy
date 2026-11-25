@@ -28,8 +28,10 @@ A --quick job is seconds of work, such as a few tests after an edit, marked so o
 trust. heavy first watches the normal lane's cores for HEAVY_QUICK_SECONDS. When they
 average under HEAVY_QUICK_BUSY busy and 4 GiB of memory are free, CMD runs at once,
 outside the queue, whether or not a job holds the lane, unless that job runs --alone:
-it takes no slot and joins no queue, and runs on the normal lane's cores, first in
-line for the OOM killer.
+it takes no slot and joins no queue, and runs on the normal lane's cores at nice 10,
+as a sharer does, so a holder keeps most of any core both want, and first in line for
+the OOM killer. It's niced even on a free lane, since a job may take the lane while it
+runs. A --quick job that takes the slot runs as any holder does, at full priority.
 Otherwise it joins the queue's front, as wt-ship's job does, and keeps watching at
 each poll: once the cores have averaged that quiet over the window, it leaves the
 queue and runs outside it. Heading the lane with the slot free, it starts at the

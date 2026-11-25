@@ -1693,8 +1693,8 @@ def test_a_waiter_whose_fit_flickers_still_passes_a_stuck_one(
 
 
 def env_report(tmp_path, name):
-    """A command that writes its HEAVY_SLOT (or `unset`), CARGO_BUILD_JOBS, cores and
-    oom_score_adj to a file, then exits."""
+    """A command that writes its HEAVY_SLOT (or `unset`), CARGO_BUILD_JOBS, cores,
+    oom_score_adj and nice to a file, then exits."""
     out = tmp_path / f"{name}.report"
     script = tmp_path / f"{name}.py"
     script.write_text(
@@ -1704,6 +1704,7 @@ def env_report(tmp_path, name):
         "    'jobs': os.environ.get('CARGO_BUILD_JOBS'),\n"
         "    'cores': sorted(os.sched_getaffinity(0)),\n"
         "    'oom': int(pathlib.Path('/proc/self/oom_score_adj').read_text()),\n"
+        "    'nice': os.nice(0),\n"
         "}\n"
         f"pathlib.Path({str(out)!r}).write_text(json.dumps(report))\n"
     )
@@ -1745,6 +1746,22 @@ def test_a_quick_job_on_quiet_cores_runs_at_once_beside_the_holder(
     assert entries(tmp_path) == []
     ran = report(out)
     assert (ran["jobs"], ran["cores"], ran["oom"]) == (str(len(CPUS)), CPUS, 1000)
+    # Niced as a sharer is, so the holder keeps the cores both want.
+    assert ran["nice"] == max(BASE_NICE, 10)
+
+
+def test_a_quick_job_outside_the_queue_on_a_free_lane_is_niced_too(box, memory):
+    # A holder may take the lane while it runs, and only root can undo a nice.
+    tmp_path, busy, env = box
+    set_busy(busy, "0.1")
+    quick, out = env_report(tmp_path, "quick")
+
+    done = heavy(env, "--quick", "--", *quick)
+
+    assert done.returncode == 0, done.stderr
+    ran = report(out)
+    assert ran["slot"].startswith("outside "), "it ran outside the queue"
+    assert ran["nice"] == max(BASE_NICE, 10)
 
 
 def test_a_heavy_inside_a_quick_run_outside_the_queue_runs_at_once(
@@ -1837,7 +1854,9 @@ def test_a_quick_job_at_the_head_starts_at_the_first_quiet_sample(
     status, _, err = finish(q)
 
     assert status == 0, err
-    assert report(out)["slot"].split()[0] == "s-test", "it took the slot"
+    ran = report(out)
+    assert ran["slot"].split()[0] == "s-test", "it took the slot"
+    assert ran["nice"] == BASE_NICE, "a holder runs at full priority"
 
 
 def test_a_waiting_quick_job_runs_once_the_cores_go_quiet(box, background, memory):

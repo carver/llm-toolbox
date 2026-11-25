@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""A Claude Code PreToolUse hook that refuses a Bash command piping git commit, wt-ship or
-bgrun --wait into another command, or piping a check and then committing.
+"""A Claude Code PreToolUse hook that refuses a Bash command piping git commit, wt-ship,
+conflicts --continue or bgrun --wait into another command, or piping a check and then
+committing.
 
-A pipeline exits with its last command's status. In `git commit -q -F MSG 2>&1 | tail -2`
-that's tail's, so a commit its hook refused reads as a success, and the agent builds on
-a commit that doesn't exist. wt-ship's landing can fail unseen the same way, and so can
-whatever `bgrun --wait` runs, since bgrun exits with its command's status. The refusal
-says to drop the pipe, since bgrun --wait prints the log's last lines itself and git
-commit prints a few lines. To filter the output anyway, put `set -o pipefail;` first and
-pipe into tail, not head, whose early exit can fail the command; or redirect to a file
-and read it in the next call. install.py registers it in ~/.claude/settings.json.
+A pipeline exits with its last command's status. In `git commit -q -F MSG 2>&1 | tail
+-2` that's tail's, so a commit its hook refused reads as a success, and the agent builds
+on a commit that doesn't exist. wt-ship's landing can fail unseen the same way, and so
+can `conflicts --continue`, which finishes a rebase wt-ship stopped (run in the wrong
+folder, it refused, and the wt-ship chained after it ran anyway), and whatever `bgrun
+--wait` runs, since bgrun exits with its command's status. `conflicts` listing or
+resolving hunks records nothing and passes. The refusal says to drop the pipe, since
+bgrun --wait prints the log's last lines itself and git commit prints a few lines. To
+filter the output anyway, put `set -o pipefail;` first and pipe into tail, not head,
+whose early exit can fail the command; or redirect to a file and read it in the next
+call. install.py registers it in ~/.claude/settings.json.
 
 A command is piped when `|` or `|&` follows it, or follows a compound command around
 it: ( ... ), { ...; }, if ... fi, case ... esac, or a for, while, until or select
@@ -32,7 +36,8 @@ the command of `heavy --`, `uv run` or uvx, or as python -m pytest or unittest),
 test, nextest, clippy, check, build or mutants, ruff check, mutate-check,
 agent-pre-commit, agent-quick-check, pre-commit, pre-commit-run, npm or make test or
 check, or ./t; one asked for its help, its version or --collect-only decides nothing
-and is none. What records is git commit, wt-ship or `build-state finish`, also under
+and is none. What records is git commit, wt-ship, `conflicts --continue` or
+`build-state finish`, also under
 bgrun, joined by `&&` or `;` alike. Any other piped command before a commit passes
 (`git diff --cached --stat | tail -5 && git commit ...`), and so do a check whose
 pipeline has pipefail on and a script that reads PIPESTATUS. Only the script's own
@@ -171,9 +176,9 @@ def check_name(words: list[str]) -> str | None:
 
 
 def record_name(words: list[str]) -> str | None:
-    """What one simple command records a result with, or None: git commit, wt-ship
-    or build-state finish, also as the command bgrun runs, not asked for help or a
-    dry run."""
+    """What one simple command records a result with, or None: git commit, wt-ship,
+    conflicts --continue or build-state finish, also as the command bgrun runs, not
+    asked for help or a dry run."""
     words, _ = command_of(words)
     if not words:
         return None
@@ -183,6 +188,8 @@ def record_name(words: list[str]) -> str | None:
         return record_name(parsed[1]) if parsed else None
     if name == "wt-ship":
         return None if asks_help(args) else "wt-ship"
+    if name == "conflicts":
+        return "conflicts --continue" if continues(args) else None
     if name == "build-state":
         finishes = args[:1] == ["finish"] and not asks_help(args[1:])
         return "build-state finish" if finishes else None
@@ -214,8 +221,8 @@ def hidden_failures(
     command: str, pipefail: bool = False, hidden: bool = False
 ) -> list[str]:
     """The names of the commands in ``command`` whose failure a pipe hides, in the order
-    they come. ``pipefail``: on as the script starts. ``hidden``: the script's own output
-    goes into a pipe that hides its status."""
+    they come. ``pipefail``: on as the script starts. ``hidden``: the script's own
+    output goes into a pipe that hides its status."""
     cleaned, substitutions, heredocs = prepare(command)
     found = []
     for simple in commands(cleaned):
@@ -267,10 +274,18 @@ def judge(words: list[str], hidden: bool, pipefail: bool) -> list[str]:
         return []
     if name == "wt-ship":
         return [] if asks_help(args) else ["wt-ship"]
+    if name == "conflicts":
+        return ["conflicts --continue"] if continues(args) else []
     commit = commit_args(args) if name == "git" else None
     if commit is None or asks_help(commit) or "--dry-run" in commit:
         return []
     return ["git commit"]
+
+
+def continues(args: list[str]) -> bool:
+    """Whether conflicts' arguments finish the stopped operation: --continue first, or
+    a prefix of it, which argparse takes, since it is conflicts' only --c option."""
+    return bool(args) and len(args[0]) > 2 and "--continue".startswith(args[0])
 
 
 def asks_help(args: list[str]) -> bool:

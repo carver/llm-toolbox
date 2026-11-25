@@ -617,12 +617,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   main session's stop never runs it. State is kept per session and subagent
   under `${XDG_STATE_HOME:-~/.local/state}/subagent-wait-gate/`, for a week.
 - **pipe-status-gate**: a Claude Code hook, which `install.py` registers, that
-  refuses a Bash command piping `git commit`, `wt-ship` or `bgrun --wait` into
-  another command. A pipeline exits with its last command's status, so in
-  `git commit -q -F MSG 2>&1 | tail -2` a commit its hook refused reads as a
-  success: an agent built on a commit that didn't exist that way. A pipe after
-  a compound command around one, as in `( ... ) | tail` or a loop's `done |
-  tail`, counts too. A command passes when pipefail is on for its pipeline,
+  refuses a Bash command piping `git commit`, `wt-ship`, `conflicts --continue` or
+  `bgrun --wait` into another command. A pipeline exits with its last command's
+  status, so in `git commit -q -F MSG 2>&1 | tail -2` a commit its hook refused
+  reads as a success: an agent built on a commit that didn't exist that way. A
+  pipe after a compound command around one, as in `( ... ) | tail` or a loop's
+  `done | tail`, counts too. A command passes when pipefail is on for its pipeline,
   from a `set -o pipefail` earlier in its script and outside any compound
   command, and so do help as the first argument (`wt-ship -h | head`), `git
   commit --dry-run`, a pipe into `git commit`, `||`, and a `|` in quotes, a
@@ -634,8 +634,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   | tail -3 && git commit ...`: a failing test got into a commit that way. A
   check is pytest, a cargo test, build or lint, `ruff check`, mutate-check, the
   commit checks and a few more its `-h` lists, as the command itself and not a
-  word among its arguments; what records is `git commit`, `wt-ship` or
-  `build-state finish`. A script that reads `PIPESTATUS` passes.
+  word among its arguments; what records is `git commit`, `wt-ship`,
+  `conflicts --continue` or `build-state finish`. A script that reads
+  `PIPESTATUS` passes.
 - **gh-body-gate**: a Claude Code hook, which `install.py` registers, that
   refuses a `gh issue` or `gh pr` `create`, `comment` or `edit` whose body
   `slop-lint` flags, before the text is public, with slop-lint's lines and the

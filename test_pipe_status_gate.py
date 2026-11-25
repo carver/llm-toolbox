@@ -1,5 +1,5 @@
-"""bin/pipe-status-gate: which Bash commands piping git commit, wt-ship or bgrun --wait it
-refuses, and what it lets through."""
+"""bin/pipe-status-gate: which Bash commands piping git commit, wt-ship, conflicts
+--continue or bgrun --wait it refuses, and what it lets through."""
 
 import json
 import subprocess
@@ -94,6 +94,18 @@ PIPED = [
     ("if true; then case $x in a) :;; esac; git commit -m x; fi | tail", "git commit"),
     ("( case $x in a) :;; esac; git commit -m x ) | tail", "git commit"),
     ("wt-ship --dry-run | tail", "wt-ship"),
+    # The rebase's status, which a wt-ship after it builds on.
+    (
+        (
+            "conflicts --continue 2>&1 | tail -3 && bgrun --wait -o log -- wt-ship -C"
+            " ../x --local --remove"
+        ),
+        "conflicts --continue",
+    ),
+    ("cd ../wt && conflicts --continue | tail", "conflicts --continue"),
+    # argparse takes a prefix of an option, and --continue is conflicts' only --c one.
+    ("conflicts --cont | tail", "conflicts --continue"),
+    ("conflicts --c 2>&1 | tail -3", "conflicts --continue"),
 ]
 
 
@@ -122,6 +134,11 @@ def test_the_refusal_says_why_and_what_to_do_in_two_lines():
         "git commit -q -F msg",
         "bgrun --wait -o log -- git commit -q -F msg",
         "wt-ship -C ../x --local --remove",
+        "conflicts --continue",
+        # Listing or resolving hunks records nothing.
+        "conflicts a.py | head",
+        "conflicts a.py all ours b.md 1 theirs | tail",
+        "conflicts -h | head",
         "git commit -m 'a | b'",
         'git commit -m "x | tail"',
         "git commit -m $'a | b'",
@@ -237,6 +254,8 @@ CHECK_THEN_RECORD = [
         "agent-quick-check",
         "git commit",
     ),
+    ("pytest -q | tail && conflicts --continue", "pytest", "conflicts --continue"),
+    ("pytest -q | tail && conflicts --cont", "pytest", "conflicts --continue"),
 ]
 
 

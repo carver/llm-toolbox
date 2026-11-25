@@ -20,8 +20,8 @@ In order, it:
    WT_SHIP_CI_TIMEOUT seconds, or anything else going wrong, and it says nothing;
 2. fetches the remote, and when HEAD lacks REMOTE/BRANCH or holds fixup! commits,
    rebases onto it, folding them (autosquash). A conflict stops it with the rebase in
-   progress: resolve the hunks (`conflicts -h`), finish with `conflicts --continue`,
-   then run it again;
+   progress, and the message names the worktree: there, resolve the hunks
+   (`conflicts -h`) and finish with `conflicts --continue`, then run wt-ship again;
 3. refuses leftover conflict markers in what it would push, and a commit message that
    names, by its ID, a commit the branch doesn't hold, as when a message cites an
    earlier commit of the same landing, whose ID a rebase changes: a word of 7 to 64
@@ -263,12 +263,15 @@ def rebase(upstream, mode):
         check=False,
     )
     if run.returncode != 0:
+        # Named, since conflicts run in any other folder finds nothing to continue.
+        here = os.path.realpath(out("rev-parse", "--show-toplevel"))
         raise Stop(
             f"{run.stdout}{run.stderr}".rstrip()
-            + f"\nThe rebase onto {upstream} hit a conflict and is still in progress."
-            "\nResolve each hunk (`conflicts FILE`, `conflicts -h`), then"
-            " `conflicts --continue`, which refuses while any marker is left,"
-            f" then run `{RERUN}` again."
+            + f"\nThe rebase onto {upstream} hit a conflict and is still in progress"
+            f" in {here}."
+            f"\nIn {here}, resolve each hunk (`conflicts FILE`, `conflicts -h`), then"
+            " run `conflicts --continue`, which refuses while any marker is left;"
+            f" then, from where you started, run `{RERUN}` again."
         )
 
 

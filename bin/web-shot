@@ -4,9 +4,9 @@
 # ///
 """Open a web page in headless Chromium, drive it, take screenshots and report its JavaScript errors.
 
-    web-shot [options] [--do ACTION ...] PAGE
+    web-shot [options] [--do ACTION ...] PAGE...
 
-PAGE is a URL or a local file path.
+PAGE is a URL or a local file path, which may end in a #fragment.
 
 Actions (--do, repeatable, run in order once the page has loaded):
   click SELECTOR         click the first element matching a CSS selector
@@ -16,6 +16,8 @@ Actions (--do, repeatable, run in order once the page has loaded):
   shot NAME [SELECTOR]   screenshot to OUT/NAME.png: the matching element, else the full page;
                          an element's shot covers what its children draw outside it, such as
                          a badge hung over its corner, unless it hides their overflow
+  view NAME              screenshot to OUT/NAME.png of what the viewport shows now: the first
+                         screen, when nothing has scrolled the page
   text [SELECTOR]        print the visible text of the matching element, else the whole page
   links [REGEX]          print "text -> url" for each link whose text or url matches REGEX
   scroll-all             scroll to the bottom until the page stops growing (endless feeds)
@@ -44,6 +46,23 @@ the next run starts. Each line on stderr about a run starts with its name, as
 in `phone-dark: page error: ...`. A run that fails ends the command, so the
 runs after it aren't made.
 
+--sizes WxH,WxH,... runs the actions once at each viewport size, each run named
+for its size: `== 360x640`, OUT/NAME.360x640.png. It doesn't go with --size or
+--variants.
+
+Several PAGEs get a run each, or one for each size or variant, named for the
+page: its #fragment when it has one, else its file's name without the
+extension, else its host, with each run of other characters than letters,
+digits, _ and - made one -. With --sizes the name is PAGE.WxH, as in
+OUT/NAME.old.360x640.png. Pages that would share a name are refused: give each
+a #fragment of its own.
+
+--montage also saves, for each shot and view NAME but the final one, the runs'
+images side by side, each under its run's name: OUT/NAME.montage.png, printed
+last, after a `== montage` line. Several pages at several sizes or variants make
+a grid, a column for each page and a row for each size. It needs more than one
+run, and a shot or view action. No page may then be named montage.
+
 Every run checks whether the page scrolls sideways, after it loads and at each
 shot, and says so on stderr: the page's width against the viewport's, then up
 to 5 elements that widen it, the furthest-reaching first, each with the start of
@@ -70,7 +89,7 @@ download is needed; with none cached it prints the install command.
 
 Exit status: 0; 1 when the page doesn't load or an action fails, with one line
 saying which, after what came before it is printed; 2 for a bad argument or no
-Chromium; 3 when the page had errors, in any run of --variants.
+Chromium; 3 when a page had errors, in any run.
 
 Examples:
   web-shot report/page.html
@@ -78,6 +97,7 @@ Examples:
   web-shot --size 390x844 https://example.com
   web-shot --color-scheme dark --do "shot dark" https://example.com
   web-shot --variants --do "shot header header" report/page.html   # 4 looks of one page
+  web-shot --sizes 360x640,390x664 --montage --do "view fold" old.html new.html   # first screens, in one image
   web-shot --do "wait 5000" --do text https://airtable.com/app.../form     # read a JS-rendered form
   web-shot --do scroll-all --do "links /event/" https://example.com/calendar
 """
@@ -132,6 +152,12 @@ SCROLL_DONE_MS = 2000
 SCROLL_MAX_ROUNDS = 400
 # Requests that stay open as long as the page does
 UNENDING = {"eventsource", "websocket", "media"}
+DEFAULT_SIZE = (1280, 900)
+# A montage's label size, the space between its images, and its colors
+MONTAGE_LABEL_PX = 15
+MONTAGE_GAP = 16
+MONTAGE_GROUND = "#eeeeee"
+MONTAGE_INK = "#000000"
 # A shot taller than this is also saved in pieces at most PIECE_HEIGHT tall, which a reader shows
 # without scaling them down: a 1280x6353 shot showed at 403x2000.
 SPLIT_ABOVE = 1500
@@ -300,7 +326,7 @@ def parse_action(text):
 @dataclass
 class Findings:
     """What a run found, kept as it goes, so an action that fails doesn't lose what came before.
-    `variant` is the run's name under --variants, such as phone-dark, else None."""
+    `variant` is the run's name when there are several, such as phone-dark, else None."""
 
     variant: str | None = None
     shots: list = field(default_factory=list)
@@ -344,7 +370,7 @@ class Findings:
             print(prefix + error, file=sys.stderr, flush=True)
 
     def shot_path(self, out, name):
-        """Where the shot NAME goes in OUT: NAME.png, or NAME.VARIANT.png under --variants."""
+        """Where the shot NAME goes in OUT: NAME.png, or NAME.VARIANT.png in a named run."""
         return out / (f"{name}.{self.variant}.png" if self.variant else f"{name}.png")
 
 
@@ -578,8 +604,70 @@ def prune_old_outputs(keep):
 
 
 def page_url(page):
-    path = Path(page)
-    return path.resolve().as_uri() if "://" not in page and path.exists() else page
+    """PAGE as a URL: a local path becomes a file:// URL, keeping a #fragment after it."""
+    if "://" in page:
+        return page
+    if Path(page).exists():
+        return Path(page).resolve().as_uri()
+    path, sep, fragment = page.partition("#")
+    if sep and Path(path).exists():
+        return f"{Path(path).resolve().as_uri()}#{fragment}"
+    return page
+
+
+def page_label(page):
+    """What a run of PAGE is named for when there are several pages: its #fragment, else its file's
+    stem, else its host. The name goes into file names, so each run of characters a path could use
+    becomes one -."""
+    parts = urllib.parse.urlsplit(page_url(page))
+    for source in (
+        parts.fragment,
+        Path(urllib.parse.unquote(parts.path)).stem,
+        parts.netloc,
+        page,
+    ):
+        label = re.sub(r"[^A-Za-z0-9_]+", "-", source).strip("-")
+        if label:
+            return label
+    return "page"
+
+
+def save_montage(path, tiles, columns):
+    """Saves at PATH the images TILES names, as (label, image path) in reading order, COLUMNS to a
+    row, each under its label. A column is as wide as its widest image and a row as tall as its
+    tallest."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    Image.MAX_IMAGE_PIXELS = None  # our own screenshots, not a decompression bomb
+    font = ImageFont.load_default(size=MONTAGE_LABEL_PX)
+    images = [(label, Image.open(shot).convert("RGB")) for label, shot in tiles]
+    rows = [images[at : at + columns] for at in range(0, len(images), columns)]
+    widths = [
+        max(row[column][1].width for row in rows if column < len(row))
+        for column in range(min(columns, len(images)))
+    ]
+    heights = [max(image.height for _, image in row) for row in rows]
+    label_height = 2 * MONTAGE_LABEL_PX
+    sheet = Image.new(
+        "RGB",
+        (
+            MONTAGE_GAP + sum(width + MONTAGE_GAP for width in widths),
+            sum(label_height + height + MONTAGE_GAP for height in heights),
+        ),
+        MONTAGE_GROUND,
+    )
+    draw = ImageDraw.Draw(sheet)
+    top = 0
+    for row, height in zip(rows, heights):
+        left = MONTAGE_GAP
+        for (label, image), width in zip(row, widths):
+            draw.text(
+                (left, top + MONTAGE_LABEL_PX // 2), label, fill=MONTAGE_INK, font=font
+            )
+            sheet.paste(image, (left, top + label_height))
+            left += width + MONTAGE_GAP
+        top += label_height + height + MONTAGE_GAP
+    sheet.save(path)
 
 
 def cached_chromium():
@@ -659,9 +747,11 @@ def perform(action, tab, network, out, found):
     elif action.verb == "scroll-all":
         scroll_all(tab, network)
     else:
-        found.check_sideways(tab, f"shot {action.args[0]}")
+        found.check_sideways(tab, f"{action.verb} {action.args[0]}")
         path = found.shot_path(out, action.args[0])
-        if len(action.args) == 2:
+        if action.verb == "view":
+            png = tab.screenshot(path=str(path))
+        elif len(action.args) == 2:
             # As a locator's own shot would: wait for it to show, and scroll it into
             # view, out of an inner scroller too.
             element = tab.locator(action.args[1]).first
@@ -672,6 +762,41 @@ def perform(action, tab, network, out, found):
         else:
             png = tab.screenshot(path=str(path), full_page=True)
         found.shots += [path, *save_pieces(path, png)]
+
+
+def page_labels(pages, montage):
+    """What each of PAGES' runs is named for, or [None] for one page. Raises UsageError for names
+    that would have two runs write one file."""
+    if len(pages) == 1:
+        return [None]
+    labels = [page_label(page) for page in pages]
+    shared = sorted({label for label in labels if labels.count(label) > 1})
+    if shared:
+        raise UsageError(
+            f"pages need names of their own, and these share the name {shared[0]}: "
+            + ", ".join(p for p, label in zip(pages, labels) if label == shared[0])
+            + "; end each with a #fragment of its own"
+        )
+    if montage and "montage" in labels:
+        raise UsageError(
+            "--montage saves NAME.montage.png, which a page named montage would"
+            " overwrite; end that page with a #fragment to name it"
+        )
+    return labels
+
+
+def save_montages(out, names, runs, columns):
+    """Saves and prints OUT/NAME.montage.png for each of NAMES: that shot from each of RUNS, the
+    Findings in reading order, COLUMNS to a row."""
+    print("== montage", flush=True)
+    for name in names:
+        sheet = out / f"{name}.montage.png"
+        save_montage(
+            sheet,
+            [(found.variant, found.shot_path(out, name)) for found in runs],
+            columns,
+        )
+        print(sheet, flush=True)
 
 
 def cookie_arg(text):
@@ -690,10 +815,14 @@ def size_arg(text):
     return int(width), int(height)
 
 
+def sizes_arg(text):
+    return [size_arg(size) for size in text.split(",")]
+
+
 def context_options(args):
     """new_context's arguments for ARGS: the viewport, and the media features asked for. A feature
     not asked for is left out, so the page sees Playwright's default."""
-    width, height = args.size
+    width, height = args.size or DEFAULT_SIZE
     options = {"viewport": {"width": width, "height": height}}
     if args.color_scheme:
         options["color_scheme"] = args.color_scheme
@@ -703,9 +832,18 @@ def context_options(args):
 
 
 def variants(args):
-    """Each run to make, as (its name, new_context's arguments): one unnamed run, or under
-    --variants the desktop and phone viewports, each light and dark."""
+    """Each look to shoot a page in, as (its name, new_context's arguments): one unnamed look, or
+    under --sizes one for each size, or under --variants the desktop and phone viewports, each
+    light and dark."""
     options = context_options(args)
+    if args.sizes:
+        return [
+            (
+                f"{width}x{height}",
+                {**options, "viewport": {"width": width, "height": height}},
+            )
+            for width, height in args.sizes
+        ]
     if not args.variants:
         return [(None, options)]
     viewports = {
@@ -730,7 +868,9 @@ def main(argv=None):
         epilog=HELP_TAIL,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("page", help="a URL or a local file")
+    parser.add_argument(
+        "page", nargs="+", help="a URL or a local file; several get a run each"
+    )
     parser.add_argument(
         "--do",
         action="append",
@@ -754,8 +894,18 @@ def main(argv=None):
     parser.add_argument(
         "--size",
         type=size_arg,
-        default=(1280, 900),
         help="viewport WxH (default 1280x900)",
+    )
+    parser.add_argument(
+        "--sizes",
+        type=sizes_arg,
+        metavar="WxH,WxH",
+        help="run the actions at each of these viewport sizes; shots are NAME.WxH.png",
+    )
+    parser.add_argument(
+        "--montage",
+        action="store_true",
+        help="also save each shot's and view's runs side by side, as NAME.montage.png",
     )
     scheme = parser.add_mutually_exclusive_group()
     scheme.add_argument(
@@ -778,20 +928,51 @@ def main(argv=None):
     errors = False
     try:
         actions = [parse_action(a) for a in args.do]
-        if args.cookie and not page_url(args.page).startswith(("http://", "https://")):
+        if args.cookie and not all(
+            page_url(page).startswith(("http://", "https://")) for page in args.page
+        ):
             raise UsageError("--cookie needs an http(s) page, not a file")
+        if args.sizes and (args.size or args.variants):
+            raise UsageError("--sizes doesn't go with --size or --variants")
+        for size in args.sizes or []:
+            if args.sizes.count(size) > 1:
+                raise UsageError(f"--sizes names {size[0]}x{size[1]} twice")
+        labels = page_labels(args.page, args.montage)
+        looks = variants(args)
+        # The shots a montage is made of: every shot and view an action names.
+        named = list(
+            dict.fromkeys(a.args[0] for a in actions if a.verb in ("shot", "view"))
+        )
+        if args.montage and len(labels) * len(looks) < 2:
+            raise UsageError(
+                "--montage needs more than one run: --sizes, --variants or several pages"
+            )
+        if args.montage and not named:
+            raise UsageError(
+                "--montage needs a shot or view action to lay side by side"
+            )
         prune_old_outputs(args.out)
         out = args.out or Path(tempfile.mkdtemp(prefix="web-shot-"))
         out.mkdir(parents=True, exist_ok=True)
-        for variant, options in variants(args):
-            found = Findings(variant)
-            if variant:
-                print(f"== {variant}", flush=True)
-            try:
-                run(args.page, actions, out, options, args.cookie, found)
-            finally:
-                found.show()
-                errors = errors or bool(found.errors)
+        # Each look's runs, a page at a time: a montage's rows, when both vary.
+        rows = [[] for _ in looks]
+        for page, label in zip(args.page, labels):
+            for row, (look, options) in zip(rows, looks):
+                variant = ".".join(part for part in (label, look) if part) or None
+                found = Findings(variant)
+                row.append(found)
+                if variant:
+                    print(f"== {variant}", flush=True)
+                try:
+                    run(page, actions, out, options, args.cookie, found)
+                finally:
+                    found.show()
+                    errors = errors or bool(found.errors)
+        if args.montage:
+            # A grid when pages and looks both vary, a row per look; else one row.
+            grid = len(labels) > 1 and len(looks) > 1
+            runs = [found for row in rows for found in row]
+            save_montages(out, named, runs, len(labels) if grid else len(runs))
     except UsageError as error:
         print(f"web-shot: {error}", file=sys.stderr)
         return 2

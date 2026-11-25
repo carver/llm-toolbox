@@ -1,5 +1,6 @@
 # Why: Add a single-file sub-shape published as an Artifact, with a hash-keyed switcher, for pages the app doesn't have yet.
 # Why: Hand a logic prototype over as an Artifact link; open does nothing with a local file here.
+# Why: Read the design doc before drafting variants, and shoot each variant's first screen at phone size before handing over.
 --- a/LOGIC.md
 +++ b/LOGIC.md
 @@ -51,7 +51,7 @@
@@ -22,7 +23,7 @@
  
  A UI prototype is much easier to judge when it's **butting up against the rest of the app**: real header, real sidebar, real data, real density. A throwaway route on its own is a vacuum: every variant looks fine in isolation. Default to sub-shape A whenever there's a plausible existing page to host the variants. Only reach for sub-shape B if the prototype genuinely has no nearby home.
  
-@@ -29,7 +29,11 @@
+@@ -29,11 +29,17 @@
  
  Before committing to sub-shape B, sanity-check: is there really no existing page this could be embedded in? An empty route hides design problems that a populated one would expose.
  
@@ -35,7 +36,22 @@
  
  ## Process
  
-@@ -101,6 +105,7 @@
+ ### 1. State the question and pick N
++
++First read what the project's design doc records about this page. A variant that breaks a decision recorded there (drops a link the doc gives a reason for, moves what it says stays put) names that decision in its switcher note, so the user chooses it knowingly. Reason: a user picked a variant that had dropped a link their own design doc required, and caught it only by missing the link.
+ 
+ Default to **3 variants**. More than 5 stops being radically different and starts being noise, so cap there.
+ 
+@@ -93,6 +99,8 @@
+ 
+ ### 5. Hand it over
+ 
++First shoot every variant's first screen at the smallest viewport the project supports, a phone's when it names none, as one image: `web-shot --sizes 360x640,390x664 --montage --do "view fold" PAGE#KEY...` (`web-shot -h`). Send that image with the link, and say which variants push the thing being prototyped below the fold or wrap its text. Reason: a variant chosen from a desktop preview wrapped to two rows on a phone and pushed its button off the first screen, which cost a rebuild after it landed.
++
+ Surface the URL (and the `?variant=` keys). The user will flip through whenever they get to it. The interesting feedback is usually **"I want the header from B with the sidebar from C"**, which is the actual design they want.
+ 
+ ### 6. Capture the answer and clean up
+@@ -101,6 +109,7 @@
  
  - **Sub-shape A**: fold the winner into the existing page; drop the losing variants and the switcher from main.
  - **Sub-shape B**: promote the winning variant to a real route; drop the throwaway route and the switcher from main.

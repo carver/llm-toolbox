@@ -597,6 +597,16 @@ the owner's):
 - Fix commits after the sweep don't count, though a spec-gap fix may change described
   behaviour: counting them would make nearly every build warn, through its review's
   fixes and refactor.
+- A term too common to read is set aside (2026-11-24). /build has the sweep search
+  the tool's name beside its old phrases, and on 2026-11-24 three names
+  (`checks-needed`, `heavy`, `agent-commit-gate`) each filled the cap of 60 lines and
+  hid the phrases' hits, which the agent then fetched again with greps. Once the
+  lines to list pass the cap, a term with more than 60 hits of its own is dropped
+  from the listing with a line giving its count, except where another term matches
+  the same line, which rg's `--only-matching` tells even past the 300-character cut;
+  the last term always stays, capped. Other repos' hits count toward the cap only
+  while they still print as lines. Session transcripts (`*.jsonl`) are skipped as
+  files nobody wrote by hand: one sweep listed another repo's.
 
 The workspace root is the folder that holds the repo's main tree, not path-refs'
 hard-coded default, so it holds on any machine with the workspace's layout.

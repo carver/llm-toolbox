@@ -184,12 +184,13 @@ dash (`build-state sweep -- --local`). It runs, from the workspace root,
 
     rg --no-config -n --hidden --fixed-strings -g '!{cache,keep}/**' -g '!*-wt-*/**'
        -g '!.git/' -g '!/.*' -g '!**/*_files/**' -g '!**/node_modules/**'
-       -g '!*.min.*' -g '!*.map' -e TERM... .
+       -g '!*.min.*' -g '!*.map' -g '!*.jsonl' -e TERM... .
 
 so it skips cache/ and keep/ (over a million files), every worktree beside a repo
 (*-wt-*), .git folders, and the root's own dot-files and dot-folders, where
 credentials live, and files nobody wrote by hand (*_files/, as a browser names a saved
-page's scripts, node_modules/, *.min.*, *.map); inside a repo, rg skips what its
+page's scripts, node_modules/, *.min.*, *.map, and *.jsonl, the session transcripts
+a repo may keep); inside a repo, rg skips what its
 .gitignore names, and the sweep skips what its .sweepignore names: a file at the
 repo's top, one path or glob a line, anchored at the repo's top (`*.sql` matches
 only there; `**/*.sql` anywhere in it), for text a build mustn't or needn't fix,
@@ -203,7 +204,12 @@ own repo's hits come first, then the rest by path: at most 5 lines a file and 60
 all, each cut at 300 characters, then a line saying how many more it cut. Other
 repos' hits print as lines only while, at 5 a file, they come to 20 or fewer; past
 that they print as one line a file, `PATH: N hits`, for 20 files by path, then a
-line saying how many files more, so a common term costs a few lines. When rg
+line saying how many files more, so a common term costs a few lines. When the lines
+it would list pass 60, a term that alone has more than 60 hits, such as a tool's
+name, is set aside, the most first, until the rest fit, the last term never: its
+hits are left out of the listing, but not those another term matches too, however
+long the line, and a line says `TERM: N hits in M files, not listed: too common to
+read`. When rg
 can't read some files, it says so on stderr and still records the sweep.
 
 The sweep is recorded in the build's state (`build-state show`): its terms, and HEAD's
@@ -234,7 +240,14 @@ SWEEP_OTHERS_LINES = 20
 SWEEP_OTHERS_FILES = 20
 # Files nobody wrote by hand, wherever they lie; a page a browser saved keeps its
 # scripts in NAME_files/. Their hits would crowd out the ones a person can act on.
-NOT_SOURCE = ["!**/*_files/**", "!**/node_modules/**", "!*.min.*", "!*.map"]
+NOT_SOURCE = [
+    "!**/*_files/**",
+    "!**/node_modules/**",
+    "!*.min.*",
+    "!*.map",
+    # Session transcripts a repo keeps, which quote every command ever run.
+    "!*.jsonl",
+]
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -707,13 +720,21 @@ class Search:
         return not self.is_own(hit), path, int(number) if number.isdigit() else 0
 
 
-def rg(where: Path, prefix: str, globs: list[str], terms: list[str]) -> Search:
-    """rg's hits for `terms` under `where`, each path shown under `prefix`; raises
-    FileNotFoundError when rg is missing."""
+def rg(
+    where: Path, prefix: str, globs: list[str], terms: list[str], matches: bool = False
+) -> Search:
+    """rg's hits for `terms` under `where`, each path shown under `prefix`; with
+    `matches`, a hit for each match, its text the term it matched, from the whole line
+    however long; raises FileNotFoundError when rg is missing."""
+    shape = (
+        ["--only-matching"]
+        if matches
+        else ["--max-columns", str(SWEEP_WIDTH), "--max-columns-preview"]
+    )
     found = subprocess.run(
         [
             *("rg", "--no-config", "-n", "--hidden", "--fixed-strings"),
-            *("--max-columns", str(SWEEP_WIDTH), "--max-columns-preview"),
+            *shape,
             *(arg for glob in globs for arg in ("-g", glob)),
             *(arg for term in terms for arg in ("-e", term)),
             ".",
@@ -746,7 +767,7 @@ def sweep_ignored(repo: Path, under: str) -> list[str]:
     ]
 
 
-def search_workspace(root: Path, terms: list[str]) -> Search:
+def search_workspace(root: Path, terms: list[str], matches: bool = False) -> Search:
     """Every hit in the workspace's repos as landed, skipping cache/, keep/, the
     worktrees beside them, .git, the root's own dot-files (credentials live
     there), files nobody wrote by hand (NOT_SOURCE) and what each repo's
@@ -761,10 +782,10 @@ def search_workspace(root: Path, terms: list[str]) -> Search:
     in_worktree = Search()
     if top != main:
         own = ["!.git", *NOT_SOURCE, *sweep_ignored(top, "/")]
-        in_worktree = rg(top, shown_from(root, top), own, terms)
+        in_worktree = rg(top, shown_from(root, top), own, terms, matches)
         if main.is_relative_to(root):
             globs.append(f"!/{main.relative_to(root)}/**")
-    rest = rg(root, ".", globs, terms)
+    rest = rg(root, ".", globs, terms, matches)
     # A workspace root that is the repo itself, as $BUILD_STATE_WORKSPACE may set it.
     own_prefix = "./" if top == root else shown_from(root, top) + "/"
     found = Search(in_worktree.hits + rest.hits, in_worktree.errors + rest.errors)
@@ -822,6 +843,59 @@ def print_lines(hits: list[str]) -> None:
         )
 
 
+def hit_place(hit: str) -> str:
+    """A hit's `path:line`."""
+    return ":".join(hit.split(":", 2)[:2])
+
+
+def listed(search: Search) -> int:
+    """How many lines print_hits would list: this repo's capped hits, and other repos'
+    while they still print as lines rather than as a count a file."""
+    own = [hit for hit in search.hits if search.is_own(hit)]
+    others = capped_a_file([hit for hit in search.hits if not search.is_own(hit)])
+    return len(capped_a_file(own)) + (
+        len(others) if len(others) <= SWEEP_OTHERS_LINES else 0
+    )
+
+
+def set_aside_common(search: Search, terms: list[str], find_matches) -> list[str]:
+    """While the lines listed pass SWEEP_CAP, take out of `search` the hits of the
+    term with the most, when it alone has more than SWEEP_CAP, but not those another
+    term also matches, and so on down; return a line for each term set aside. A
+    tool's name, which a sweep searches beside the old phrases, can otherwise fill the
+    cap. `find_matches` gives a hit per match, its text the matched term, which tells
+    the terms of a line rg cut short apart."""
+    if listed(search) <= SWEEP_CAP:
+        return []
+    terms_at: dict[str, set[str]] = {}
+    for match in find_matches().hits:
+        place, _, text = match.rpartition(":")
+        terms_at.setdefault(place, set()).update(t for t in terms if t in text)
+    notes, left = [], list(dict.fromkeys(terms))
+    # The last term left stays listed, capped: setting it aside would list nothing.
+    while listed(search) > SWEEP_CAP and len(left) > 1:
+        matching = {
+            t: [h for h in search.hits if t in terms_at.get(hit_place(h), ())]
+            for t in left
+        }
+        term = max(left, key=lambda t: len(matching[t]))
+        if len(matching[term]) <= SWEEP_CAP:
+            break
+        left.remove(term)
+        files = len({path_of(hit) for hit in matching[term]})
+        notes.append(
+            f"{term}: {len(matching[term])} hits in {files} files, not listed:"
+            " too common to read"
+        )
+        search.hits = [
+            hit
+            for hit in search.hits
+            if term not in (found := terms_at.get(hit_place(hit), set()))
+            or found & set(left)
+        ]
+    return notes
+
+
 def sweep(args: argparse.Namespace) -> int:
     if any(not term for term in args.terms):
         print("build-state sweep: a TERM is empty.", file=sys.stderr)
@@ -841,7 +915,12 @@ def sweep(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         print("rg isn't installed: install ripgrep, then sweep again.", file=sys.stderr)
         return 3
+    common = set_aside_common(
+        search, args.terms, lambda: search_workspace(root, args.terms, matches=True)
+    )
     print_hits(search)
+    for line in common:
+        print(line)
     if search.errors:
         print(
             "rg reported errors, so files it couldn't read went unsearched:",

@@ -2572,3 +2572,60 @@ def test_start_keeps_refusing_a_build_that_recorded_a_step(
 
     assert done.returncode == 1, done.stdout
     assert "already open" in done.stderr
+
+
+def test_sweep_skips_session_transcripts(repo, tmp_path):
+    root = workspace(tmp_path)
+    (root / "notes/session.jsonl").write_text('{"text": "Nothing records a search."}\n')
+    build_state(repo, "start")
+    swept = sweep(repo, root, "Nothing records")
+    assert "session.jsonl" not in swept.stdout, swept.stdout
+
+
+def test_sweep_sets_aside_a_term_too_common_to_read(template, tmp_path):
+    root = tmp_path / "workspace"
+    proj = own_repo(template, root)
+    for number in range(70):
+        (proj / f"f{number:02}.md").write_text("the tool's name\n")
+    (proj / "doc.md").write_text("the tool's name says the old phrase\n")
+    (proj / "other.md").write_text("the old phrase alone\n")
+
+    swept = sweep(proj, root, "name", "old phrase")
+
+    lines = swept.stdout.splitlines()
+    assert "./proj/other.md:1:the old phrase alone" in lines, lines
+    # A hit the other term also matches stays listed.
+    assert "./proj/doc.md:1:the tool's name says the old phrase" in lines, lines
+    assert not any(line.startswith("./proj/f") for line in lines), lines
+    assert "name: 71 hits in 71 files, not listed: too common to read" in lines, lines
+
+
+def test_sweep_keeps_a_long_lines_hit_the_other_term_matches(template, tmp_path):
+    root = tmp_path / "workspace"
+    proj = own_repo(template, root)
+    for number in range(70):
+        (proj / f"f{number:02}.md").write_text("the tool's name\n")
+    (proj / "long.md").write_text("name " + "x" * 400 + " old phrase\n")
+
+    swept = sweep(proj, root, "name", "old phrase")
+
+    assert any(
+        line.startswith("./proj/long.md:1:") for line in swept.stdout.splitlines()
+    )
+
+
+def test_sweep_sets_nothing_aside_for_other_repos_hits_it_only_counts(
+    template, tmp_path
+):
+    root = tmp_path / "workspace"
+    proj = own_repo(template, root)
+    (proj / "mine.md").write_text("the tool's name\n")
+    for number in range(80):
+        (root / "other" / f"o{number:02}.md").parent.mkdir(exist_ok=True)
+        (root / "other" / f"o{number:02}.md").write_text("the tool's name\n")
+
+    swept = sweep(proj, root, "name", "old phrase")
+
+    lines = swept.stdout.splitlines()
+    assert "./proj/mine.md:1:the tool's name" in lines, lines
+    assert not any("too common" in line for line in lines), lines

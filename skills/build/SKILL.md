@@ -15,6 +15,8 @@ First find the **design forks**: places where the request leaves a choice open a
 
 When a fork's options change what people or agents see or run, such as a command a skill tells agents to run, text they read, or data the service keeps about them, write out each option's consequences before you ask: how it looks to those it reaches, the prompts or approvals it triggers, where its data lands in each deployment, what it misses, and what undoing it costs. A question tool's one-line option descriptions can't carry that. Reason: an option's cost often shows only in how it looks to the people it reaches (a command that reads environment variables can look like credential snooping), and bare option names hide that until the code is built.
 
+When an option would move, merge or delete stored data, or change who owns it, review that option before you ask: write it into the brief as it would be built, and give a subagent the gate ask below, with "say what each option costs that its description doesn't" added. Then put the fork to the user with what the review found. Reason: a user chose to merge two accounts twice, from one-line descriptions, before a plan review found that it changed a public entry's account, stranded entries for good and opened a way past the review guard; the choice was reversed, and the review that reversed it came after both decisions.
+
 Write the **brief** to a file named for the change, such as `brief-<topic>.md`: subagents running builds at once share one scratchpad, and a plain `brief.md` gets overwritten. It is the spec the reviewers check the code against, and a reviewer has seen none of this conversation, so it carries everything that matters:
 
 - the repo path, and the goal in the user's words

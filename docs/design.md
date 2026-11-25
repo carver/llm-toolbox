@@ -222,6 +222,18 @@ first, each checked out in turn (03bc4c8, 2026-11-08), since checking only HEAD 
 the commits before it checked only on the base they were made on. Measured cost: see
 above.
 
+### Each check run reports and records its parts' timings (2026-11-24)
+
+The pass line gave a check's total alone (`passed (258s, …)`), and wt-ship's logs
+live in session scratchpads, so finding what made filedrawer's landings take four
+minutes a commit took an hour of benchmarking: its bin/tests was 41% of the check,
+and a fresh copy of the index rebuilt the crates every time. A check now writes its
+parts' seconds to the file CHECK_TIMINGS names, the gate puts them on the pass line
+or before the refusal, and every run goes on a record in the repo's common git dir.
+The owner chose there, per repo and shared by its worktrees, over the workspace's
+keep/ (a workspace path in a tool for any project) and heavy's folder (/tmp, wiped
+by a reboot), and chose every run, commit checks included, over landings alone.
+
 ### wt-ship --local checks only while it holds the main tree (2026-11-08)
 
 It rebases before it waits, so a conflict shows without holding anyone up, but checks

@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -2289,3 +2290,144 @@ def test_an_empty_secrets_file_variable_strips_nothing_more(installed):
     assert done.returncode == 0, done.stderr
     assert "FAKE_CERT_ID" in names_received(installed)
     assert "AGENT_SECRETS_FILE" in empty_names_received(installed)
+
+
+# A check's own timings: CHECK_TIMINGS names a file it may write `NAME SECONDS` to.
+
+
+def timed_check(repo, lines, code=0):
+    """Make the repo's agent check write `lines` to $CHECK_TIMINGS, then exit `code`."""
+    writes = "".join(f"echo '{line}' >> \"$CHECK_TIMINGS\"\n" for line in lines)
+    hook(repo, "agent-pre-commit", f"{writes}exit {code}")
+
+
+def timings_record(repo):
+    path = repo / ".git" / gate.TIMINGS_RECORD
+    return [line.split("\t") for line in path.read_text().splitlines()]
+
+
+def test_a_checks_timings_show_in_its_pass_line(installed):
+    timed_check(installed, ["bin-tests 5.2", "nextest 106"])
+    run = recheck(installed)
+    assert run.returncode == 0, run.stderr
+    (line,) = [ln for ln in run.stderr.splitlines() if "passed (" in ln]
+    assert line.startswith("agent-pre-commit: passed (")
+    assert line.endswith("; bin-tests 5s, nextest 106s)"), line
+
+
+def test_a_check_that_writes_no_timings_keeps_its_pass_line(installed):
+    timed_check(installed, [])
+    run = recheck(installed)
+    (line,) = [ln for ln in run.stderr.splitlines() if "passed (" in ln]
+    assert ";" not in line, line
+
+
+def test_lines_that_arent_a_name_and_seconds_are_left_out(installed):
+    timed_check(installed, ["garbage", "two words here", "clippy soon", "clippy 3"])
+    run = recheck(installed)
+    assert run.stderr.rstrip().endswith("; clippy 3s)"), run.stderr
+
+
+def test_a_failing_check_says_where_its_time_went_before_the_refusal(installed):
+    timed_check(installed, ["bin-tests 5", "nextest 289"], code=1)
+    run = recheck(installed)
+    lines = run.stderr.splitlines()
+    assert lines[-1].startswith("COMMIT REFUSED: agent-pre-commit failed"), lines
+    assert re.fullmatch(
+        r"agent-pre-commit: took \d+s \(bin-tests 5s, nextest 289s\)", lines[-2]
+    ), lines
+
+
+def test_each_check_run_goes_on_the_repos_timings_record(installed):
+    assert commit(installed).returncode == 0
+    (installed / ".git" / gate.TIMINGS_RECORD).unlink()
+    timed_check(installed, ["bin-tests 5", "nextest 106"])
+    recheck(installed)
+    timed_check(installed, ["clippy 2"], code=3)
+    recheck(installed)
+    rows = timings_record(installed)
+    assert len(rows) == 2, rows
+    head = git(installed, "rev-parse", "--short=12", "HEAD").stdout.strip()
+    first, second = rows
+    assert len(first) == 11, first
+    when, kind, name, sha, tree, code, waited, took, where, base, parts = first
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", when), when
+    assert (kind, name, sha, code, where) == (
+        "run",
+        "agent-pre-commit",
+        head,
+        "0",
+        "queue",
+    )
+    assert re.fullmatch(r"[0-9a-f]{12}", tree), tree
+    assert float(waited) >= 0 and float(took) >= 0
+    # The commit passed the check as it was before timed_check rewrote it.
+    assert base == "", base
+    assert parts == "bin-tests=5,nextest=106"
+    assert (second[5], second[10]) == ("3", "clippy=2")
+
+
+def test_a_commits_check_goes_on_the_record_as_a_commit(installed):
+    timed_check(installed, ["fast-part 1"])
+    assert commit(installed).returncode == 0
+    (row,) = timings_record(installed)
+    assert (row[1], row[2], row[10]) == ("commit", "agent-pre-commit", "fast-part=1")
+
+
+def test_the_record_keeps_its_newest_lines(installed):
+    record = installed / ".git" / gate.TIMINGS_RECORD
+    record.write_text("".join(f"old{n}\n" for n in range(gate.TIMINGS_SIZE)))
+    timed_check(installed, ["x 1"])
+    recheck(installed)
+    lines = record.read_text().splitlines()
+    assert len(lines) == gate.TIMINGS_SIZE
+    assert lines[0] == "old1" and lines[-1].split("\t")[10] == "x=1"
+
+
+def test_a_checks_timings_are_capped_and_their_names_cut(installed):
+    long = "n" * 50
+    timed_check(installed, [f"{long} 1", *(f"p{n} 1" for n in range(40))])
+    run = recheck(installed)
+    (line,) = [ln for ln in run.stderr.splitlines() if "passed (" in ln]
+    shown = line.split("; ", 1)[1].rstrip(")").split(", ")
+    assert len(shown) == gate.TIMINGS_MAX, shown
+    assert shown[0] == f"{'n' * gate.TIMING_NAME_MAX} 1s"
+    assert shown[-1] == f"p{gate.TIMINGS_MAX - 2} 1s"
+
+
+def test_a_name_that_would_muddle_the_record_is_left_out(installed):
+    timed_check(installed, ["a=b 1", "a,b 2", "ok.part-2_x 3"])
+    recheck(installed)
+    (row,) = timings_record(installed)
+    assert row[10] == "ok.part-2_x=3"
+
+
+def test_a_record_that_cant_be_written_says_so_and_passes(installed):
+    (installed / ".git" / gate.TIMINGS_RECORD).mkdir()
+    timed_check(installed, ["x 1"])
+    run = recheck(installed)
+    assert run.returncode == 0, run.stderr
+    assert "agent-pre-commit: couldn't record its timings" in run.stderr
+
+
+def test_a_check_that_restages_is_recorded_as_refused_with_the_tree_it_checked(
+    installed,
+):
+    tree = git(installed, "write-tree").stdout.strip()
+    hook(
+        installed,
+        "agent-pre-commit",
+        "echo changed >> a\ngit add a\nexit 0",
+    )
+    run = recheck(installed)
+    assert run.returncode == 1, run.stderr
+    (row,) = timings_record(installed)
+    assert (row[4], row[5]) == (tree[:12], "1"), row
+
+
+def test_a_skipped_check_isnt_recorded(installed):
+    timed_check(installed, ["x 1"])
+    assert commit(installed).returncode == 0
+    run = recheck(installed)
+    assert "skipped" in run.stderr, run.stderr
+    assert len(timings_record(installed)) == 1

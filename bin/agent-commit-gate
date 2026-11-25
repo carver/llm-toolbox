@@ -128,6 +128,22 @@ from loading the machine. Beyond that the queue works on trust, as the --no-veri
 refusal below does: a check that names the variable and never exits with its code
 never waits.
 
+Each check also gets CHECK_TIMINGS, the path of an empty file it may write its parts'
+timings to, a line each: a name of one word and its seconds (`nextest 106.2`). The
+pass line then ends with them, after the base (`passed (124s, given CHECK_BASE
+abc123; bin-tests 5s, nextest 106s)`), and says `waited Ns` when the check waited
+a second or more in heavy's queue; a failing check's timings go on a line of their
+own (`NAME: took 300s (bin-tests 5s, nextest 289s)`) before the refusal. Lines that
+aren't a name and a number are left out, at most 32 kept, names cut to 40
+characters. Every check the gate runs, passing or failing, also goes on a record in
+the repo's common git dir, agent-check-timings.tsv, a tab-separated line each, its
+last 5000 kept: the UTC time, `commit` for a git commit's check or `run` for
+another (wt-ship's), the check's name, HEAD and the tree checked (12 hex digits
+each), its exit status, the seconds it waited in the queue and ran, `queue` or
+`outside` the queue, CHECK_BASE, and its timings as `name=seconds` joined by commas.
+So `column -t -s$'\t' .git/agent-check-timings.tsv | tail` shows where recent checks
+spent their time. A check skipped because its tree passed already isn't recorded.
+
 `--install` also puts a line first in each repo's post-commit hook, creating the hook
 if needed, which runs `--post-commit` after an agent's `git commit`. It says nothing
 for a rebase, a cherry-pick or a revert, which run that hook too, some through a `git
@@ -169,8 +185,10 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import ExitStack, contextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -378,6 +396,15 @@ COMMIT_CHECK_NAME = "agent-commit-check"
 # QUEUE_EXIT, the exit status that asks for the queue (sysexits' EX_TEMPFAIL).
 QUEUE_EXIT_NAME = "CHECK_QUEUE_EXIT"
 QUEUE_EXIT = commitcheck.QUEUE_EXIT
+# The file a check may write its own parts' timings to, a `NAME SECONDS` line each.
+TIMINGS_NAME = "CHECK_TIMINGS"
+# A name of letters, digits, `_`, `.` and `-`, so the record's `name=seconds,...` stays
+# plain to read back.
+TIMING_LINE = re.compile(r"([A-Za-z0-9_.-]+)\s+(\d+(?:\.\d+)?)")
+TIMINGS_MAX, TIMING_NAME_MAX = 32, 40
+# The record of every check run, a tab-separated line each, in the common git dir.
+TIMINGS_RECORD = "agent-check-timings.tsv"
+TIMINGS_SIZE = 5000
 
 
 def names_queue_exit(content):
@@ -751,58 +778,146 @@ def on_one_core():
             os.sched_setaffinity(0, cores)
 
 
+class Run(NamedTuple):
+    """A check's run: its process, how long it took, the timings it wrote, whether it
+    ran outside heavy's queue, and how long it waited for its turn there."""
+
+    process: subprocess.CompletedProcess
+    took: float
+    timings: list[tuple[str, float]]
+    outside: bool = False
+    waited: float = 0.0
+
+    @property
+    def code(self):
+        return self.process.returncode
+
+
 def run_once(path, env):
-    """The check's run, its output with stderr merged in, and how long it took."""
-    started = time.monotonic()
-    # `path` as given: Path() would drop a leading ./ and send it to a PATH lookup.
-    run = subprocess.run(
-        [path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-        env=env,
-    )
-    return run, time.monotonic() - started
+    """The check's run, its output with stderr merged in, how long it took, and the
+    timings it wrote to the file TIMINGS_NAME names."""
+    fd, timings = tempfile.mkstemp(prefix="check-timings-")
+    os.close(fd)
+    try:
+        started = time.monotonic()
+        # `path` as given: Path() would drop a leading ./ and send it to a PATH lookup.
+        run = subprocess.run(
+            [path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            env=env | {TIMINGS_NAME: timings},
+        )
+        took = time.monotonic() - started
+        return Run(run, took, read_timings(Path(timings)))
+    finally:
+        Path(timings).unlink(missing_ok=True)
 
 
-def report(name, base, run, took, outside=False):
-    """Print the check's pass line, or its output and the refusal; return its code."""
-    code = run.returncode
-    if code == 0:
-        where = ", outside heavy's queue" if outside else ""
+def read_timings(path):
+    """The (name, seconds) pairs a check wrote, in its order: lines that aren't a name
+    and a number left out, at most TIMINGS_MAX, names cut to TIMING_NAME_MAX."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return []
+    found = (TIMING_LINE.fullmatch(line.strip()) for line in text.splitlines())
+    pairs = [(m[1][:TIMING_NAME_MAX], float(m[2])) for m in found if m]
+    return pairs[:TIMINGS_MAX]
+
+
+def timings_shown(timings):
+    """The timings as the pass line shows them: `bin-tests 5s, nextest 106s`."""
+    return ", ".join(f"{name} {seconds:.0f}s" for name, seconds in timings)
+
+
+def timings_recorded(timings):
+    """The timings as the record keeps them: `bin-tests=5,nextest=106`."""
+    return ",".join(f"{name}={seconds:.0f}" for name, seconds in timings)
+
+
+def report(name, base, run):
+    """Print the check's pass line, or its output, where its time went and the
+    refusal; return the run."""
+    if run.code == 0:
+        where = ", outside heavy's queue" if run.outside else ""
         given = f", given CHECK_BASE {base[:12]}" if base else ""
-        print(f"{name}: passed ({took:.0f}s{where}{given})", file=sys.stderr)
+        wait = f", waited {run.waited:.0f}s" if run.waited >= 1 else ""
+        parts = f"; {timings_shown(run.timings)}" if run.timings else ""
+        print(
+            f"{name}: passed ({run.took:.0f}s{where}{given}{wait}{parts})",
+            file=sys.stderr,
+        )
     else:
-        sys.stderr.write(run.stdout.decode(errors="replace"))
-        print(f"COMMIT REFUSED: {name} failed (exit {code})", file=sys.stderr)
-    return code
+        sys.stderr.write(run.process.stdout.decode(errors="replace"))
+        if run.timings:
+            print(
+                f"{name}: took {run.took:.0f}s ({timings_shown(run.timings)})",
+                file=sys.stderr,
+            )
+        print(f"COMMIT REFUSED: {name} failed (exit {run.code})", file=sys.stderr)
+    return run
+
+
+def record_timings(name, base, run, code, kind, tree):
+    """Add the run, whose final exit status is `code` (a pass the gate refused counts
+    as refused), to the repo's TIMINGS_RECORD, keeping its last TIMINGS_SIZE lines,
+    rewritten and renamed into place under its lock as the pass record is. A failure
+    says so in a line and changes nothing else."""
+    record = passrecord.record_path(TIMINGS_RECORD)
+    if record is None:
+        return
+    row = [
+        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        kind,
+        name,
+        git_out("rev-parse", "-q", "--verify", "--short=12", "HEAD") or "",
+        (tree or "")[:12],
+        str(code),
+        f"{run.waited:.1f}",
+        f"{run.took:.1f}",
+        "outside" if run.outside else "queue",
+        (base or "")[:12],
+        timings_recorded(run.timings),
+    ]
+    line = "\t".join(row)
+    part = record.with_name(f"{record.name}.{os.getpid()}")
+    try:
+        with passrecord.record_lock(record):
+            kept = passrecord.recorded(record)[-(TIMINGS_SIZE - 1) :]
+            part.write_text("".join(f"{kept_line}\n" for kept_line in [*kept, line]))
+            part.replace(record)
+    except OSError as error:
+        part.unlink(missing_ok=True)
+        print(f"{name}: couldn't record its timings: {error}", file=sys.stderr)
 
 
 def run_outside_first(path, name, base, queue=True):
     """Run the check as run_quiet does, but first outside heavy's queue, on one core,
     with CHECK_QUEUE_EXIT set. That run's outcome is the check's, unless it exits with
     QUEUE_EXIT: then what it printed shows, as its reason, and it runs again in the
-    queue, or without queue, returns QUEUE_EXIT for the caller to run it there."""
+    queue, or without queue, returns None for the caller to run it there."""
     env = check_env(os.environ, base) | {
         QUEUE_EXIT_NAME: str(QUEUE_EXIT),
         "CARGO_BUILD_JOBS": "1",
     }
     with on_one_core():
-        run, took = run_once(path, env)
-    if run.returncode != QUEUE_EXIT:
-        return report(name, base, run, took, outside=True)
-    sys.stderr.write(run.stdout.decode(errors="replace"))
-    return run_quiet(path, name, base) if queue else QUEUE_EXIT
+        run = run_once(path, env)._replace(outside=True)
+    if run.code != QUEUE_EXIT:
+        return report(name, base, run)
+    sys.stderr.write(run.process.stdout.decode(errors="replace"))
+    return run_quiet(path, name, base) if queue else None
 
 
 def run_quiet(path, name, base, queue=True):
     """Run the check at `path`, named `name` in what it prints, with CHECK_BASE set to
-    `base` (None: unset, whatever this process inherited), and return its exit code.
+    `base` (None: unset, whatever this process inherited), and return its Run.
     Its output shows only when it fails: agents filtered a noisy pass with greps, and
     the greps hid failed commits. With queue, it runs once it's its turn in heavy's
     queue, whose waiting lines print as they come."""
     with ExitStack() as stack:
         env, job = os.environ, None
+        asked = time.monotonic()
         try:
             if queue:
                 job = stack.enter_context(heavyqueue.turn(command=name, hint=False))
@@ -813,10 +928,11 @@ def run_quiet(path, name, base, queue=True):
                 f"heavy: can't use its queue ({error}), so the check runs without it.",
                 file=sys.stderr,
             )
-        run, took = run_once(path, check_env(env, base))
+        waited = time.monotonic() - asked
+        run = run_once(path, check_env(env, base))._replace(waited=waited)
         if job is not None:
-            job.exited(run.returncode)  # a passing check goes into heavy's history
-    return report(name, base, run, took)
+            job.exited(run.code)  # a passing check goes into heavy's history
+    return report(name, base, run)
 
 
 class Check(NamedTuple):
@@ -920,7 +1036,17 @@ def run_check(path, queue=True):
     at_commit = commit_check(path)
     counted = [check for check in (full, at_commit) if check is not None]
     before = staged()
+    tree = git_out("write-tree")
     fix = (args := running_commit_args()) is not None and is_fix_commit(args)
+    kind = "commit" if args is not None else "run"
+
+    def finished(name, run, base):
+        """The check's final exit status, a pass refused when what's staged changed,
+        with the run put on the timings record."""
+        code = refuse_if_staged_changed(run.code, before, name)
+        record_timings(name, base, run, code, kind, tree)
+        return code
+
     if fix and is_small_fix():
         # The quick check's base passed the full check, whose checks include its own.
         base = check_base([full])
@@ -930,17 +1056,16 @@ def run_check(path, queue=True):
             # Fast static checks only, no tests: not worth a place in heavy's queue,
             # unless it asks for one.
             if names_queue_exit(Path(quick).read_bytes()):
-                code = run_outside_first(quick, QUICK_NAME, base)
+                run = run_outside_first(quick, QUICK_NAME, base)
             else:
-                code = run_quiet(quick, QUICK_NAME, base, queue=False)
-            return refuse_if_staged_changed(code, before, QUICK_NAME)
+                run = run_quiet(quick, QUICK_NAME, base, queue=False)
+            return finished(QUICK_NAME, run, base)
         print(
             f"{HOOK_NAME}: skipped for a small fix commit; wt-ship runs it on the tip "
             "of the landing",
             file=sys.stderr,
         )
         return 0
-    tree = git_out("write-tree")
     if tree and tree == git_out("rev-parse", "-q", "--verify", "HEAD^{tree}"):
         for check in counted:
             if check.passed_tree(tree):
@@ -955,14 +1080,16 @@ def run_check(path, queue=True):
     if heavyqueue.inside_job():
         # The job holds the lane already, so a run outside the queue would be a
         # second one: wt-ship's job for a landing's check.
-        code = run_quiet(check.path, check.name, base)
+        run = run_quiet(check.path, check.name, base)
     elif names_queue_exit(check.content):
-        code = run_outside_first(check.path, check.name, base, queue=queue)
+        run = run_outside_first(check.path, check.name, base, queue=queue)
     elif queue:
-        code = run_quiet(check.path, check.name, base)
+        run = run_quiet(check.path, check.name, base)
     else:
+        run = None
+    if run is None:
         return QUEUE_EXIT  # it waits in the queue: the caller's to run there
-    code = refuse_if_staged_changed(code, before, check.name)
+    code = finished(check.name, run, base)
     # Some checks read the work tree, so it must match the index from start to end.
     if code == 0 and clean and no_unstaged_changes() and tree and check.record:
         passrecord.remember(check.record, check.key(tree), check.name)

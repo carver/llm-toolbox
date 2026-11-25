@@ -19,8 +19,9 @@ Pick a heredoc delimiter that isn't a line of the blocks: a line EOF in the text
 
 Stdin holds apply-edits blocks (`apply-edits -h` shows the format), which apply-edits
 applies all or nothing; --edits FILE reads them from FILE instead, and stdin isn't
-read. Use --edits under bgrun or heavy: bgrun gives its job no stdin, so `bgrun ... --
-heavy -- mutate-check -- CMD < blocks` runs with no blocks. Then the command runs, and
+read. Use --edits under bgrun or heavy: bgrun gives its job no stdin without its
+--stdin, so `bgrun ... -- heavy -- mutate-check -- CMD < blocks` runs with no blocks
+(bgrun warns). Then the command runs, and
 every file the blocks name is put back byte for byte, also when mutate-check is
 stopped by Ctrl-C, SIGTERM or SIGHUP.
 

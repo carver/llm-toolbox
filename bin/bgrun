@@ -12,6 +12,13 @@ prints is CMD's. Pair it with `waitone --pid PID` and `kill PID`.
 
   pid=$(bgrun -o run.log -C ~/project -- python3 sweep.py --workers 8)
 
+--stdin reads bgrun's own stdin to its end before CMD starts and gives CMD
+that, for a heredoc or a pipe: `bgrun --stdin -o LOG -- git commit -F - <<EOF`.
+It refuses a terminal. Without it, bgrun warns on stderr when its stdin is a
+pipe or a file with bytes left to read, since CMD reads none of it. It reads
+stdin only when asked, so `while read f; do bgrun -o LOG -- job "$f"; done <
+list` keeps its list, and an inherited pipe that never closes can't hold it up.
+
 An earlier run's output is kept: bgrun renames a non-empty LOG to LOG plus the
 time of its last write (run.log.2026-10-22T17-32-50, numbered if that name is
 taken), says so on stderr, and starts a fresh LOG. --append adds to LOG
@@ -30,21 +37,25 @@ waiting bgrun is killed.
   bgrun --wait -o run.log -- python3 sweep.py    # e.g. as a run_in_background call
 
 Exit status: 0 started, 1 CMD could not start (not found, not executable,
--C is not a directory, or LOG can't be moved aside or opened), 2 usage error. A failed
+-C is not a directory, or LOG can't be moved aside or opened), 2 usage error
+(--stdin from a terminal among them). A failed
 start leaves LOG as it was. With --wait, after a successful start: CMD's
 status.
 """
 
 import argparse
+import contextlib
 import os
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import IO
 
 CANT_START = 1
 ROTATE, APPEND, TRUNCATE = (
@@ -92,6 +103,11 @@ def main(argv: list[str] | None = None) -> int:
         "and exit with CMD's status",
     )
     parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="give CMD bgrun's own stdin, read to its end first, instead of /dev/null",
+    )
+    parser.add_argument(
         "--tail",
         type=int,
         metavar="N",
@@ -106,13 +122,25 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--tail needs --wait")
     if args.tail is not None and args.tail < 0:
         parser.error("--tail must be 0 or more")
+    if args.stdin and sys.stdin.isatty():
+        parser.error("--stdin reads a pipe or a file, not a terminal")
+    if not args.stdin and holds_input(sys.stdin.fileno()):
+        print(
+            "bgrun: CMD's stdin is /dev/null, so the input piped or redirected to "
+            "bgrun goes unread; pass --stdin to give it to CMD",
+            file=sys.stderr,
+        )
     env = caller_env()
     problem = start_problem(command[0], args.cwd, env)
     if problem:
         print(f"bgrun: {problem}", file=sys.stderr)
         return CANT_START
     log = Path(args.output)
-    proc = start(command, log, args.mode, args.cwd, env)
+    # CMD holds its own copy of the file once it starts, so bgrun can close it.
+    with saved_stdin() if args.stdin else contextlib.nullcontext() as given:
+        proc = start(
+            command, log, args.mode, args.cwd, env, given or subprocess.DEVNULL
+        )
     if proc is None:
         return CANT_START
     print(proc.pid, flush=True)
@@ -121,8 +149,33 @@ def main(argv: list[str] | None = None) -> int:
     return wait_and_report(proc, log, 10 if args.tail is None else args.tail)
 
 
+def holds_input(fd: int) -> bool:
+    """Whether stdin is a pipe or a regular file with bytes left, input CMD would miss."""
+    try:
+        info = os.fstat(fd)
+        if stat.S_ISREG(info.st_mode):
+            return info.st_size > os.lseek(fd, 0, os.SEEK_CUR)
+    except OSError:
+        return False
+    return stat.S_ISFIFO(info.st_mode)
+
+
+@contextlib.contextmanager
+def saved_stdin():
+    """bgrun's stdin, read to its end into an unnamed file, rewound for CMD."""
+    with tempfile.TemporaryFile() as saved:
+        shutil.copyfileobj(sys.stdin.buffer, saved)
+        saved.seek(0)
+        yield saved
+
+
 def start(
-    command: list[str], log: Path, mode: str, cwd: str | None, env: dict[str, str]
+    command: list[str],
+    log: Path,
+    mode: str,
+    cwd: str | None,
+    env: dict[str, str],
+    stdin: IO[bytes] | int,
 ) -> subprocess.Popen | None:
     """Start CMD with its output in LOG, after dealing with an earlier run's LOG as mode says.
 
@@ -145,7 +198,7 @@ def start(
         try:
             proc = subprocess.Popen(
                 command,
-                stdin=subprocess.DEVNULL,
+                stdin=stdin,
                 stdout=out,
                 stderr=subprocess.STDOUT,
                 cwd=cwd,

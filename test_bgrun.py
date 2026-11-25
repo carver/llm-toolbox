@@ -18,8 +18,14 @@ OLD_RUN = 1729618370  # 2024-10-22T17:32:50Z, the last write of an earlier run's
 
 
 def bgrun(
-    *args: str, cwd: Path | None = None, env: dict[str, str] | None = None
+    *args: str,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    input: str | None = None,
+    stdin=subprocess.DEVNULL,
 ) -> subprocess.CompletedProcess[str]:
+    """bgrun's result; stdin is /dev/null unless `input` pipes text or `stdin` names a
+    file object."""
     return subprocess.run(
         [str(SCRIPT), *args],
         text=True,
@@ -27,7 +33,12 @@ def bgrun(
         check=False,
         cwd=cwd,
         env=env,
+        input=input,
+        stdin=None if input is not None else stdin,
     )
+
+
+READ_STDIN = "import sys; print('read', repr(sys.stdin.read()))"
 
 
 def old_log(path: Path) -> Path:
@@ -435,3 +446,112 @@ def test_the_command_gets_the_callers_path_not_bgruns_own_environment(
     started.append(int(out.stdout.split()[0]))
     content = wait_for(log, "end")
     assert "VE=unset" in content and f"PATH={env['PATH']}\n" in content
+
+
+def test_stdin_forwards_piped_input_to_the_command(tmp_path):
+    log = tmp_path / "out.log"
+
+    result = bgrun(
+        "--wait",
+        "--stdin",
+        "-o",
+        str(log),
+        "--",
+        sys.executable,
+        "-c",
+        READ_STDIN,
+        input="the message\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "read 'the message\\n'" in log.read_text()
+    assert result.stderr == ""
+
+
+def test_stdin_forwards_a_file_redirected_in(tmp_path):
+    log, given = tmp_path / "out.log", tmp_path / "in.txt"
+    given.write_text("from a file")
+
+    with given.open() as f:
+        result = bgrun(
+            "--wait",
+            "--stdin",
+            "-o",
+            str(log),
+            "--",
+            sys.executable,
+            "-c",
+            READ_STDIN,
+            stdin=f,
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert "read 'from a file'" in log.read_text()
+
+
+def test_piped_input_without_stdin_warns_and_the_command_still_reads_nothing(tmp_path):
+    log = tmp_path / "out.log"
+
+    result = bgrun(
+        "--wait",
+        "-o",
+        str(log),
+        "--",
+        sys.executable,
+        "-c",
+        READ_STDIN,
+        input="a commit message\n",
+    )
+
+    assert result.returncode == 0
+    assert "read ''" in log.read_text()
+    assert "--stdin" in result.stderr and "/dev/null" in result.stderr
+
+
+def test_no_warning_when_stdin_is_dev_null_or_an_empty_file(tmp_path):
+    log, empty = tmp_path / "out.log", tmp_path / "empty"
+    empty.write_text("")
+
+    with empty.open() as f:
+        quiet = [
+            bgrun("--wait", "-o", str(log), "--", "true"),
+            bgrun("--wait", "--truncate", "-o", str(log), "--", "true", stdin=f),
+        ]
+
+    assert [r.stderr for r in quiet] == ["", ""]
+
+
+def test_stdin_from_a_terminal_is_a_usage_error(tmp_path):
+    log = tmp_path / "out.log"
+    leader, follower = os.openpty()
+    try:
+        with os.fdopen(follower) as tty:
+            result = bgrun("--stdin", "-o", str(log), "--", "true", stdin=tty)
+    finally:
+        os.close(leader)
+
+    assert result.returncode == 2
+    assert "terminal" in result.stderr and not log.exists()
+
+
+def test_a_file_redirected_in_without_stdin_warns(tmp_path):
+    log, given = tmp_path / "out.log", tmp_path / "in.txt"
+    given.write_text("a list\n")
+
+    with given.open() as f:
+        result = bgrun("--wait", "-o", str(log), "--", "true", stdin=f)
+
+    assert "--stdin" in result.stderr
+
+
+def test_a_socket_as_stdin_gets_no_warning(tmp_path):
+    """The Bash tool hands its commands a socket that ends at once."""
+    import socket
+
+    log = tmp_path / "out.log"
+    ours, theirs = socket.socketpair()
+    ours.close()
+    with theirs:
+        result = bgrun("--wait", "-o", str(log), "--", "true", stdin=theirs)
+
+    assert result.stderr == ""

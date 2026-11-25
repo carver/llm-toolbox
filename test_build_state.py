@@ -219,6 +219,7 @@ def test_start_refuses_while_a_build_is_open_unless_forced(repo):
 
 def test_start_refusal_says_to_review_refactor_and_finish_the_open_build(repo):
     build_state(repo, "start")
+    commit(repo, "a.py", "Work")
     refused = build_state(repo, "start")
     assert "review-prompt" in refused.stderr, refused.stderr
     assert "refactor" in refused.stderr, refused.stderr
@@ -2508,3 +2509,66 @@ def test_review_prompt_says_t_runs_its_files_in_one_process(repo, tmp_path):
     git(repo, "add", "t")
     git(repo, "commit", "-q", "-m", "A test wrapper")
     assert "`./t FILES`, which runs them in one process" in prompt_text(repo, tmp_path)
+
+
+def test_start_restarts_an_open_build_that_only_moved_onto_main(repo, worktree):
+    build_state(worktree, "start")
+    old = git(worktree, "rev-parse", "HEAD").strip()
+    # Another session lands on main; this worktree, with nothing of its own yet,
+    # catches up, as before it commits.
+    commit(repo, "other.py", "Another session's work")
+    git(worktree, "rebase", "-q", "main")
+
+    done = build_state(worktree, "start")
+
+    assert done.returncode == 0, done.stderr
+    assert old[:12] in done.stdout + done.stderr
+    new = git(worktree, "rev-parse", "HEAD").strip()
+    assert f"base {new}" in build_state(worktree, "show").stdout
+
+
+def test_start_still_refuses_an_open_build_with_a_commit_of_its_own(repo, worktree):
+    build_state(worktree, "start")
+    commit(repo, "other.py", "Another session's work")
+    git(worktree, "rebase", "-q", "main")
+    commit(worktree, "mine.py", "Work of this build")
+
+    done = build_state(worktree, "start")
+
+    assert done.returncode == 1, done.stdout
+    assert "already open" in done.stderr
+
+
+def test_start_restarts_a_branch_build_that_only_pulled_its_upstream(repo):
+    git(repo, "checkout", "-q", "-b", "work")
+    git(repo, "update-ref", "refs/remotes/origin/work", "HEAD")
+    git(repo, "config", "branch.work.remote", "origin")
+    git(repo, "config", "branch.work.merge", "refs/heads/work")
+    git(repo, "config", "remote.origin.url", "/nowhere")
+    git(repo, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+    build_state(repo, "start")
+    advance(repo, "refs/remotes/origin/work")
+    git(repo, "merge", "-q", "--ff-only", "origin/work")
+
+    done = build_state(repo, "start")
+
+    assert done.returncode == 0, done.stderr
+
+
+@pytest.mark.parametrize("step", ["sweep", "review"])
+def test_start_keeps_refusing_a_build_that_recorded_a_step(
+    repo, worktree, tmp_path, step
+):
+    build_state(worktree, "start")
+    if step == "sweep":
+        root = workspace(tmp_path)
+        sweep(worktree, root, "Nothing records")
+    else:
+        review(worktree, tmp_path)
+    commit(repo, "other.py", "Another session's work")
+    git(worktree, "rebase", "-q", "main")
+
+    done = build_state(worktree, "start")
+
+    assert done.returncode == 1, done.stdout
+    assert "already open" in done.stderr

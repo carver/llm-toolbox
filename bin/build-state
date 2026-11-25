@@ -3,7 +3,10 @@
 
     build-state start [--base REV]
                             record the base (HEAD, or an earlier REV) and the repo's
-                            fingerprint
+                            fingerprint; refuses while a build is open (--force
+                            replaces it), unless that build holds no commit of its
+                            own, as after a rebase onto the branch it lands on, and
+                            recorded no review, refactor base or sweep
     build-state refactor    record the refactor base (HEAD), before applying review
                             fixes; refuses while tracked files have changes
     build-state show        print the recorded bases
@@ -546,14 +549,26 @@ def save(path: Path, state: dict) -> None:
 def start(args: argparse.Namespace) -> int:
     path = state_file()
     if path.exists() and not args.force:
-        base = load(path)["base"]
+        state = load(path)
+        base = state["base"]
+        recorded = [step for step in RESTART_KEEPS if state.get(step)]
+        lands_on = [
+            *state.get("targets", []),
+            *([short_ref(up)] if (up := start_upstream(state)) else []),
+        ]
+        if recorded or own_commits(base, lands_on):
+            print(
+                f"A build is already open, from base {base}: review its commit"
+                " (review-prompt), record the refactor base (refactor) and finish it"
+                " before starting the next, or start --force.",
+                file=sys.stderr,
+            )
+            return 1
         print(
-            f"A build is already open, from base {base}: review its commit"
-            " (review-prompt), record the refactor base (refactor) and finish it"
-            " before starting the next, or start --force.",
+            f"The open build from base {base[:12]} holds no commit of its own, only"
+            " the branch it lands on: started again.",
             file=sys.stderr,
         )
-        return 1
     work = work_refs()
     if args.base is None:
         base = head()
@@ -584,6 +599,30 @@ def start(args: argparse.Namespace) -> int:
     )
     print(f"base {base}")
     return 0
+
+
+# What a build records before its commits, which a restart would lose: so start
+# restarts only a build that recorded none of them.
+RESTART_KEEPS = ("reviewed", "refactor_base", "sweeps")
+
+
+def own_commits(base: str, targets: list[str]) -> list[str]:
+    """The commits since `base` that none of `targets`, the branches the build lands
+    on (a name, or remote/name for an upstream), holds, locally or on a remote: the
+    build's own. A rebase or fast-forward of a build with none onto its target leaves
+    this empty."""
+    held = [
+        ref
+        for name in targets
+        for ref in git(
+            "for-each-ref",
+            "--format=%(refname)",
+            f"refs/heads/{name}",
+            f"refs/remotes/*/{name}",
+            f"refs/remotes/{name}",
+        ).stdout.split()
+    ]
+    return git("rev-list", f"{base}..HEAD", "--not", *held, "--").stdout.split()
 
 
 def refactor(args: argparse.Namespace) -> int:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A Claude Code PreToolUse hook that refuses a Bash command piping git commit, wt-ship,
-conflicts --continue or bgrun --wait into another command, or piping a check and then
-committing.
+conflicts --continue or bgrun --wait into another command, piping a check and then
+committing, or giving bgrun input its command won't see.
 
 A pipeline exits with its last command's status. In `git commit -q -F MSG 2>&1 | tail
 -2` that's tail's, so a commit its hook refused reads as a success, and the agent builds
@@ -44,6 +44,18 @@ pipeline has pipefail on and a script that reads PIPESTATUS. Only the script's o
 commands are read for this rule, not those inside a bash -c, an eval, a $(...) or a
 heredoc.
 
+It also refuses input given to bgrun without its --stdin: bgrun gives its command
+/dev/null, so in `bgrun --wait -o LOG -- git commit -F - <<EOF` the commit ran its
+checks and then aborted for want of a message, and bgrun's own warning came only as
+the background call ended. Input is a heredoc, a here-string, a `<`, `<&N` or `<>`
+redirect (but `< /dev/null` and `<&-` pass), or a `|` right before bgrun, also after a
+compound command (`{ ...; } | bgrun`). It reads the script's own commands and its
+$(...), past wrappers such as nice and env; `xargs bgrun` passes, since xargs reads the
+input itself. A loop's redirect or pipe (`while read f; do bgrun ...; done < list`)
+belongs to the loop and passes, as do `{ bgrun ...; } < file`, a bash -c, an eval, a
+heredoc fed to a shell, an alias and an `exec < file` earlier in the script. When
+another rule refuses the same call, its refusal adds this one's reason.
+
 Claude Code shows one hook's refusal at a time, so when this hook refuses, it also
 asks heavy-gate, beside it, about the same call, and adds heavy-gate's reason when that
 would refuse the call too: a foreground `bgrun --wait -- heavy -- CMD | tail` would
@@ -66,6 +78,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import refused
 from shellparse import (
+    BGRUN_VALUES,
     NOTHING_RAN,
     SHELLS,
     Command,
@@ -78,6 +91,7 @@ from shellparse import (
     reads_stdin,
     set_pipefail,
     shell_script,
+    split_options,
 )
 
 REFUSAL = (
@@ -96,6 +110,57 @@ UNSEEN_CHECK = (
     "Put `set -o pipefail;` first, or run the check in a call of its own and read "
     "what it printed before the next one."
 )
+
+UNREAD_INPUT = (
+    "Refused: bgrun gives its command /dev/null as stdin, so the {what} given to bgrun "
+    "here goes unread (a `git commit -F -` runs its checks, then aborts for want of a "
+    "message).\n"
+    "Add --stdin, which hands bgrun's stdin to the command: `bgrun --stdin --wait -o "
+    "LOG -- git commit -F - <<'EOF'`; or pass the input as a file (`git commit -F FILE`)."
+)
+# Wrappers that read the input themselves and start bgrun with stdin of their own.
+STDIN_TAKERS = {"xargs"}
+
+
+def unread_input(command: str) -> str | None:
+    """What input a bgrun in ``command`` is given but won't pass on, without --stdin:
+    "heredoc", "here-string", "redirected file" or "piped input"; or None. Reads the
+    script's own commands and its $(...), not a bash -c, an eval or a heredoc fed to a
+    shell."""
+    cleaned, substitutions, _ = prepare(command)
+    for simple in commands(cleaned):
+        if found := bgrun_input(simple):
+            return found
+    for substitution in substitutions:
+        if found := unread_input(substitution):
+            return found
+    return None
+
+
+def bgrun_input(simple: Command) -> str | None:
+    """unread_input() for one simple command."""
+    words, _ = command_of(simple.words)
+    if not words or Path(words[0]).name != "bgrun":
+        return None
+    options, _ = split_options(words[1:], BGRUN_VALUES)
+    if any(is_help(o) or (len(o) > 2 and "--stdin".startswith(o)) for o in options):
+        return None
+    ahead = simple.words[: len(simple.words) - len(words)]
+    if STDIN_TAKERS & {Path(w).name for w in ahead}:
+        return None
+    for operator, target in simple.redirects:
+        if operator.startswith("<<<"):
+            return "here-string"
+        if operator.startswith("<<"):
+            return "heredoc"
+        if operator == "<&" and target != "-" or operator == "<>":
+            return "redirected file"
+        if operator == "<" and target != "/dev/null":
+            return "redirected file"
+    if simple.fed:
+        return "piped input"
+    return None
+
 
 # The options of uv run and uvx that take a value, which is no command.
 UV_VALUES = frozenset(
@@ -350,12 +415,17 @@ def main(argv=None) -> int:
         return 0
     command = (event.get("tool_input") or {}).get("command") or ""
     found = hidden_failures(command)
+    unread = unread_input(command)
     if found:
         refusal = REFUSAL.format(name=found[0])
     elif unseen := unseen_check(command):
         refusal = UNSEEN_CHECK.format(check=unseen[0], record=unseen[1])
+    elif unread:
+        refusal = UNREAD_INPUT.format(what=unread)
     else:
         return 0
+    if unread and (found or unseen):
+        refusal += "\n" + UNREAD_INPUT.format(what=unread).removeprefix("Refused: ")
     if heavy := heavy_gate_reason(event):
         refusal += f"\nheavy-gate would refuse this call too: {heavy}"
     print(f"{refusal} {refused.ending(event)}", file=sys.stderr)

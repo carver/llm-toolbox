@@ -645,7 +645,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   commit checks and a few more its `-h` lists, as the command itself and not a
   word among its arguments; what records is `git commit`, `wt-ship`,
   `conflicts --continue` or `build-state finish`. A script that reads
-  `PIPESTATUS` passes.
+  `PIPESTATUS` passes. And it refuses input given to `bgrun` without
+  `--stdin`, which bgrun's command never sees (a heredoc, a here-string, a `<`
+  file other than /dev/null, or a pipe into it): `bgrun --wait -o LOG -- git
+  commit -F - <<EOF` ran its commit checks, then committed nothing, for want
+  of a message. `xargs bgrun` passes.
 - **gh-body-gate**: a Claude Code hook, which `install.py` registers, that
   refuses a `gh issue` or `gh pr` `create`, `comment` or `edit` whose body
   `slop-lint` flags, before the text is public, with slop-lint's lines and the

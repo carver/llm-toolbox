@@ -92,12 +92,15 @@ class Command:
     command: ( ... ), { ...; }, if ... fi, case ... esac, or a for, while, until or
     select loop; and its redirections, each as (operator, target), such as (">>", "log")
     or ("<<", "EOF"). A redirection after a compound command's close, as in
-    `( ... ) > log`, goes to the last simple command before it."""
+    `( ... ) > log`, goes to the last simple command before it. `fed`: a `|` comes
+    right before it, so its stdin is the output of the command or compound command
+    before it, as in `{ ...; } | CMD`."""
 
     words: list[str]
     piped: bool
     grouped: bool
     redirects: list[tuple[str, str]] = field(default_factory=list)
+    fed: bool = False
 
 
 @dataclass
@@ -135,14 +138,15 @@ def commands(cleaned: str) -> list[Command]:
     # around it, and its redirections; the compound commands open now, innermost last;
     # the output a `|` would take now; the words of the command being read, and its
     # redirections so far.
-    found: list[tuple[list[str], list[_Output], list[tuple[str, str]]]] = []
+    found: list[tuple[list[str], list[_Output], list[tuple[str, str]], bool]] = []
     groups: list[_Output] = []
     pipe_source: _Output | None = None
     words: list[str] = []
     redirects: list[tuple[str, str]] = []
+    fed = False  # a `|` came since the last command ended
 
     def end() -> None:
-        nonlocal words, pipe_source, redirects
+        nonlocal words, pipe_source, redirects, fed
         if not words:
             if redirects and found:  # after a compound command's close
                 found[-1][2].extend(redirects)
@@ -157,8 +161,8 @@ def commands(cleaned: str) -> list[Command]:
             elif word not in KEYWORDS:
                 break
         own = _Output()
-        found.append((words, [own, *groups], redirects))
-        pipe_source, words, redirects = closed or own, [], []
+        found.append((words, [own, *groups], redirects, fed))
+        pipe_source, words, redirects, fed = closed or own, [], [], False
 
     def close() -> None:
         """A `)`: it ends a subshell, or a case's pattern."""
@@ -193,16 +197,18 @@ def commands(cleaned: str) -> list[Command]:
                 end()
                 if token.startswith("||", i):
                     i += 1
-                elif char == "|" and pipe_source:  # the & of a |& only separates
-                    pipe_source.piped = True
+                elif char == "|":  # the & of a |& only separates
+                    fed = True
+                    if pipe_source:
+                        pipe_source.piped = True
                 elif char == "(":
                     groups.append(_Output())
                 pipe_source = None
             i += 1
     end()
     return [
-        Command(words, any(o.piped for o in outputs), len(outputs) > 1, redirects)
-        for words, outputs, redirects in found
+        Command(words, any(o.piped for o in outputs), len(outputs) > 1, redirects, fed)
+        for words, outputs, redirects, fed in found
     ]
 
 

@@ -411,3 +411,64 @@ def test_help_prints_the_docstring():
 
     assert result.returncode == 0
     assert "pipefail" in result.stdout
+
+
+UNREAD_INPUT = [
+    "bgrun --wait -o log -- git commit -q -F - <<'EOF'\nsubject\nEOF",
+    "bgrun -o log -- git commit -F - <<-EOF\n\tsubject\n\tEOF",
+    "bgrun -o log -- cat <<< 'some text'",
+    "bgrun -o log -- sort < names.txt",
+    "bgrun -o log -- sort 0< names.txt",
+    "bgrun -o log -- sort <&3",
+    "bgrun -o log -- sort <> names.txt",
+    "echo msg | bgrun --wait -o log -- git commit -F -",
+    "{ echo a; echo b; } | bgrun -o log -- sort",
+    "if true; then echo a; fi | bgrun -o log -- sort",
+    "for x in a b; do echo $x; done | bgrun -o log -- sort",
+    "cd repo && nice bgrun -o log -- git commit -F - <<EOF\nsubject\nEOF",
+    "pid=$(bgrun -o log -- git commit -F - <<EOF\nsubject\nEOF\n)",
+    "bgrun -o log -- job --stdin <<EOF\nthe option is the job's, not bgrun's\nEOF",
+]
+
+
+@pytest.mark.parametrize("command", UNREAD_INPUT)
+def test_input_given_to_bgrun_without_stdin_is_refused(command):
+    code, err = run_hook(command)
+    assert code == 2, err
+    assert "--stdin" in err and "/dev/null" in err
+    assert err.rstrip().endswith(NOTHING_RAN)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bgrun --stdin --wait -o log -- git commit -F - <<'EOF'\nsubject\nEOF",
+        "bgrun --st -o log -- sort < names.txt",
+        "echo a | bgrun --stdin -o log -- sort",
+        "bgrun -o log -- sort < /dev/null",
+        "bgrun -o log -- sort <&-",
+        "bgrun -o log -- sort > out.txt",
+        "bgrun -o log -- git commit -F msg.txt",
+        'while read f; do bgrun -o log -- job "$f"; done < list',
+        'cat list | while read f; do bgrun -o log -- job "$f"; done',
+        "printf '%s\\n' a b | xargs -n1 bgrun -o log -- job",
+        "xargs -n1 bgrun -o log -- job < names.txt",
+        "xargs -n1 bgrun -o log -- job <<EOF\na\nb\nEOF",
+        "bgrun --s -o log -- sort < names.txt",
+        "echo a | sort; bgrun -o log -- job",
+        "bgrun -o log -- sh -c 'sort < names.txt'",
+        "git commit -F - <<EOF\nsubject\nEOF",
+        "bgrun -h <<EOF\nx\nEOF",
+    ],
+)
+def test_bgrun_without_input_or_with_stdin_passes(command):
+    code, err = run_hook(command)
+    assert (code, err) == (0, "")
+
+
+def test_a_piped_wait_given_a_heredoc_names_both_problems_at_once():
+    code, err = run_hook(
+        "bgrun --wait -o log -- git commit -F - <<EOF | tail\nsubject\nEOF"
+    )
+    assert code == 2
+    assert "piped into another command" in err and "--stdin" in err

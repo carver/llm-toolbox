@@ -1376,7 +1376,9 @@ def main(argv=None):
             " wait its turn in heavy's queue, for minutes, and a foreground Bash call"
             " is killed at its time limit. Run the commit as a background call"
             " (run_in_background: true): `bgrun --wait -o <scratchpad>/commit.log --"
-            f" git commit ...`, and read its log when it ends. {refused.ending(event)}",
+            " git commit ...`, and read its log when it ends; give the message as"
+            " `-F FILE`, or add bgrun's --stdin for a heredoc."
+            f" {refused.ending(event)}",
             file=sys.stderr,
         )
         return 2

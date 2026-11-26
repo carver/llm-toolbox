@@ -389,7 +389,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   simulated human (`claude-fresh`) to answer open questions and judge
   conditional turns (never sent when it fails), and saves screens, transcripts
   and the files the run made (`~/.config` with the values it was given and
-  keys or tokens blanked), then removes the user. `--setup FILE` prepares
+  keys or tokens blanked), then removes the user. A turn
+  `{"wait_for_file": "NAME", "say": "..."}` prints one line naming `DIR/NAME`,
+  waits up to `DRIVE_AGENT_WAIT_LIMIT` seconds for that file, as a person
+  confirms an emailed link, then sends `say`; `--keep-file REL:DEST` copies
+  `~/REL` to DEST, mode 600 and unredacted, before the home goes, however the
+  run ends, and prints only that it did. `--setup FILE` prepares
   the home first, `--agent-env`/`--setup-env`/`--var` pass named variables
   without putting them on a command line. `digest RUN_DIR` prints a run's
   transcripts compactly, sessions in the order they ran, with keys and tokens

@@ -20,6 +20,7 @@ import ipaddress
 import json
 import os
 import re
+import selectors
 import shutil
 import signal
 import socket
@@ -1942,3 +1943,304 @@ def test_a_kill_server_that_never_returns_still_ends_the_server_and_says_so(
         check=False,
     )
     assert alive.returncode != 0, "the run's tmux server outlived it"
+
+
+def read_until(process, pattern, deadline):
+    """Lines of `process`'s stdout up to the first that matches `pattern`, read
+    without blocking past `deadline`; fails when none does by then. It reads the
+    pipe itself, since a buffered readline may hold the line select waits for."""
+    text = ""
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    while time.time() < deadline:
+        if not selector.select(timeout=max(0, deadline - time.time())):
+            break
+        chunk = os.read(process.stdout.fileno(), 4096).decode()
+        if not chunk:
+            break
+        text += chunk
+        lines = text.splitlines(keepends=True)
+        for n, line in enumerate(lines):
+            if line.endswith("\n") and re.search(pattern, line):
+                return lines[: n + 1]
+    pytest.fail(f"no line matching {pattern!r} by the deadline: {text!r}")
+
+
+def test_a_wait_for_file_turn_sends_its_text_only_once_the_file_appears(tmp_path, env):
+    path = scenario(
+        tmp_path,
+        turns=[
+            "first",
+            {"wait_for_file": "confirmed", "say": "I clicked the link"},
+            "last",
+        ],
+    )
+    out = tmp_path / "out"
+    process = subprocess.Popen(
+        [str(TOOL), "run", str(path), "--harness", "claude", "--name", "jason150"]
+        + ["--out", str(out)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        lines = read_until(process, r"waits for", time.time() + 30)
+        assert str(out / "confirmed") in lines[-1]
+        assert sum("waits for" in line for line in lines) == 1
+        # The turn before has ended and been logged, and so has the wait, so a run
+        # stopped mid-wait says what it waited for; the wait sends nothing.
+        log = (out / "turns.md").read_text()
+        assert "Sent: first" in log and "I clicked the link" not in log
+        assert f"## Turn 2: waiting for {out / 'confirmed'}" in log
+        assert process.poll() is None
+        (out / "confirmed").touch()
+        _, stderr = process.communicate(timeout=60)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=30)
+    assert process.returncode == 0, stderr
+    log = (out / "turns.md").read_text()
+    assert f"Waited for {out / 'confirmed'}" in log
+    assert log.index("Sent: first") < log.index("Waited for")
+    assert log.index("Waited for") < log.index("Sent: I clicked the link")
+    assert log.index("Sent: I clicked the link") < log.index("Sent: last")
+    assert "done: I clicked the link" in (out / "screen-02.txt").read_text()
+    assert json.loads((out / "run.json").read_text())["outcome"] == "done"
+
+
+def test_a_wait_for_file_past_its_limit_fails_the_run(tmp_path, env):
+    path = scenario(
+        tmp_path, turns=["first", {"wait_for_file": "never", "say": "never sent"}]
+    )
+    out = tmp_path / "out"
+    done = drive(
+        {**env, "DRIVE_AGENT_WAIT_LIMIT": "1"},
+        "run",
+        path,
+        "--harness",
+        "claude",
+        "--name",
+        "jason151",
+        "--out",
+        out,
+        check=False,
+    )
+    assert done.returncode == 1
+    assert json.loads((out / "run.json").read_text())["outcome"] == "no-file"
+    log = (out / "turns.md").read_text()
+    assert (
+        f"NO FILE SEEN: {out / 'never'}" in log
+        and "Sent:" not in log.split("## Turn 2")[1]
+    )
+    assert str(out / "never") in done.stderr
+    assert not (Path(env["DRIVE_AGENT_HOME_ROOT"]) / "jason151").exists()
+
+
+@pytest.mark.parametrize(
+    "turn, why",
+    [
+        ({"wait_for_file": "a/b", "say": "x"}, "file name"),
+        ({"wait_for_file": "..", "say": "x"}, "file name"),
+        ({"wait_for_file": "", "say": "x"}, "file name"),
+        ({"wait_for_file": "turns.md", "say": "x"}, "drive-agent writes"),
+        ({"wait_for_file": "screen-03.txt", "say": "x"}, "drive-agent writes"),
+        ({"wait_for_file": "files", "say": "x"}, "drive-agent writes"),
+        ({"wait_for_file": "ok"}, "say"),
+        ({"wait_for_file": "ok", "say": 3}, "say"),
+        ({"wait_for_file": "ok", "say": "x", "only_if": "y"}, "only"),
+        ({"wait_for_file": "ok", "say": "again"}, "turn 1 waits for ok too"),
+    ],
+)
+def test_a_wait_for_file_turn_drive_agent_cant_take_is_refused_before_the_run(
+    tmp_path, env, turn, why
+):
+    out = tmp_path / "out"
+    done = drive(
+        env,
+        "run",
+        scenario(tmp_path, turns=[{"wait_for_file": "ok", "say": "x"}, "y", turn]),
+        "--harness",
+        "claude",
+        "--name",
+        "jason152",
+        "--out",
+        out,
+        check=False,
+    )
+    assert done.returncode == 2 and why in done.stderr, done.stderr
+    assert not out.exists()
+
+
+def test_a_wait_for_file_turn_in_print_mode_is_refused(tmp_path, env):
+    done = drive(
+        env,
+        "run",
+        scenario(
+            tmp_path,
+            turns=[{"wait_for_file": "ok", "say": "x"}],
+            print_mode=True,
+        ),
+        "--harness",
+        "claude",
+        "--name",
+        "jason153",
+        "--out",
+        tmp_path / "out",
+        check=False,
+    )
+    assert done.returncode == 2 and "print_mode" in done.stderr, done.stderr
+
+
+HEADER_SETUP = (
+    "#!/usr/bin/env python3\nimport os\n"
+    "d = os.path.join(os.environ['HOME'], '.config', 'tool')\n"
+    "os.makedirs(d)\n"
+    "open(os.path.join(d, 'site.header'), 'w').write("
+    "'Authorization: Bearer ' + os.environ['TOKEN'] + '\\n')\n"
+)
+
+
+@pytest.mark.parametrize("ready", [True, False], ids=["done", "not-ready"])
+def test_keep_file_copies_a_home_file_whole_before_cleanup_and_prints_none_of_it(
+    tmp_path, env, ready
+):
+    token = "fdt_" + "q" * 52
+    setup = tmp_path / "setup.py"
+    setup.write_text(
+        HEADER_SETUP
+        + (
+            ""
+            if ready
+            else "open(os.path.join(os.environ['HOME'], 'never-ready'), 'w')\n"
+        )
+    )
+    out = tmp_path / "out"
+    kept = tmp_path / "kept" / "site.header"
+    kept.parent.mkdir()
+    done = drive(
+        {**env, "TOKEN": token, "DRIVE_AGENT_LAUNCH_LIMIT": "3"},
+        "run",
+        scenario(tmp_path, turns=["hi"]),
+        "--harness",
+        "claude",
+        "--name",
+        "jason154",
+        "--out",
+        out,
+        "--setup",
+        setup,
+        "--setup-env",
+        "TOKEN",
+        "--keep-file",
+        f".config/tool/site.header:{kept}",
+        check=False,
+    )
+    assert done.returncode == (0 if ready else 1), done.stderr
+    assert kept.read_text() == f"Authorization: Bearer {token}\n"
+    assert kept.stat().st_mode & 0o777 == 0o600
+    assert f"kept ~/.config/tool/site.header at {kept}" in done.stdout
+    assert token not in done.stdout + done.stderr
+    for saved in out.rglob("*"):
+        if saved.is_file():
+            assert token not in saved.read_text(errors="replace"), saved
+    assert not (Path(env["DRIVE_AGENT_HOME_ROOT"]) / "jason154").exists()
+
+
+@pytest.mark.parametrize("linked", ["file", "folder"])
+def test_keep_file_never_follows_a_link_the_agent_planted_in_the_home(
+    tmp_path, env, linked
+):
+    """The copy is read outside the box, where a link could reach a file the box
+    hides from the agent."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "site.header").write_text("hidden-from-the-box\n")
+    target = outside / "site.header" if linked == "file" else outside
+    link = ".config/tool/site.header" if linked == "file" else ".config/tool"
+    setup = tmp_path / "setup.py"
+    setup.write_text(
+        "#!/usr/bin/env python3\nimport os\n"
+        f"p = os.path.join(os.environ['HOME'], {link!r})\n"
+        "os.makedirs(os.path.dirname(p), exist_ok=True)\n"
+        f"os.symlink({str(target)!r}, p)\n"
+    )
+    kept = tmp_path / "kept.header"
+    done = drive(
+        env,
+        "run",
+        scenario(tmp_path, turns=["hi"]),
+        "--harness",
+        "claude",
+        "--name",
+        "jason157",
+        "--out",
+        tmp_path / "out",
+        "--setup",
+        setup,
+        "--keep-file",
+        f".config/tool/site.header:{kept}",
+    )
+    assert "kept no ~/.config/tool/site.header: it is a link" in done.stderr
+    assert not kept.exists()
+    assert "hidden-from-the-box" not in done.stdout + done.stderr
+
+
+def test_keep_file_with_no_such_file_says_so_and_keeps_nothing(tmp_path, env):
+    kept = tmp_path / "site.header"
+    done = drive(
+        env,
+        "run",
+        scenario(tmp_path, turns=["hi"]),
+        "--harness",
+        "claude",
+        "--name",
+        "jason155",
+        "--out",
+        tmp_path / "out",
+        "--keep-file",
+        f".config/tool/site.header:{kept}",
+    )
+    assert "kept no ~/.config/tool/site.header" in done.stderr
+    assert not kept.exists()
+
+
+@pytest.mark.parametrize(
+    "spec, why",
+    [
+        ("site.header", "REL:DEST"),
+        ("/etc/passwd:{dest}", "relative"),
+        ("../x:{dest}", "relative"),
+        ("a/../../x:{dest}", "relative"),
+        (":{dest}", "REL:DEST"),
+        ("a:", "REL:DEST"),
+        ("a:{exists}", "exists"),
+        ("a:{nowhere}", "no folder"),
+    ],
+)
+def test_keep_file_it_cant_take_is_refused_before_the_run(tmp_path, env, spec, why):
+    exists = tmp_path / "exists"
+    exists.touch()
+    spec = spec.format(
+        dest=tmp_path / "dest",
+        exists=exists,
+        nowhere=tmp_path / "no" / "dest",
+    )
+    out = tmp_path / "out"
+    done = drive(
+        env,
+        "run",
+        scenario(tmp_path, turns=["hi"]),
+        "--harness",
+        "claude",
+        "--name",
+        "jason156",
+        "--out",
+        out,
+        "--keep-file",
+        spec,
+        check=False,
+    )
+    assert done.returncode == 2 and why in done.stderr, done.stderr
+    assert not out.exists()

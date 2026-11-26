@@ -36,6 +36,12 @@ SCENARIO is JSON:
               sent only when the simulated human judges `only_if` holds of the
               agent's last message, else `else` (or nothing). "{RESTART}" quits the
               harness and starts a new session in the same home.
+              {"wait_for_file": "NAME", "say": "..."} is a step only a person can
+              take mid-run, such as confirming an emailed link: the run prints one
+              line naming DIR/NAME and waits until that file exists (up to
+              DRIVE_AGENT_WAIT_LIMIT, not a turn's limit), then sends `say` as an
+              ordinary turn. NAME is a bare file name, none of those drive-agent
+              writes in DIR.
   gated       actions the simulated human never approves unless a scripted message
               has, such as ["posting to File Drawer"]. Required.
   persona     text added to --persona's.
@@ -73,6 +79,11 @@ run options:
                        box already hides /etc/sandbox-persistent.sh and
                        /etc/sandbox-secrets.sh, which set this sandbox's own
                        variables in every shell
+  --keep-file REL:DEST copy ~/REL to DEST, mode 600 and unredacted, as the run ends
+                       however it ends, before the home goes; for a check after the
+                       run with a token the agent got (repeatable). DEST must not
+                       exist, and a link on the way to ~/REL keeps nothing. It
+                       prints only that it kept the file, or why not.
   --keep-home          leave the home in place (isolation none only; for tests)
 
 The run's DIR holds scenario.json, run.json (harness, version, isolation, times,
@@ -109,6 +120,8 @@ Environment:
                              runs as the driver, in a home under DRIVE_AGENT_HOME_ROOT
   DRIVE_AGENT_HOME_ROOT      where homes go with isolation none
   DRIVE_AGENT_TURN_LIMIT     seconds a turn may take (default 1200)
+  DRIVE_AGENT_WAIT_LIMIT     seconds a wait_for_file turn waits for its file
+                             (default 86400)
   DRIVE_AGENT_SETTLE         seconds a turn end must hold before the next turn (8)
   DRIVE_AGENT_LAUNCH_LIMIT   seconds the harness has to show its prompt (60)
   DRIVE_AGENT_TRUST_GRACE    seconds the prompt must show with no folder-trust
@@ -124,11 +137,12 @@ Environment:
 
 Needs tmux, and for isolation, passwordless sudo, bwrap (the bubblewrap package) and
 iptables. Exit status: 0 the run ended, 1 it failed (harness not ready, a turn
-timed out, a question dialog it couldn't answer, a tmux command that didn't
-return, a setup error), 2 usage error. SIGUSR1 prints where each of its threads
-is to stderr, for a run that seems stuck; SIGTERM stops it and cleans up.
+timed out, a file it waited for never came, a question dialog it couldn't answer,
+a tmux command that didn't return, a setup error), 2 usage error. SIGUSR1 prints
+where each of its threads is to stderr, for a run that seems stuck; SIGTERM stops
+it and cleans up.
 run.json's outcome then says which: failed, not-ready, timeout, auth, rate-limit,
-dialog (a turn stopped on some other dialog), dialog-unanswered.
+dialog (a turn stopped on some other dialog), dialog-unanswered, no-file.
 """
 
 import argparse
@@ -209,6 +223,8 @@ def number(name: str, default: float) -> float:
 
 
 TURN_LIMIT = number("DRIVE_AGENT_TURN_LIMIT", 1200)
+# A person's step mid-run, such as confirming an emailed link, may take hours.
+WAIT_LIMIT = number("DRIVE_AGENT_WAIT_LIMIT", 86400)
 SETTLE = number("DRIVE_AGENT_SETTLE", 8)
 LAUNCH_LIMIT = number("DRIVE_AGENT_LAUNCH_LIMIT", 60)
 # How long the prompt must show with no trust dialog before the first turn: Codex in
@@ -461,6 +477,35 @@ LAUNCH = (
 )
 
 
+# Prints the regular file argv[2] under the folder argv[1], walking each folder with
+# O_NOFOLLOW; says why not, on stderr, when it can't. A link where a folder should be
+# fails with ENOTDIR, not ELOOP, so a failed step looks at what it opened.
+READ_UNLINKED = (
+    "import os, stat, sys\n"
+    "parts = [p for p in sys.argv[2].split('/') if p not in ('', '.')]\n"
+    "fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)\n"
+    "for n, part in enumerate(parts):\n"
+    "    last = n == len(parts) - 1\n"
+    "    flags = os.O_RDONLY | os.O_NOFOLLOW\n"
+    "    flags |= os.O_NONBLOCK if last else os.O_DIRECTORY\n"
+    "    try:\n"
+    "        new = os.open(part, flags, dir_fd=fd)\n"
+    "    except OSError as e:\n"
+    "        try:\n"
+    "            link = stat.S_ISLNK(os.stat(part, dir_fd=fd,"
+    " follow_symlinks=False).st_mode)\n"
+    "        except OSError:\n"
+    "            link = False\n"
+    "        sys.exit('it is a link' if link else e.strerror)\n"
+    "    os.close(fd)\n"
+    "    fd = new\n"
+    "if not stat.S_ISREG(os.fstat(fd).st_mode):\n"
+    "    sys.exit('it is no regular file')\n"
+    "with os.fdopen(fd, 'rb') as f:\n"
+    "    sys.stdout.buffer.write(f.read())\n"
+)
+
+
 class Box:
     """Where the agent runs. UserBox: a system user in bwrap. NoBox (tests): the
     driver's own user. Every path is absolute; reads and writes in the home run as
@@ -602,6 +647,19 @@ class Box:
             [*self.as_user(), "cat", "--", str(path)], capture_output=True, check=False
         )
         return done.stdout if done.returncode == 0 else None
+
+    def read_unlinked(self, rel: str) -> tuple[bytes | None, str]:
+        """The regular file ~/`rel`, opened one folder at a time with no link
+        followed, as `read` would follow one outside the box to a file the box
+        hides. Returns its bytes, or None and why not."""
+        done = subprocess.run(
+            [*self.as_user(), "python3", "-c", READ_UNLINKED, str(self.home), rel],
+            capture_output=True,
+            check=False,
+        )
+        if done.returncode:
+            return None, done.stderr.decode(errors="replace").strip()[-200:]
+        return done.stdout, ""
 
     def files(self, folder: Path) -> list[tuple[str, int, float]]:
         """Regular files under `folder`, not following links, as (relative path,
@@ -1577,14 +1635,37 @@ def interactive(
             with log.open("a") as f:
                 f.write(f"## Turn {n}: new session\n\n")
             continue
-        turn = {"text": turn} if isinstance(turn, str) else turn
+        turn = logged = {"text": turn} if isinstance(turn, str) else turn
+        waited = ""
+        if "wait_for_file" in turn:
+            path = session.out.resolve() / turn["wait_for_file"]
+            with log.open("a") as f:
+                f.write(
+                    f"## Turn {n}: waiting for {path} ({time.strftime('%H:%M:%S')})\n\n"
+                )
+            took = wait_for_file(path, session.box.name, n)
+            if took is None:
+                with log.open("a") as f:
+                    f.write(
+                        f"## Turn {n}: NO FILE SEEN: {path}\n\n"
+                        f"Scripted: {json.dumps(logged)}\n\n"
+                        f"Waited {WAIT_LIMIT:g} s.\n\n"
+                    )
+                print(
+                    f"drive-agent: turn {n}: {path} didn't appear within "
+                    f"{WAIT_LIMIT:g} s",
+                    file=sys.stderr,
+                )
+                return "no-file"
+            waited = f"Waited for {path}: {took:.0f} s.\n\n"
+            turn = {"text": turn["say"]}
         last = session.harness.last_message() if history else ""
         text, note = human_turn(turn, scenario, persona, last, history)
         if text is None:
             with log.open("a") as f:
                 f.write(
                     f"## Turn {n}: skipped, {note or 'its condition did not hold'}\n\n"
-                    f"Scripted: {json.dumps(turn)}\n\n"
+                    f"Scripted: {json.dumps(logged)}\n\n{waited}"
                 )
             continue
         # Only what was sent counts as scripted so far, so a skipped "Yes, post it."
@@ -1615,7 +1696,8 @@ def interactive(
             with log.open("a") as f:
                 f.write(
                     f"## Turn {n}: FAILED, {failed}\n\n"
-                    f"Scripted: {json.dumps(turn)}\n\n{answered}Message: {text}\n\n"
+                    f"Scripted: {json.dumps(logged)}\n\n{waited}{answered}"
+                    f"Message: {text}\n\n"
                 )
             print(
                 f"drive-agent: turn {n}: {failed}; see turns.md and screen-{n:02}.txt",
@@ -1628,7 +1710,8 @@ def interactive(
         with log.open("a") as f:
             f.write(
                 f"## Turn {n} ({status}, "
-                f"{time.strftime('%H:%M:%S')})\n\nScripted: {json.dumps(turn)}\n\n"
+                f"{time.strftime('%H:%M:%S')})\n\nScripted: {json.dumps(logged)}\n\n"
+                + waited
                 + (f"{note}\n\n" if note else "")
                 + answered
                 + f"Sent: {text}\n\n"
@@ -1645,6 +1728,55 @@ def interactive(
         if not ended:
             return why_stuck(session.last_screen())
     return "done"
+
+
+def wait_for_file(path: Path, name: str, n: int) -> float | None:
+    """Waits up to WAIT_LIMIT for `path` to exist, having said so in one line.
+    Returns the seconds it took, or None when it never came."""
+    print(f"{name}: turn {n} waits for {path}; create it to go on", flush=True)
+    began = time.time()
+    while not path.exists():
+        if time.time() - began > WAIT_LIMIT:
+            return None
+        time.sleep(min(1, SETTLE))
+    return time.time() - began
+
+
+# The names drive-agent writes in a run's folder, which a wait_for_file turn can't
+# wait for.
+RUN_FILES = re.compile(
+    r"scenario\.json|run\.json|turns\.md|print-mode\.jsonl|files"
+    r"|screen-.*\.txt|transcript-.*"
+)
+FILE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+
+
+def check_turns(scenario: dict) -> None:
+    """Refuses a wait_for_file turn the run couldn't take."""
+    waits = {}
+    for n, turn in enumerate(scenario["turns"], 1):
+        if not isinstance(turn, dict) or "wait_for_file" not in turn:
+            continue
+        name = turn["wait_for_file"]
+        if scenario.get("print_mode"):
+            raise Usage(f"turn {n}: print_mode sends one turn and waits for no file")
+        if set(turn) != {"wait_for_file", "say"}:
+            raise Usage(f'turn {n}: a wait_for_file turn takes only "say"')
+        if not isinstance(turn["say"], str) or not turn["say"]:
+            raise Usage(f'turn {n}: a wait_for_file turn needs "say", its text')
+        if not isinstance(name, str) or not FILE_NAME.fullmatch(name):
+            raise Usage(
+                f"turn {n}: wait_for_file takes a bare file name, of letters, "
+                "digits, ., _ and -"
+            )
+        if RUN_FILES.fullmatch(name):
+            raise Usage(f"turn {n}: drive-agent writes {name} in the run's folder")
+        if name in waits:
+            raise Usage(
+                f"turn {n}: turn {waits[name]} waits for {name} too, so this one "
+                "would go on at once"
+            )
+        waits[name] = n
 
 
 def leave_for_chat(asked: dict) -> bool:
@@ -1830,6 +1962,44 @@ def prepare_home(
     return project, base_env
 
 
+def keep_spec(spec: str) -> tuple[str, Path]:
+    """--keep-file's REL:DEST, refused unless REL stays in the home and DEST is new
+    in a folder that exists."""
+    rel, colon, dest = spec.partition(":")
+    if not (colon and rel and dest):
+        raise Usage(f"--keep-file {spec}: give REL:DEST")
+    if Path(rel).is_absolute() or ".." in Path(rel).parts or not Path(rel).parts:
+        raise Usage(f"--keep-file {spec}: REL is relative to the home, with no ..")
+    if os.path.lexists(dest):
+        raise Usage(f"--keep-file {spec}: {dest} exists")
+    if not Path(dest).parent.is_dir():
+        raise Usage(f"--keep-file {spec}: no folder {Path(dest).parent}")
+    return rel, Path(dest)
+
+
+def keep_files(box: Box, keep: list[tuple[str, Path]]) -> None:
+    """Copies each ~/REL to its DEST, mode 600 and unredacted, saying only whether
+    it did: the file may hold a live token."""
+    for rel, dest in keep:
+        data, why = box.read_unlinked(rel)
+        if data is None:
+            print(f"drive-agent: kept no ~/{rel}: {why}", file=sys.stderr)
+            continue
+        try:
+            fd = os.open(
+                dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+            )
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+        except OSError as error:
+            print(
+                f"drive-agent: kept no ~/{rel}: {dest}: {error.strerror}",
+                file=sys.stderr,
+            )
+            continue
+        print(f"{box.name}: kept ~/{rel} at {dest}", flush=True)
+
+
 def drive(args) -> int:
     scenario_path = Path(args.scenario)
     try:
@@ -1843,6 +2013,8 @@ def drive(args) -> int:
         )
     if not scenario.get("turns"):
         raise Usage("the scenario has no turns")
+    check_turns(scenario)
+    keep = [keep_spec(spec) for spec in args.keep_file]
     values = {}
     for name in args.var:
         if name not in os.environ:
@@ -1960,7 +2132,10 @@ def drive(args) -> int:
         if out.is_dir():
             (out / "run.json").write_text(json.dumps(record, indent=1) + "\n")
         if box.made:
-            box.destroy()
+            try:
+                keep_files(box, keep)
+            finally:
+                box.destroy()
     print(f"{args.name}: {record['outcome']}, {out}")
     return 0 if record["outcome"] == "done" else 1
 
@@ -2139,6 +2314,7 @@ def main() -> int:
     r.add_argument("--deny-host", action="append", default=[])
     r.add_argument("--bind-tool", action="append", default=[])
     r.add_argument("--hide", action="append", default=[])
+    r.add_argument("--keep-file", action="append", default=[])
     r.add_argument("--keep-home", action="store_true")
     d = sub.add_parser("digest", add_help=False)
     d.add_argument("run_dir")

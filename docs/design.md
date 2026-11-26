@@ -995,6 +995,17 @@ The agent sees a declined dialog, not answers, which a usability finding should 
 A session reads only its own transcript: before its first prompt the newest one is the last session's, and the simulated human answered that session's dialog again after a restart (jason86).
 Codex has no such dialog in default mode: `request_user_input` is for Plan mode, and `request_user_input_async` returns at once and shows its question as an agent message.
 
+### A person's step mid-run is a file the run waits for; a token outlives the run only through --keep-file (2026-11-26)
+
+A scenario turn `{"wait_for_file": "NAME", "say": "..."}` prints one line naming `<--out>/NAME`, waits for that file past no turn limit (`DRIVE_AGENT_WAIT_LIMIT`, a day by default), then sends `say` as an ordinary turn; turns.md logs the wait.
+`--keep-file REL:DEST` copies `~/REL` to DEST, mode 600 and unredacted, in the run's cleanup, before the home goes, on every exit, and prints only that it kept the file or why not; `files/` keeps its redacted copy.
+Reason: filedrawer#141's no-account scenario (2026-11-24) had the agent make an account and ask for a claim, which the owner confirmed in a browser mid-run, and then meant to check the account with the agent's token.
+`run` types every turn in one loop with no hook for its caller between turns, so the pause has to be a turn of its own; and the home goes on every exit, so the token, which the runner never had, could leave only through drive-agent.
+A file in the run folder works from any shell or another agent, and holds the run with no terminal attached.
+DEST must not exist and is opened with `O_EXCL | O_NOFOLLOW`, so a run never overwrites a file or follows a link someone planted there.
+`~/REL` is read as the box's user but outside bwrap, where a link the agent planted would reach a file the box hides from it, such as `/etc/sandbox-persistent.sh`, and the caller would then send that file on (filedrawer sends the kept header to its site). So the read opens one folder at a time with `O_NOFOLLOW` and takes only a regular file; a link anywhere on the way keeps nothing and says so.
+A wait turn's NAME is a bare file name, none drive-agent writes in the run folder (`turns.md` would end the wait at once) and no earlier wait turn's (the file is already there); print mode, which sends one turn, refuses one. turns.md logs the wait as it starts, so a run stopped mid-wait shows what it waited for.
+
 ### Rejected: a separate user without bwrap (2026-11-10)
 
 It blocks writes but not reads of the workspace, which is world-readable, and leaves `/proc` and `/var/tmp` shared between runs.

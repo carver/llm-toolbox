@@ -141,8 +141,11 @@ last 5000 kept: the UTC time, `commit` for a git commit's check or `run` for
 another (wt-ship's), the check's name, HEAD and the tree checked (12 hex digits
 each), its exit status, the seconds it waited in the queue and ran, `queue` or
 `outside` the queue, CHECK_BASE, and its timings as `name=seconds` joined by commas.
-So `column -t -s$'\t' .git/agent-check-timings.tsv | tail` shows where recent checks
-spent their time. A check skipped because its tree passed already isn't recorded.
+`--timings [--since TIME]` sums it up: the runs and the span they cover, then by
+check, its runs, the seconds it ran in all and on average, the seconds it waited and
+its failed runs, and by part, its runs and seconds in all and on average, longest
+first; TIME is an ISO date or time, compared as text; `column -t -s$'\t' .git/agent-check-timings.tsv | tail`
+shows the latest runs. A check skipped because its tree passed already isn't recorded.
 
 `--install` also puts a line first in each repo's post-commit hook, creating the hook
 if needed, which runs `--post-commit` after an agent's `git commit`. It says nothing
@@ -191,6 +194,7 @@ paths that differ from that base.
     agent-commit-gate --install REPO...    # add the lines to each repo's hooks
     agent-commit-gate --run HOOK           # as the pre-commit line calls it
     agent-commit-gate --post-commit        # as the post-commit line calls it
+    agent-commit-gate --timings [--since TIME]  # where the repo's checks spent time
     agent-commit-gate < hook-input.json    # as Claude Code calls it
 """
 
@@ -919,6 +923,85 @@ def record_timings(name, base, run, code, kind, tree):
         print(f"{name}: couldn't record its timings: {error}", file=sys.stderr)
 
 
+class TimedRun(NamedTuple):
+    """One row of TIMINGS_RECORD, as --timings sums it up."""
+
+    at: str
+    check: tuple  # (kind, name)
+    failed: bool
+    waited: float
+    took: float
+    parts: list  # [(name, seconds)]
+
+
+def timed_run(line):
+    """The row `line` as a TimedRun, or None when it isn't whole: too short, or a
+    number that isn't one, so no row counts in part."""
+    row = line.split("\t")
+    if len(row) < 8:
+        return None
+    try:
+        parts = [
+            (name, float(seconds))
+            for name, _, seconds in (
+                part.partition("=")
+                for part in (row[10] if len(row) > 10 else "").split(",")
+            )
+            if name and seconds
+        ]
+        return TimedRun(
+            row[0], (row[1], row[2]), row[5] != "0", float(row[6]), float(row[7]), parts
+        )
+    except ValueError:
+        return None
+
+
+def show_timings(since):
+    """Print the repo's TIMINGS_RECORD summed up, from the rows at or after `since`
+    (ISO time text, compared as text): the runs and the span they cover, then by
+    check (kind and name: runs, total and mean seconds run, seconds waited, failed
+    runs) and by part, longest total first."""
+    record = passrecord.record_path(TIMINGS_RECORD)
+    runs = [
+        run
+        for line in (passrecord.recorded(record) if record else [])
+        if (run := timed_run(line))
+    ]
+    runs = [run for run in runs if not since or run.at >= since]
+    if not runs:
+        print("no check timings recorded" + (f" since {since}" if since else ""))
+        return
+    checks, parts = {}, {}
+    for run in runs:
+        check = checks.setdefault(run.check, [0, 0.0, 0.0, 0])
+        check[0] += 1
+        check[1] += run.took
+        check[2] += run.waited
+        check[3] += run.failed
+        for name, seconds in run.parts:
+            entry = parts.setdefault(name, [0, 0.0])
+            entry[0] += 1
+            entry[1] += seconds
+    times = sorted(run.at for run in runs)
+    print(f"{len(runs)} runs from {times[0]} to {times[-1]}")
+    print()
+    print(
+        f"{'check':<34} {'runs':>5} {'run_s':>8} {'mean_s':>8} {'waited_s':>8} {'failed':>6}"
+    )
+    for (kind, name), (count, took, waited, failed) in sorted(
+        checks.items(), key=lambda item: -item[1][1]
+    ):
+        label = f"{kind} {name}"
+        print(
+            f"{label:<34} {count:>5} {took:>8.0f} {took / count:>8.1f} {waited:>8.0f}"
+            f" {failed:>6}"
+        )
+    print()
+    print(f"{'part':<34} {'runs':>5} {'total_s':>8} {'mean_s':>8}")
+    for name, (runs, total) in sorted(parts.items(), key=lambda item: -item[1][1]):
+        print(f"{name:<34} {runs:>5} {total:>8.0f} {total / runs:>8.1f}")
+
+
 def run_outside_first(path, name, base, queue=True):
     """Run the check as run_quiet does, but first outside heavy's queue, on one core,
     with CHECK_QUEUE_EXIT set. That run's outcome is the check's, unless it exits with
@@ -1363,7 +1446,26 @@ def main(argv=None):
         help="as the post-commit line calls it: warn when the fix commit just made "
         "changes a file its target didn't",
     )
+    parser.add_argument(
+        "--timings",
+        action="store_true",
+        help="sum up the repo's check timings record, by check and by part",
+    )
+    parser.add_argument(
+        "--since",
+        metavar="TIME",
+        help="with --timings: only the runs at or after TIME (2026-11-25, or a time)",
+    )
     args = parser.parse_args(argv)
+    if args.since is not None and not args.timings:
+        parser.error("--since goes with --timings")
+    if args.since is not None and not re.match(r"\d{4}", args.since):
+        parser.error(
+            f"--since takes an ISO date or time, such as 2026-11-25, not {args.since!r}"
+        )
+    if args.timings:
+        show_timings(args.since)
+        return 0
     if args.post_commit:
         warn_repeated_message()
         warn_stray_files()

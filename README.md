@@ -442,7 +442,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   write its parts' seconds to the file `$CHECK_TIMINGS` names, `NAME SECONDS` a
   line, which the pass line, or a line before the refusal, then shows; every
   run also goes on `agent-check-timings.tsv` in the common git dir, with its
-  queue wait and run time (`agent-commit-gate -h` lists the columns). A small
+  queue wait and run time (`agent-commit-gate -h` lists the columns), which
+  `agent-commit-gate --timings [--since TIME]` sums up by check and by part,
+  longest first. A small
   fixup!, squash! or amend! commit (found from the running `git commit`'s
   arguments) runs `agent-quick-check` instead, when the repo keeps one beside
   `agent-pre-commit`, and otherwise skips the check, since `wt-ship` checks

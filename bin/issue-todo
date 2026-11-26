@@ -21,7 +21,8 @@ wt-ship lists them for each issue a landing closes.
     issue-todo read 42 43             # body and every comment, which gh splits in two
     issue-todo unticked 42 43         # each unticked item, as "#42 TEXT", one a line
     issue-todo claim 42               # refuses while another session holds a claim
-    issue-todo release 42
+    issue-todo release 42             # deletes the claim's comment
+    issue-todo release 42 --note "blocked on #50"   # and leaves a comment saying why
     issue-todo claims                 # "#41  5c618940  3h  Beta backups", one a claim
     issue-todo tick 42 "forecast measure" --note "built in 8d5068e"
     issue-todo tick 42 "Add hub" --undo
@@ -60,10 +61,15 @@ then the `git log` that lists the rest. Work planned from an issue's numbers may
 already be done: a fix that landed after the issue was opened shows here. Outside a
 clone of the repo, or when git fails, the section is left out.
 
-`claim` and `release` keep a claim in the issue's comments, each with a hidden marker
-`<!-- issue-todo claim ID -->` (or `release`), so two sessions don't both take one
-issue. ID is the session's name: --as NAME, else $CLAUDE_CODE_SESSION_ID's first 8
-characters. `claim` refuses while a claim by another ID stands unreleased.
+`claim` keeps a claim in a comment of the issue, with a hidden marker
+`<!-- issue-todo claim ID -->`, so two sessions don't both take one issue. ID is the
+session's name: --as NAME, else $CLAUDE_CODE_SESSION_ID's first 8 characters. `claim`
+refuses while a claim by another ID stands. `release` deletes that comment, so an
+issue claimed and released three times holds no comment about it; --note WHY leaves
+one, `Released (session ID): WHY`, without a marker. A claim comment someone added
+text to keeps the text and loses its marker. Until 2026-11-25 `release` posted a
+comment with a `release` marker instead: such a marker still ends the claim before it,
+and `release` deletes the session's old ones along with its claim.
 `claims` lists the claims standing on open issues, one a line, as
 `#N  ID  AGE  TITLE`, AGE floored to `45m`, `3h` or `2d`, and prints nothing when
 none stands. It costs one GraphQL call per 100 open issues, plus a REST listing for
@@ -508,12 +514,15 @@ def claims(comments: list[tuple[str, str]]) -> dict[str, str]:
     return held
 
 
+def issue_comments(repo: str, number: int) -> list[dict]:
+    """The issue's comments, in order, as REST lists them."""
+    return json.loads(gh("api", "--paginate", f"repos/{repo}/issues/{number}/comments"))
+
+
 def holders(repo: str, number: int) -> dict[str, str]:
     """The sessions holding a claim on the issue, with each claim's time, as GitHub
     gives it (`2026-10-25T08:04:00Z`)."""
-    comments = json.loads(
-        gh("api", "--paginate", f"repos/{repo}/issues/{number}/comments")
-    )
+    comments = issue_comments(repo, number)
     return claims([(c.get("body") or "", c["created_at"]) for c in comments])
 
 
@@ -540,16 +549,26 @@ def claimed_by(bodies: list[str]) -> str:
     return f" [claimed by {', '.join(held)}]" if held else ""
 
 
+def write_body(method: str, path: str, body: str) -> None:
+    """POST a comment to an issue's comments `path`, or PATCH the one at `path`."""
+    gh("api", "-X", method, path, "--input", "-", stdin=json.dumps({"body": body}))
+
+
 def post_comment(repo: str, number: int, body: str) -> None:
-    gh(
-        "api",
-        "-X",
-        "POST",
-        f"repos/{repo}/issues/{number}/comments",
-        "--input",
-        "-",
-        stdin=json.dumps({"body": body}),
+    write_body("POST", f"repos/{repo}/issues/{number}/comments", body)
+
+
+def claim_body(session: str, number: int) -> str:
+    return (
+        f"Taking this (session {session}); `issue-todo release {number}` frees it.\n"
+        f"<!-- issue-todo claim {session} -->"
     )
+
+
+def old_release_body(session: str) -> str:
+    """The comment `release` posted until 2026-11-25, when it began deleting the
+    claim's comment instead."""
+    return f"Released (session {session}).\n<!-- issue-todo release {session} -->"
 
 
 def claim(repo: str, number: int, session: str) -> int:
@@ -568,28 +587,35 @@ def claim(repo: str, number: int, session: str) -> int:
                 file=sys.stderr,
             )
         return 1
-    post_comment(
-        repo,
-        number,
-        f"Taking this (session {session}); `issue-todo release {number}` frees it.\n"
-        f"<!-- issue-todo claim {session} -->",
-    )
+    post_comment(repo, number, claim_body(session, number))
     print(f"#{number} claimed by {session}")
     return 0
 
 
-def release(repo: str, number: int, session: str) -> int:
-    if session not in holders(repo, number):
+def release(repo: str, number: int, session: str, note: str | None) -> int:
+    """Remove the session's claim from the issue: delete each comment that is only
+    what issue-todo wrote for the session, its claim and any older claim and release,
+    and take the session's markers out of one with other text. Then post `note`."""
+    comments = issue_comments(repo, number)
+    if session not in claims([(c.get("body") or "", "") for c in comments]):
         print(
             f"issue-todo: {session} has no claim on #{number} to release",
             file=sys.stderr,
         )
         return 1
-    post_comment(
-        repo,
-        number,
-        f"Released (session {session}).\n<!-- issue-todo release {session} -->",
-    )
+    own = {claim_body(session, number), old_release_body(session)}
+    for comment in comments:
+        body = comment.get("body") or ""
+        if all(marked != session for _, marked in CLAIM.findall(body)):
+            continue
+        path = f"repos/{repo}/issues/comments/{comment['id']}"
+        unmarked = CLAIM.sub(lambda m: "" if m[2] == session else m[0], body).rstrip()
+        if body.replace("\r\n", "\n").strip() in own or not unmarked:
+            gh("api", "-X", "DELETE", path)
+        else:
+            write_body("PATCH", path, unmarked)
+    if note:
+        post_comment(repo, number, f"Released (session {session}): {note}")
     print(f"#{number} released by {session}")
     return 0
 
@@ -724,15 +750,7 @@ def tick_one(
                 file=sys.stderr,
             )
             return 1
-        gh(
-            "api",
-            "-X",
-            "PATCH",
-            part.path,
-            "--input",
-            "-",
-            stdin=json.dumps({"body": new}),
-        )
+        write_body("PATCH", part.path, new)
     print(
         f"{part.label}{' (dry run)' if dry_run else ''}:\n{new.split('\n')[item.line]}"
     )
@@ -793,7 +811,10 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("numbers", type=int, nargs="+", metavar="number")
     for name, what in (
         ("claim", "claim the issue for this session, unless another holds it"),
-        ("release", "release this session's claim on the issue"),
+        (
+            "release",
+            "release this session's claim on the issue, deleting the claim's comment",
+        ),
     ):
         c = sub.add_parser(name, parents=[common], help=what, description=what)
         c.add_argument(
@@ -801,6 +822,13 @@ def main(argv: list[str] | None = None) -> int:
             dest="name",
             help="the claimant's name (default: $CLAUDE_CODE_SESSION_ID's first 8 characters)",
         )
+        if name == "release":
+            c.add_argument(
+                "--note",
+                metavar="WHY",
+                help="leave a comment, `Released (session ID): WHY`, for whoever "
+                "takes the issue next; without it, release leaves no comment",
+            )
     what = (
         "each claim standing on an open issue, one a line, with its issue's number "
         "and title, the session and its age; one GraphQL call per 100 open issues"
@@ -826,7 +854,7 @@ def main(argv: list[str] | None = None) -> int:
         "unticked": lambda: unticked(repo, args.numbers),
         "read": lambda: read(repo, args.numbers),
         "claim": lambda: claim(repo, args.number, session),
-        "release": lambda: release(repo, args.number, session),
+        "release": lambda: release(repo, args.number, session, args.note),
         "claims": lambda: list_claims(repo),
         "tick": lambda: tick_one(
             repo,

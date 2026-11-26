@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import itertools
 import json
 import os
 import re
@@ -56,7 +57,7 @@ def test_undo_unticks_an_item_and_keeps_its_text():
 
 class FakeGh:
     """Serves issue 7 of owner/repo, with a comment holding two items, and records every call
-    and every PATCH."""
+    and every PATCH, POST and DELETE."""
 
     def __init__(self, body=BODY):
         self.issue = {
@@ -105,8 +106,24 @@ class FakeGh:
         self.open_pages = [[]]
         self.sub_issues = []  # issue 7's, as REST's issues/7/sub_issues lists them
         self.graphql_fails = False
-        self.patched = []
+        self.patched = []  # each PATCH and POST, as (path, body)
+        self.deleted = []  # each DELETE's path
+        self.comment_ids = itertools.count(20)  # for claim_comment
         self.calls = []
+
+    def claim_comment(self, session, kind="claim", remark=""):
+        """A comment as `claim` writes it, or as `release` wrote it until 2026-11-25,
+        with any `remark` someone added above it."""
+        text = {
+            "claim": f"Taking this (session {session}); `issue-todo release 7` frees it.",
+            "release": f"Released (session {session}).",
+        }[kind]
+        return {
+            "id": next(self.comment_ids),
+            "user": {"login": "robo"},
+            "created_at": "2026-10-25T08:04:00Z",
+            "body": f"{remark}{text}\n<!-- issue-todo {kind} {session} -->",
+        }
 
     def graphql(self, args):
         if self.graphql_fails:
@@ -136,7 +153,14 @@ class FakeGh:
             return "owner/repo\n"
         if args[:2] == ("api", "graphql"):
             return self.graphql(args)
+        assert args[0] == "api"
+        if "DELETE" in args:
+            self.deleted.append(args[-1])
+            return ""
         if "-X" in args:
+            # A new comment is POSTed to the issue's list; one that exists is PATCHed.
+            posts = args[-3].endswith("/issues/7/comments")
+            assert args[args.index("-X") + 1] == ("POST" if posts else "PATCH")
             self.patched.append((args[-3], json.loads(stdin)["body"]))
             return "{}"
         path = args[-1]
@@ -414,15 +438,6 @@ def test_a_failed_mentions_lookup_still_prints_the_issue(fake, capsys):
     assert "couldn't look up the issues #7 mentions" in captured.err
 
 
-def claim_comment(session, kind="claim"):
-    return {
-        "id": 20 + len(session),
-        "user": {"login": "robo"},
-        "created_at": "2026-10-25T08:04:00Z",
-        "body": f"Claimed.\n<!-- issue-todo {kind} {session} -->",
-    }
-
-
 def test_claim_posts_a_comment_naming_the_session(fake, capsys, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abcd1234-ffff-0000")
 
@@ -435,7 +450,7 @@ def test_claim_posts_a_comment_naming_the_session(fake, capsys, monkeypatch):
 
 def test_claim_refuses_while_another_session_holds_it(fake, capsys, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abcd1234-ffff-0000")
-    fake.comments.append(claim_comment("other999"))
+    fake.comments.append(fake.claim_comment("other999"))
 
     assert tool.main(["claim", "7"]) == 1
 
@@ -446,27 +461,80 @@ def test_claim_refuses_while_another_session_holds_it(fake, capsys, monkeypatch)
 
 def test_a_released_claim_can_be_claimed_again(fake, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abcd1234-ffff-0000")
-    fake.comments += [claim_comment("other999"), claim_comment("other999", "release")]
+    fake.comments += [
+        fake.claim_comment("other999"),
+        fake.claim_comment("other999", "release"),
+    ]
 
     assert tool.main(["claim", "7"]) == 0
     assert len(fake.patched) == 1
 
 
 def test_claiming_your_own_claim_again_posts_nothing(fake, capsys):
-    fake.comments.append(claim_comment("mine0001"))
+    fake.comments.append(fake.claim_comment("mine0001"))
 
     assert tool.main(["claim", "7", "--as", "mine0001"]) == 0
 
     assert fake.patched == [] and "already" in capsys.readouterr().out
 
 
-def test_release_posts_a_release_comment(fake, monkeypatch):
-    fake.comments.append(claim_comment("mine0001"))
+def test_release_deletes_the_claim_comment_and_posts_none(fake, capsys):
+    fake.comments += [fake.claim_comment("other999"), fake.claim_comment("mine0001")]
+    mine = fake.comments[-1]["id"]
 
     assert tool.main(["release", "7", "--as", "mine0001"]) == 0
 
-    ((_, body),) = fake.patched
-    assert "<!-- issue-todo release mine0001 -->" in body
+    assert fake.deleted == [f"repos/owner/repo/issues/comments/{mine}"]
+    assert fake.patched == []
+    assert capsys.readouterr().out == "#7 released by mine0001\n"
+
+
+def test_release_with_a_note_leaves_it_in_a_comment_without_a_marker(fake):
+    fake.comments.append(fake.claim_comment("mine0001"))
+
+    assert tool.main(["release", "7", "--as", "mine0001", "--note", "needs #9"]) == 0
+
+    assert len(fake.deleted) == 1
+    assert fake.patched == [
+        ("repos/owner/repo/issues/7/comments", "Released (session mine0001): needs #9")
+    ]
+
+
+def test_release_deletes_the_sessions_earlier_claim_and_release_comments_too(fake):
+    fake.comments += [
+        fake.claim_comment("mine0001"),
+        fake.claim_comment("gone0001"),
+        fake.claim_comment("mine0001", "release"),
+        fake.claim_comment("gone0001", "release"),
+        fake.claim_comment("mine0001"),
+    ]
+    mine = [c["id"] for c in fake.comments if "mine0001" in c["body"]]
+
+    assert tool.main(["release", "7", "--as", "mine0001"]) == 0
+
+    assert fake.deleted == [f"repos/owner/repo/issues/comments/{i}" for i in mine]
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_release_deletes_a_claim_comment_whatever_its_line_endings(fake, newline):
+    comment = fake.claim_comment("mine0001")
+    comment["body"] = comment["body"].replace("\n", newline) + newline
+    fake.comments.append(comment)
+
+    assert tool.main(["release", "7", "--as", "mine0001"]) == 0
+
+    assert len(fake.deleted) == 1 and fake.patched == []
+
+
+def test_release_keeps_a_claim_comment_someone_added_to_without_its_marker(fake):
+    fake.comments.append(fake.claim_comment("mine0001", remark="Blocked on #9.\n\n"))
+    mine = fake.comments[-1]["id"]
+
+    assert tool.main(["release", "7", "--as", "mine0001"]) == 0
+
+    assert fake.deleted == []
+    kept = "Blocked on #9.\n\nTaking this (session mine0001); `issue-todo release 7` frees it."
+    assert fake.patched == [(f"repos/owner/repo/issues/comments/{mine}", kept)]
 
 
 def test_claim_without_a_session_or_a_name_says_so(fake, capsys, monkeypatch):
@@ -483,6 +551,51 @@ def test_release_without_a_claim_posts_nothing(fake, capsys):
     assert tool.main(["release", "7", "--as", "mine0001"]) == 1
 
     assert fake.patched == [] and "no claim" in capsys.readouterr().err
+
+
+def test_release_deletes_a_claim_comment_edited_down_to_its_marker(fake):
+    comment = fake.claim_comment("mine0001")
+    comment["body"] = "<!-- issue-todo claim mine0001 -->"
+    fake.comments.append(comment)
+
+    assert tool.main(["release", "7", "--as", "mine0001"]) == 0
+
+    assert len(fake.deleted) == 1 and fake.patched == []
+
+
+def test_release_leaves_another_sessions_marker_in_a_comment_it_keeps(fake):
+    comment = fake.claim_comment("mine0001", remark="Pairing on this.\n")
+    comment["body"] += "\n<!-- issue-todo claim other999 -->"
+    fake.comments.append(comment)
+
+    assert tool.main(["release", "7", "--as", "mine0001"]) == 0
+
+    ((_, body),) = fake.patched
+    assert body == (
+        "Pairing on this.\n"
+        "Taking this (session mine0001); `issue-todo release 7` frees it.\n\n"
+        "<!-- issue-todo claim other999 -->"
+    )
+
+
+def test_release_posts_its_note_once_the_claim_is_gone(fake):
+    fake.comments.append(fake.claim_comment("mine0001"))
+
+    assert tool.main(["release", "7", "--as", "mine0001", "--note", "needs #9"]) == 0
+
+    methods = [args[args.index("-X") + 1] for args in fake.calls if "-X" in args]
+    assert methods == ["DELETE", "POST"]
+
+
+def test_release_of_a_claim_already_released_removes_nothing(fake, capsys):
+    fake.comments += [
+        fake.claim_comment("mine0001"),
+        fake.claim_comment("mine0001", "release"),
+    ]
+
+    assert tool.main(["release", "7", "--as", "mine0001"]) == 1
+
+    assert fake.deleted == [] and fake.patched == []
 
 
 def test_a_name_with_a_space_is_refused(fake, capsys):
@@ -515,10 +628,10 @@ def test_unticked_prints_nothing_for_an_issue_with_every_item_ticked(fake, capsy
 
 def test_open_titles_names_each_issues_unreleased_claimants(fake, capsys):
     fake.comments += [
-        claim_comment("held0001"),
-        claim_comment("gone0001"),
-        claim_comment("gone0001", "release"),
-        claim_comment("held0002"),
+        fake.claim_comment("held0001"),
+        fake.claim_comment("gone0001"),
+        fake.claim_comment("gone0001", "release"),
+        fake.claim_comment("held0002"),
     ]
     fake.listing = [
         fake.issue | {"comments": 6},
@@ -619,9 +732,9 @@ def test_claims_reads_all_comments_of_an_issue_with_more_than_graphql_served(
     fake.open_pages = [[open_issue(7, "Long thread", [marker("held0001", days=3)])]]
     fake.open_pages[0][0]["comments"]["totalCount"] = 150
     fake.comments = [
-        claim_comment("held0001"),
-        claim_comment("held0001", "release"),
-        claim_comment("late0001") | {"created_at": ago(hours=4)},
+        fake.claim_comment("held0001"),
+        fake.claim_comment("held0001", "release"),
+        fake.claim_comment("late0001") | {"created_at": ago(hours=4)},
     ]
 
     assert tool.main(["claims", "--repo", "owner/repo"]) == 0

@@ -101,6 +101,14 @@ HOOKS = [
             "if": "Bash(gh issue *)",
         },  # starts the script only for gh issue
     ),
+    # A note beside an edit or a Bash write into a main tree. No `if`: it takes one
+    # rule, and whether Edit(...) matches Write and NotebookEdit there is unverified.
+    (
+        "PostToolUse",
+        "Edit|Write|NotebookEdit|MultiEdit|Bash",
+        "main-tree-hint",
+        {"timeout": 10},
+    ),
     ("SessionStart", "*", "scratch-usage --warn-if-full", {"timeout": 10}),
     # A line per workflow failing on the default branch on GitHub; its own deadline
     # (CI_STATUS_TIMEOUT, 5 s) comes well before this one.

@@ -175,7 +175,39 @@ no target or every file is the target's, and `--post-commit` always exits 0. A r
 installed before this gets the line by running --install again.
 
 Without arguments it is a Claude Code PreToolUse hook (install.py registers it
-in ~/.claude/settings.json) that refuses `git commit --no-verify` (or `-n`),
+in ~/.claude/settings.json). It finds each `git commit` in the Bash command and
+the directory it would run in through lib/maintree.py: the hook's cwd, moved by
+each `cd` or `pushd` before it in its scope (a subshell's ends with it), `git -C`
+and bgrun's -C, and passes the commit whenever that directory isn't certain.
+
+First it refuses a commit in the main tree of a repo with an agent check (an
+executable agent-pre-commit among its hooks), not a linked worktree: by the
+owner's rule an agent commits in a worktree, and the main tree only receives
+landings. The refusal names the worktree command, the repo's own executable
+bin/new-worktree when it has one, else `git worktree add --detach` (and
+`origin/BRANCH` after a fetch, when the repo has an origin and HEAD a branch); it
+says to leave any changes
+already in the main tree as they are and tell the user, and to ask the user first
+if the commit belongs there. A commit passes when the directory isn't certain (a
+word with an expansion, as in `cd "$WT"` or `cd ~/x`; `cd -`, `popd` or a plain
+`cd`; a sourced file or an eval before it, or a function the command defines;
+`env -C`; GIT_DIR or GIT_WORK_TREE set
+or exported; `git --git-dir` or `--work-tree`), when git can't answer for it (a
+folder that doesn't exist yet, as when `git worktree add` runs earlier in the
+same command; a git that fails or hangs), and in a new repo's first commit, a
+submodule, a bare repo, or with a merge, cherry-pick, revert, rebase or sequencer
+in progress, whose commit finishes it. A detached main tree is refused too, its
+refusal naming no branch. `git commit -h`, `--help` and `--dry-run` commit
+nothing and pass. The one-shot prefix `AGENT_MAIN_TREE_OK=1 git commit ...` (or
+before the bgrun or heavy that runs it) lets one commit through, for a commit the
+user asked for there; the refusal doesn't name it, since that is the user's call.
+Tools that commit as subprocesses, such as wt-ship's landing (`commit-tree`, `merge
+--ff-only`), build-state and issue-todo, aren't Bash commands and are never seen;
+nor are `git merge`, `cherry-pick`, `revert` or `commit-tree` run by hand, which
+this refusal doesn't catch. A cd that fails leaves the shell where it was, which
+the gate can't know beforehand: it judges the folder the cd names.
+
+It also refuses `git commit --no-verify` (or `-n`),
 which would skip the check. It catches a mistake, not an agent set on getting
 around the check (`AI_AGENT= git commit`, `AGENT_PRE_COMMIT=1 git commit`, `git
 -c core.hooksPath=...`, or a line written into the pass record by hand, which
@@ -198,6 +230,13 @@ paths that differ from that base.
     agent-commit-gate --post-commit        # as the post-commit line calls it
     agent-commit-gate --timings [--since TIME]  # where the repo's checks spent time
     agent-commit-gate < hook-input.json    # as Claude Code calls it
+
+Exit status: as a hook, 0 lets the call run and 2 refuses it, the only status
+Claude Code blocks on; each refusal says on stderr which it is (`Commit refused:
+... main tree`, `Commit blocked: --no-verify`, `Commit blocked: this repo's
+commit-needs-queue`). A command it can't read runs unjudged. --run exits with the
+check's status, 75 under --no-queue for a check that would wait in heavy's queue,
+and 130 when stopped; --install exits 1 when a repo's hooks couldn't be written.
 """
 
 import argparse
@@ -219,6 +258,7 @@ from typing import NamedTuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import commitcheck
 import heavyqueue
+import maintree
 import passrecord
 import refused
 import shellparse
@@ -296,9 +336,6 @@ SECRETS_FILE_BYTES = 64 << 10
 # How many of HEAD's first-parent commits, HEAD included, --run looks through for one
 # whose tree passed the check: the check's CHECK_BASE.
 BASE_SEARCH = 100
-REDIRECT = re.compile(r"^\d*[<>]")
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
-ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 SHELLS = {"sh", "bash", "dash", "ksh", "zsh"}
 
 # git's own options (before the subcommand) whose value is the next word.
@@ -325,49 +362,6 @@ COMMIT_LONG_VALUE = {
 }
 
 
-def strip_heredocs(command):
-    """The command without heredoc bodies: their lines are data, not commands."""
-    kept, closing = [], []
-    for line in command.split("\n"):
-        if closing:
-            if line.strip() == closing[0]:
-                closing.pop(0)
-            continue
-        kept.append(line)
-        closing += [m.group(2) for m in HEREDOC.finditer(line)]
-    return "\n".join(kept)
-
-
-def segments(command):
-    """The simple commands in a shell command: split on &&, ||, ;, | and newlines
-    outside quotes, so a quoted message never splits."""
-    parts, current, quote, i = [], [], None, 0
-    while i < len(command):
-        char = command[i]
-        if quote:
-            current.append(char)
-            if char == "\\" and quote == '"' and i + 1 < len(command):
-                current.append(command[i + 1])
-                i += 1
-            elif char == quote:
-                quote = None
-        elif char in "'\"":
-            quote = char
-            current.append(char)
-        elif command.startswith(("&&", "||"), i):
-            parts.append("".join(current))
-            current = []
-            i += 1
-        elif char in ";|\n":
-            parts.append("".join(current))
-            current = []
-        else:
-            current.append(char)
-        i += 1
-    parts.append("".join(current))
-    return parts
-
-
 def git_subcommand(words):
     """(the words after git's own options, the -C directories among those options),
     for a git command line without its leading `git`."""
@@ -381,39 +375,20 @@ def git_subcommand(words):
     return rest, directories
 
 
-def commits(command):
-    """(arguments, directory) for each `git commit` in a shell command: the directory
-    it runs in, relative to the command's own, from a `cd DIR` before it and `git -C
-    DIR`. Heredoc bodies are skipped; arguments stop at the first redirection."""
-    directory = Path()
-    for segment in segments(strip_heredocs(command)):
-        try:
-            words = shlex.split(segment)
-        except ValueError:
-            words = segment.split()
-        while words and ASSIGNMENT.match(words[0]):
-            words = words[1:]
-        # A command a wrapper runs, after its `--`: `bgrun --wait -o LOG -- git
-        # commit`, `heavy -- git commit`.
-        while words and Path(words[0]).name in WRAPPERS and "--" in words:
-            words = words[words.index("--") + 1 :]
-        if len(words) == 2 and words[0] == "cd":
-            directory = directory / words[1]
-            continue
-        if not words or Path(words[0]).name != "git":
-            continue
-        rest, directories = git_subcommand(words[1:])
-        here = directory.joinpath(*directories)
-        if rest[:1] != ["commit"]:
-            continue
-        args = []
-        for word in rest[1:]:
-            if REDIRECT.match(word):
-                break
-            args.append(word)
-        yield args, here
+def commits(command, cwd):
+    """(arguments, directory, step, guess) for each `git commit` in a shell command
+    run from `cwd`, as lib/maintree.py walks it: the directory is None when it isn't
+    certain, and the guess, which the --no-verify and queue checks read, follows the
+    plain cds alone, as the parser before the main-tree refusal did."""
+    for call in maintree.git_calls(command, cwd):
+        if call.subcommand == "commit":
+            yield call.args, call.directory, call.step, call.guess
 
 
+# A repo's own script for making a worktree, which the refusal names when it's there.
+NEW_WORKTREE = "bin/new-worktree"
+# The one-shot prefix that lets a commit through in a main tree: AGENT_MAIN_TREE_OK=1.
+OPT_OUT = "AGENT_MAIN_TREE_OK"
 FIX_SUBJECT = ("fixup!", "squash!", "amend!")
 # The optional fast check a small fix commit runs instead of HOOK_NAME, beside it.
 QUICK_NAME = "agent-quick-check"
@@ -428,8 +403,6 @@ QUEUE_EXIT = commitcheck.QUEUE_EXIT
 # wait in heavy's queue: exit 0 if so, 1 if not; past PREDICTOR_SECONDS, not.
 PREDICTOR_NAME = "commit-needs-queue"
 PREDICTOR_SECONDS = 5
-# Commands that run the command after their `--`, which commits() looks through.
-WRAPPERS = ("bgrun", "heavy")
 # The file a check may write its own parts' timings to, a `NAME SECONDS` line each.
 TIMINGS_NAME = "CHECK_TIMINGS"
 # A name of letters, digits, `_`, `.` and `-`, so the record's `name=seconds,...` stays
@@ -1502,12 +1475,15 @@ def main(argv=None):
     if event.get("tool_name") != "Bash":
         return 0
     command = event.get("tool_input", {}).get("command", "")
-    cwd = Path(event.get("cwd") or ".")
-    found = list(commits(command))
-    if any(
-        skips_hooks(args) and has_agent_check(cwd / directory)
-        for args, directory in found
-    ):
+    cwd = Path(event["cwd"]) if event.get("cwd") else None
+    try:
+        found = list(commits(command, cwd))
+    except Exception:  # noqa: BLE001 - a command the gate can't read runs unjudged
+        return 0
+    if refusal := next(filter(None, map(main_tree_refusal, found)), None):
+        print(f"{refusal} {refused.ending(event)}", file=sys.stderr)
+        return 2
+    if any(skips_hooks(args) and has_agent_check(guess) for args, _, _, guess in found):
         print(
             "Commit blocked: --no-verify (-n) skips the pre-commit hook, which runs "
             f"this repo's checks, {HOOK_NAME} included. Fix what they report and "
@@ -1518,8 +1494,8 @@ def main(argv=None):
         return 2
     background = event.get("tool_input", {}).get("run_in_background") in (True, "true")
     if not background and any(
-        check_will_queue(cwd / directory)
-        for args, directory in found
+        check_will_queue(directory)
+        for args, _, _, directory in found
         if not skips_hooks(args)
     ):
         print(
@@ -1536,12 +1512,55 @@ def main(argv=None):
     return 0
 
 
+def main_tree_refusal(found):
+    """The refusal of a `git commit`, given as commits() finds it, that would commit
+    in the main tree of a repo with an agent check; None when it may run, or when
+    that can't be told for certain."""
+    args, directory, step, _ = found
+    if step.assigned.get(OPT_OUT) == "1" or any(
+        shellparse.is_help(word) or word == "--dry-run" for word in args
+    ):
+        return None
+    try:
+        where = maintree.place(directory)
+        if where is None or not where.main or where.exempt:
+            return None
+        agent = where.hooks / HOOK_NAME
+        if not (agent.is_file() and os.access(agent, os.X_OK)):
+            return None
+        pushes = maintree.has_origin(where.top)
+    except Exception:  # noqa: BLE001 - a gate that can't tell lets the commit through
+        return None
+    repo = where.top.name
+    # A repo's own worktree script, as filedrawer's AGENTS.md asks agents to use.
+    own = where.top / NEW_WORKTREE
+    if own.is_file() and os.access(own, os.X_OK):
+        worktree, at = f"{NEW_WORKTREE} <topic>", "with --at origin/"
+    else:
+        worktree, at = f"git worktree add --detach ../{repo}-wt-<topic>", "at origin/"
+    if not pushes:
+        remote = ""
+    elif where.branch:
+        remote = (
+            f" (in a repo that pushes, `git fetch`, then add it {at}{where.branch})"
+        )
+    else:
+        remote = " (in a repo that pushes, `git fetch`, then add it at the remote branch it lands on)"
+    return (
+        f"Commit refused: {where.top} is {repo}'s main tree, which only receives"
+        f" landings. Commit in a worktree beside it: `{worktree}`{remote}, then land"
+        " it with wt-ship. Changes already made in the main tree stay there: leave"
+        " them as they are (no checkout, stash or reset), and tell the user. If this"
+        " commit belongs in the main tree, ask the user first."
+    )
+
+
 def check_will_queue(directory):
     """Whether the repo at `directory` says, through its PREDICTOR_NAME, that a commit
     there will wait in heavy's queue. A repo without one, one that can't run (not
     executable), fails, answers otherwise or runs past PREDICTOR_SECONDS says no, so
-    a broken predictor never blocks a commit."""
-    hooks = hooks_dir(directory) if directory.is_dir() else None
+    a broken predictor never blocks a commit; so does a directory that isn't certain."""
+    hooks = hooks_dir(directory) if directory and directory.is_dir() else None
     predictor = hooks / PREDICTOR_NAME if hooks else None
     if predictor is None or not predictor.is_file():
         return False
@@ -1589,9 +1608,9 @@ def predicted_base(directory, hooks):
 
 
 def has_agent_check(directory):
-    """Whether the repo at `directory` has an agent check, or can't be told: a scratch
-    repo without one may skip its hooks."""
-    hooks = hooks_dir(directory) if directory.is_dir() else None
+    """Whether the repo at `directory` has an agent check, or can't be told (as for a
+    directory that isn't certain): a scratch repo without one may skip its hooks."""
+    hooks = hooks_dir(directory) if directory and directory.is_dir() else None
     if hooks is None:
         return True
     agent = hooks / HOOK_NAME

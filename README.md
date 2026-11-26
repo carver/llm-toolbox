@@ -493,7 +493,17 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   --no-verify`, except in a repo with no agent check, such as a scratch repo, and
   a foreground `git commit` whose check the repo's `commit-needs-queue`, beside
   its hooks, says will wait in heavy's queue (exit 0), naming the `bgrun --wait`
-  background call to run it as instead.
+  background call to run it as instead. First, it refuses a `git commit` in the
+  main tree of a repo with an agent check, which only receives landings, naming
+  the worktree command to use and saying to leave any changes already there and
+  tell the user. It follows the command's `cd`s, subshells, `pushd`, `git -C`
+  and bgrun's `-C` through `lib/maintree.py`, and lets the commit through
+  whenever it can't be sure: a directory written with an expansion (`"$WT"`,
+  `~`), `cd -`, `GIT_DIR`, `--git-dir`, a folder that doesn't exist yet, a git
+  that fails. Also let through: a new repo's first commit, a submodule, a bare
+  repo, a merge, cherry-pick, revert or rebase in progress, and a commit with
+  the one-shot prefix `AGENT_MAIN_TREE_OK=1`, for one the user asked for there.
+  wt-ship's own landings run git as subprocesses, which no hook sees.
   The check runs once it's its turn in `heavy`'s queue, whose waiting lines
   print as they come. A check whose change may need no build or test, such as
   filedrawer's for a docs-only commit, can skip the queue by naming
@@ -748,6 +758,13 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   adds a note for the agent: the body and the comments come out separately, and
   `issue-todo show N` lists both. It never blocks, and other commands get no
   note.
+- **main-tree-hint**: a Claude Code hook, which `install.py` registers. After an
+  Edit, Write or NotebookEdit call, or a Bash command that writes a file (`sed
+  -i`, `perl -i`, a `>` or `>>` redirection, `tee`, apply-edits), into the main
+  tree of a repo with an agent check, it adds a note for the agent: the change
+  stays there uncommitted, so leave it, tell the user, and carry on in a
+  worktree. Ignored files, `.git/` and the states agent-commit-gate lets a
+  commit through in get none. It never blocks.
 - **skill-change-hint**: a Claude Code hook, which `install.py` registers. It
   records each skill an agent loads, by the Skill tool or a slash command, and
   before the agent's next Bash or Agent call adds a note for each one whose

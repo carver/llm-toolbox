@@ -94,22 +94,29 @@ class Command:
     or ("<<", "EOF"). A redirection after a compound command's close, as in
     `( ... ) > log`, goes to the last simple command before it. `fed`: a `|` comes
     right before it, so its stdin is the output of the command or compound command
-    before it, as in `{ ...; } | CMD`."""
+    before it, as in `{ ...; } | CMD`. `subshells`: the `( ... )` subshells it sits
+    in, each a number of its own, outermost first, so a `cd` inside one can be told
+    to end with it. `after`: the operator that ends it (`&&`, `||`, `|`, `;`, `&`,
+    a newline, `(` or `)`), or "" at the end of the command."""
 
     words: list[str]
     piped: bool
     grouped: bool
     redirects: list[tuple[str, str]] = field(default_factory=list)
     fed: bool = False
+    subshells: tuple[int, ...] = ()
+    after: str = ""
 
 
 @dataclass
 class _Output:
-    """Whether the output of a simple or compound command goes into a pipe, and whether
-    the compound command is a case, whose patterns end in a `)` that closes nothing."""
+    """Whether the output of a simple or compound command goes into a pipe, whether
+    the compound command is a case, whose patterns end in a `)` that closes nothing,
+    and the number of the `( ... )` subshell it is, if it is one."""
 
     piped: bool = False
     case: bool = False
+    subshell: int | None = None
 
 
 def _lexer(cleaned: str) -> shlex.shlex:
@@ -138,14 +145,15 @@ def commands(cleaned: str) -> list[Command]:
     # around it, and its redirections; the compound commands open now, innermost last;
     # the output a `|` would take now; the words of the command being read, and its
     # redirections so far.
-    found: list[tuple[list[str], list[_Output], list[tuple[str, str]], bool]] = []
+    found: list[tuple[list[str], list[_Output], list[tuple[str, str]], bool, str]] = []
     groups: list[_Output] = []
     pipe_source: _Output | None = None
     words: list[str] = []
     redirects: list[tuple[str, str]] = []
     fed = False  # a `|` came since the last command ended
+    subshells = 0  # how many ( ... ) subshells have opened so far
 
-    def end() -> None:
+    def end(after: str = "") -> None:
         nonlocal words, pipe_source, redirects, fed
         if not words:
             if redirects and found:  # after a compound command's close
@@ -161,13 +169,13 @@ def commands(cleaned: str) -> list[Command]:
             elif word not in KEYWORDS:
                 break
         own = _Output()
-        found.append((words, [own, *groups], redirects, fed))
+        found.append((words, [own, *groups], redirects, fed, after))
         pipe_source, words, redirects, fed = closed or own, [], [], False
 
     def close() -> None:
         """A `)`: it ends a subshell, or a case's pattern."""
         nonlocal pipe_source
-        end()
+        end(")")
         if groups and groups[-1].case:
             pipe_source = None
         else:
@@ -194,21 +202,31 @@ def commands(cleaned: str) -> list[Command]:
             if char == ")":
                 close()
             else:
-                end()
-                if token.startswith("||", i):
+                pair = token[i : i + 2]
+                end(pair if pair in ("&&", "||") else char)
+                if pair in ("&&", "||"):
                     i += 1
                 elif char == "|":  # the & of a |& only separates
                     fed = True
                     if pipe_source:
                         pipe_source.piped = True
                 elif char == "(":
-                    groups.append(_Output())
+                    subshells += 1
+                    groups.append(_Output(subshell=subshells))
                 pipe_source = None
             i += 1
     end()
     return [
-        Command(words, any(o.piped for o in outputs), len(outputs) > 1, redirects, fed)
-        for words, outputs, redirects, fed in found
+        Command(
+            words,
+            any(o.piped for o in outputs),
+            len(outputs) > 1,
+            redirects,
+            fed,
+            tuple(o.subshell for o in outputs[1:] if o.subshell is not None),
+            after,
+        )
+        for words, outputs, redirects, fed, after in found
     ]
 
 

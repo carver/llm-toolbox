@@ -64,7 +64,13 @@ class Repo:
 
     def is_main_worktree(self) -> bool:
         """Whether this is the repository's main worktree, not one `git worktree add` made: its git dir
-        is the common one."""
-        found = self.git("rev-parse", "--absolute-git-dir", "--git-common-dir")
+        is the common one. A copy of lib/maintree.py's test (place().main), since paperkit is vendored
+        into projects without it; test_maintree.py holds the two to the same answers."""
+        found = self.git(
+            "rev-parse",
+            "--absolute-git-dir",
+            "--path-format=absolute",
+            "--git-common-dir",
+        )
         git_dir, common = found.stdout.splitlines()[:2]
-        return Path(git_dir).resolve() == (self.root / common).resolve()
+        return Path(git_dir).resolve() == Path(common).resolve()

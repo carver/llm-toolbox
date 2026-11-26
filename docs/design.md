@@ -1133,6 +1133,71 @@ save removes saved files older than 30 days from every session's `refused/` fold
 (the owner's choice over pruning only the session's own), and only the names it
 writes, never through a link.
 
+## The main tree only receives landings
+
+### A commit in a main tree is refused; an edit there gets a note (#4, 2026-11-26)
+
+The owner's rule is that agents edit and commit in a linked worktree, and a repo's
+main tree only receives landings. Measured over the transcripts from 2026-11-01 to
+11-10 (`keep/llm-toolbox/main-tree-writes/`), 71 sessions ran `git commit` in a main
+tree 333 times in 21 sessions, Edit or Write into one 525 times in 13, and shell
+writes 1,916 times; of 10 sampled commits, 7 were plain mistakes. The owner's
+decisions: refuse the commit in agent-commit-gate's PreToolUse mode, before anything
+runs, in repos with an agent check (scratch repos stay free); let an edit through,
+since it has happened, with a PostToolUse note (bin/main-tree-hint). A refusal in
+the git pre-commit line was dropped: it would refuse only after the hook's formatters
+had written in the main tree, and need every repo's hooks reinstalled.
+
+The gate refuses every agent session in every such repo, so it lets a commit through
+whenever it isn't sure. lib/maintree.py's walk, on lib/shellparse.py, follows `cd`,
+`pushd`, subshells, `git -C` and bgrun's `-C`, and gives no directory for a word with
+an expansion, `cd -`, a sourced file or eval, `env -C`, GIT_DIR or `--git-dir`; git
+that can't answer, as for a worktree `git worktree add` makes earlier in the same
+command, passes too. The old commits() read `(cd ../r-wt-x && git commit)`, pushd, `cd
+-` and `--git-dir` as the session's cwd (12 of the 333 commands). A cd inside a
+piped or backgrounded group, as in `echo m | (cd ../r-wt-x && git commit -F -)`,
+makes the directory uncertain, since a scope can't tell the group's commands from
+those after the pipeline. A list sent to the background, as in `cd WT && sleep 900 &
+by=$!; heavy -- bin/mutate-check ...`, moves only its own commands: that command once
+left mutate-check running in a main tree, and its mutants killed every process on
+the VM (2026-11-26). The gate's older checks (--no-verify, the queue
+predictor) read each step's `guess` instead, which follows the plain cds alone, so
+a sourced file, a function or GIT_DIR changes nothing for them. The refusal names a
+repo's own `bin/new-worktree` when it has one (filedrawer's AGENTS.md). Exempt: an unborn
+HEAD, a submodule, a bare repo, and a merge, cherry-pick, revert, rebase or sequencer
+in progress, whose commit finishes it. The opt-out is a one-shot `AGENT_MAIN_TREE_OK=1`
+prefix, visible in the command; the refusal says to ask the user first and doesn't
+name it. Claude Code blocks a call only on exit 2, so the refusal shares that status
+with the gate's other two and its first words tell them apart.
+
+A dry run of the gate over 2,441 Bash calls holding a `git commit` (2026-11-02 to
+11-26, against the filesystem of 11-26) refused 223, each in one of six main trees
+(175 in filedrawer, 27 in llm-toolbox, 15 in sandbox-setup), all main-tree work from
+11-03 to 11-07 but a message amend on a landed commit (11-18) and a hook probe
+(11-09). None of the 18 whose output showed a commit on a detached HEAD, a
+worktree's, was refused. The first replay refused three review-scratch runs that
+sourced a script which made and entered a repo (`. $S/mk.sh`), so a sourced file now
+makes the directory uncertain. A replay can't see the state a commit met then (an
+unborn HEAD, a rebase), so the tests cover the exemptions.
+
+The gate takes the hook's `cwd` as where the command starts and keeps no state
+between calls. Claude Code documents cwd as the directory when the hook runs; in the
+transcripts a call's cwd follows the previous call's `cd DIR &&` under the session's
+start folder 145 times of 192, and the rest match the shell's rules (a cd outside the
+working folders, a background call or a failed command doesn't carry).
+
+main-tree-hint covers Bash writes as well as the file tools, since those were most
+of the measured writes: `sed -i`, `perl -i`, `>`/`>>` redirections, `tee`, and
+apply-edits' `--- PATH` lines, each found from its step's directory; ignored files
+and `.git/` get no note. It runs on every such call, with no `if`: `if` takes one
+rule, and whether `Edit(...)` there matches Write and NotebookEdit, as it does in
+permission rules, is undocumented.
+
+lib/paperkit/git.py keeps its own copy of the main-tree test, since paperkit is
+vendored into projects without lib/; test_maintree.py holds the two to one answer.
+Issue #12 (destructive git after a bare `cd X;`) reuses the walk: each step names the
+latest earlier `cd` in its scope that ends with `;` or a newline.
+
 ## subagent-wait-gate
 
 ### A subagent blocks on its job; a SubagentStop hook refuses a stop to wait (2026-11-13)

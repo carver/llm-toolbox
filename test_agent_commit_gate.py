@@ -2535,7 +2535,8 @@ def test_the_predictor_gets_the_base_the_check_would(installed, monkeypatch, cap
     passed = git(installed, "rev-parse", "HEAD").stdout.strip()
     seen = installed / "seen-base"
     predicting(installed, f'echo "${{CHECK_BASE-unset}}" > {seen}\nexit 1')
-    hook_on(installed, monkeypatch, capsys, "git commit -q -m x")
+    # A main tree with a commit, where the main-tree refusal comes first.
+    hook_on(installed, monkeypatch, capsys, "AGENT_MAIN_TREE_OK=1 git commit -q -m x")
     assert seen.read_text().strip() == passed
 
 

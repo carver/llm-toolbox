@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""A Claude Code PostToolUse hook that tells an agent its edit landed in a main tree.
+
+The owner's rule is that agents edit in a worktree, and a repo's main tree only
+receives landings. agent-commit-gate refuses a commit there; this lets an edit go
+through, since it has already happened, and adds a note beside the result: the file
+is in the repo's main tree, the change stays there uncommitted, so leave it as it is,
+tell the user, and carry on in a worktree.
+
+It looks at Edit, Write and NotebookEdit calls, by their file, and at Bash commands
+that write files: `sed -i` and `perl -i`, a `>`, `>>` or `&>` redirection, `tee`, and
+apply-edits (not --cached), by the `--- PATH` lines of its heredoc. A Bash write is
+found in the directory lib/maintree.py's walk gives it, past each `cd`; one whose
+directory or file name isn't certain, such as `> "$out"`, is left out. A file counts
+when it is in the main tree of a repo with an agent check (an executable
+agent-pre-commit among its hooks, as agent-commit-gate's refusal reads it), outside
+.git, and not ignored by git. It says nothing when the repo is in the state that lets
+agent-commit-gate's commits through there: an unborn HEAD, a submodule, or a merge,
+cherry-pick, revert or rebase in progress. It never blocks, says nothing on input it
+can't read, and exits 0. install.py registers it in ~/.claude/settings.json.
+
+    main-tree-hint < hook-input.json    # as Claude Code calls it
+"""
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import maintree
+from shellparse import prepare
+
+AGENT_CHECK = "agent-pre-commit"
+# A repo's own script for making a worktree, which the note names when it's there.
+NEW_WORKTREE = "bin/new-worktree"
+FILE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
+WRITES = {">", ">>", ">|", "&>", "&>>"}
+APPLY_EDITS_PATH = re.compile(r"^--- (.+)$", re.MULTILINE)
+SHOWN = 3  # files named in a note, before "and N more"
+
+
+def option_values(args, values):
+    """(the files among a sed's or perl's arguments: the words that aren't options,
+    or values of the options in `values`, after the script when no -e or -f gave
+    one)."""
+    files, script_given, words = [], False, iter(args)
+    for word in words:
+        if word == "--":
+            files += list(words)
+            break
+        if word.startswith("--"):
+            if word.split("=", 1)[0] in ("--expression", "--file") or word in values:
+                script_given = True
+                if "=" not in word:
+                    next(words, None)
+            continue
+        if word.startswith("-") and len(word) > 1:
+            letters = word[1:]
+            for j, letter in enumerate(letters):
+                if letter in values:
+                    script_given = True
+                    if j == len(letters) - 1:
+                        next(words, None)
+                    break
+            continue
+        files.append(word)
+    return files if script_given else files[1:]
+
+
+def in_place(words):
+    """Whether a sed or perl command edits files in place: -i, or a cluster with i."""
+    if Path(words[0]).name == "sed":
+        return any(
+            w == "--in-place"
+            or w.startswith("--in-place=")
+            or re.fullmatch(r"-[a-zA-Z]*i.*", w)
+            for w in words[1:]
+            if not w.startswith("-e")
+        )
+    return any(re.fullmatch(r"-[a-zA-Z]*i.*", w) for w in words[1:])
+
+
+def written(command, cwd):
+    """The files a Bash command writes that the hook can name for certain, each as an
+    absolute path."""
+    found = []
+    heredoc_paths = [
+        path
+        for _, body in prepare(command)[2]
+        for path in APPLY_EDITS_PATH.findall(body)
+    ]
+    for step in maintree.walk(command, cwd):
+        targets = [t for op, t in step.redirects if op in WRITES]
+        words = step.words
+        name = Path(words[0]).name if words else ""
+        if name == "sed" and in_place(words):
+            targets += option_values(words[1:], {"e", "f"})
+        elif name == "perl" and in_place(words):
+            targets += option_values(words[1:], {"e", "E", "M", "I"})
+        elif name == "tee":
+            targets += [w for w in words[1:] if not w.startswith("-")]
+        elif name == "apply-edits" and "--cached" not in words:
+            targets += heredoc_paths
+        found += [
+            maintree.moved(step.directory, t)
+            for t in targets
+            if maintree.certain(t) and not t.startswith("/dev/")
+        ]
+    return [path for path in found if path is not None]
+
+
+def main_tree_of(path, places):
+    """The Place of the main tree that holds `path`, when the hook should name it:
+    a repo with an agent check, in no exempt state, the file outside .git and not
+    ignored; else None. `places` caches each directory's answer."""
+    directory = path.parent
+    while not directory.is_dir() and directory != directory.parent:
+        directory = directory.parent
+    if directory not in places:
+        places[directory] = maintree.place(directory)
+    where = places[directory]
+    if where is None or not where.main or where.exempt:
+        return None
+    agent = where.hooks / AGENT_CHECK
+    if not (agent.is_file() and os.access(agent, os.X_OK)):
+        return None
+    if (
+        not path.is_relative_to(where.top)
+        or ".git" in path.relative_to(where.top).parts
+    ):
+        return None
+    relative = str(path.relative_to(where.top))
+    if maintree.git(where.top, "check-ignore", "-q", "--", relative) is not None:
+        return None
+    return where
+
+
+def note(by_repo):
+    """The note for the files written in main trees, grouped by the tree's top."""
+    parts = []
+    for top, paths in by_repo.items():
+        names = [str(p.relative_to(top)) for p in paths]
+        shown = ", ".join(names[:SHOWN])
+        if len(names) > SHOWN:
+            shown += f" and {len(names) - SHOWN} more"
+        repo = top.name
+        own = top / NEW_WORKTREE
+        if own.is_file() and os.access(own, os.X_OK):
+            command = f"{NEW_WORKTREE} <topic>"
+        else:
+            command = f"git worktree add --detach ../{repo}-wt-<topic>"
+        parts.append(
+            f"{shown} {'is' if len(names) == 1 else 'are'} in {top}, {repo}'s main"
+            " tree, which only receives landings. The change stays there, uncommitted:"
+            " leave it as it is (no checkout, stash or reset), tell the user, and make"
+            " further edits in a worktree beside it:"
+            f" `{command}`."
+        )
+    return " ".join(parts)
+
+
+def paths_of(event):
+    """The files the tool call wrote, as absolute paths."""
+    tool, given = event.get("tool_name"), event.get("tool_input") or {}
+    cwd = Path(event["cwd"]) if event.get("cwd") else None
+    if tool in FILE_TOOLS:
+        path = given.get("file_path") or given.get("notebook_path")
+        if not path:
+            return []
+        if not Path(path).is_absolute():
+            path = maintree.moved(cwd, path)
+        return [Path(os.path.normpath(path))] if path else []
+    if tool == "Bash":
+        return written(given.get("command") or "", cwd)
+    return []
+
+
+def main():
+    try:
+        event = json.load(sys.stdin)
+        places, by_repo = {}, {}
+        for path in dict.fromkeys(paths_of(event)):
+            where = main_tree_of(path, places)
+            if where is not None:
+                by_repo.setdefault(where.top, []).append(path)
+    except Exception:  # noqa: BLE001 - a note that can't be worked out says nothing
+        return 0
+    if by_repo:
+        output = {"hookEventName": "PostToolUse", "additionalContext": note(by_repo)}
+        print(json.dumps({"hookSpecificOutput": output}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

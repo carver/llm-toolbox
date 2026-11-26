@@ -3,7 +3,9 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 import re
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -853,3 +855,345 @@ def test_an_empty_reason_to_drop_is_refused(fake):
 def test_undo_still_takes_a_note(fake):
     assert tool.main(["tick", "7", "Starred", "--undo", "--note", "not yet"]) == 0
     assert "* [ ] Starred and capital X *not yet*" in fake.patched[0][1]
+
+
+# The commits that landed since an issue was opened, from the clone the command runs
+# in: those that mention it or touch a path it names in backticks.
+
+OPENED = "2026-11-20T00:00:00Z"
+
+
+class Clone:
+    """A scratch git repo whose origin is owner/repo, with main and origin/main."""
+
+    def __init__(self, root: Path, url: str = "https://github.com/owner/repo.git"):
+        self.root = root
+        root.mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "t")
+        self.git("config", "user.email", "t@t")
+        self.git("remote", "add", "origin", url)
+        self.n = 0
+
+    def git(self, *args: str, date: str | None = None) -> str:
+        env = {**os.environ}
+        if date:
+            env |= {"GIT_COMMITTER_DATE": date, "GIT_AUTHOR_DATE": date}
+        return subprocess.run(
+            ["git", "-C", str(self.root), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        ).stdout.strip()
+
+    def commit(self, subject: str, date: str, *paths: str) -> str:
+        self.n += 1
+        for path in paths or ("other.txt",):
+            (self.root / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / path).write_text(f"{self.n}\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", subject, date=date)
+        return self.git("rev-parse", "--short", "HEAD")
+
+    def push(self) -> None:
+        """origin/main at main's tip, and origin/HEAD pointing to it."""
+        self.git("update-ref", "refs/remotes/origin/main", "main")
+        self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+
+
+NAMES = "Plan: see `src/app.py:12`, `docs/` and `gone.py`.\n\n- [ ] A step\n"
+
+
+@pytest.fixture
+def clone(fake, tmp_path, monkeypatch):
+    fake.issue |= {"created_at": OPENED, "body": NAMES}
+    clone = Clone(tmp_path / "clone")
+    monkeypatch.chdir(clone.root)
+    return clone
+
+
+def landed(capsys) -> list[str]:
+    out = capsys.readouterr().out.splitlines()
+    heads = [i for i, line in enumerate(out) if line.startswith("--- landed since")]
+    if not heads:
+        return []
+    (head,) = heads
+    return out[head:]
+
+
+def test_read_ends_with_what_landed_since_the_issue_was_opened(clone, capsys):
+    clone.commit("before it", "2026-11-19T12:00:00Z", "src/app.py")
+    app = clone.commit("fix the app", "2026-11-21T09:00:00Z", "src/app.py")
+    clone.commit("an unrelated change", "2026-11-21T10:00:00Z", "elsewhere.txt")
+    note = clone.commit("closes #7 at last", "2026-11-22T10:00:00Z", "elsewhere.txt")
+    clone.commit("for #70 only", "2026-11-22T11:00:00Z", "elsewhere.txt")
+    doc = clone.commit("both", "2026-11-23T10:00:00Z", "docs/a.md", "src/app.py")
+    clone.push()
+
+    assert tool.main(["read", "7"]) == 0
+
+    assert landed(capsys) == [
+        "--- landed since #7 was opened (main, origin/main)",
+        f"{app} 2026-11-21 fix the app (touches src/app.py)",
+        f"{note} 2026-11-22 closes #7 at last (mentions #7)",
+        # In the order the issue names them.
+        f"{doc} 2026-11-23 both (touches src/app.py, docs)",
+    ]
+
+
+def test_show_ends_with_it_too(clone, capsys):
+    sha = clone.commit("for #7", "2026-11-21T09:00:00Z")
+
+    assert tool.main(["show", "7"]) == 0
+
+    assert landed(capsys) == [
+        "--- landed since #7 was opened (main)",
+        f"{sha} 2026-11-21 for #7 (mentions #7)",
+    ]
+
+
+def test_the_committer_date_counts_not_the_author_date(clone, capsys):
+    # As a rebase or wt-ship's landing leaves it: written before, committed after.
+    (clone.root / "src").mkdir()
+    (clone.root / "src/app.py").write_text("x\n")
+    clone.git("add", "-A")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_DATE": "2026-11-19T12:00:00Z",
+        "GIT_COMMITTER_DATE": "2026-11-21T09:00:00Z",
+    }
+    subprocess.run(
+        ["git", "-C", str(clone.root), "commit", "-qm", "rebased"], check=True, env=env
+    )
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys)[1:] == [
+        f"{clone.git('rev-parse', '--short', 'HEAD')} 2026-11-21 rebased (touches src/app.py)"
+    ]
+
+
+def test_a_commit_only_the_remote_holds_counts(clone, capsys):
+    clone.commit("start", "2026-11-19T12:00:00Z")
+    clone.push()
+    clone.git("checkout", "-q", "--detach")
+    remote = clone.commit("merged on GitHub, #7", "2026-11-21T09:00:00Z")
+    clone.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    clone.git("checkout", "-q", "main")
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys)[1:] == [
+        f"{remote} 2026-11-21 merged on GitHub, #7 (mentions #7)"
+    ]
+
+
+def test_a_merge_commit_is_left_out(clone, capsys):
+    clone.commit("start", "2026-11-19T12:00:00Z")
+    clone.git("checkout", "-q", "-b", "topic")
+    work = clone.commit("the work", "2026-11-21T09:00:00Z", "src/app.py")
+    clone.git("checkout", "-q", "main")
+    clone.commit("beside it", "2026-11-21T10:00:00Z", "elsewhere.txt")
+    clone.git(
+        "merge",
+        "-q",
+        "--no-ff",
+        "-m",
+        "Merge #7's work",
+        "topic",
+        date="2026-11-22T00:00:00Z",
+    )
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys)[1:] == [f"{work} 2026-11-21 the work (touches src/app.py)"]
+
+
+def test_at_most_15_lines_then_how_to_see_the_rest(clone, capsys):
+    for day in range(1, 18):
+        clone.commit(f"step {day} of #7", f"2026-11-21T{day:02d}:00:00Z")
+
+    tool.main(["read", "7"])
+
+    shown = landed(capsys)
+    assert len(shown) == 1 + 15 + 1
+    # No path the issue names exists in this clone, so the hint names only the grep.
+    assert shown[-1] == (
+        "... and 2 more: git log --no-merges --since=2026-11-20T00:00:00Z"
+        " -E '--grep=(^|[^/[:alnum:]_])#7([^0-9]|$)' main"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://github.com/someone/else.git", None],
+    ids=["another-repo", "no-remote"],
+)
+def test_a_clone_of_another_repo_shows_nothing_landed(
+    fake, tmp_path, monkeypatch, capsys, url
+):
+    fake.issue |= {"created_at": OPENED, "body": NAMES}
+    other = Clone(tmp_path / "clone", url or "https://github.com/x/y")
+    if url is None:
+        other.git("remote", "remove", "origin")
+    other.commit("for #7", "2026-11-21T09:00:00Z", "src/app.py")
+    monkeypatch.chdir(other.root)
+
+    assert tool.main(["read", "7"]) == 0
+
+    assert landed(capsys) == []
+
+
+def test_outside_a_clone_it_shows_nothing_landed(fake, tmp_path, monkeypatch, capsys):
+    fake.issue |= {"created_at": OPENED, "body": NAMES}
+    monkeypatch.chdir(tmp_path)
+
+    assert tool.main(["read", "7"]) == 0
+
+    assert landed(capsys) == []
+
+
+def test_nothing_landed_prints_no_heading(clone, capsys):
+    clone.commit("before it", "2026-11-19T12:00:00Z", "src/app.py")
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys) == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/Owner/Repo.git",
+        "https://github.com/owner/repo",
+        "git@github.com:owner/repo.git",
+        "ssh://git@github.com/owner/repo",
+    ],
+)
+def test_each_way_of_naming_a_github_remote_names_its_repo(url):
+    assert tool.github_repo(url) == "owner/repo"
+
+
+def test_a_remote_elsewhere_names_no_github_repo():
+    assert tool.github_repo("https://gitlab.com/owner/repo.git") is None
+
+
+def test_the_default_branch_is_the_one_the_remotes_head_names(clone, capsys):
+    clone.git("checkout", "-q", "-b", "trunk")
+    sha = clone.commit("for #7", "2026-11-21T09:00:00Z")
+    clone.git("update-ref", "refs/remotes/origin/trunk", "trunk")
+    clone.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys) == [
+        "--- landed since #7 was opened (trunk, origin/trunk)",
+        f"{sha} 2026-11-21 for #7 (mentions #7)",
+    ]
+
+
+def test_a_path_named_twice_is_listed_once(clone, capsys):
+    sha = clone.commit("fix", "2026-11-21T09:00:00Z", "src/app.py")
+    tool.gh.issue["body"] = "`src/app.py` and again `src/app.py:3`"
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys)[1:] == [f"{sha} 2026-11-21 fix (touches src/app.py)"]
+
+
+def test_a_commit_that_mentions_the_issue_and_touches_its_path_says_both(clone, capsys):
+    sha = clone.commit("fix #7", "2026-11-21T09:00:00Z", "src/app.py")
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys)[1:] == [
+        f"{sha} 2026-11-21 fix #7 (mentions #7; touches src/app.py)"
+    ]
+
+
+@pytest.mark.parametrize("named", ["/", ":12", "-v", "/etc/passwd", "https://x.org/a"])
+def test_a_word_in_backticks_that_is_no_path_of_the_clone_names_none(
+    clone, capsys, named
+):
+    clone.commit("unrelated", "2026-11-21T09:00:00Z", "elsewhere.txt")
+    sha = clone.commit("fix", "2026-11-21T10:00:00Z", "src/app.py")
+    tool.gh.issue["body"] = f"Run `{named}` on `src/app.py`."
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys)[1:] == [f"{sha} 2026-11-21 fix (touches src/app.py)"]
+
+
+def test_without_git_it_shows_nothing_landed(clone, capsys, monkeypatch):
+    clone.commit("for #7", "2026-11-21T09:00:00Z")
+    monkeypatch.setenv("PATH", "/nonexistent")
+
+    assert tool.main(["read", "7"]) == 0
+
+    assert landed(capsys) == []
+
+
+def test_run_from_a_folder_of_the_clone_it_still_finds_what_touched_the_paths(
+    clone, capsys, monkeypatch
+):
+    sha = clone.commit("fix", "2026-11-21T09:00:00Z", "src/app.py", "docs/a.md")
+    monkeypatch.chdir(clone.root / "docs")
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys)[1:] == [f"{sha} 2026-11-21 fix (touches src/app.py, docs)"]
+
+
+def test_a_path_written_from_dot_slash_counts_as_the_path(clone, capsys):
+    sha = clone.commit("fix", "2026-11-21T09:00:00Z", "src/app.py")
+    tool.gh.issue["body"] = "See `./src/app.py`."
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys)[1:] == [f"{sha} 2026-11-21 fix (touches src/app.py)"]
+
+
+def test_a_path_a_comment_names_counts_too(clone, capsys):
+    sha = clone.commit("fix", "2026-11-21T09:00:00Z", "notes/plan.md")
+    tool.gh.issue["body"] = "No paths here."
+    tool.gh.comments[1]["body"] = "Later: `notes/plan.md` needs it."
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys)[1:] == [f"{sha} 2026-11-21 fix (touches notes/plan.md)"]
+
+
+def test_another_repos_issue_of_that_number_is_no_mention(clone, capsys):
+    clone.commit("closes other/repo#7", "2026-11-21T09:00:00Z")
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys) == []
+
+
+def test_a_shallow_clone_shows_nothing_landed(clone, capsys, tmp_path, monkeypatch):
+    clone.commit("start", "2026-11-19T12:00:00Z")
+    clone.commit("for #7", "2026-11-21T09:00:00Z")
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth", "1", f"file://{clone.root}", str(shallow)],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(shallow),
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+        check=True,
+    )
+    monkeypatch.chdir(shallow)
+
+    tool.main(["read", "7"])
+
+    assert landed(capsys) == []

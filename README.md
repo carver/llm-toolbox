@@ -561,7 +561,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   issue's body and every comment, with author and date. `show` and `read` end
   with the issue's parent, its sub-issues, and the issues and pull requests it
   mentions as `#N`, each with its state, open items (unticked ones, once closed),
-  title and, while open, claims, so a plan issue tells which of its steps are done. `issue-todo unticked N...`
+  title and, while open, claims, so a plan issue tells which of its steps are done.
+  Run in a clone of the repo, they end with the commits committed since the issue
+  was opened that mention it or touch a path it names in backticks, so work planned
+  from its numbers starts from what has already landed. `issue-todo unticked N...`
   prints each unticked item as `#N TEXT`, one a line, for a script such as
   wt-ship. `issue-todo claim N` claims
   an issue for this session (`--as NAME`, else `CLAUDE_CODE_SESSION_ID`'s first 8

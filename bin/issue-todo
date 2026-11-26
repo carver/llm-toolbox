@@ -51,6 +51,15 @@ is listed twice. One GraphQL call fetches
 them all, and only an issue with sub-issues costs one REST call more, so a plan issue
 tells which of its steps are done.
 
+Run in a clone of the issue's repo, they then end with `--- landed since #N was
+opened (main, origin/main)`: each commit on the default branch, here or on its
+remote, committed since the issue was opened, no merge, that mentions `#N` or touches
+a path the issue names in backticks (one the clone has, a `path:line` as its path),
+oldest first, as `SHA DATE SUBJECT (mentions #N; touches PATH, ...)`, at most 15,
+then the `git log` that lists the rest. Work planned from an issue's numbers may
+already be done: a fix that landed after the issue was opened shows here. Outside a
+clone of the repo, or when git fails, the section is left out.
+
 `claim` and `release` keep a claim in the issue's comments, each with a hidden marker
 `<!-- issue-todo claim ID -->` (or `release`), so two sessions don't both take one
 issue. ID is the session's name: --as NAME, else $CLAUDE_CODE_SESSION_ID's first 8
@@ -210,6 +219,7 @@ def show(repo: str, number: int) -> int:
         for i, item in enumerate(listed, 1):
             print(f"  [{'x' if item.done else ' '}] {i}  {short(item.text)}")
     print_related(repo, issue, found)
+    print_landed(repo, issue, found)
     return 0
 
 
@@ -285,6 +295,128 @@ def sub_issues(repo: str, issue: dict) -> list[dict]:
         return []
 
 
+GITHUB_REMOTE = re.compile(
+    r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"([^/]+/[^/]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+# A word in backticks: a path, when the clone has it.
+NAMED_PATH = re.compile(r"`([^`\s]+)`")
+LANDED_LINES = 15
+
+
+def github_repo(url: str) -> str | None:
+    """The OWNER/REPO a GitHub remote URL names, lowercased; None for another host."""
+    match = GITHUB_REMOTE.match(url.strip())
+    return match.group(1).lower() if match else None
+
+
+def git(*args: str) -> str | None:
+    """A git command's output in the current directory, or None when it fails."""
+    try:
+        done = subprocess.run(
+            ["git", *args], check=False, capture_output=True, text=True
+        )
+    except OSError:
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def clone_refs(repo: str) -> list[str]:
+    """The current directory's default branch and its remote's, when the directory is
+    a clone of `repo`: each that exists, the local branch first. None of them in a
+    clone of another repo, outside any, or in a shallow clone, which lacks commits."""
+    if (git("rev-parse", "--is-shallow-repository") or "").strip() == "true":
+        return []
+    for remote in (git("remote") or "").split():
+        if github_repo(git("remote", "get-url", remote) or "") != repo.lower():
+            continue
+        head = git("symbolic-ref", "--short", f"refs/remotes/{remote}/HEAD") or ""
+        branch = head.strip().split("/", 1)[1] if "/" in head else "main"
+        return [
+            ref
+            for ref in (branch, f"{remote}/{branch}")
+            if git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}") is not None
+        ]
+    return []
+
+
+def named_paths(markdown: str, refs: list[str]) -> list[str]:
+    """The paths `markdown` names in backticks that exist at a tip of `refs`, as a file
+    or a folder, in order of first mention; a `path:line` counts as its path."""
+    paths: list[str] = []
+    for token in NAMED_PATH.findall(markdown):
+        path = re.sub(r":\d+(?:-\d+)?$", "", token).removeprefix("./").rstrip("/")
+        # An empty one names the root tree, which every tip has, and an empty
+        # pathspec makes the whole `git log` fail.
+        if not path or path in paths:
+            continue
+        if any(git("cat-file", "-e", f"{ref}:{path}") is not None for ref in refs):
+            paths.append(path)
+    return paths
+
+
+def mention(number: int) -> str:
+    """The extended regex for a commit message that mentions #`number` of this repo:
+    not #`number`0, nor another repo's OWNER/REPO#`number`."""
+    return rf"(^|[^/[:alnum:]_])#{number}([^0-9]|$)"
+
+
+def logged(*args: str) -> Iterator[tuple[tuple[int, str], list[str]]]:
+    """Each commit `git log ARGS` lists, as its committer time and `SHA DATE SUBJECT`
+    line, with the file names `--name-only` adds after it, if any."""
+    out = git("log", "--format=%x00%ct %h %cs %s", *args) or ""
+    for entry in out.split("\0")[1:]:
+        head, *files = entry.strip("\n").split("\n")
+        time, line = head.split(" ", 1)
+        yield (int(time), line), files
+
+
+def landed_commits(
+    number: int, opened: str, refs: list[str], paths: list[str]
+) -> list[tuple[str, str]]:
+    """Each commit of `refs` committed since `opened`, no merge, that mentions
+    #`number` or touches one of `paths`: its `SHA DATE SUBJECT` line and why it counts,
+    oldest first."""
+    since = ["--no-merges", f"--since={opened}"]
+    why: dict[tuple[int, str], list[str]] = {}
+    if paths:
+        # From the top, as named_paths checked them, wherever this runs.
+        top = [f":(top){path}" for path in paths]
+        for commit, files in logged(*since, "--name-only", *refs, "--", *top):
+            touched = [
+                p for p in paths if any(f == p or f.startswith(p + "/") for f in files)
+            ]
+            why[commit] = ["touches " + ", ".join(touched[:3])]
+    for commit, _ in logged(*since, "-E", f"--grep={mention(number)}", *refs):
+        why.setdefault(commit, []).insert(0, f"mentions #{number}")
+    return [(line, "; ".join(why[(time, line)])) for time, line in sorted(why)]
+
+
+def print_landed(repo: str, issue: dict, found: list[Part]) -> None:
+    """The commits on the default branch, here or on its remote, committed since the
+    issue was opened, that mention it or touch a path it names in backticks, oldest
+    first, at most LANDED_LINES. Nothing outside a clone of `repo`."""
+    number, opened = issue["number"], issue.get("created_at")
+    refs = clone_refs(repo) if opened else []
+    if not refs:
+        return
+    paths = named_paths("\n".join(part.markdown for part in found), refs)
+    commits = landed_commits(number, opened, refs, paths)
+    if not commits:
+        return
+    print(f"--- landed since #{number} was opened ({', '.join(refs)})")
+    for line, why in commits[:LANDED_LINES]:
+        print(f"{line} ({why})")
+    if len(commits) > LANDED_LINES:
+        log = f"git log --no-merges --since={opened}"
+        where = " ".join(refs)
+        rest = f"{log} -E '--grep={mention(number)}' {where}"
+        if paths:
+            rest += f", and {log} {where} -- {' '.join(paths)}"
+        print(f"... and {len(commits) - LANDED_LINES} more: {rest}")
+
+
 def print_related(repo: str, issue: dict, found: list[Part]) -> None:
     """The issue's parent, its sub-issues, and the issues and pull requests `found`
     mentions, each under its own heading, with no issue listed twice. One GraphQL call
@@ -345,6 +477,7 @@ def read(repo: str, numbers: list[int]) -> int:
             print(f"--- {part.label}")
             print(part.markdown.rstrip())
         print_related(repo, issue, found)
+        print_landed(repo, issue, found)
     return 0
 
 

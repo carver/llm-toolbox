@@ -191,9 +191,13 @@ Environment:
   HEAVY_CORES_USED     a number that stands in for the cores a run used (tests)
   HEAVY_SLOT           set for CMD, to the slot it holds (for a --few-seconds job run
                        outside the queue, `outside` and the line naming its heavy)
+  OWN_PIDS             set by own-pids inside its PID namespace, where heavy refuses
+                       the shared queue (HEAVY_DIR unset or /tmp/heavy): it would take
+                       other sessions' jobs, whose PIDs it can't see, for ended ones
 
 Exit status: CMD's own; 2 a usage error; 3 `heavy waits --until-open` reached
---max-wait with the queue still held; 125 heavy couldn't use its queue; 126 CMD
+--max-wait with the queue still held; 125 heavy couldn't use its queue, or refused
+the shared one inside own-pids; 126 CMD
 couldn't be run (a folder, or not executable); 127 CMD wasn't found; 128+N stopped
 by signal N.
 """
@@ -223,6 +227,7 @@ QUICK_WITHOUT = {
     " cores are quiet, and --share is for work without time limits, such as a build.",
 }
 PR_SET_PDEATHSIG = 1
+SHARED_QUEUE = Path("/tmp/heavy")
 
 
 class Stopped(Exception):
@@ -491,6 +496,14 @@ def main(argv=None):
         help="status, history [OPTIONS], waits [OPTIONS], or -- CMD [ARGS...]",
     )
     args = parser.parse_args(argv)
+    if os.environ.get("OWN_PIDS") and heavyqueue.base().resolve() == SHARED_QUEUE:
+        print(
+            "heavy: refusing the shared queue inside own-pids' PID namespace (as"
+            " mutate-check runs its command), where other sessions' jobs look ended:"
+            " put heavy outside, `heavy -- mutate-check ...`",
+            file=sys.stderr,
+        )
+        return 125
     if args.quick:
         for option, why in QUICK_WITHOUT.items():
             if getattr(args, option.removeprefix("--")):

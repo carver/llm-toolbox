@@ -13,6 +13,11 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "mutate-check"
+OWN_PIDS = SCRIPT.parent / "own-pids"
+# A stand-in for own-pids that passes the command on: most tests here are about
+# judging a run, and the real one needs passwordless sudo. The tests at the end
+# check the namespace.
+PASS_ON = '#!/bin/sh\n[ "$1" = --check ] && exit 0\n[ "$1" = -- ] && shift\nexec "$@"\n'
 
 CODE = "def double(n):\n    return n * 2\n"
 TEST = "from calc import double\n\n\ndef test_double():\n    assert double(2) == 4\n"
@@ -61,6 +66,22 @@ def check(
         check=False,
         env=env,
     )
+
+
+def stand_in(path: Path, text: str) -> Path:
+    path.write_text(text)
+    path.chmod(0o755)
+    return path
+
+
+@pytest.fixture(scope="module")
+def pass_on(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return stand_in(tmp_path_factory.mktemp("own-pids") / "pass-on", PASS_ON)
+
+
+@pytest.fixture(autouse=True)
+def _own_pids_passes_on(pass_on: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MUTATE_CHECK_OWN_PIDS", str(pass_on))
 
 
 @pytest.fixture
@@ -165,7 +186,7 @@ def test_a_command_that_wont_start_is_a_usage_error_not_a_miss(repo: Path) -> No
 @pytest.mark.parametrize(
     ("status", "says"),
     [
-        (126, "heavy: can't run ./m.sh: Exec format error."),
+        (126, "env: './m.sh': Exec format error"),
         (127, "sh: 1: no-such-command-xyz: not found"),
     ],
 )
@@ -855,9 +876,46 @@ def template(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture
 def project(template: Path, tmp_path: Path) -> Path:
+    """A worktree of a copy of the template, on its main branch: mutate-check refuses
+    a main tree."""
+    repo = tmp_path / "repo"
+    shutil.copytree(template, repo, symlinks=True)
+    git(repo, "switch", "-q", "--detach")
     root = tmp_path / "project"
-    shutil.copytree(template, root, symlinks=True)
+    git(repo, "worktree", "add", "-q", str(root), "main")
     return root
+
+
+@pytest.mark.parametrize("diff", [True, False])
+def test_it_refuses_a_main_tree(project: Path, diff: bool) -> None:
+    main_tree = project.parent / "repo"
+    (main_tree / "calc.py").write_text(LABEL)
+
+    if diff:
+        result = diff_check(main_tree, "touch", "ran")
+    else:
+        result = check(main_tree, BREAK, "touch", "ran", options=("--unisolated",))
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "main tree" in result.stderr
+    assert "git worktree add --detach ../repo-wt-TOPIC" in result.stderr
+    assert not (main_tree / "ran").exists()
+    assert (main_tree / "calc.py").read_text() == LABEL
+
+
+def test_a_heavy_that_refuses_inside_the_namespace_stops_it(repo: Path) -> None:
+    refuses = (
+        "heavy: refusing the shared queue inside own-pids' PID namespace (as"
+        " mutate-check runs its command)"
+    )
+    command = ("sh", "-c", f'echo "{refuses}" >&2; echo "make: *** Error 125"; exit 2')
+
+    result = check(repo, BREAK, *command)
+
+    assert result.returncode == 2, result.stdout
+    assert refuses in result.stderr
+    assert "caught" not in result.stdout
+    assert (repo / "calc.py").read_text() == CODE
 
 
 def mutate(
@@ -1733,3 +1791,205 @@ def test_a_redirection_to_stderr_from_a_message_runs_last(project: Path) -> None
         "msg.sh:3: dropped: >&2",
         "msg.sh:3: deleted: echo 'it failed' >&2",
     ], result.stdout
+
+
+# Each run in a PID namespace of its own, through own-pids.
+
+NO_NAMESPACE = (
+    "own-pids: no PID namespace: sudo -n unshare exited 1 before the command started"
+)
+
+
+def recording(path: Path, log: Path, fails: str = "") -> Path:
+    """A stand-in for own-pids that logs each call's name and arguments and passes
+    the command on, after running `fails`, shell that may exit first."""
+    text = (
+        f'#!/bin/sh\necho "$0 $*" >> {log}\n{fails}\n'
+        '[ "$1" = --check ] && exit 0\n[ "$1" = -- ] && shift\nexec "$@"\n'
+    )
+    return stand_in(path, text)
+
+
+@pytest.mark.parametrize("diff", [False, True])
+def test_every_run_goes_through_a_copy_of_own_pids(
+    project: Path, tmp_path: Path, diff: bool
+) -> None:
+    (project / "calc.py").write_text(LABEL)
+    log = tmp_path / "calls.log"
+    fake = recording(tmp_path / "own-pids", log)
+    env = os.environ | {"MUTATE_CHECK_OWN_PIDS": str(fake)}
+
+    if diff:
+        result = diff_check(project, "true", env=env)
+        runs = 1 + int(result.stdout.split("survived")[0].split()[-1])
+    else:
+        result = check(project, BREAK, "true", env=env)
+        runs = 1
+
+    calls = log.read_text().splitlines()
+    assert calls[0].endswith(" --check"), calls
+    assert calls[1:] == [calls[1]] * runs, calls
+    assert calls[1].endswith(" -- true")
+    copy = Path(calls[0].split()[0])
+    assert copy != fake and copy.name == "own-pids"
+    assert not copy.exists(), "the copy outlived the run"
+    assert result.returncode in (0, 1), result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("diff", [False, True])
+def test_with_no_namespace_it_refuses_and_runs_nothing(
+    project: Path, tmp_path: Path, diff: bool
+) -> None:
+    (project / "calc.py").write_text(LABEL)
+    fake = stand_in(
+        tmp_path / "own-pids",
+        f"#!/bin/sh\necho 'sudo: a password is required' >&2\necho '{NO_NAMESPACE}' >&2\nexit 125\n",
+    )
+    env = os.environ | {"MUTATE_CHECK_OWN_PIDS": str(fake)}
+
+    if diff:
+        result = diff_check(project, "touch", "ran", env=env)
+    else:
+        result = check(project, BREAK, "touch", "ran", env=env)
+
+    assert result.returncode == 2
+    assert "sudo: a password is required; own-pids: no PID namespace" in result.stderr
+    assert "--unisolated" in result.stderr
+    assert not (project / "ran").exists()
+    assert (project / "calc.py").read_text() == LABEL
+
+
+@pytest.mark.parametrize("diff", [False, True])
+def test_unisolated_runs_the_command_without_own_pids(
+    project: Path, tmp_path: Path, diff: bool
+) -> None:
+    (project / "calc.py").write_text(LABEL)
+    log = tmp_path / "calls.log"
+    fake = recording(tmp_path / "own-pids", log, fails="exit 125")
+    env = os.environ | {"MUTATE_CHECK_OWN_PIDS": str(fake)}
+
+    if diff:
+        result = diff_check(project, "touch", "ran", options=("--unisolated",), env=env)
+    else:
+        result = check(
+            project, BREAK, "touch", "ran", options=("--unisolated",), env=env
+        )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert (project / "ran").exists()
+    assert not log.exists()
+
+
+def test_a_namespace_that_fails_mid_run_stops_with_the_code_put_back(
+    project: Path, tmp_path: Path
+) -> None:
+    (project / "calc.py").write_text(LABEL)
+    log = tmp_path / "calls.log"
+    # The check and the unmutated run pass; the first mutant's namespace fails.
+    third_fails = (
+        f'[ "$(wc -l < {log})" -lt 3 ] || {{ echo "{NO_NAMESPACE}" >&2; exit 125; }}'
+    )
+    fake = recording(tmp_path / "own-pids", log, fails=third_fails)
+    env = os.environ | {"MUTATE_CHECK_OWN_PIDS": str(fake)}
+
+    result = diff_check(project, "true", env=env)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert f"mutate-check: stopped: {NO_NAMESPACE}" in result.stderr
+    assert len(log.read_text().splitlines()) == 3
+    assert (project / "calc.py").read_text() == LABEL
+
+
+def test_a_command_that_exits_125_by_itself_is_judged_as_usual(project: Path) -> None:
+    (project / "calc.py").write_text(LABEL)
+
+    result = diff_check(
+        project, "sh", "-c", "[ -e started ] && exit 125; touch started"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("diff", [False, True])
+def test_heavy_inside_the_command_is_refused(project: Path, diff: bool) -> None:
+    (project / "calc.py").write_text(LABEL)
+    command = ("/usr/local/bin/heavy", "--", "touch", "ran")
+
+    if diff:
+        result = diff_check(project, *command)
+    else:
+        result = check(project, BREAK, *command)
+
+    assert result.returncode == 2
+    assert "heavy -- mutate-check" in result.stderr
+    assert not (project / "ran").exists()
+    assert (project / "calc.py").read_text() == LABEL
+
+
+def own_pids_works() -> bool:
+    checked = subprocess.run(
+        [str(OWN_PIDS), "--check"], capture_output=True, check=False
+    )
+    return checked.returncode == 0
+
+
+# Kills the processes whose parent is `parent`. Negating its check kills every
+# process it can see, as the mutant of drive-agent's kill_tmux_server did (#15). It
+# refuses outside a fresh PID namespace, where that would kill all the user's.
+REAPER = """\
+import os
+import signal
+from pathlib import Path
+
+
+def kill_children(parent):
+    pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    if not (len(pids) < 10 and max(pids) < 100):
+        raise SystemExit(f"refusing: {len(pids)} processes visible")
+    for pid in pids:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            continue
+        ppid = stat.rsplit(")", 1)[1].split()[1]
+        if str(parent) == ppid:
+            os.kill(pid, signal.SIGKILL)
+"""
+TEST_REAPER = """\
+import os
+import subprocess
+
+from reaper import kill_children
+
+
+def test_kill_children_kills_a_child():
+    child = subprocess.Popen(["sleep", "60"])
+    kill_children(os.getpid())
+    assert child.wait(timeout=5) == -9
+"""
+
+
+@pytest.mark.skipif(not own_pids_works(), reason="own-pids needs passwordless sudo")
+def test_a_mutant_that_kills_every_process_it_sees_spares_the_users_others(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MUTATE_CHECK_OWN_PIDS")
+    add(project, {"reaper.py": REAPER, "test_reaper.py": TEST_REAPER})
+    git(project, "commit", "-q", "-m", "reaper")
+    # Only the check's line changes, so only it is mutated, never the guard.
+    reaper = project / "reaper.py"
+    changed = REAPER.replace("if str(parent) == ppid:", "if ppid == str(parent):")
+    reaper.write_text(changed)
+    bystander = subprocess.Popen(["sleep", "60"])
+    try:
+        result = diff_check(
+            project, sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"
+        )
+
+        assert bystander.poll() is None, "the mutant killed a process outside"
+    finally:
+        bystander.kill()
+        bystander.wait()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines()[-1].startswith("mutate-check: 1 caught, 0 surv")
+    assert reaper.read_text() == changed

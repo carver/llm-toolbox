@@ -2906,3 +2906,34 @@ def test_until_open_options_need_until_open(box):
 
     assert done.returncode == 2, done.stdout
     assert "--until-open" in done.stderr, done.stderr
+
+
+@pytest.mark.parametrize("queue", [None, "/tmp/heavy"])
+def test_in_an_own_pids_namespace_it_refuses_the_shared_queue(box, queue):
+    tmp_path, _, env = box
+    env = {k: v for k, v in env.items() if k != "HEAVY_DIR"} | {"OWN_PIDS": "1"}
+    if queue:
+        env["HEAVY_DIR"] = queue
+
+    done = subprocess.run(
+        [str(SCRIPT), "--few-seconds", "--", "touch", "ran"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        cwd=tmp_path,
+    )
+
+    assert done.returncode == 125, done.stderr
+    assert "heavy -- mutate-check" in done.stderr
+    assert not (tmp_path / "ran").exists()
+
+
+def test_in_an_own_pids_namespace_a_queue_of_its_own_still_works(box):
+    tmp_path, _, env = box
+
+    done = heavy(env, "--", "touch", "ran", OWN_PIDS="1")
+
+    assert done.returncode == 0, done.stderr
+    assert (tmp_path / "ran").exists()

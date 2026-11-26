@@ -11,8 +11,8 @@
 
   mutate-check --diff main -- uv run pytest -q tests/test_watch.py
 
-  mutate-check [--timeout SECONDS] [--edits FILE] -- CMD...
-  mutate-check --diff BASE [--max N] [--timeout SECONDS] -- CMD...
+  mutate-check [--timeout SECONDS] [--edits FILE] [--unisolated] -- CMD...
+  mutate-check --diff BASE [--max N] [--timeout SECONDS] [--unisolated] -- CMD...
 
 Pick a heredoc delimiter that isn't a line of the blocks: a line EOF in the text ends
 <<'EOF' early, and the shell runs the rest as commands.
@@ -27,16 +27,15 @@ stopped by Ctrl-C, SIGTERM or SIGHUP.
 
 A failure counts as a catch only when tests ran. A mutation that stops the build (a Rust
 `error: could not compile` or `error[E...]`, as unused code under `-D warnings` does),
-pytest exiting 2, 4 or 5 (collection errors, usage, no tests) with no `N failed` in
-its summary (under pytest-xdist, -x exits 2 after a failure), or a `cargo test` or
-`cargo nextest` run that fails with no line saying a test ran, is inconclusive: no test
-judged it. So is an exit of 126 or 127 with no line saying a test ran: a shell, or a
-wrapper such as heavy, gives that when the program it runs can't start (not found,
-not executable, a script with no shebang); its last line, which says why, is shown.
-So is a command that runs past --timeout (default 600 seconds), which is
-stopped: a hang isn't a catch. A cargo test run that passes with no test run (a
-filter that matched none), or a pytest run whose summary counts no test passed (all
-skipped), is inconclusive too.
+pytest exiting 2, 4 or 5 (collection errors, usage, no tests) with no `N failed` in its
+summary (under pytest-xdist, -x exits 2 after a failure), or a `cargo test` or `cargo
+nextest` run that fails with no line saying a test ran, is inconclusive: no test judged
+it. So is an exit of 126 or 127 with no line saying a test ran: a shell, or a wrapper
+such as env or timeout, gives that when the program it runs can't start (not found, not
+executable, a script with no shebang); its last line, which says why, is shown. So is a
+command that runs past --timeout (default 600 seconds), which is stopped: a hang isn't a
+catch. A cargo test run that passes with no test run (a filter that matched none), or a
+pytest run whose summary counts no test passed (all skipped), is inconclusive too.
 
 The cargo case covers nextest refusing a filter (exit 94) or finding no test to run
 (exit 4). A test ran when the output, colour codes aside, has libtest's `test result:`,
@@ -44,7 +43,7 @@ nextest's `Summary [...]` with a count of tests run other than 0, or cargo's `er
 test failed, to rerun pass ...` (also `doctest`, `bench`), which it prints for a test
 binary that crashed or has no libtest harness. The command is a cargo test run when it
 holds `cargo`, then any `+toolchain` or `-flag` words, then `test`, `t` or `nextest`,
-also inside `sh -c '...'` or after a wrapper such as `heavy --`.
+also inside `sh -c '...'` or after a wrapper such as `timeout 600`.
 
 Prints one line, then, when it failed, a few of its own: for a catch, the tests that
 failed (up to 3 names, from nextest's, libtest's or pytest's lines, and how many more)
@@ -55,6 +54,26 @@ found; never the whole output.
 Stopped, or past --timeout, it stops the command's process group: SIGTERM, then
 SIGKILL after $MUTATE_CHECK_GRACE seconds (default 5; the tests shorten it).
 
+Each run of CMD, in both modes and the unmutated run included, goes through
+own-pids (`own-pids -h`): a PID namespace of its own, where a mutant that signals
+every process it can see, such as a negated check of which ones to kill, kills only
+the run's, not the user's shells and agent sessions. That takes passwordless sudo.
+Before CMD first runs, `own-pids --check` says whether this machine can make one,
+and without one mutate-check refuses, exit 2, unless --unisolated says to run CMD
+without one. mutate-check stays outside, so it can always put the code back, and
+runs a copy of own-pids made at its start, so a mutant of own-pids itself leaves
+every run's namespace alone; $MUTATE_CHECK_OWN_PIDS names a stand-in for own-pids
+(tests). A namespace that fails mid-run stops mutate-check, exit 2, with the code
+put back. A CMD with a word `heavy` is refused: in the namespace heavy takes other
+sessions' queued jobs for ended ones and drops them, so run `heavy -- mutate-check`.
+A heavy run deeper, from a script or `make`, refuses its shared queue itself, seeing
+the OWN_PIDS that own-pids sets, and mutate-check stops, exit 2, on its line.
+
+It refuses, exit 2, to mutate a file in a repo's main tree, --unisolated or not: other
+sessions run the files there (tools on PATH, git hooks) outside any namespace, so a
+mutant of a kill-all check there kills them all. Run it in a worktree (`git worktree
+add --detach ../REPO-wt-TOPIC`). A file outside any repo is mutated as before.
+
 The command runs with PYTHONDONTWRITEBYTECODE=1. Python takes a .pyc as current when
 its source's size and mtime in whole seconds match, so a same-size mutation put back
 within the second would leave its bytecode for the next import. A Python started with
@@ -62,11 +81,11 @@ within the second would leave its bytecode for the next import. A Python started
 second past the mutant's.
 
 Exit status: 0 the command failed, so the mutation was caught; 1 it passed, so the
-tests miss it; 2 usage error, an --edits FILE that can't be read, or blocks that didn't
-apply (the command didn't run), or the command itself can't start (not found, not
-executable);
-3 inconclusive: the build failed, no tests ran, a wrapper exited 126 or 127, or the
-command hung; 128+N stopped by signal N.
+tests miss it; 2 usage error, an --edits FILE that can't be read, blocks that didn't
+apply, a file in a main tree, no PID namespace for the command, or the command itself
+can't start (not found, not executable), so it didn't run; 3 inconclusive: the build
+failed, no tests ran, a wrapper exited 126 or 127, or the command hung; 128+N stopped
+by signal N.
 
 --diff BASE makes the mutants itself, from the lines added or changed since BASE's
 merge base with HEAD, work tree included: commits since BASE, and edits not yet
@@ -117,10 +136,11 @@ CMD`. Each Python mutant gets an mtime a second past the last one's, so a .pyc t
 a Python ignoring PYTHONDONTWRITEBYTECODE wrote for one never passes for the next.
 
 Exit status with --diff: 0 no mutant survived; 1 one did; 2 usage error, BASE isn't
-a commit, CMD rewrote a code file, or a file couldn't be put back; 3 no mutant was
-judged: the unmutated run didn't pass with tests run, the first 3 mutants or all of
-them were inconclusive or skipped, or a changed code file couldn't be read and the
-rest had no mutants; 128+N stopped by signal N, after putting the file back.
+a commit, CMD rewrote a code file, a file couldn't be put back, the folder is in a
+main tree, or no PID namespace for CMD; 3 no mutant was judged: the unmutated run
+didn't pass with tests run, the first 3 mutants or all of them were inconclusive or
+skipped, or a changed code file couldn't be read and the rest had no mutants; 128+N
+stopped by signal N, after putting the file back.
 """
 
 import ast
@@ -140,14 +160,18 @@ import tempfile
 import time
 import warnings
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import FrameType, ModuleType
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import maintree
+
 CAUGHT, MISSED, USAGE, INCONCLUSIVE = 0, 1, 2, 3
 DEFAULT_TIMEOUT = 600.0
-# The statuses a shell, or a wrapper such as heavy, gives a program it can't start:
-# not executable (or no shebang, a folder), and not found.
+# The statuses a shell, or a wrapper such as env or timeout, gives a program it can't
+# start: not executable (or no shebang, a folder), and not found.
 CANT_START = {126, 127}
 # pytest's statuses when no test judged anything: interrupted or collection errors,
 # a usage error, no tests collected.
@@ -172,6 +196,11 @@ PANICKED = re.compile(r"\bpanicked at \S+:\d+:\d+:\s*$")
 BIN = Path(__file__).resolve().parent
 SHOWN_ERRORS = 3
 STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+# own-pids' status and the start of its line when it made no namespace.
+NO_NAMESPACE = 125
+NO_NAMESPACE_SAID = "own-pids: no PID namespace"
+# The start of heavy's line when it refuses its shared queue inside own-pids.
+HEAVY_REFUSED = "heavy: refusing the shared queue inside own-pids"
 
 
 class UsageError(Exception):
@@ -214,7 +243,8 @@ def snapshot(paths: list[Path]) -> dict[Path, Original]:
 
 
 def put(target: Path, original: Original) -> None:
-    """Write the file through a temp file beside it, so a crash can't leave half of one."""
+    """Write the file through a temp file beside it, so a crash can't leave half of
+    one."""
     fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
     with os.fdopen(fd, "wb") as f:
         f.write(original.content)
@@ -280,7 +310,74 @@ def run(command: list[str], timeout: float) -> tuple[int, str]:
         stop_child(child, grace)
         raise TimedOut from e
     # Without colour codes, which CARGO_TERM_COLOR=always or --color puts mid-line
-    return child.returncode, COLOUR.sub("", output.decode(errors="replace"))
+    text = COLOUR.sub("", output.decode(errors="replace"))
+    if child.returncode == NO_NAMESPACE:
+        said = [line for line in text.splitlines() if NO_NAMESPACE_SAID in line]
+        if said:
+            raise UsageError(f"mutate-check: stopped: {said[-1]}")
+    # Whatever status reached here, through make or a script: no test judged the run.
+    refused = [line for line in text.splitlines() if HEAVY_REFUSED in line]
+    if refused:
+        raise UsageError(f"mutate-check: stopped: {refused[-1]}")
+    return child.returncode, text
+
+
+def refuse_main_trees(folders: set[Path]) -> None:
+    """Raises UsageError when a folder is in a repo's main tree: other sessions run
+    its files, tools on PATH and hooks among them, and no namespace covers them."""
+    for folder in sorted(folders):
+        found = maintree.place(folder)
+        if found is not None and found.main:
+            raise UsageError(
+                f"mutate-check: {found.top} is a repo's main tree, whose files other"
+                " sessions run (tools on PATH, hooks) outside any PID namespace, so a"
+                " mutant there reaches them. Run it in a worktree:"
+                f" `git worktree add --detach ../{found.top.name}-wt-TOPIC`"
+            )
+
+
+@contextmanager
+def isolation(options: "Options") -> Iterator[list[str]]:
+    """The words to put before the command so it runs in a PID namespace of its own
+    (none with --unisolated): a copy of own-pids, made now, so a mutant of own-pids
+    itself leaves each run's namespace alone. Raises UsageError when `own-pids
+    --check` says this machine can't make one, or the command runs heavy."""
+    if not options.isolate:
+        yield []
+        return
+    for word in options.command:
+        if Path(word).name == "heavy":
+            raise UsageError(
+                "mutate-check: run heavy outside, `heavy -- mutate-check ...`: in the"
+                " command's PID namespace heavy takes other sessions' jobs for ended"
+                " ones and drops them from its queue"
+            )
+    # Inside, a command that won't start exits 127, which would read as a catch.
+    if shutil.which(options.command[0]) is None:
+        raise UsageError(f"mutate-check: can't run {options.command[0]}: not found")
+    source = Path(os.environ.get("MUTATE_CHECK_OWN_PIDS") or BIN / "own-pids")
+    with tempfile.TemporaryDirectory(prefix="mutate-check-") as folder:
+        copy = Path(folder) / "own-pids"
+        try:
+            shutil.copy2(source, copy)
+        except OSError as e:
+            raise UsageError(f"mutate-check: can't copy {source}: {e}") from e
+        checked = subprocess.run(
+            [str(copy), "--check"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if checked.returncode != 0:
+            why = "; ".join(checked.stderr.split("\n")).strip("; ")
+            raise UsageError(
+                f"mutate-check: the command can't have a PID namespace of its own here"
+                f" ({why or f'own-pids --check exited {checked.returncode}'}). Without"
+                " one, a mutant that signals every process it can see kills all of"
+                " yours, agent sessions included. Pass --unisolated to run it anyway."
+            )
+        yield [str(copy), "--"]
 
 
 def stop_child(child: subprocess.Popen[bytes], grace: float) -> None:
@@ -329,7 +426,7 @@ TESTS_PASSED = re.compile(
 )
 COLOUR = re.compile(r"\x1b\[[0-9;]*m")
 # `cargo`, then any `+toolchain` or `-flag` words, then a subcommand that runs tests,
-# anywhere in the command, so also inside `sh -c '...'` or after `heavy --`.
+# anywhere in the command, so also inside `sh -c '...'` or after `timeout 600`.
 CARGO_TEST_RUN = re.compile(r"(?<![\w-])cargo(\s+[-+]\S*)*\s+(test|t|nextest)(?![\w-])")
 
 
@@ -442,7 +539,7 @@ def judge(code: int, output: str, command: list[str]) -> Verdict:
     ran = test_line or any(map(PYTEST_SUMMARY.search, lines))
     if code in CANT_START and not ran:
         reason = (
-            f"it exited {code}, the status a shell or a wrapper such as heavy gives a"
+            f"it exited {code}, the status a shell or a wrapper such as env gives a"
             " program it can't start (not found, not executable, no shebang)"
         )
         report = [
@@ -518,6 +615,7 @@ class Options:
     edits_file: Path | None = None
     base: str | None = None
     limit: int | None = None
+    isolate: bool = True
 
 
 # --diff BASE: mutants made from the Python and shell lines a diff adds or changes.
@@ -654,7 +752,8 @@ class PythonFile:
 
     @staticmethod
     def parses(text: bytes) -> bool:
-        """Whether Python compiles the text: syntax, and what the symbol table checks."""
+        """Whether Python compiles the text: syntax, and what the symbol table
+        checks."""
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -1299,8 +1398,8 @@ def env_option(word: str) -> bool:
 
 
 def code_kind(path: Path, name: str) -> Kind | None:
-    """PythonFile or ShellFile for a code file, by its name or else its #! line; None for
-    tests, their helpers, and anything that isn't code."""
+    """PythonFile or ShellFile for a code file, by its name or else its #! line; None
+    for tests, their helpers, and anything that isn't code."""
     parts = PurePosixPath(name)
     folders_and_stem = (*parts.parent.parts, parts.stem)
     if parts.name == "conftest.py" or any(map(TEST_PART.search, folders_and_stem)):
@@ -1620,6 +1719,7 @@ def diff_main(options: Options) -> int:
     for signum in STOP_SIGNALS:
         signal.signal(signum, stop)
     try:
+        refuse_main_trees({Path.cwd()})
         try:
             least = seconds(os.environ.get("MUTATE_CHECK_MIN_TIMEOUT"), MIN_TIMEOUT)
         except ValueError:
@@ -1639,8 +1739,10 @@ def diff_main(options: Options) -> int:
                 f" so nothing to mutate{uncommitted if diff.base_commit == head else ''}"
             )
             return CAUGHT
-        timeout = baseline(options.command, options.timeout, diff, least)
-        run_mutants(diff, options.command, timeout, limit, tally)
+        with isolation(options) as wrapper:
+            command = [*wrapper, *options.command]
+            timeout = baseline(command, options.timeout, diff, least)
+            run_mutants(diff, command, timeout, limit, tally)
     except UsageError as e:
         print(e, file=sys.stderr)
         return USAGE
@@ -1674,7 +1776,17 @@ def seconds(text: str | None, default: float) -> float:
 def parse_args(args: list[str]) -> Options:
     """The options before `--`, in any order, and the command. Raises UsageError."""
     timeout, edits_file, base, limit = None, None, None, None
-    while args[:1] in (["--timeout"], ["--edits"], ["--diff"], ["--max"]):
+    isolate = True
+    while args[:1] in (
+        ["--timeout"],
+        ["--edits"],
+        ["--diff"],
+        ["--max"],
+        ["--unisolated"],
+    ):
+        if args[0] == "--unisolated":
+            isolate, args = False, args[1:]
+            continue
         if len(args) < 2 or args[1] == "--":
             raise UsageError(f"mutate-check: {args[0]} takes a value")
         option, value = args[:2]
@@ -1704,7 +1816,7 @@ def parse_args(args: list[str]) -> Options:
         raise UsageError(
             "mutate-check: --edits goes without --diff, which makes its own mutants"
         )
-    return Options(args[1:], timeout, edits_file, base, limit)
+    return Options(args[1:], timeout, edits_file, base, limit, isolate)
 
 
 def main() -> int:
@@ -1732,12 +1844,18 @@ def main() -> int:
     except FORMAT.UsageError as e:
         print(f"apply-edits: {e}", file=sys.stderr)
         return USAGE
+    try:
+        refuse_main_trees({(Path.cwd() / f.path).parent for f in files})
+    except UsageError as e:
+        print(e, file=sys.stderr)
+        return USAGE
     originals = snapshot([f.path for f in files])
     for signum in STOP_SIGNALS:
         signal.signal(signum, stop)
     status: int | None = None
     try:
-        code, output = mutated_run(edits, command, timeout)
+        with isolation(options) as wrapper:
+            code, output = mutated_run(edits, [*wrapper, *command], timeout)
     except UsageError as e:
         print(e, file=sys.stderr)
         status = USAGE

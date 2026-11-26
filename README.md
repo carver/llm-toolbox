@@ -215,7 +215,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   error, such as unused code under `-D warnings`), pytest collected nothing (not
   pytest-xdist's exit 2 for `-x` after a failure, which is a catch), a
   `cargo test` or `cargo nextest` run failed without running a test (a filter
-  nextest refused or that matched nothing), a shell or wrapper such as `heavy`
+  nextest refused or that matched nothing), a shell or wrapper such as `env`
   exited 126 or 127 (the program it runs can't start: not found, not
   executable, no shebang) with no test run, a `cargo test` passed without running
   one or pytest passed with every test skipped, or CMD ran past `--timeout` (600
@@ -241,6 +241,26 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   survived, 1 when one did, and 3 when no mutant was judged. The daily mutants
   workflow runs it over the lines landed since its last covered run; run it by
   hand to check a diff's tests before a review does.
+
+  In both modes each run of CMD goes through a copy of own-pids, made at the
+  start, in a PID namespace of its own, so a mutant that signals every process it
+  sees (a negated check of which to kill) can't kill the user's agent sessions.
+  Without passwordless sudo it refuses, exit 2, unless `--unisolated`;
+  `$MUTATE_CHECK_OWN_PIDS` names a stand-in for own-pids in the tests. It refuses
+  a CMD that runs heavy, which can't see other sessions' jobs from inside: run
+  `heavy -- mutate-check ...`; a heavy run deeper, from a script or `make`, refuses
+  its shared queue itself, and mutate-check stops on its line. It refuses a repo's
+  main tree, `--unisolated` or not, since other sessions run the files there from
+  PATH: run it in a worktree.
+- **own-pids**: `own-pids -- CMD` runs CMD in a PID namespace of its own, with
+  its own /proc, as the same user and groups, in the same folder, with the same
+  environment and umask (`sudo -n unshare --pid --mount-proc`, then `setpriv`
+  back; bash is the init). CMD sees and can signal only the processes it started,
+  and what it leaves running ends with it. A stop signal goes on to CMD, and
+  `$OWN_PIDS_GRACE` seconds (5) later the namespace is killed. `own-pids --check`
+  says whether this machine can make one. CMD gets `OWN_PIDS=1`, and heavy
+  refuses its shared queue when it sees it. Exits with CMD's status, or 125 when
+  no namespace was made. mutate-check runs every mutant through it.
 - **conflicts**: `conflicts FILE` lists a file's conflict hunks, numbered, with
   each side and its marker label; `conflicts FILE N SIDE` (or `all SIDE`)
   resolves them as `ours`, `theirs`, `both` or `base`, and the triples repeat,
@@ -583,7 +603,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   instead. A heavy inside a job (`$HEAVY_SLOT`), or inside a `--few-seconds` run
   outside the queue, runs at once. The queue and
   its history and record live in `$HEAVY_DIR`
-  (`/tmp/heavy`). A Ctrl-Z while heavy holds the queue's lock, a moment at each
+  (`/tmp/heavy`); inside own-pids' namespace (`$OWN_PIDS`), where other
+  sessions' jobs look ended, heavy refuses that shared queue, exit 125. A Ctrl-Z
+  while heavy holds the queue's lock, a moment at each
   look, stops it once it lets go; a wait of `$FIFO_LOCK_SECONDS` (5) for that lock
   names the process holding it, and how to continue it when it's stopped. For
   the tests, `$HEAVY_BUSY` names a file that stands in for how busy the cores

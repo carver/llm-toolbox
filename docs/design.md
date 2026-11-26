@@ -1645,8 +1645,62 @@ outlived `test_a_timeout_stops_the_commands_children_too`'s wait. The init ignor
 SIGKILL sent from inside, so the killing mutant reads as caught, exit 137, and
 `--kill-child` ends the namespace when mutate-check stops a run past its timeout.
 
-mutate-check doesn't do this itself, so a local `--diff` run over such a mutant would
-kill the user's own processes, Claude Code sessions included.
+mutate-check didn't do this itself, so a local `--diff` run over such a mutant would
+have killed the user's own processes, Claude Code sessions included. The next entry
+moved the wrapper into mutate-check.
+
+### mutate-check runs every command through own-pids, and refuses without it (2026-11-26)
+
+#15: /build's step 2 tells each build to run `mutate-check --diff`, and a local run
+over `kill_tmux_server`'s line 249 SIGKILLs every process the user owns, every agent
+session on the VM. So the wrapper became `bin/own-pids`, with tests, and mutate-check
+puts it before every run of the command, in both modes, the unmutated run included.
+mutate-check itself stays outside, so it can always put the file back. mutants.yml
+lost its inline copy and gets the namespace from mutate-check.
+
+Without a namespace it refuses, exit 2, unless `--unisolated`. A warning only when
+the diff touches code that sends signals was dropped: no reading of a diff tells. The
+mutant that kills everything negates `if fields[1:2] == [str(pid)]:`, which sends no
+signal, and lib/procmatch.py's `matches` (#17) sends none at all; safekill, which
+calls it, does. `own-pids --check` decides, before the command first runs: a probe in
+a namespace has to see only itself and the init. A namespace that fails later, where
+own-pids exits 125 with its `no PID namespace` line, stops the run with the file put
+back, so no later run goes unisolated.
+
+It runs a copy of own-pids made at its start: the daily run mutates own-pids too, and
+a mutant of the wrapper would otherwise change the namespace of the runs judging it.
+Inside, a command that won't start exits 127, which reads as a catch, so mutate-check
+looks the command up first. A command with a `heavy` word is refused: lib/fifo.py
+takes a holder whose pid isn't in /proc for ended, so heavy inside would drop other
+sessions' queued jobs, and they would drop its; `heavy -- mutate-check` keeps it
+outside. The word check misses a heavy run deeper, by `sh -c '...'`, `make test` or a
+script, so own-pids sets OWN_PIDS=1 for the command and heavy refuses its shared
+queue (HEAVY_DIR unset or /tmp/heavy) when it sees it, with a line mutate-check stops
+on, exit 2, whatever status reaches it. A heavy with a queue of its own, as
+test_heavy.py's runs have, still works there, so the daily run can mutate heavy. The
+word check stays, as the early and clearer error.
+
+It refuses a main tree, --unisolated or not. The namespace covers only the command:
+other sessions run the main tree's files themselves, safekill from PATH importing its
+lib/procmatch.py, drive-agent, the git hooks, so a mutant there of a kill-all check
+reaches every session that runs it meanwhile. The crash of 2026-11-26 08:36 was
+mutate-check applying the line-249 mutant to the main tree's live bin/drive-agent.
+The test is lib/maintree.py's (#4): a folder whose git dir is the common one. A file
+outside any repo is allowed, and mutants.yml runs in a worktree of its checkout.
+
+Measured while building own-pids: unshare blocks SIGTERM and SIGINT while it waits,
+and the init ignores them, so neither `--kill-child` nor sudo's relay acts on a stop
+sent to own-pids alone. own-pids passes it to the command and, $OWN_PIDS_GRACE seconds
+later, kills the init. A stop that comes before bash has started the command, in the
+first 50 to 90 ms, found no one to pass it to, and the first version dropped it: a
+`sleep 6` ran to its end (review of #15). It now looks again every 10 ms until the
+command is there, and the grace starts once the signal reaches it. Started without a
+terminal, the command shares own-pids' process group, so mutate-check's
+group signal reaches it directly, and its SIGKILL kills the init; from a terminal,
+sudo's use_pty gives it a session of its own. bash runs with
+--posix, so it doesn't source the $BASH_ENV of the environment it restores. The
+environment goes through a 0600 file the init's first process deletes, as JSON, not
+`export -p`, since it is exec'd whole. Each run costs about 0.1 s.
 
 ## paper
 

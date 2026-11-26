@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Run a command in a PID namespace of its own, where it sees and can signal only
+the processes it starts.
+
+  own-pids -- CMD...
+  own-pids --check
+
+A command that sends a signal to every process it can see, such as a mutant that
+negates the check picking which processes to kill, kills only its own there, not
+the user's other processes (agent sessions, shells, the CI runner's agent). The
+command gets a /proc of its own, so it lists only those processes too.
+
+CMD runs as the user and groups that ran own-pids, in the same folder, with the same
+environment and umask, under `sudo -n unshare --pid --mount-proc --kill-child`, then
+`setpriv` back to the user: a user namespace would break a command that calls sudo
+itself. sudo drops PYTHON* and LD_* variables even with --preserve-env, so the
+environment goes through a file only the user can read, which the namespace's first
+process deletes as it reads it. bash is the namespace's init, run with --posix so it
+reads no startup file, not even the one BASH_ENV names, and reaps the processes orphaned
+there; a signal sent from inside the namespace can't stop it. When CMD exits, the
+namespace ends and the kernel kills whatever CMD left running in it.
+
+CMD's environment has OWN_PIDS=1, so a tool that mustn't run in such a namespace, such
+as heavy, whose queue holds other sessions' jobs by PID, can refuse to.
+
+A SIGTERM, SIGINT or SIGHUP that own-pids gets goes on to CMD: neither unshare, which
+blocks them while it waits, nor the init, which ignores them, would act on it. One
+that comes before CMD has started waits, looked for again every few milliseconds,
+until it has. If the namespace hasn't ended $OWN_PIDS_GRACE seconds after the signal
+reached CMD (default 5; the tests shorten it), own-pids kills its init, and the
+kernel kills the rest. Started with no terminal, as mutate-check and CI start it, CMD
+runs in own-pids' process group, so a signal to the group, such as mutate-check's
+when a run is past its time, reaches CMD and the init at once, and a SIGKILL there
+ends the namespace. From a terminal, sudo (with use_pty) runs CMD in a session of its
+own, which only own-pids' forwarding reaches. A SIGKILL to own-pids alone leaves CMD
+running either way.
+
+--check runs a probe in a namespace and says whether it saw only itself and the
+namespace's init: whether own-pids works on this machine, which needs passwordless
+sudo, and unshare and setpriv from util-linux.
+
+Exit status: CMD's own (128+N when a signal N ended it); 125 when no namespace was
+made (sudo refused, unshare or setpriv failed), or a usage error. With --check: 0
+the namespace works, 125 it doesn't, with a line on stderr saying why.
+"""
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+from types import FrameType
+
+NO_NAMESPACE = 125
+FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# Seconds between looks for CMD when a stop signal comes before it has started.
+RETRY = 0.01
+# The namespace's first process, run as the user: it reads the environment back,
+# deletes its file, takes the umask, and becomes bash, the namespace's init. bash runs
+# CMD as its child: with a lone command, bash -c would exec it as the init itself.
+INSIDE = """\
+import json, os, sys
+path, umask, bash, *command = sys.argv[1:]
+with open(path) as f:
+    env = json.load(f)
+os.unlink(path)
+os.umask(int(umask, 8))
+os.execve(bash, [bash, "--posix", "-c", '"$@"; exit $?', "own-pids", *command], env)
+"""
+# Exits 0 when the probe sees only itself and the namespace's init.
+PROBE = """\
+import os, sys
+seen = {p for p in os.listdir("/proc") if p.isdigit()}
+if seen != {"1", str(os.getpid())}:
+    sys.exit(f"own-pids: the probe saw {len(seen)} processes, not only itself and init")
+"""
+
+
+def launch(command: list[str], env_file: str, bash: str) -> list[str]:
+    umask = os.umask(0)
+    os.umask(umask)
+    groups = ",".join(str(g) for g in os.getgroups())
+    return [
+        "sudo",
+        "-n",
+        "unshare",
+        "--pid",
+        "--mount-proc",
+        "--kill-child",
+        "--",
+        "setpriv",
+        f"--reuid={os.getuid()}",
+        f"--regid={os.getgid()}",
+        f"--groups={groups}" if groups else "--clear-groups",
+        "--",
+        sys.executable,
+        "-I",
+        "-c",
+        INSIDE,
+        env_file,
+        f"{umask:o}",
+        bash,
+        *command,
+    ]
+
+
+def children() -> dict[int, list[int]]:
+    """Each process's children, by pid, from /proc."""
+    found: dict[int, list[int]] = {}
+    for entry in os.scandir("/proc"):
+        if entry.name.isdigit():
+            try:
+                stat = Path(entry.path, "stat").read_text()
+            except OSError:
+                continue
+            parent = int(stat.rsplit(")", 1)[1].split()[1])
+            found.setdefault(parent, []).append(int(entry.name))
+    return found
+
+
+def namespace_init(sudo: int, tree: dict[int, list[int]]) -> int | None:
+    """The init's pid as this side sees it: the first of sudo's descendants that runs
+    as this user (sudo and unshare run as root)."""
+    level = [sudo]
+    while level:
+        for pid in level:
+            try:
+                if os.stat(f"/proc/{pid}").st_uid == os.getuid() and pid != sudo:
+                    return pid
+            except OSError:
+                continue
+        level = [c for pid in level for c in tree.get(pid, [])]
+    return None
+
+
+class Stopper:
+    """Passes a stop signal on to the command, and kills the namespace's init if the
+    namespace outlives the grace period. It runs in the signal handler and in timer
+    threads; the lock is reentrant since a signal can come while the main thread
+    holds it."""
+
+    def __init__(self, grace: float) -> None:
+        self.grace = grace
+        self.pending: list[int] = []
+        self.sudo: int | None = None
+        self.timer: threading.Timer | None = None
+        self.retry: threading.Timer | None = None
+        self.lock = threading.RLock()
+        self.done = False
+
+    def __call__(self, signum: int, _frame: FrameType | None) -> None:
+        self.pending.append(signum)
+        if self.sudo is not None:
+            self.forward()
+
+    def started(self, sudo: int) -> None:
+        self.sudo = sudo
+        if self.pending:
+            self.forward()
+
+    def forward(self) -> None:
+        assert self.sudo is not None
+        with self.lock:
+            if self.done:
+                return
+            tree = children()
+            init = namespace_init(self.sudo, tree)
+            command = tree.get(init, []) if init is not None else []
+            if init is None or not command:
+                # setpriv is still root, or the init hasn't started CMD yet.
+                self.retry = threading.Timer(RETRY, self.forward)
+                self.retry.daemon = True
+                self.retry.start()
+                return
+            for pid in command:
+                signal_pid(pid, self.pending[-1])
+            if self.timer is None:
+                kill = (init, signal.SIGKILL)
+                self.timer = threading.Timer(self.grace, signal_pid, kill)
+                self.timer.daemon = True
+                self.timer.start()
+
+    def cancel(self) -> None:
+        with self.lock:
+            self.done = True
+            for timer in (self.timer, self.retry):
+                if timer is not None:
+                    timer.cancel()
+
+
+def signal_pid(pid: int, signum: int) -> None:
+    try:
+        os.kill(pid, signum)
+    except ProcessLookupError:
+        pass
+
+
+def run(command: list[str]) -> int:
+    """Run the command in a namespace of its own and give its exit status, or
+    NO_NAMESPACE, with a line on stderr, when none was made."""
+    bash = shutil.which("bash")
+    if bash is None:
+        print("own-pids: no PID namespace: bash isn't on PATH", file=sys.stderr)
+        return NO_NAMESPACE
+    try:
+        grace = float(os.environ.get("OWN_PIDS_GRACE", "5"))
+    except ValueError:
+        print("own-pids: $OWN_PIDS_GRACE takes a number of seconds", file=sys.stderr)
+        return NO_NAMESPACE
+    stopper = Stopper(grace)
+    for signum in FORWARDED:
+        signal.signal(signum, stopper)
+    fd, env_file = tempfile.mkstemp(prefix="own-pids-env.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(dict(os.environ) | {"OWN_PIDS": "1"}, f)
+        try:
+            child = subprocess.Popen(launch(command, env_file, bash))
+        except OSError as e:
+            print(f"own-pids: no PID namespace: can't run sudo: {e}", file=sys.stderr)
+            return NO_NAMESPACE
+        stopper.started(child.pid)
+        status = child.wait()
+        stopper.cancel()
+    finally:
+        # The namespace's first process deletes it as it reads it: a file still here
+        # means none started. A SIGKILL to own-pids before that, in its first 50 ms
+        # or so, leaves the file in TMPDIR, readable only by the user.
+        started = not os.path.exists(env_file)
+        if not started:
+            os.unlink(env_file)
+    if not started:
+        print(
+            f"own-pids: no PID namespace: sudo -n unshare exited {status}"
+            " before the command started",
+            file=sys.stderr,
+        )
+        return NO_NAMESPACE
+    return 128 - status if status < 0 else status
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    if args == ["--check"]:
+        return run([sys.executable, "-I", "-c", PROBE]) and NO_NAMESPACE
+    if args[:1] == ["--"]:
+        args = args[1:]
+    elif args[:1] and args[0].startswith("-"):
+        args = []
+    if not args:
+        print(f"own-pids: give the command after --\n{__doc__}", file=sys.stderr)
+        return NO_NAMESPACE
+    return run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

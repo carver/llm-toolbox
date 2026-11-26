@@ -1297,6 +1297,68 @@ owner chose a per-repo opt-out, `git config --add ci-status.ignore FILE.yml`, ma
 against the workflow's file name. It applies after the cache, so a change counts at
 once, and `-v` names the failing workflows it left out.
 
+## gh-ci-wait
+
+### Wait for the runs to appear, then report what failed (2026-11-26)
+
+A filedrawer session ran `gh pr checks --watch` right after `gh pr create`, as
+GLOBAL_CLAUDE.md said to, and it exited 1, "no checks reported on the
+'apt-config-isolate' branch", because GitHub had not queued the runs yet; it cost a
+`gh run list` and a second watch. In the same week PR filedrawer-dev/filedrawer#172
+failed CI on a test the branch didn't touch, a bug in its base, and nobody acted;
+main broke on a push 13 h later. The owner chose one tool for both: wait for the
+runs to appear (3 minutes, then exit 3), watch them with no overall deadline, since
+CI can take hours and the caller runs it in the background, and print "verdicts and
+failures": a line per run, each failed run's failed jobs and steps and its failed
+tests' lines from the log, within about 20 lines, plus a line for each failing pytest
+file the branch didn't change. Exit 0 all green, 1 a run failed, 3 no run in time.
+
+A review of the brief settled the rest:
+
+- The runs come from one `gh api repos/R/actions/runs?head_sha=SHA&per_page=100`
+  a poll, not `gh run list`: that takes two calls, lists 20 runs by default, and
+  gives an empty `workflowName` for a ruleset's workflow. GitHub matches only a
+  full SHA (a short one returned `[]`), so a short one is resolved by git first.
+  Digits alone are a PR number, unless git has a commit they abbreviate: about 1 in
+  27 short SHAs is all digits.
+- A PR counts only its pull_request runs and a commit only its push runs, each
+  workflow's newest, and the workflows `ci-status.ignore` names stay out, as in
+  ci-status, which shares that list's reader. Newest is per workflow path, since a
+  ruleset's `org/.github/.github/workflows/ci.yml@…` and the repo's own `ci.yml`
+  are two workflows; the report and the ignore list still name the file. A PR's
+  head is read each poll, and the wait starts over when it moves.
+- A workflow that starts late, as a path-filtered one can, joins: the wait ends
+  only when every run is done and none has been new for 45 s.
+- A run waiting for approval, or concluded action_required, would hang the wait,
+  so it ends it with exit 5. Cancelled and stale fail, since nothing passed.
+- gh failing is retried with backoff for 10 minutes before exit 4, and an answer of
+  a shape it can't read counts as gh failing, so a blip in an hours-long wait
+  doesn't lose it. Exit 2 is for usage alone, and for a PR number GitHub says it
+  doesn't have on the first lookup, which no retry would fix. The jobs and log calls
+  are best effort: a startup_failure has no log, and the run list alone sets the
+  status.
+- The job lines list failed jobs before cancelled ones: a fail-fast matrix cancels
+  the failed job's siblings, which would otherwise fill the 5 lines. When the 20
+  lines run out, test lines go before the unchanged-file notes, which are the
+  report's reason for #172.
+- Log text is written by whoever writes the PR, a fork's included, so after the
+  matching it is cut to printable characters (colour codes, control, bidi and
+  separator characters out), 200 a line; names go through ci-status's `plain`.
+  GitHub's logs carry a BOM and colour codes written as a literal `^[`, both
+  stripped before matching. nextest prints each FAIL line twice, so lines are
+  kept once.
+- The owner revised the note to `<path>: unchanged by this branch`, claiming
+  nothing about the base: in #172's case the base held local commits origin's CI
+  never ran, so GLOBAL_CLAUDE.md has the agent run the test on the base before
+  saying the base fails it. No note when the commit is its own merge base, as on
+  main, or git can't answer (no `origin/HEAD` in an older clone).
+- `github_repo` and `plain` moved to `lib/github.py`, shared with ci-status.
+  wt-ship's and issue-todo's copies of `github_repo` stay, out of this change.
+
+A gap stays open: a re-run, or a reopened PR, whose older completed run is listed
+before GitHub creates the new one can end the wait on the old verdict. Taking each
+workflow's newest run and the settle window narrow it.
+
 ## path-refs
 
 ### rg runs in the workspace root (2026-11-09)

@@ -800,6 +800,22 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   together ask GitHub once. `install.py` registers `ci-status --session-start`
   as a SessionStart hook, which adds the lines to the session's context, and
   `wt-ship` prints them before it lands.
+- **gh-ci-wait**: `gh-ci-wait [-C DIR] [--remote NAME] [PR | SHA]` waits for a
+  PR's pull_request runs, or a commit's push runs (HEAD by default), to appear
+  and finish, then prints about 20 lines at most: a line per workflow,
+  `ci.yml: failure URL`, and for each failed run its failed jobs and steps and
+  the pytest `FAILED`/`ERROR` and nextest `FAIL [` lines from its failed log
+  (else the log's last lines), with `<path>: unchanged by this branch` for a
+  failing test file the branch didn't change. It waits
+  `GH_CI_WAIT_QUEUE_SECONDS` (180) for a first run, polls every
+  `GH_CI_WAIT_POLL_SECONDS` (15), counts the runs in once none is new for
+  `GH_CI_WAIT_SETTLE_SECONDS` (45), gives each gh call
+  `GH_CI_WAIT_CALL_SECONDS` (60) and retries gh for
+  `GH_CI_WAIT_GIVE_UP_SECONDS` (600). It follows a PR's head when it moves,
+  and leaves out the workflows `ci-status.ignore` names. Exit 0 all passed, 1
+  a run failed, 2 usage, 3 no run in time, 4 gh kept failing, 5 a run needs
+  approval. Unlike `gh pr checks --watch`, it doesn't fail when run before
+  GitHub has queued the runs.
 
 - **build-state**: `/build`'s bookkeeping. `start` records the base commit
   (HEAD, or `--base REV`) and the repo's fingerprint (every other ref but the

@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""Wait for a PR's or a commit's GitHub Actions runs, then say how each ended and what failed.
+
+`gh pr checks --watch`, run right after `gh pr create` or a push, exits 1 with "no
+checks reported" before GitHub has queued a run. This waits for the runs to appear,
+then for them to finish, and prints a report of about 20 lines at most:
+
+    ci.yml: failure https://github.com/OWNER/REPO/actions/runs/123
+    lint.yml: success https://github.com/OWNER/REPO/actions/runs/124
+      check: Run bin/agent-pre-commit
+      FAILED bin/tests/test_x.py::test_y - ValueError: ...
+      bin/tests/test_x.py: unchanged by this branch
+
+    gh-ci-wait [-C DIR] [--remote NAME] [PR | SHA]
+
+The target is a commit (7 to 40 hex digits; a short one is resolved by git in DIR, since
+GitHub matches only a full SHA), a PR number (all digits, and no commit git has), or, by
+default, the repo's HEAD. A PR's runs are its pull_request runs for its head commit,
+which is read again each poll: when it moves, a line says so and the wait starts over on
+the new head. A commit's runs are its push runs. Of those, each workflow's newest
+counts, and a workflow the repo names in `git config ci-status.ignore` (ci-status -h) is
+left out.
+
+It waits GH_CI_WAIT_QUEUE_SECONDS for a first run, then until every run has finished
+and no new one has appeared for GH_CI_WAIT_SETTLE_SECONDS, for a workflow that starts
+late. Past that there is no deadline, since CI can take hours: run it in the
+background (`bgrun --wait -o LOG -- gh-ci-wait 42`) and stop it when you like.
+
+The report: a line per run, `<workflow file>: <conclusion> <url>`; then, for each run
+that didn't pass, its failed jobs and steps (5 at most, cancelled ones last), and from
+its failed jobs' log the failed tests' lines (10 at most): pytest's `FAILED ` and
+`ERROR ` summary lines and nextest's `FAIL [`, `TIMEOUT [`, `SIGSEGV [`, `SIGABRT [`
+and `LEAK-FAIL [` lines, once each. When none match, the last 5 lines before the log's
+`Process completed` line. A pytest FAILED line whose file this branch didn't change
+(against the merge base with REMOTE/<the PR's base branch>, or REMOTE/HEAD for a commit)
+gets a line, `<path>: unchanged by this branch`: run that test on the base before
+calling the base broken, since the base may hold commits CI never ran. No such line when
+the commit is its own merge base, as on main, or git can't tell. A report cut short ends
+with `(N more lines: gh run view ID -R OWNER/REPO --log-failed)`; the cut drops test
+lines before the unchanged-file lines. The jobs and the log are best effort: when gh
+can't give them, their lines are left out and the exit status stands. Log text and names
+are written by whoever writes the workflow or the PR, so they are cut to plain
+characters, 200 a line for log text.
+
+Success, skipped and neutral pass; a run waiting for approval, or concluded
+action_required, "needs approval"; any other conclusion (failure, timed_out,
+startup_failure, cancelled, stale) fails.
+
+Each gh call may take GH_CI_WAIT_CALL_SECONDS and is stopped with the tool. A poll
+that fails is retried, backing off, and only after gh has failed for
+GH_CI_WAIT_GIVE_UP_SECONDS does the tool give up, naming gh's error. An answer of a
+shape it can't read counts as gh failing.
+
+Options:
+  -C DIR         look at the repo in DIR (default: the current folder)
+  --remote NAME  the remote whose GitHub repo to ask, and whose branches the
+                 unchanged-file line compares with (default: origin)
+
+Environment:
+  GH_CI_WAIT_QUEUE_SECONDS    seconds to wait for a first run (default 180)
+  GH_CI_WAIT_POLL_SECONDS     seconds between polls (default 15)
+  GH_CI_WAIT_SETTLE_SECONDS   seconds with no new run before the runs are all
+                              in (default 45)
+  GH_CI_WAIT_CALL_SECONDS     seconds one gh call may take (default 60)
+  GH_CI_WAIT_GIVE_UP_SECONDS  seconds of failing gh calls before giving up
+                              (default 600); the tests shorten all five
+
+Exit status: 0 every run passed; 1 a run failed; 2 a usage error, such as a target
+that isn't one, a PR GitHub says doesn't exist, a setting that isn't a number or a
+remote that isn't on GitHub; 3 no run appeared in time; 4 gh kept failing; 5 no run
+failed but one needs approval.
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from github import NotOnGitHub, github_repo, ignored_workflows, plain
+
+PASS = {"success", "skipped", "neutral"}
+APPROVAL = "needs approval"
+BUDGET = 20
+JOB_LINES = 5
+TEST_LINES = 10
+TAIL_LINES = 5
+LOG_WIDTH = 200
+SHA = re.compile(r"[0-9a-fA-F]{7,40}")
+# The test lines of pytest's short summary and of nextest's, once colours are out.
+TEST_LINE = re.compile(
+    r"^(?:FAILED |ERROR |(?:FAIL|TIMEOUT|SIGSEGV|SIGABRT|LEAK-FAIL) \[)"
+)
+PYTEST_FAILED = re.compile(r"^FAILED (\S+?)::")
+STAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ?")
+# Colour codes, as escapes and as GitHub's log writes them, a literal `^[`.
+COLOUR = re.compile(r"(?:\x1b|\^\[)\[[0-9;]*[A-Za-z]")
+DONE_LINE = "##[error]Process completed"
+# What gh says when the PR doesn't exist.
+NO_PR = re.compile(r"Could not resolve to a PullRequest|no pull requests found")
+
+
+class Usage(Exception):
+    """A usage error: exit 2."""
+
+
+class GhFailed(Exception):
+    """A gh call failed, ran past its time, or answered in a shape this can't read."""
+
+
+class Done(Exception):
+    """Stop with this exit status, after printing the message on stderr."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def knob(name: str, default: float) -> float:
+    """The number of seconds the environment sets in `name`, or `default`."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        raise Usage(f"{name} is {plain(value)!r}, not a number of seconds") from None
+
+
+class Gh:
+    """gh calls, each with its own time limit, and the one running, which `stop`
+    kills when the tool is told to stop."""
+
+    def __init__(self, repo: str, seconds: float):
+        self.repo = repo
+        self.seconds = seconds
+        self.child: subprocess.Popen | None = None
+
+    def call(self, *args: str) -> str:
+        try:
+            self.child = subprocess.Popen(
+                ["gh", *args],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as error:
+            raise GhFailed(f"no gh: {error}") from None
+        try:
+            stdout, stderr = self.child.communicate(timeout=self.seconds)
+        except subprocess.TimeoutExpired:
+            self.child.kill()
+            self.child.communicate()
+            raise GhFailed(
+                f"gh {args[0]} gave no answer in {self.seconds:g} s"
+            ) from None
+        finally:
+            code, self.child = self.child.returncode, None
+        if code != 0:
+            last = (stderr.strip().splitlines() or ["no message"])[-1]
+            raise GhFailed(f"gh {args[0]} failed: {last}")
+        return stdout
+
+    def json(self, *args: str) -> dict:
+        try:
+            answer = json.loads(self.call(*args))
+        except ValueError:
+            raise GhFailed(f"gh {args[0]}'s answer isn't JSON") from None
+        if not isinstance(answer, dict):
+            raise GhFailed(f"gh {args[0]}'s answer isn't a JSON object")
+        return answer
+
+    def stop(self) -> None:
+        child = self.child
+        if child is not None:
+            child.kill()
+
+
+def git(folder: str, *args: str) -> str | None:
+    """git's output, or None when it fails."""
+    got = subprocess.run(
+        ["git", "-C", folder, *args], capture_output=True, text=True, check=False
+    )
+    return got.stdout.strip() if got.returncode == 0 else None
+
+
+class Target:
+    """What to wait on: a PR, whose head is read each poll, or a fixed commit."""
+
+    def __init__(self, folder: str, remote: str, given: str | None):
+        self.folder = folder
+        self.remote = remote
+        self.pr = None
+        self.sha = ""
+        self.base = f"{remote}/HEAD"
+        sha = None
+        if given is not None and SHA.fullmatch(given):
+            sha = git(folder, "rev-parse", "--verify", "--quiet", f"{given}^{{commit}}")
+            if sha is not None and not sha.startswith(given.lower()):
+                sha = None  # a branch or tag of that name, not the commit
+        if given is None:
+            sha = git(folder, "rev-parse", "--verify", "HEAD^{commit}")
+            if sha is None:
+                raise Usage(
+                    f"no commit at HEAD in {folder}: commit first, or name a PR or a"
+                    " commit"
+                )
+            self.sha = sha
+        elif sha is not None:
+            self.sha = sha
+        elif given.isdigit():
+            self.pr = given
+        elif SHA.fullmatch(given):
+            if len(given) < 40:
+                raise Usage(f"no commit {given} here: fetch it, or pass the full SHA")
+            self.sha = given.lower()
+        else:
+            raise Usage(f"{given} isn't a PR number or a commit (7 to 40 hex digits)")
+
+    @property
+    def event(self) -> str:
+        return "pull_request" if self.pr else "push"
+
+    def refresh(self, gh: Gh) -> str | None:
+        """Read a PR's head again; a line saying so when it moved."""
+        if self.pr is None:
+            return None
+        try:
+            answer = gh.json(
+                "pr", "view", self.pr, "-R", gh.repo, "--json", "headRefOid,baseRefName"
+            )
+        except GhFailed as error:
+            if not self.sha and NO_PR.search(str(error)):
+                raise Usage(
+                    f"no PR #{self.pr} in {gh.repo}: check the number, or pass a commit"
+                ) from None
+            raise
+        head, base = answer.get("headRefOid"), answer.get("baseRefName")
+        if not isinstance(head, str) or not SHA.fullmatch(head):
+            raise GhFailed("gh pr view gave no head commit")
+        if isinstance(base, str):
+            self.base = f"{self.remote}/{base}"
+        old, self.sha = self.sha, head.lower()
+        if old and old != self.sha:
+            return (
+                f"PR #{self.pr}'s head moved from {old[:7]} to {self.sha[:7]}:"
+                f" waiting on {self.sha[:7]}"
+            )
+        return None
+
+
+def workflow(run: dict) -> str:
+    return run["path"].split("@", 1)[0].rsplit("/", 1)[-1]
+
+
+def counted(answer: dict, event: str, ignored: set[str]) -> list[dict]:
+    """Each workflow's newest run of the event, by the workflow's full path, so a
+    ruleset's ci.yml and the repo's own count apart; those whose file name is ignored
+    left out; in order of file name. A shape this can't read is gh failing."""
+    try:
+        newest: dict[str, dict] = {}
+        for run in answer["workflow_runs"]:
+            path = run["path"]
+            if run["event"] != event or not isinstance(path, str):
+                continue
+            name = workflow(run)
+            if name in ignored:
+                continue
+            key = (str(run["created_at"]), int(run["id"]))
+            if path not in newest or key > newest[path]["key"]:
+                newest[path] = {
+                    "key": key,
+                    "id": int(run["id"]),
+                    "name": plain(name),
+                    "status": str(run["status"]),
+                    "conclusion": run["conclusion"],
+                    "url": clean(str(run["html_url"])),
+                }
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise GhFailed(
+            f"gh api's runs aren't in the shape expected: {error!r}"
+        ) from None
+    return sorted(newest.values(), key=lambda run: (run["name"], run["key"]))
+
+
+def verdict(run: dict) -> str:
+    if run["status"] == "waiting" or run["conclusion"] == "action_required":
+        return APPROVAL
+    return plain(str(run["conclusion"]))
+
+
+def finished(run: dict) -> bool:
+    return run["status"] in {"completed", "waiting"}
+
+
+def span(seconds: float) -> str:
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds / 60:g} min"
+    return f"{seconds:g} s"
+
+
+class Waiter:
+    """The polls, with their retries, until the runs are in and done."""
+
+    def __init__(self, gh: Gh, target: Target, ignored: set[str]):
+        self.gh = gh
+        self.target = target
+        self.ignored = ignored
+        self.poll = knob("GH_CI_WAIT_POLL_SECONDS", 15)
+        self.queue = knob("GH_CI_WAIT_QUEUE_SECONDS", 180)
+        self.settle = knob("GH_CI_WAIT_SETTLE_SECONDS", 45)
+        self.give_up = knob("GH_CI_WAIT_GIVE_UP_SECONDS", 600)
+        self.failing_since: float | None = None
+        self.failures = 0
+        # When this head's wait started, the runs seen, and when a new one last showed.
+        self.started = time.monotonic()
+        self.seen: set[int] = set()
+        self.last_new = self.started
+
+    def once(self) -> list[dict] | None:
+        """This poll's counted runs, or None when gh failed and it is retrying."""
+        try:
+            moved = self.target.refresh(self.gh)
+            if moved:
+                print(moved, flush=True)
+                self.restart()
+            answer = self.gh.json(
+                "api",
+                "-X",
+                "GET",
+                f"repos/{self.gh.repo}/actions/runs",
+                "-f",
+                f"head_sha={self.target.sha}",
+                "-f",
+                "per_page=100",
+            )
+            runs = counted(answer, self.target.event, self.ignored)
+        except GhFailed as error:
+            now = time.monotonic()
+            if self.failing_since is None:
+                self.failing_since = now
+            if now - self.failing_since >= self.give_up:
+                raise Done(
+                    4,
+                    f"gh kept failing for {span(self.give_up)}: {error}: check that gh"
+                    " reaches GitHub (gh api rate_limit), then run gh-ci-wait again",
+                ) from None
+            self.failures += 1
+            time.sleep(min(self.poll * 2**self.failures, self.poll * 8))
+            return None
+        self.failing_since, self.failures = None, 0
+        return runs
+
+    def restart(self) -> None:
+        self.started = time.monotonic()
+        self.seen = set()
+
+    def wait(self) -> list[dict]:
+        self.restart()
+        while True:
+            runs = self.once()
+            if runs is None:
+                continue
+            now = time.monotonic()
+            if not runs:
+                if now - self.started >= self.queue:
+                    raise Done(3, self.nothing_queued())
+            else:
+                ids = {run["id"] for run in runs}
+                if ids - self.seen:
+                    self.seen |= ids
+                    self.last_new = now
+                if all(map(finished, runs)) and now - self.last_new >= self.settle:
+                    return runs
+            time.sleep(self.poll)
+
+    def nothing_queued(self) -> str:
+        said = (
+            f"no CI run for {self.target.sha[:7]} on GitHub after {span(self.queue)}: "
+        )
+        if self.target.pr:
+            try:
+                state = self.gh.json(
+                    "pr",
+                    "view",
+                    self.target.pr,
+                    "-R",
+                    self.gh.repo,
+                    "--json",
+                    "mergeable",
+                ).get("mergeable")
+            except GhFailed:
+                state = None
+            if state == "CONFLICTING":
+                return said + (
+                    f"PR #{self.target.pr} conflicts with its base, and GitHub runs"
+                    " no pull_request workflow until it merges cleanly: rebase it"
+                )
+        said += (
+            "check the push reached it, or that its workflows' path filters run"
+            " for this change"
+        )
+        if not self.target.pr:
+            said += ", or no workflow runs on a push to this branch: open a PR"
+        return said
+
+
+def clean(text: str) -> str:
+    """Log text cut to printable characters: colour codes, control, format (bidi)
+    and separator characters out, 200 at most."""
+    text = COLOUR.sub("", text)
+    kept = "".join(
+        ch for ch in text if ch == " " or unicodedata.category(ch)[0] not in {"C", "Z"}
+    )
+    return kept[:LOG_WIDTH]
+
+
+def log_texts(log: str) -> list[str]:
+    """The text of each line of `--log-failed`, `job<TAB>step<TAB>stamp text`, with the
+    BOM, the stamp and colour codes out."""
+    texts = []
+    for line in log.splitlines():
+        text = line.split("\t", 2)[-1].replace("﻿", "")
+        texts.append(COLOUR.sub("", STAMP.sub("", text)).strip())
+    return texts
+
+
+def test_lines(texts: list[str]) -> list[str]:
+    found: list[str] = []
+    for text in texts:
+        if TEST_LINE.match(text) and text not in found:
+            found.append(text)
+    return found
+
+
+def tail(texts: list[str]) -> list[str]:
+    """The last lines before the last `Process completed` line, or the log's end."""
+    ends = [i for i, text in enumerate(texts) if text.startswith(DONE_LINE)]
+    before = texts[: ends[-1]] if ends else texts
+    kept = [
+        text for text in before if text and not text.startswith(("##[", "[command]"))
+    ]
+    return kept[-TAIL_LINES:]
+
+
+def changed_files(folder: str, base: str, sha: str) -> set[str] | None:
+    """The files `sha` changed since its merge base with `base`, or None when git
+    can't say or `sha` is its own merge base."""
+    fork = git(folder, "merge-base", base, sha)
+    if fork is None or fork == sha:
+        return None
+    names = git(folder, "diff", "--name-only", fork, sha)
+    return None if names is None else set(names.splitlines())
+
+
+def unchanged_notes(tests: list[str], changed: set[str] | None) -> list[str]:
+    if changed is None:
+        return []
+    notes: list[str] = []
+    for text in tests:
+        match = PYTEST_FAILED.match(text)
+        if not match:
+            continue
+        path = match.group(1).removeprefix("./")
+        touched = any(name == path or name.endswith(f"/{path}") for name in changed)
+        note = f"  {clean(path)}: unchanged by this branch"
+        if not touched and note not in notes:
+            notes.append(note)
+    return notes
+
+
+def details(gh: Gh, run: dict, changed: set[str] | None) -> tuple[list[str], list[str]]:
+    """A failed run's jobs and steps and its failed tests, then its unchanged-file
+    notes, best effort."""
+    lines: list[str] = []
+    try:
+        jobs = gh.json("run", "view", str(run["id"]), "-R", gh.repo, "--json", "jobs")
+        # Cancelled last: a fail-fast matrix cancels the failed job's siblings, which
+        # would otherwise fill the job lines before the one that failed.
+        cancelled_last = sorted(
+            jobs["jobs"], key=lambda job: job.get("conclusion") == "cancelled"
+        )
+        for job in cancelled_last:
+            if job.get("conclusion") in PASS or job.get("conclusion") is None:
+                continue
+            steps = [
+                plain(str(step["name"]))
+                for step in job.get("steps") or []
+                if step.get("conclusion") not in PASS | {None}
+            ]
+            name = plain(str(job["name"]))
+            lines += [f"  {name}: {s}" for s in steps] or [f"  {name}"]
+    except (GhFailed, KeyError, TypeError, AttributeError):
+        lines = []
+    lines = lines[:JOB_LINES]
+    try:
+        log = gh.call("run", "view", str(run["id"]), "-R", gh.repo, "--log-failed")
+    except GhFailed:
+        return lines, []
+    texts = log_texts(log)
+    tests = test_lines(texts)[:TEST_LINES]
+    if tests:
+        lines += [f"  {clean(text)}" for text in tests]
+        return lines, unchanged_notes(tests, changed)
+    lines += [f"  {clean(text)}" for text in tail(texts)]
+    return lines, []
+
+
+def report(gh: Gh, target: Target, runs: list[dict]) -> tuple[list[str], int]:
+    """The lines to print, cut to the budget, and the exit status. The cut drops the
+    detail lines from the end, and the headers and notes only once those are gone."""
+    lines = [f"{run['name']}: {verdict(run)} {run['url']}" for run in runs]
+    failed = [r for r in runs if verdict(r) not in PASS | {APPROVAL}]
+    changed = changed_files(target.folder, target.base, target.sha) if failed else None
+    # The lines under the run lines: (the run's id, the line, whether it is a header
+    # or a note, which the cut keeps longest).
+    run_details: list[tuple[int, str, bool]] = []
+    for run in failed:
+        more, notes = details(gh, run, changed)
+        if (more or notes) and len(failed) > 1:
+            run_details.append((run["id"], f"{run['name']}:", True))
+        run_details += [(run["id"], text, False) for text in more]
+        run_details += [(run["id"], text, True) for text in notes]
+    room = max(0, BUDGET - len(lines))
+    if len(run_details) > room:
+        last_first = list(reversed(range(len(run_details))))
+        cut_order = [i for i in last_first if not run_details[i][2]] + [
+            i for i in last_first if run_details[i][2]
+        ]
+        cut = set(cut_order[: len(run_details) - max(room - 1, 0)])
+        first = run_details[min(cut)][0]
+        run_details = [line for i, line in enumerate(run_details) if i not in cut]
+        hint = f"gh run view {first} -R {gh.repo} --log-failed"
+        run_details.append((0, f"({len(cut)} more lines: {hint})", True))
+    lines += [text for _, text, _ in run_details]
+    if failed:
+        return lines, 1
+    if any(verdict(r) == APPROVAL for r in runs):
+        return lines, 5
+    return lines, 0
+
+
+def parse(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="gh-ci-wait",
+        usage="gh-ci-wait [-C DIR] [--remote NAME] [PR | SHA]",
+        add_help=False,
+    )
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("-C", dest="folder", default=".")
+    parser.add_argument("--remote", default="origin")
+    parser.add_argument("target", nargs="?")
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse(sys.argv[1:] if argv is None else argv)
+    if args.help:
+        print(__doc__)
+        return 0
+    try:
+        repo = github_repo(args.folder, args.remote)
+        target = Target(args.folder, args.remote, args.target)
+        gh = Gh(repo, knob("GH_CI_WAIT_CALL_SECONDS", 60))
+
+        def stop(signum, _frame):
+            gh.stop()
+            sys.exit(128 + signum)
+
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(signum, stop)
+        runs = Waiter(gh, target, ignored_workflows(args.folder)).wait()
+        lines, status = report(gh, target, runs)
+    except (Usage, NotOnGitHub) as error:
+        print(f"gh-ci-wait: {error}", file=sys.stderr)
+        return 2
+    except Done as done:
+        print(f"gh-ci-wait: {done}", file=sys.stderr)
+        return done.status
+    print("\n".join(lines))
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

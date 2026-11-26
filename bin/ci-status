@@ -64,7 +64,6 @@ import argparse
 import fcntl
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -74,16 +73,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
 
-# A GitHub remote's URL, by HTTPS or SSH, and the OWNER/REPO in it.
-GITHUB_URL = re.compile(r"(?:^|[@/])github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from github import IGNORE_KEY, NotOnGitHub, github_repo, ignored_workflows, plain
+
 EVENTS = {"push", "schedule"}
 FAILING = {"failure", "timed_out", "startup_failure"}
 NO_VERDICT = {"cancelled", "skipped", "neutral", None}
 RUNS = 50
 FAILED_LOOKUP_SECONDS = 60
-UNSAFE = re.compile(r"[^\w .:/-]")
-NAME_LENGTH = 40
-IGNORE_KEY = "ci-status.ignore"
 
 
 class Quiet(Exception):
@@ -170,23 +167,6 @@ def in_parallel(*calls):
     for thread in threads:
         thread.join()
     return results
-
-
-def github_repo(folder: str, remote: str) -> str:
-    got = subprocess.run(
-        ["git", "-C", folder, "remote", "get-url", remote],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    match = GITHUB_URL.search(got.stdout.strip()) if got.returncode == 0 else None
-    if not match:
-        raise Quiet(f"{remote} isn't on GitHub here")
-    return match.group(1)
-
-
-def plain(name: str) -> str:
-    return UNSAFE.sub("", name)[:NAME_LENGTH]
 
 
 def latest_verdicts(runs: list, active: set | None) -> list[dict]:
@@ -349,27 +329,19 @@ def status(repo: str, branch: str | None, gh: Gh) -> dict:
     return cached["answer"]
 
 
-def ignored(folder: str) -> set[str]:
-    """The workflow file names `git config ci-status.ignore` lists, one per value."""
-    got = subprocess.run(
-        ["git", "-C", folder, "config", "--get-all", IGNORE_KEY],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return set(got.stdout.splitlines()) if got.returncode == 0 else set()
-
-
 def lines(
     folder: str, remote: str, branch: str | None, seconds: float
 ) -> tuple[list[str], list[str]]:
     """The lines to print, and the failing workflows ci-status.ignore left out."""
-    repo = github_repo(folder, remote)
+    try:
+        repo = github_repo(folder, remote)
+    except NotOnGitHub as error:
+        raise Quiet(str(error)) from None
     gh = Gh(seconds)
     signal.signal(signal.SIGTERM, lambda *_: (gh.stop(), sys.exit(0)))
     answer = status(repo, branch, gh)
     # After the cache, so a change to the setting counts at once.
-    skip = ignored(folder)
+    skip = ignored_workflows(folder)
     left_out = [run["file"] for run in answer["failing"] if run["file"] in skip]
     failing = [run for run in answer["failing"] if run["file"] not in skip]
     if not failing:

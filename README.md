@@ -530,6 +530,17 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   for sccache's server's CPU time, and `$HEAVY_CORES_USED` a run's measured
   cores. A command that fails while the out-of-memory killer ends a process
   hears so, and to run it again if the failure looks odd.
+- **heavy-bench**: `heavy-bench --out DIR NAME=CMD ...` times commands against
+  each other for a benchmark of minutes: each run is its own `heavy --alone`
+  job, so other sessions' jobs go between runs, and the variants interleave
+  round by round (`--rounds`, 3), after an optional untimed `--warmup` run each.
+  `--prepare CMD` resets state before each run, with `$BENCH_VARIANT` set. A run
+  whose cores did more than `$HEAVY_ALONE_OUTSIDE` (0.5) cores of other work is
+  flagged and run once more, unless `--no-rerun`. Rows go to `DIR/results.tsv`
+  as each run ends, output to a log per run, and a table sums up each variant
+  over its clean runs. It refuses to run inside a heavy job (`$HEAVY_SLOT`),
+  where heavy measures nothing, and an `--out` that holds results already;
+  stopped, it stops its heavy job and still prints the table.
 - **issue-todo**: a GitHub issue's task-list items across its body and every
   comment (`issue-todo show N`), which `gh issue view` splits between two
   commands, and ticking one where it lives (`issue-todo tick N MATCH --note

@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Time commands against each other in short heavy --alone jobs, interleaved.
+
+    heavy-bench --out DIR [--rounds N] [--warmup] [--prepare CMD] [--no-rerun] \\
+        NAME=CMD [NAME=CMD ...]
+
+Each run of a variant's CMD (`sh -c CMD`, in this folder) is its own
+`heavy --alone` job, so heavy's queue holds one of this bench's jobs at a time and
+other sessions' jobs go between its runs, where one long benchmark job would hold
+the queue for all of it. Runs go round by round, each round every variant in the
+order given, so a drift in the machine (a cache warming, another session's load)
+falls on every variant alike. --warmup runs each variant once first, untimed.
+Run it bare, not inside `heavy`: inside a job, heavy runs each run at once and
+measures nothing, so heavy-bench refuses. A bench takes minutes, so start it with
+`bgrun -o LOG -- heavy-bench ...` and wait for it as for any background job.
+
+--prepare CMD runs before each run, outside heavy and untimed, with BENCH_VARIANT
+set to the variant's name, to reset what a run left behind; one that fails stops
+the bench.
+
+heavy reports what other work used the job's cores while it ran (`heavy -h`). A run
+past HEAVY_ALONE_OUTSIDE cores of it on average (0.5) is flagged and run once more
+at once, unless --no-rerun; both rows are kept. A warmup run is never rerun.
+
+Each run's output goes to DIR/NAME-ROUND.log (-ATTEMPT added for a rerun), and its
+row to DIR/results.tsv as it ends: variant, round, attempt, wall seconds (from
+heavy, so time spent in the queue doesn't count), user and sys seconds (CMD's, plus
+heavy's own, which polls once a second while it waits its turn), outside
+CPU-seconds, exit status, flagged. DIR must not hold results already, so a stopped
+bench's rows are never overwritten. At the end a table sums up each variant over
+its runs that were measured and neither flagged nor failed.
+
+Stopping it (SIGINT, SIGTERM, SIGHUP) stops the run's heavy job, which frees its
+place in the queue, then prints the table of what it measured; so does a run that
+ends by one of those signals, as when Ctrl-C at a terminal reaches CMD.
+
+Environment:
+  HEAVY_ALONE_OUTSIDE  heavy's threshold for a run's outside load, in cores
+                       (default 0.5)
+  BENCH_VARIANT        set for --prepare, to the variant about to run
+  HEAVY_SLOT           set inside a heavy job, where heavy-bench refuses to run
+
+Exit status: 0 every timed run exited 0; 1 a run or a prepare failed; 2 a usage
+error; 128+N stopped by signal N.
+"""
+
+import argparse
+import os
+import signal
+import statistics
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HEAVY = Path(__file__).resolve().parent / "heavy"
+FIELDS = [
+    "variant",
+    "round",
+    "attempt",
+    "wall",
+    "user",
+    "sys",
+    "outside",
+    "exit",
+    "flagged",
+]
+STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+STOPPED_BY = {128 + sig for sig in STOPS}
+
+
+class Stopped(Exception):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+def variants(specs, parser):
+    found = {}
+    for spec in specs:
+        name, sep, command = spec.partition("=")
+        if not sep or not name or not command:
+            parser.error(f"expected NAME=CMD, got {spec!r}")
+        if name in found:
+            parser.error(f"variant {name!r} named twice")
+        found[name] = command
+    if not found:
+        parser.error("give at least one NAME=CMD")
+    return found
+
+
+def limit(parser):
+    """heavy's HEAVY_ALONE_OUTSIDE, which a value that isn't a number makes a usage
+    error here: heavy would measure nothing for any run."""
+    text = os.environ.get("HEAVY_ALONE_OUTSIDE", "0.5")
+    try:
+        return float(text)
+    except ValueError:
+        parser.error(f"HEAVY_ALONE_OUTSIDE is {text!r}, not a number of cores")
+
+
+def timed(command, log):
+    """Run command as a heavy --alone job: (exit, wall, user, sys, outside). A stop
+    signal meanwhile goes on to heavy, which stops CMD and frees its place; the run
+    then ends with heavy's 128+N."""
+    with tempfile.NamedTemporaryFile("r", prefix="heavy-bench-") as report:
+        env = os.environ | {"HEAVY_ALONE_REPORT": report.name}
+        with log.open("w") as out:
+            proc = subprocess.Popen(
+                [str(HEAVY), "--alone", "--", "sh", "-c", command],
+                env=env,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+            )
+            forward = {
+                sig: signal.signal(sig, lambda signum, _: proc.send_signal(signum))
+                for sig in STOPS
+            }
+            try:
+                _, status, used = os.wait4(proc.pid, 0)
+            finally:
+                for sig, old in forward.items():
+                    signal.signal(sig, old)
+        code = os.waitstatus_to_exitcode(status)
+        code = 128 - code if code < 0 else code
+        words = Path(report.name).read_text().split()
+    wall, _, outside = (float(w) for w in words) if len(words) == 3 else (0.0, 0.0, 0.0)
+    return code, wall, used.ru_utime, used.ru_stime, outside
+
+
+class Bench:
+    def __init__(self, out, prepare, rerun, limit):
+        self.out, self.prepare, self.rerun, self.limit = out, prepare, rerun, limit
+        self.rows = []
+        out.mkdir(parents=True, exist_ok=True)
+        self.tsv = out / "results.tsv"
+        self.tsv.write_text("\t".join(FIELDS) + "\n")
+
+    def run(self, name, command, round_):
+        """Run one variant's round, rerunning a flagged timed run once; False when a
+        prepare failed. Raises Stopped when the run was stopped by a signal."""
+        attempts = 2 if self.rerun and round_ != "warmup" else 1
+        for attempt in range(1, attempts + 1):
+            if self.prepare:
+                env = os.environ | {"BENCH_VARIANT": name}
+                done = subprocess.run(["sh", "-c", self.prepare], env=env, check=False)
+                if done.returncode != 0:
+                    print(
+                        f"heavy-bench: --prepare exited {done.returncode} before {name}"
+                        f" round {round_}; stopping.",
+                        file=sys.stderr,
+                    )
+                    return False
+            suffix = "" if attempt == 1 else f"-{attempt}"
+            log = self.out / f"{name}-{round_}{suffix}.log"
+            code, wall, user, sys_, outside = timed(command, log)
+            if wall == 0 and code not in STOPPED_BY:
+                print(
+                    f"heavy-bench: heavy gave no measure for {name} round {round_};"
+                    " its log says why.",
+                    file=sys.stderr,
+                )
+            flagged = wall > 0 and outside / wall > self.limit
+            row = {
+                "variant": name,
+                "round": str(round_),
+                "attempt": str(attempt),
+                "wall": f"{wall:.2f}",
+                "user": f"{user:.2f}",
+                "sys": f"{sys_:.2f}",
+                "outside": f"{outside:.1f}",
+                "exit": str(code),
+                "flagged": str(int(flagged)),
+            }
+            self.rows.append(row)
+            with self.tsv.open("a") as tsv:
+                tsv.write("\t".join(row[f] for f in FIELDS) + "\n")
+            if code in STOPPED_BY:
+                raise Stopped(code - 128)
+            if not flagged:
+                break
+        return True
+
+    def table(self, names):
+        print(
+            f"{'variant':<12} {'runs':>4} {'mean s':>8} {'min':>8} {'max':>8}"
+            f" {'user':>8} {'sys':>8} {'flagged':>7} {'failed':>6}"
+        )
+        for name in names:
+            mine = [
+                r for r in self.rows if r["variant"] == name and r["round"] != "warmup"
+            ]
+            clean = [
+                r
+                for r in mine
+                if r["flagged"] == "0" and r["exit"] == "0" and float(r["wall"]) > 0
+            ]
+            walls = [float(r["wall"]) for r in clean]
+
+            def mean(field, rows=clean):
+                if not rows:
+                    return "-"
+                return f"{statistics.mean(float(r[field]) for r in rows):.1f}"
+
+            low = f"{min(walls):.1f}" if walls else "-"
+            high = f"{max(walls):.1f}" if walls else "-"
+            flagged = sum(r["flagged"] == "1" for r in mine)
+            failed = sum(r["exit"] != "0" for r in mine)
+            print(
+                f"{name:<12} {len(clean):>4} {mean('wall'):>8} {low:>8} {high:>8}"
+                f" {mean('user'):>8} {mean('sys'):>8} {flagged:>7} {failed:>6}"
+            )
+        print(f"results: {self.tsv}")
+
+    def failed(self):
+        return any(r["exit"] != "0" for r in self.rows if r["round"] != "warmup")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--out", required=True, type=Path, help="folder for the logs and results.tsv"
+    )
+    parser.add_argument(
+        "--rounds", type=int, default=3, help="timed runs of each variant (default 3)"
+    )
+    parser.add_argument(
+        "--warmup", action="store_true", help="run each variant once first, untimed"
+    )
+    parser.add_argument(
+        "--prepare",
+        metavar="CMD",
+        help="run before each run, untimed, with BENCH_VARIANT set",
+    )
+    parser.add_argument(
+        "--no-rerun",
+        action="store_true",
+        help="keep a run flagged for outside load as it is",
+    )
+    parser.add_argument("variant", nargs="*", metavar="NAME=CMD")
+    args = parser.parse_args(argv)
+    found = variants(args.variant, parser)
+    if args.rounds < 1:
+        parser.error("--rounds must be at least 1")
+    if os.environ.get("HEAVY_SLOT"):
+        parser.error(
+            "it runs inside a heavy job, where heavy runs each run at once and measures"
+            " nothing: run heavy-bench bare, as `bgrun -o LOG -- heavy-bench ...`"
+        )
+    if (args.out / "results.tsv").exists():
+        parser.error(f"{args.out} already holds results: give a new --out")
+    bench = Bench(args.out, args.prepare, rerun=not args.no_rerun, limit=limit(parser))
+    rounds = (["warmup"] if args.warmup else []) + list(range(1, args.rounds + 1))
+
+    def stop(signum, _frame):
+        raise Stopped(signum)
+
+    for sig in STOPS:
+        signal.signal(sig, stop)
+    try:
+        for round_ in rounds:
+            for name, command in found.items():
+                if not bench.run(name, command, round_):
+                    bench.table(found)
+                    return 1
+    except Stopped as stopped:
+        print(f"heavy-bench: stopped by signal {stopped.signum}.", file=sys.stderr)
+        bench.table(found)
+        return 128 + stopped.signum
+    bench.table(found)
+    return 1 if bench.failed() else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

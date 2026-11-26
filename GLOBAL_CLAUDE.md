@@ -62,9 +62,9 @@ Before scraping a site, look for its data source: an official API or MCP endpoin
 
 ## Profiling
 
-Time things inside `heavy --alone`, which starts them once their cores are quiet and lets no job share their lane: other sessions share this machine's cores, and a busy machine slows every timing you take.
+Time things inside `heavy --alone`, which starts them once their cores are quiet and lets no job share their lane: other sessions share this machine's cores, and a busy machine slows every timing you take. It ends with a line giving the CPU time other work used on its cores meanwhile; a run that line warns about is no timing.
 
-To find what's slow, start with a sampling profiler (`py-spy` for Python, `--subprocesses` for the interpreters it spawns): it disturbs what it measures far less than cProfile, `strace -f` or a hand-built timing loop. Compare timings with `hyperfine`, not repeated runs by hand. Reach for deterministic tracing only for what sampling can't tell, such as an exact call count.
+To find what's slow, start with a sampling profiler (`py-spy` for Python, `--subprocesses` for the interpreters it spawns): it disturbs what it measures far less than cProfile, `strace -f` or a hand-built timing loop. Compare commands with `heavy-bench` (`-h`) when the whole benchmark, runs times variants times a run's length, would take more than a minute or two: each run is its own `heavy --alone` job, the variants interleaved round by round, a run under outside load flagged and run again. One `heavy --alone -- hyperfine ...` holds the queue for every session until the whole benchmark ends, so keep hyperfine for benchmarks that end within a minute or two. Start heavy-bench bare with `bgrun`, never inside `heavy`, where it measures nothing and refuses. Reach for deterministic tracing only for what sampling can't tell, such as an exact call count.
 
 ## Claude from code
 

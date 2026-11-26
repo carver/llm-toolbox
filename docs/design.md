@@ -58,6 +58,13 @@ landings are fewer full checks per landing and cheaper ones, not more at once.
 The script and its raw results (hyperfine JSON, vmstat logs) are in
 `/home/carver/code/claudedev/keep/heavy-lane-exp/` on the host disk, outside git.
 
+### heavy-bench: a benchmark is many short --alone jobs, interleaved (2026-11-25)
+
+In filedrawer #137's benchmark (2026-11-25), `heavy --alone -- hyperfine` over three variants of a 2-minute suite held heavy's queue for about 25 minutes, so every session's commit checks waited behind it; the owner asked for it split.
+A job per run lets other jobs in between, and interleaving the variants round by round spreads a drift in the machine over all of them, where hyperfine's runs of one variant in a row would put it on the last.
+The cost is heavy's quiet-cores wait before each run, seconds on a quiet machine.
+heavy-bench reads each run's wall and outside CPU from heavy's `HEAVY_ALONE_REPORT`, so time in the queue doesn't count, and reruns a run taken under outside load once, keeping both rows.
+
 ### An --alone job reports the other work its cores did (2026-11-25)
 
 `--alone` keeps other heavy jobs off a timing's cores, but not work outside the queue: agent-commit-gate's `checks-needed` runs before it asks for a place, and an agent can run a build bare.

@@ -1379,6 +1379,32 @@ reviews found survivors the builder hadn't, each a fix round, and those rounds c
 come back, a day later. A builder or reviewer still runs `mutate-check` on one mutant
 to show a test catches what it's meant to (/build step 2, /tdd).
 
+### /build's --diff run, brought back on 2026-11-25, is dropped again (2026-11-26)
+
+A session's /upskill pitched putting `mutate-check --diff` back in /build's step 2
+(030df63), saying each mutant "reruns tests that take seconds". The owner approved
+it. Nobody measured that claim, the pitch didn't name the 2026-11-10 decision above,
+and this file wasn't updated. The day after, a study of the heavy record and the
+session logs measured what it did:
+
+- 32 runs in about 22 builds: median 8.2 minutes from launch to result, p90 27.5,
+  max 39.6; one run judged 9 mutants in 57 minutes before it was stopped.
+- Every job in the long lane that day was a mutate-check, holding the lane for
+  about 63% of the VM's uptime on 0.4 to 1.0 of its 4 cores. Other jobs waited up to
+  54 minutes behind them.
+- 1663 mutants, 189 survivors; 39% of the distinct survivors were string values
+  (help metavars, temp prefixes, defaults). About 7 builds got a useful test from a
+  survivor; none found a production bug.
+- Every gap that mattered, both of the rule's own examples included, came from a
+  reviewer's targeted mutate-check.
+
+The owner dropped it again: the 2026-11-10 entry above holds. A reviewer's targeted
+run stays, and llm-toolbox's daily mutants run, which judged no mutant from
+2026-11-14 to 2026-11-25, is to be fixed. The lesson the owner drew: a change sold on
+how fast it is must say what was measured, and the speed must keep being measured,
+with a warning once it gets much worse (2x or more), so a promise like "tests that
+take seconds" can't turn into many-minute waits unseen.
+
 ### A daily run cut off at its time limit still moves the base (2026-11-10)
 
 The brief had a run cover its range only when it judged every mutant. A review found

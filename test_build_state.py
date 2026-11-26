@@ -3,7 +3,9 @@
 import json
 import os
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -745,7 +747,7 @@ def test_a_fixup_that_conflicts_leaves_the_branch_as_it_was(repo):
 
     done = build_state(repo, "finish")
 
-    assert done.returncode == 1 and "CONFLICT" in done.stderr
+    assert done.returncode == 1 and "a.py: conflicts at" in done.stderr
     assert git(repo, "rev-parse", "HEAD").strip() == before
     assert git(repo, "status", "--porcelain") == ""
 
@@ -831,6 +833,223 @@ def test_a_conflicting_squash_is_told_to_keep_its_message(repo):
     assert done.returncode == 1
     assert f"`squash! {second[:12]}`" in done.stderr
     assert "echo" not in done.stderr  # it would replace the squash's own words
+
+
+def prompt_for_review(repo, tmp_path):
+    """Run review-prompt in `repo`, as /build's step 3 does."""
+    (tmp_path / "brief.md").write_text("Parse dates.\n")
+    return build_state(
+        repo,
+        "review-prompt",
+        str(tmp_path / "brief.md"),
+        "--skill",
+        str(code_review_skill(tmp_path)),
+    )
+
+
+def untouched(repo, before):
+    """Assert the trial fold left the repo as it found it: HEAD, the work tree, the
+    worktree list and no rebase under way."""
+    assert git(repo, "rev-parse", "HEAD").strip() == before
+    assert git(repo, "status", "--porcelain", "--untracked-files=no") == ""
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").strip())
+    assert not (git_dir / "rebase-merge").exists()
+
+
+def test_review_prompt_names_each_file_a_trial_fold_of_the_fixups_conflicts_in(
+    repo, tmp_path
+):
+    build_state(repo, "start")
+    first = commit_files(repo, "First", "a.py", "b.py")
+    commit_files(repo, "Second", "a.py", "b.py")
+    fix = commit_files(repo, "fix", "a.py", "b.py", flags=[f"--fixup={first}"])
+    before = git(repo, "rev-parse", "HEAD").strip()
+
+    shown = prompt_for_review(repo, tmp_path)
+
+    assert shown.returncode == 0, shown.stderr
+    assert "build-review-prompt.md" in shown.stdout  # the review still goes ahead
+    lines = [line for line in shown.stderr.splitlines() if "conflicts at" in line]
+    assert lines == [
+        f"  a.py: conflicts at {fix[:12]} fixup! First",
+        f"  b.py: conflicts at {fix[:12]} fixup! First",
+    ]
+    assert "before landing" in shown.stderr
+    untouched(repo, before)
+
+
+def test_review_prompt_says_nothing_of_a_fold_when_the_fixups_fold_cleanly(
+    repo, tmp_path
+):
+    build_state(repo, "start")
+    first = commit(repo, "a.py", "First")
+    commit(repo, "b.py", "Second")
+    commit(repo, "a.py", "fix first", f"--fixup={first}")
+    before = git(repo, "rev-parse", "HEAD").strip()
+
+    shown = prompt_for_review(repo, tmp_path)
+
+    assert shown.returncode == 0, shown.stderr
+    assert "conflict" not in shown.stderr.lower()
+    untouched(repo, before)
+
+
+def test_review_prompts_trial_fold_runs_no_hook_and_moves_no_branch(repo, tmp_path):
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    for name in ("post-checkout", "post-rewrite", "post-commit"):
+        (hooks / name).write_text(f"#!/bin/sh\ntouch {tmp_path}/ran-{name}\n")
+        (hooks / name).chmod(0o755)
+    build_state(repo, "start")
+    first = commit(repo, "a.py", "First")
+    second = commit(repo, "b.py", "Second")
+    git(repo, "branch", "marker", second)
+    git(repo, "config", "core.hooksPath", str(hooks))
+    git(repo, "config", "rebase.updateRefs", "true")
+    commit(repo, "a.py", "fix first", f"--fixup={first}")
+    for ran in tmp_path.glob("ran-*"):
+        ran.unlink()  # the commits' own post-commit runs
+
+    shown = prompt_for_review(repo, tmp_path)
+
+    assert shown.returncode == 0, shown.stderr
+    assert list(tmp_path.glob("ran-*")) == []
+    assert git(repo, "rev-parse", "marker").strip() == second
+
+
+def test_review_prompts_trial_fold_reaches_a_fix_of_an_earlier_builds_commit(
+    repo, worktree, tmp_path
+):
+    # Started again for each commit, as /build does: the fix names a commit before
+    # the base, which finish folds from that commit's parent.
+    build_state(worktree, "start")
+    first = commit(worktree, "a.py", "First")
+    assert build_state(worktree, "finish").returncode == 0
+    build_state(worktree, "start")
+    commit(worktree, "a.py", "Second")
+    fix = commit(worktree, "a.py", "fix first", f"--fixup={first}")
+
+    shown = prompt_for_review(worktree, tmp_path)
+
+    assert shown.returncode == 0, shown.stderr
+    assert f"  a.py: conflicts at {fix[:12]} fixup! First" in shown.stderr
+    assert "Folding from" not in shown.stdout + shown.stderr  # finish's own note
+
+
+def test_review_prompt_tries_no_fold_once_the_base_has_left_heads_history(
+    repo, tmp_path
+):
+    # finish finds where to fold from then (rewritten_base); folding onto the old base
+    # would replay the rewritten history and conflict where nothing will.
+    build_state(repo, "start")
+    (repo / "README").write_text("start, rewritten\n")
+    git(repo, "commit", "-q", "--amend", "-am", "start, rewritten")
+    commit(repo, "README", "Work")
+    commit(repo, "README", "fix work", "--fixup=HEAD")
+
+    shown = prompt_for_review(repo, tmp_path)
+
+    assert shown.returncode == 0, shown.stderr
+    assert "conflict" not in shown.stderr.lower()
+
+
+def wrapped_git(tmp_path, on_rebase):
+    """PATH with a git that runs shell `on_rebase` in place of any `git ... rebase`."""
+    folder = tmp_path / "wrapped-bin"
+    folder.mkdir()
+    real = shutil.which("git")
+    (folder / "git").write_text(
+        f'#!/bin/sh\ncase " $* " in *" rebase "*) {on_rebase} ;; esac\n'
+        f'exec {real} "$@"\n'
+    )
+    (folder / "git").chmod(0o755)
+    return {"PATH": f"{folder}:{os.environ['PATH']}"}
+
+
+def test_a_trial_fold_stopped_by_sigterm_removes_its_worktree(repo, tmp_path):
+    build_state(repo, "start")
+    first = commit(repo, "a.py", "First")
+    commit(repo, "a.py", "fix first", f"--fixup={first}")
+    (tmp_path / "brief.md").write_text("Parse dates.\n")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    started = tmp_path / "rebase-started"
+    # fixed sleep: a rebase that outlasts the test, which stops it long before
+    slow = wrapped_git(tmp_path, f"touch {started}; exec sleep 60")
+    command = [str(SCRIPT), "review-prompt", str(tmp_path / "brief.md")]
+    command += ["--skill", str(code_review_skill(tmp_path))]
+    env = os.environ | slow | {"TMPDIR": str(scratch)}
+    with subprocess.Popen(
+        command, cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    ) as running:
+        deadline = time.monotonic() + 30
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        running.terminate()
+        _, err = running.communicate(timeout=30)
+
+    assert started.exists()
+    assert running.returncode == 128 + signal.SIGTERM, err
+    assert b"Traceback" not in err
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+    assert list(scratch.iterdir()) == []
+
+
+def test_review_prompt_warns_when_the_trial_fold_changes_the_tree(repo, tmp_path):
+    build_state(repo, "start")
+    first = commit(repo, "a.py", "First")
+    commit(repo, "b.py", "Second")
+    commit(repo, "a.py", "fix first", f"--fixup={first}")
+    real = shutil.which("git")
+    # A rebase that also changes a file stands in for a fold gone wrong.
+    changing = wrapped_git(
+        tmp_path,
+        f'{real} "$@" && echo extra >> b.py && {real} commit -qa --amend --no-edit;'
+        " exit $?",
+    )
+    (tmp_path / "brief.md").write_text("Parse dates.\n")
+
+    shown = build_state(
+        repo,
+        "review-prompt",
+        str(tmp_path / "brief.md"),
+        "--skill",
+        str(code_review_skill(tmp_path)),
+        env=changing,
+    )
+
+    assert shown.returncode == 0, shown.stderr
+    assert "changes the tree" in shown.stderr
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def test_review_prompts_hint_says_to_point_the_fix_after_the_review(repo, tmp_path):
+    build_state(repo, "start")
+    first = commit(repo, "a.py", "First")
+    second = commit(repo, "a.py", "Second")
+    fix = commit(repo, "a.py", "fix first", f"--fixup={first}")
+
+    shown = prompt_for_review(repo, tmp_path)
+
+    assert f"echo 'fixup! {second[:12]}' | build-state reword {fix[:12]}" in (
+        shown.stderr
+    )
+    assert "once the review is in" in shown.stderr
+    assert "finish again" not in shown.stderr
+
+
+def test_finish_names_each_file_its_fold_conflicts_in_as_review_prompt_does(repo):
+    build_state(repo, "start")
+    first = commit_files(repo, "First", "a.py", "b.py")
+    commit_files(repo, "Second", "a.py", "b.py")
+    fix = commit_files(repo, "fix", "a.py", "b.py", flags=[f"--fixup={first}"])
+
+    done = build_state(repo, "finish")
+
+    assert done.returncode == 1
+    assert f"  a.py: conflicts at {fix[:12]} fixup! First" in done.stderr
+    assert f"  b.py: conflicts at {fix[:12]} fixup! First" in done.stderr
 
 
 def test_show_prints_the_recorded_bases(repo):

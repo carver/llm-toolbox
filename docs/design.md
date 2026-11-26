@@ -58,6 +58,26 @@ landings are fewer full checks per landing and cheaper ones, not more at once.
 The script and its raw results (hyperfine JSON, vmstat logs) are in
 `/home/carver/code/claudedev/keep/heavy-lane-exp/` on the host disk, outside git.
 
+### Every job goes on a record; its command is cut, not redacted (2026-11-26)
+
+On 2026-11-24 a filedrawer landing's tests ran ten times slower than usual, beside a 12-minute pytest that the sandbox's processes.log showed by its PID alone; by then it had exited, and nothing said what it ran, for whom, or how it got in (#9, #8).
+history.json, keyed by a hash, couldn't say either.
+So every job a heavy runs in a slot or outside the queue writes a JSON line to `HEAVY_DIR/jobs.jsonl` as it starts and one as it ends, and `heavy history --overlapping PID|TIME|START..END` answers "what ran beside my landing?" in one command.
+
+- The start line is written before CMD runs, so a job still running, or one whose heavy was killed, shows (as `running` or `no end recorded`).
+- Overlaps are found when the record is read, from each job's start and end, rather than stored with a job: one still running when another ends is found the same way as one that ended first.
+- Each job's end line holds the CPU-seconds other work used on its cores while it ran, as `--alone`'s report measures it, so load from work outside the queue shows too, not only heavy's jobs.
+- A heavy inside a job adds no record: its work is the job's, and a commit check inside wt-ship's job would list each landing twice.
+- Lines are appended in one write without the queue's lock, and the file is cut to its newest 2000 lines past 2 MiB, by a rename. A line appended during that rename can be lost; taking the lock at each line would add a wait to every job's start and end for a record that only explains.
+- Nothing in it fails a job: any error is a one-line note, and heavy's stop signals wait while a line is written, since heavy stops CMD by raising from its signal handler.
+- It lives with the queue in /tmp, so a reboot clears it. A crash's post-mortem then has only the sandbox's processes.log.
+- A wt-ship check that fails in its heavy job prints, before the failure, one line saying how many jobs overlapped it, how many at full priority, and the CPU other work used on its cores, then the three that used the most CPU, so the agent reads load before it reads a flaky test (#8). It stays short because `bgrun --wait` shows only a log's last lines; `heavy history --overlapping PID` lists the rest. Its job is matched by PID and a start no earlier than the check's, so a lost start line can't name a days-old job of a recycled PID. A record it can't read is a note, never a skipped cleanup. A check that fails outside the queue, or passes, prints none.
+
+A command line can hold a secret (`--token X`, `TOKEN=X`, `-pX`, a URL's credentials), and the record outlives the job, so it keeps the command's first words only, up to the first that may be a value (a word holding `=` or `@`, one after an option, or an option other than a bare `-X` or `--word`, which may hold its value glued on) and at most 120 characters, with `cut` set when it dropped any.
+It doesn't keep every secret out: a bare positional token, as in `./deploy prod TOKEN`, looks like a subcommand and is kept.
+The other option the issue named, redacting what looks like a secret and keeping the rest, fails open: every shape it doesn't know (a header after `-H`, a positional token, a new tool's flag) is kept in full. Cutting fails closed: what it drops can't leak, and the first words still name the tool, its subcommand and its folder, enough to say which job overlapped.
+The cost is detail: `sh -c 'pytest -n 8'` shows as `sh -c`, and `pytest -k name` as `pytest -k`. The record's `key`, history.json's hash of the repo and the whole command, still tells two runs of one command from runs of another.
+
 ### heavy-bench: a benchmark is many short --alone jobs, interleaved (2026-11-25)
 
 In filedrawer #137's benchmark (2026-11-25), `heavy --alone -- hyperfine` over three variants of a 2-minute suite held heavy's queue for about 25 minutes, so every session's commit checks waited behind it; the owner asked for it split.
@@ -515,6 +535,41 @@ reviewed commit, which can't tell a drop from an accidental reset and misses mid
 drops; a `build-state drop` command, more code for the same check; a review of the
 drop's interactions every time, a subagent for what is usually nothing.
 
+### build-state review-prompt tries the fold before the review (#10, 2026-11-26)
+
+In a seven-commit build on 2026-11-23 a late fix was folded into an early commit of
+the series, twice, and each fold conflicted at later commits (filedrawer's
+`skills/versions.txt`, rewritten in every commit that touches a skill). Nothing said
+so until a reviewer tried `rebase --autosquash` in a throwaway clone. Now
+`review-prompt`, when the build holds fix commits, runs finish's own fold (the same
+`fold_base`, the same autosquash rebase) in a temporary worktree, and warns on stderr
+of each conflicting file with the commit the fold stopped at, then writes the prompt
+as before: a conflict is for fixing before landing, not a reason to hold the review
+(the issue's decision). finish prints the same lines when its own fold conflicts.
+
+- A worktree rather than a clone: it shares the object store, so it copies nothing
+  but the checkout, and `worktree remove` drops it. It runs with no hooks, no rerere,
+  no signing, no auto gc and `--no-update-refs`, so a `rebase.updateRefs` setting
+  can't move a branch and nothing lands in the shared repo but loose objects.
+  SIGTERM, SIGHUP and SIGINT exit through its cleanup, so a stopped review-prompt
+  leaves no worktree registered; when `worktree remove` fails it deletes only the
+  trial's own entry under the git dir, not a `worktree prune` of every stale one.
+  A clean fold that changes the tree, which finish refuses, is warned of too.
+- Only the first stop shows, as git stops there: resolving it by guess to go on
+  would make up conflicts the real fold may not have.
+- It sees what finish's fold sees, and wt-ship's while the branch it lands on hasn't
+  moved: wt-ship rebases from the fork point, an ancestor of `fold_base`'s start,
+  and the commits between are replayed unchanged. Checked on a ten-commit series
+  with a fix of commit 2 conflicting in a file every commit rewrites: the trial and
+  `rebase -i --autosquash --fork-point main` stopped at the same fix, in the same
+  file. A main that moved can add conflicts of its own, which neither finish nor the
+  trial looks for.
+- Cost: about half a second. On a ten-commit series with two fixups, in a clone of
+  this repo (224 files), review-prompt took 0.60 s against 0.14 s without the trial
+  (hyperfine, 15 runs each, twice, both under heavy's outside-load warning, about
+  one core). A bigger checkout costs more, as the worktree checks out every file. A
+  build with no fix commits skips it.
+
 ### wt-ship --remove keeps a worktree that processes still run in (2026-11-25)
 
 In a filedrawer session the agent stopped `bin/live-preview`, which it had started in
@@ -806,6 +861,52 @@ the id, neither is picked, and the current folder's newest is read as before. Th
 and when no project holds it, a line on stderr names the log that was read, since it
 may be another session's; session-scan passes the line on.
 
+### session-grep prints commands only, and masks secret-shaped values (#13, 2026-11-26)
+
+An agent looking for the session that ran `git reset --hard HEAD~1` in a main
+tree grepped the raw JSONL about eight times. JSON escaping hid matches, and each
+try printed 1 to 2k characters of log. session-grep decodes each assistant
+record's tool calls and matches the command as typed. Every tool_use record checked
+(about 3,900 in the 30 newest main logs, 1,100 in the 30 newest subagent logs,
+2026-11-26) carries `timestamp`, `cwd` and `sessionId`. A subagent's log has
+`agentId` and sits in its session's folder, and no main log held a sidechain record
+with a call. So the session and agent come from the log's path, and the time and cwd
+from the record.
+
+It reads only calls' inputs. Outputs and message text are never searched, since
+an output can hold anything a command printed. A command can hold a secret too,
+typed inline (`GH_TOKEN=... gh api`, a curl Authorization header), so values of
+the common shapes print as `***`. The pattern matches before masking, so searching
+for a token finds the call without printing the token. There is no flag to turn
+the mask off. A regex mask misses shapes it doesn't know, so `-h` calls it best
+effort and says to treat the output as private. Names that end in a secret word
+are masked (`GH_TOKEN`, `--client-secret`) and names that only contain one are
+not (`--token-file PATH`). `$references` are left as typed, since they name the
+secret rather than hold it. A value after a space is masked only after an
+option's dashes (`--password x`). The first version also masked a bare word's
+next word, and on 7 days of real logs 473 of its 538 masked commands were that
+form, mostly ordinary words such as `grep -rn password src/` and `gh secret set
+FOO`. YAML-style `password: x` stays unmasked for the same reason: code holds it
+far more often than a secret does.
+
+A call is logged before it runs, so every search found its own call and exit 1
+never happened inside a session. A call that runs session-grep is held back until
+its result appears in the log, and left out when none does. That skips the
+running search wherever it runs (a subagent's log, a parallel batch) without
+guessing which call is newest. A session-grep call that was cut off before its
+result is left out too.
+
+The default line is short: the session's and a subagent's first 8 id characters,
+the cwd with `~` for home, and the project folder only when the log has no cwd.
+The first version printed the full ids and the project, a median of 194
+characters before the command. `--full` keeps that long form, since
+session-digest takes the whole session id.
+
+The log listing and record time are in `lib/sessionlogs.py`, which session-digest
+now uses too. session-digest reads each log whole. session-grep streams it and
+parses only lines that contain `"tool_use"`, and skips a log last written before
+`--since`. A search over all 1.8G of logs took 8.7 s, unmeasured under load.
+
 ### Rejected: a rebuild only after 40 idle minutes (2026-11-09)
 
 The first rule. It caught all four of the main session's rebuilds, but only one
@@ -929,6 +1030,17 @@ Checked against Claude Code 2.1.325: the option's number takes effect at once, t
 The agent sees a declined dialog, not answers, which a usability finding should allow for.
 A session reads only its own transcript: before its first prompt the newest one is the last session's, and the simulated human answered that session's dialog again after a restart (jason86).
 Codex has no such dialog in default mode: `request_user_input` is for Plan mode, and `request_user_input_async` returns at once and shows its question as an agent message.
+
+### A person's step mid-run is a file the run waits for; a token outlives the run only through --keep-file (2026-11-26)
+
+A scenario turn `{"wait_for_file": "NAME", "say": "..."}` prints one line naming `<--out>/NAME`, waits for that file past no turn limit (`DRIVE_AGENT_WAIT_LIMIT`, a day by default), then sends `say` as an ordinary turn; turns.md logs the wait.
+`--keep-file REL:DEST` copies `~/REL` to DEST, mode 600 and unredacted, in the run's cleanup, before the home goes, on every exit, and prints only that it kept the file or why not; `files/` keeps its redacted copy.
+Reason: filedrawer#141's no-account scenario (2026-11-24) had the agent make an account and ask for a claim, which the owner confirmed in a browser mid-run, and then meant to check the account with the agent's token.
+`run` types every turn in one loop with no hook for its caller between turns, so the pause has to be a turn of its own; and the home goes on every exit, so the token, which the runner never had, could leave only through drive-agent.
+A file in the run folder works from any shell or another agent, and holds the run with no terminal attached.
+DEST must not exist and is opened with `O_EXCL | O_NOFOLLOW`, so a run never overwrites a file or follows a link someone planted there.
+`~/REL` is read as the box's user but outside bwrap, where a link the agent planted would reach a file the box hides from it, such as `/etc/sandbox-persistent.sh`, and the caller would then send that file on (filedrawer sends the kept header to its site). So the read opens one folder at a time with `O_NOFOLLOW` and takes only a regular file; a link anywhere on the way keeps nothing and says so.
+A wait turn's NAME is a bare file name, none drive-agent writes in the run folder (`turns.md` would end the wait at once) and no earlier wait turn's (the file is already there); print mode, which sends one turn, refuses one. turns.md logs the wait as it starts, so a run stopped mid-wait shows what it waited for.
 
 ### Rejected: a separate user without bwrap (2026-11-10)
 
@@ -1174,6 +1286,56 @@ never covered. So a run that judged any mutant covers its range, and its summary
 the mutants it left out are not retried; only a run that judged none (the suite fails
 unmutated on the runner) keeps the base, and fails. Raising MUTANT_MINUTES, as a
 public repo's free minutes would allow, leaves out fewer.
+
+### One mutants-base for llm-toolbox and filedrawer (2026-11-26)
+
+Two builders wrote a `bin/mutants-base` each on 2026-11-10, one per repo (#3).
+filedrawer now copies this one. Its rules differed in three places, and only one
+became an option:
+
+- Whether a full run covers: no option. Both tools took any successful scheduled or
+  dispatched run holding a live `mutants-covered`; what differed was when each
+  workflow uploads that artifact (filedrawer's full run does, llm-toolbox's run over
+  a base given by hand doesn't). The workflow keeps that rule.
+- How far back to look: `--retention-days N`, required, which each workflow passes
+  as its marker's retention-days (30 and 90). Older runs can't hold the marker, so
+  asking for them only costs calls.
+- Output: one form, `base=`/`skip=` lines plus a stderr line on where the base came
+  from. filedrawer's workflow appends them to `$GITHUB_OUTPUT` and ignores `skip`
+  (its daily run with nothing new still marks its range covered), so a bare-SHA
+  form would serve no caller.
+
+A run whose head HEAD lacks is passed over before its artifacts are asked for. Each
+repo's test runs its workflow's `Find the base` line as GitHub would, since a call
+that no longer fits shows otherwise only in the next scheduled run.
+
+### The daily run gives each mutant's suite a PID namespace (2026-11-26)
+
+Six daily runs, 11-19 to 11-24, all at `bf78929`, passed the unmutated check, then
+died after 2h27m to 2h50m with "The hosted runner lost communication with the
+server" and uploaded nothing. `bf78929` added drive-agent's `kill_tmux_server`, which
+SIGKILLs a stuck tmux server and its children, found by their parent pid in /proc,
+and `test_a_kill_server_that_never_returns_still_ends_the_server_and_says_so` calls
+it for real. The mutant that negates the parent-pid check SIGKILLs every other
+process the user owns, and on a hosted runner that user runs the runner's own agent.
+In a PID namespace, with a `sleep` standing in for the agent, that mutant killed the
+`sleep` and mutate-check itself, which left the mutant in the file. The first guess,
+a mutant growing memory without bound, would have called for a ulimit, which
+wouldn't have stopped it.
+
+So mutants.yml runs each mutant's suite through a small wrapper, `own-pids`: `sudo
+unshare --pid --mount-proc --kill-child`, then `setpriv` back to the runner's user
+and groups. The drive-agent tests call `sudo`, which a user namespace would break.
+`env -i` and the `export -p` taken before sudo give the suite the environment
+mutate-check gave the wrapper, since `sudo --preserve-env` still drops
+`PYTHONDONTWRITEBYTECODE` and the other `PYTHON*` and `LD_*` variables. bash is the
+namespace's init, and reaps what is orphaned there: with `uv` as init, a zombie
+outlived `test_a_timeout_stops_the_commands_children_too`'s wait. The init ignores a
+SIGKILL sent from inside, so the killing mutant reads as caught, exit 137, and
+`--kill-child` ends the namespace when mutate-check stops a run past its timeout.
+
+mutate-check doesn't do this itself, so a local `--diff` run over such a mutant would
+kill the user's own processes, Claude Code sessions included.
 
 ## paper
 

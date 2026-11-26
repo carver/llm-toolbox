@@ -1,5 +1,6 @@
 """wt-ship, against a bare remote, a main tree and a detached worktree beside it."""
 
+import json
 import os
 import shutil
 import signal
@@ -2092,6 +2093,84 @@ def test_a_tips_check_that_needs_the_queue_runs_in_a_heavy_job(setup):
     assert len(slots.read_text().splitlines()) == 1
     # It asked for the queue once: inside the job the gate runs it straight away.
     assert (main.parent / "asks").read_text().split() == ["ask"]
+
+
+def record_a_job_beside(holder, started=None):
+    """Put a job on heavy's record that started a minute ago (or at `started`) and
+    still runs, as a --few-seconds pytest outside the queue would; return its
+    process."""
+    alive = holder()
+    record = Path(os.environ["HEAVY_DIR"]) / "jobs.jsonl"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    started = time.time() - 60 if started is None else started
+    line = {"v": 1, "id": f"{alive.pid}-1", "at_start": started}
+    line |= {"pid": alive.pid, "proc_start": start_time(alive.pid)}
+    line |= {"host": socket.gethostname(), "cwd": "/x", "cmd": "pytest -n 10"}
+    line |= {"lane": "normal", "how": "outside", "quick": True}
+    record.write_text(json.dumps(line) + "\n")
+    return alive
+
+
+def test_a_check_that_fails_in_a_heavy_job_names_the_jobs_beside_it(setup, holder):
+    _, main, wt, _ = setup
+    record_a_job_beside(holder)
+    install_hook(
+        main,
+        "agent-pre-commit",
+        'if [ -n "${CHECK_QUEUE_EXIT:-}" ]; then exit "$CHECK_QUEUE_EXIT"; fi\nexit 1',
+    )
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1, done.stderr
+    said = done.stdout + done.stderr
+    assert "heavy history --overlapping" in said
+    assert "1 job overlapped it (1 at full priority)" in said
+    assert "pytest -n 10" in said
+
+
+def test_a_record_it_cant_read_doesnt_stop_a_failed_checks_cleanup(setup, holder):
+    _, main, wt, _ = setup
+    record_a_job_beside(holder, started=-1e300)  # a time no clock can show
+    install_hook(
+        main,
+        "agent-pre-commit",
+        'if [ -n "${CHECK_QUEUE_EXIT:-}" ]; then exit "$CHECK_QUEUE_EXIT"; fi\n'
+        "echo dirt >> a.py; exit 1",
+    )
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1, done.stderr
+    assert "heavy: can't read its record" in done.stdout
+    assert "fails at HEAD" in done.stderr
+    assert git(wt, "status", "--porcelain") == ""  # the check's change was reset
+
+
+def test_a_check_that_fails_outside_heavys_queue_says_nothing_of_load(setup, holder):
+    _, main, wt, _ = setup
+    record_a_job_beside(holder)
+    install_hook(main, "agent-pre-commit", ': "${CHECK_QUEUE_EXIT:-}"; exit 1')
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 1, done.stderr
+    assert "heavy history" not in done.stdout + done.stderr
+
+
+def test_a_check_that_passes_in_a_heavy_job_says_nothing_of_load(setup, holder):
+    _, main, wt, _ = setup
+    record_a_job_beside(holder)
+    queue_asking_check(main, main.parent / "slots")
+    commit(wt, "a.py", "x = 1\n", "Add a")
+
+    done = ship(wt, "--local")
+
+    assert done.returncode == 0, done.stderr
+    assert "heavy history" not in done.stdout + done.stderr
 
 
 def test_a_landings_job_joins_heavys_queue_ahead_of_ordinary_waiters(

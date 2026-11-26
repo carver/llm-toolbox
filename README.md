@@ -78,7 +78,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   subagent checks it on `/code-review`'s two axes, against
   `coding/standards.md`, and the agent
   triages the findings and refactors. It asks before handing a large change to
-  an implementer subagent.
+  an implementer subagent, which only implements: a fresh subagent reviews it.
 - **unslop**: cut AI tells from writing.
 - **upskill**: run by hand (`/upskill`) near the end of a session, or on an
   earlier one. Reviews it for mistakes, waste, repeated work and missing
@@ -190,9 +190,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   that covered its range (it judged mutants and uploaded `mutants-covered`) and is
   still in HEAD's
   history; else the commit that added the workflow; `--override REV` instead.
-  Prints `base=SHA` and `skip=true|false` for `$GITHUB_OUTPUT`. It asks GitHub
+  `--retention-days N`, the marker's retention in the workflow, limits the runs it
+  asks for to the last N+1 days. Prints `base=SHA` and `skip=true|false` for
+  `$GITHUB_OUTPUT`, and where the base came from on stderr. It asks GitHub
   with `gh api`, each call bounded by `$MUTANTS_BASE_GH_SECONDS` (60), and fails
-  on any gh error rather than guess.
+  on any gh error rather than guess. filedrawer's `bin/mutants-base` is a copy.
 - **mutants-pending**: `mutants-pending [REPO_DIR...]` lists, for each repo whose
   `.github/workflows/mutants.yml` names a `# Tracking issue: #N`, the completed
   runs with results newer than the newest one a trusted comment on issue N marks
@@ -276,7 +278,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   tip, so the check covers the whole landing: first outside `heavy`'s queue
   (`--no-queue`), so a docs-only landing never waits, then, when it needs the
   queue, in a `heavy` job, at the queue's front when it lands under the main
-  tree's claim. A failure stops it. One commit lands as it is; two or more land as a merge
+  tree's claim. A failure stops it; one in a `heavy` job also prints, from
+  heavy's record, how many jobs ran beside the job and the three that used the
+  most CPU, so a test past its time limit reads as load first. One commit lands as it is; two or more land as a merge
   commit (`Merge TOPIC (N commits)`, TOPIC from the `REPO-wt-TOPIC` folder,
   the commits' subjects in its body) whose tree is the tip's, so the commits
   inside it get no check at landing, and `git bisect --first-parent` walks
@@ -389,7 +393,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   simulated human (`claude-fresh`) to answer open questions and judge
   conditional turns (never sent when it fails), and saves screens, transcripts
   and the files the run made (`~/.config` with the values it was given and
-  keys or tokens blanked), then removes the user. `--setup FILE` prepares
+  keys or tokens blanked), then removes the user. A turn
+  `{"wait_for_file": "NAME", "say": "..."}` prints one line naming `DIR/NAME`,
+  waits up to `DRIVE_AGENT_WAIT_LIMIT` seconds for that file, as a person
+  confirms an emailed link, then sends `say`; `--keep-file REL:DEST` copies
+  `~/REL` to DEST, mode 600 and unredacted, before the home goes, however the
+  run ends, and prints only that it did. `--setup FILE` prepares
   the home first, `--agent-env`/`--setup-env`/`--var` pass named variables
   without putting them on a command line. `digest RUN_DIR` prints a run's
   transcripts compactly, sessions in the order they ran, with keys and tokens
@@ -528,15 +537,22 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   process group,
   with SIGKILL after `$HEAVY_GRACE` seconds. `heavy status` shows each lane's
   holder, sharer, waiters, their usual cores and how busy the lane's cores
-  are. An `--alone` job ends with a line giving the CPU-seconds other work
-  used on its cores while it ran, warning past `$HEAVY_ALONE_OUTSIDE` (0.5)
+  are. Every job goes on a record in `$HEAVY_DIR/jobs.jsonl`: its times, wait,
+  exit, folder, session, PID, lane, how it got in, the CPU it and other work on
+  its cores used, and its command's first words, up to the first that may be a
+  value (a bare positional token, as in `./deploy prod TOKEN`, is still kept).
+  `heavy history` lists the last hour's jobs, or
+  those `--since TIME`; `heavy history --overlapping PID|TIME|START..END`, the
+  jobs that ran beside a job or at a time. An `--alone` job ends with a line
+  giving the CPU-seconds other work used on its cores while it ran, warning
+  past `$HEAVY_ALONE_OUTSIDE` (0.5)
   cores on average that the timing may be off; sccache's server's CPU counts
   as the job's own, and the line names it. `$HEAVY_ALONE_REPORT` names a file
   that gets the numbers. A third job in a lane, or a head stalled for
   `$HEAVY_STALL_SECONDS` (600), gets a hint to push a topic branch and open a PR for CI's results
   instead. A heavy inside a job (`$HEAVY_SLOT`), or inside a `--few-seconds` run
   outside the queue, runs at once. The queue and
-  its history live in `$HEAVY_DIR`
+  its history and record live in `$HEAVY_DIR`
   (`/tmp/heavy`). A Ctrl-Z while heavy holds the queue's lock, a moment at each
   look, stops it once it lets go; a wait of `$FIFO_LOCK_SECONDS` (5) for that lock
   names the process holding it, and how to continue it when it's stopped. For
@@ -799,7 +815,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   subagent; it says on stderr when the repo has no `CODING_STANDARDS.md`. When
   the repo has an `agent-pre-commit`, which `wt-ship` runs on the tip of what
   it lands, the prompt tells the reviewer to run only the tests a finding
-  needs rather than the whole suite.
+  needs rather than the whole suite. When the build holds fixups, it first
+  tries finish's fold in a temporary worktree it removes after (no hooks, no
+  branch moved), and when that conflicts it warns on stderr, one line a
+  conflicting file with the commit the fold stopped at, as `finish` does on a
+  conflict, and still writes the prompt.
   `fold` folds each commit whose changed lines came mostly (75%) from an
   earlier commit since the branch it lands on into that commit, in one rebase,
   leaving a commit that uses a name defined after its target, one with a
@@ -912,6 +932,21 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `--verify-only` verifies what an earlier run left unverified (exit 4 when any
   is), `--candidates-only` skips verifying. Also lists each line where an agent
   set something aside ("left for later", "out of scope", "TODO").
+
+- **session-grep**: `session-grep PATTERN` searches the commands every session,
+  subagent and workflow agent ran, across projects, decoded from the logs'
+  JSON so a pattern matches the command as typed. One line a match: local time,
+  the session's and subagent's ids cut to 8 characters, the call's cwd, and the
+  command cut to 160 characters around the match; `--full` prints the whole
+  ids, the project folder and the whole command. `--tool NAME` (a glob)
+  searches another tool's inputs, file contents for Write and Edit;
+  `--since`/`--until` take a time or a duration (`2h`); `--project GLOB`,
+  `--cwd PATH`; `--max N` (default 50) keeps the newest. The running search
+  doesn't find its own call. It never searches or prints tool output or message
+  text, and prints secret-shaped values (`GH_TOKEN=...`, an Authorization
+  header, a `ghp_` key) as `***`, which is best effort. Reads `$CLAUDE_CONFIG_DIR` (default
+  `~/.claude`). Its log reading, shared with session-digest, is in
+  `lib/sessionlogs.py`.
 
 - **yt-transcript**: prints a YouTube video's captions, or the ones around
   the URL's timestamp (90 seconds before, 60 after, by default), each line

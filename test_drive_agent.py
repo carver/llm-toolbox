@@ -10,12 +10,17 @@ the rules below, writes a transcript in its harness's format and fires the harne
 turn-end hook (Claude Code's Stop hook from settings.json, Codex's notify program).
 What a fake saw (its user, environment, PATH) it writes to a file in its home, which
 the run's `files/` collects. One test runs the real isolation and skips unless
-passwordless sudo and bwrap are there.
+passwordless sudo and bwrap are there. The proxy's tests with no upstream proxy load
+the tool as a module instead (see `load_drive_agent`).
 """
 
+import importlib.machinery
+import importlib.util
+import ipaddress
 import json
 import os
 import re
+import selectors
 import shutil
 import signal
 import socket
@@ -1178,6 +1183,195 @@ def test_proxy_refuses_github_and_loopback_and_forwards_the_rest(tmp_path, env):
     assert upstream.seen == ["CONNECT staging.example.org:443 HTTP/1.1"]
 
 
+# The proxy with no upstream proxy connects itself, which a run can't show without
+# reaching the internet: the deny list refuses every local address. These tests load
+# the tool as a module and run its Proxy in the test's process, with 127.0.0.1 let
+# through as if it were public.
+def load_drive_agent():
+    loader = importlib.machinery.SourceFileLoader("drive_agent", str(TOOL))
+    spec = importlib.util.spec_from_loader("drive_agent", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+drive_agent = load_drive_agent()
+PUBLIC = "127.0.0.1"  # the listener the tests run, which the proxy takes as public
+
+
+class Service:
+    """A server for one connection on `host`: it reads until it has `expect`, answers
+    `reply`, and keeps what it read in `got`."""
+
+    def __init__(self, host, expect, reply, port=0):
+        self.sock = socket.socket()
+        self.sock.bind((host, port))
+        self.sock.listen()
+        self.port = self.sock.getsockname()[1]
+        self.expect, self.reply, self.got = expect, reply, b""
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        try:
+            conn, _ = self.sock.accept()
+        except OSError:
+            return
+        with conn:
+            conn.settimeout(10)
+            try:
+                while not self.got.endswith(self.expect):
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        return
+                    self.got += chunk
+                conn.sendall(self.reply)
+                while chunk := conn.recv(4096):
+                    self.got += chunk
+            except OSError:
+                pass
+
+
+def stop_listening(sock):
+    """Closes a listening socket, first waking the thread blocked in its accept(),
+    which close() alone leaves blocked on Linux, holding the port."""
+    sock.shutdown(socket.SHUT_RDWR)
+    sock.close()
+
+
+@pytest.fixture
+def serve():
+    """Starts Services as `serve(host, expect, reply[, port])`, closing them after."""
+    started = []
+
+    def start(*args, **kw):
+        started.append(Service(*args, **kw))
+        return started[-1]
+
+    yield start
+    for service in started:
+        stop_listening(service.sock)
+
+
+@pytest.fixture
+def proxy(monkeypatch):
+    for name in ("HTTPS_PROXY", "https_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    real_local = drive_agent.local
+    monkeypatch.setattr(drive_agent, "local", lambda a: a != PUBLIC and real_local(a))
+    p = drive_agent.Proxy([])
+    yield p
+    stop_listening(p.sock)
+    stop_listening(p.unix)
+    shutil.rmtree(os.path.dirname(p.path), ignore_errors=True)
+
+
+def ask(proxy, request, until):
+    """Sends `request` to the proxy and returns what comes back, read until it ends
+    with `until` or the connection closes."""
+    with socket.create_connection(("127.0.0.1", proxy.port), timeout=10) as conn:
+        conn.sendall(request)
+        got = b""
+        while not got.endswith(until):
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            got += chunk
+        return got
+
+
+def test_proxy_with_no_upstream_answers_connect_and_passes_bytes_both_ways(
+    proxy, serve
+):
+    service = serve(PUBLIC, b"hello", b"pong")
+    request = f"CONNECT {PUBLIC}:{service.port} HTTP/1.1\r\nHost: x\r\n\r\n"
+    with socket.create_connection(("127.0.0.1", proxy.port), timeout=10) as conn:
+        # Bytes sent with the request, before the 200, are the tunnel's first.
+        conn.sendall(request.encode() + b"hello")
+        want = b"HTTP/1.1 200 Connection established\r\n\r\npong"
+        got = b""
+        while len(got) < len(want) and (chunk := conn.recv(4096)):
+            got += chunk
+        assert got == want
+        conn.sendall(b" world")
+        conn.shutdown(socket.SHUT_WR)
+        assert conn.recv(4096) == b""
+    deadline = time.monotonic() + 10
+    while service.got != b"hello world" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert service.got == b"hello world"
+
+
+def test_proxy_with_no_upstream_passes_a_plain_request_on_whole(proxy, serve):
+    answer = b"HTTP/1.1 204 No Content\r\n\r\n"
+    service = serve(PUBLIC, b"\r\n\r\n", answer)
+    head = f"GET http://{PUBLIC}:{service.port}/x HTTP/1.1\r\nHost: {PUBLIC}\r\n\r\n"
+    assert ask(proxy, head.encode(), answer) == answer
+    assert service.got == head.encode()
+
+
+@pytest.mark.parametrize(
+    "method, target, want",
+    [
+        ("GET", "http://example.org/x", ("example.org", 80)),
+        ("GET", "http://example.org:8080/x", ("example.org", 8080)),
+        ("CONNECT", "example.org", ("example.org", 443)),
+        ("CONNECT", "example.org:8443", ("example.org", 8443)),
+        ("CONNECT", "[::1]:8080", ("::1", 8080)),
+        ("CONNECT", "[::1]", ("::1", 443)),
+    ],
+)
+def test_target_of_reads_host_and_port_with_each_methods_default(method, target, want):
+    assert drive_agent.target_of(method, target) == want
+
+
+def outward_address():
+    """This machine's address on its default route, which a UDP connect finds without
+    sending anything, or None with no route."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("192.0.2.1", 9))
+        except OSError:
+            return None
+        return s.getsockname()[0]
+
+
+def test_proxy_listens_on_loopback_only(proxy):
+    address = outward_address()
+    if address is None or ipaddress.ip_address(address).is_loopback:
+        pytest.skip("no address but loopback")
+    socket.create_connection(("127.0.0.1", proxy.port), timeout=10).close()
+    with pytest.raises(ConnectionRefusedError):
+        socket.create_connection((address, proxy.port), timeout=10)
+
+
+@pytest.mark.parametrize("method", ["CONNECT", "GET"])
+def test_proxy_connects_to_the_address_it_checked_not_a_new_lookup(
+    proxy, serve, monkeypatch, method
+):
+    # A name whose first lookup is public and any later one loopback, as a DNS
+    # rebinding attack answers: a second lookup would reach the loopback service.
+    # Each service answers as soon as a connection comes.
+    first = serve(PUBLIC, b"", b"first")
+    serve("127.0.0.2", b"", b"second", port=first.port)
+    real = socket.getaddrinfo
+    lookups = []
+
+    def getaddrinfo(host, port, *args, **kw):
+        if host != "rebind.test":
+            return real(host, port, *args, **kw)
+        lookups.append(host)
+        address = PUBLIC if len(lookups) == 1 else "127.0.0.2"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port or 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    target = f"rebind.test:{first.port}"
+    if method == "GET":
+        target = f"http://{target}/"
+    request = f"{method} {target} HTTP/1.1\r\nHost: rebind.test\r\n\r\n".encode()
+    assert ask(proxy, request, b"first").endswith(b"first")
+    assert lookups == ["rebind.test"]
+
+
 def test_digest_shows_turns_and_tools_and_redacts(tmp_path):
     run = tmp_path / "run"
     run.mkdir()
@@ -1749,3 +1943,304 @@ def test_a_kill_server_that_never_returns_still_ends_the_server_and_says_so(
         check=False,
     )
     assert alive.returncode != 0, "the run's tmux server outlived it"
+
+
+def read_until(process, pattern, deadline):
+    """Lines of `process`'s stdout up to the first that matches `pattern`, read
+    without blocking past `deadline`; fails when none does by then. It reads the
+    pipe itself, since a buffered readline may hold the line select waits for."""
+    text = ""
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    while time.time() < deadline:
+        if not selector.select(timeout=max(0, deadline - time.time())):
+            break
+        chunk = os.read(process.stdout.fileno(), 4096).decode()
+        if not chunk:
+            break
+        text += chunk
+        lines = text.splitlines(keepends=True)
+        for n, line in enumerate(lines):
+            if line.endswith("\n") and re.search(pattern, line):
+                return lines[: n + 1]
+    pytest.fail(f"no line matching {pattern!r} by the deadline: {text!r}")
+
+
+def test_a_wait_for_file_turn_sends_its_text_only_once_the_file_appears(tmp_path, env):
+    path = scenario(
+        tmp_path,
+        turns=[
+            "first",
+            {"wait_for_file": "confirmed", "say": "I clicked the link"},
+            "last",
+        ],
+    )
+    out = tmp_path / "out"
+    process = subprocess.Popen(
+        [str(TOOL), "run", str(path), "--harness", "claude", "--name", "jason150"]
+        + ["--out", str(out)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        lines = read_until(process, r"waits for", time.time() + 30)
+        assert str(out / "confirmed") in lines[-1]
+        assert sum("waits for" in line for line in lines) == 1
+        # The turn before has ended and been logged, and so has the wait, so a run
+        # stopped mid-wait says what it waited for; the wait sends nothing.
+        log = (out / "turns.md").read_text()
+        assert "Sent: first" in log and "I clicked the link" not in log
+        assert f"## Turn 2: waiting for {out / 'confirmed'}" in log
+        assert process.poll() is None
+        (out / "confirmed").touch()
+        _, stderr = process.communicate(timeout=60)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=30)
+    assert process.returncode == 0, stderr
+    log = (out / "turns.md").read_text()
+    assert f"Waited for {out / 'confirmed'}" in log
+    assert log.index("Sent: first") < log.index("Waited for")
+    assert log.index("Waited for") < log.index("Sent: I clicked the link")
+    assert log.index("Sent: I clicked the link") < log.index("Sent: last")
+    assert "done: I clicked the link" in (out / "screen-02.txt").read_text()
+    assert json.loads((out / "run.json").read_text())["outcome"] == "done"
+
+
+def test_a_wait_for_file_past_its_limit_fails_the_run(tmp_path, env):
+    path = scenario(
+        tmp_path, turns=["first", {"wait_for_file": "never", "say": "never sent"}]
+    )
+    out = tmp_path / "out"
+    done = drive(
+        {**env, "DRIVE_AGENT_WAIT_LIMIT": "1"},
+        "run",
+        path,
+        "--harness",
+        "claude",
+        "--name",
+        "jason151",
+        "--out",
+        out,
+        check=False,
+    )
+    assert done.returncode == 1
+    assert json.loads((out / "run.json").read_text())["outcome"] == "no-file"
+    log = (out / "turns.md").read_text()
+    assert (
+        f"NO FILE SEEN: {out / 'never'}" in log
+        and "Sent:" not in log.split("## Turn 2")[1]
+    )
+    assert str(out / "never") in done.stderr
+    assert not (Path(env["DRIVE_AGENT_HOME_ROOT"]) / "jason151").exists()
+
+
+@pytest.mark.parametrize(
+    "turn, why",
+    [
+        ({"wait_for_file": "a/b", "say": "x"}, "file name"),
+        ({"wait_for_file": "..", "say": "x"}, "file name"),
+        ({"wait_for_file": "", "say": "x"}, "file name"),
+        ({"wait_for_file": "turns.md", "say": "x"}, "drive-agent writes"),
+        ({"wait_for_file": "screen-03.txt", "say": "x"}, "drive-agent writes"),
+        ({"wait_for_file": "files", "say": "x"}, "drive-agent writes"),
+        ({"wait_for_file": "ok"}, "say"),
+        ({"wait_for_file": "ok", "say": 3}, "say"),
+        ({"wait_for_file": "ok", "say": "x", "only_if": "y"}, "only"),
+        ({"wait_for_file": "ok", "say": "again"}, "turn 1 waits for ok too"),
+    ],
+)
+def test_a_wait_for_file_turn_drive_agent_cant_take_is_refused_before_the_run(
+    tmp_path, env, turn, why
+):
+    out = tmp_path / "out"
+    done = drive(
+        env,
+        "run",
+        scenario(tmp_path, turns=[{"wait_for_file": "ok", "say": "x"}, "y", turn]),
+        "--harness",
+        "claude",
+        "--name",
+        "jason152",
+        "--out",
+        out,
+        check=False,
+    )
+    assert done.returncode == 2 and why in done.stderr, done.stderr
+    assert not out.exists()
+
+
+def test_a_wait_for_file_turn_in_print_mode_is_refused(tmp_path, env):
+    done = drive(
+        env,
+        "run",
+        scenario(
+            tmp_path,
+            turns=[{"wait_for_file": "ok", "say": "x"}],
+            print_mode=True,
+        ),
+        "--harness",
+        "claude",
+        "--name",
+        "jason153",
+        "--out",
+        tmp_path / "out",
+        check=False,
+    )
+    assert done.returncode == 2 and "print_mode" in done.stderr, done.stderr
+
+
+HEADER_SETUP = (
+    "#!/usr/bin/env python3\nimport os\n"
+    "d = os.path.join(os.environ['HOME'], '.config', 'tool')\n"
+    "os.makedirs(d)\n"
+    "open(os.path.join(d, 'site.header'), 'w').write("
+    "'Authorization: Bearer ' + os.environ['TOKEN'] + '\\n')\n"
+)
+
+
+@pytest.mark.parametrize("ready", [True, False], ids=["done", "not-ready"])
+def test_keep_file_copies_a_home_file_whole_before_cleanup_and_prints_none_of_it(
+    tmp_path, env, ready
+):
+    token = "fdt_" + "q" * 52
+    setup = tmp_path / "setup.py"
+    setup.write_text(
+        HEADER_SETUP
+        + (
+            ""
+            if ready
+            else "open(os.path.join(os.environ['HOME'], 'never-ready'), 'w')\n"
+        )
+    )
+    out = tmp_path / "out"
+    kept = tmp_path / "kept" / "site.header"
+    kept.parent.mkdir()
+    done = drive(
+        {**env, "TOKEN": token, "DRIVE_AGENT_LAUNCH_LIMIT": "3"},
+        "run",
+        scenario(tmp_path, turns=["hi"]),
+        "--harness",
+        "claude",
+        "--name",
+        "jason154",
+        "--out",
+        out,
+        "--setup",
+        setup,
+        "--setup-env",
+        "TOKEN",
+        "--keep-file",
+        f".config/tool/site.header:{kept}",
+        check=False,
+    )
+    assert done.returncode == (0 if ready else 1), done.stderr
+    assert kept.read_text() == f"Authorization: Bearer {token}\n"
+    assert kept.stat().st_mode & 0o777 == 0o600
+    assert f"kept ~/.config/tool/site.header at {kept}" in done.stdout
+    assert token not in done.stdout + done.stderr
+    for saved in out.rglob("*"):
+        if saved.is_file():
+            assert token not in saved.read_text(errors="replace"), saved
+    assert not (Path(env["DRIVE_AGENT_HOME_ROOT"]) / "jason154").exists()
+
+
+@pytest.mark.parametrize("linked", ["file", "folder"])
+def test_keep_file_never_follows_a_link_the_agent_planted_in_the_home(
+    tmp_path, env, linked
+):
+    """The copy is read outside the box, where a link could reach a file the box
+    hides from the agent."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "site.header").write_text("hidden-from-the-box\n")
+    target = outside / "site.header" if linked == "file" else outside
+    link = ".config/tool/site.header" if linked == "file" else ".config/tool"
+    setup = tmp_path / "setup.py"
+    setup.write_text(
+        "#!/usr/bin/env python3\nimport os\n"
+        f"p = os.path.join(os.environ['HOME'], {link!r})\n"
+        "os.makedirs(os.path.dirname(p), exist_ok=True)\n"
+        f"os.symlink({str(target)!r}, p)\n"
+    )
+    kept = tmp_path / "kept.header"
+    done = drive(
+        env,
+        "run",
+        scenario(tmp_path, turns=["hi"]),
+        "--harness",
+        "claude",
+        "--name",
+        "jason157",
+        "--out",
+        tmp_path / "out",
+        "--setup",
+        setup,
+        "--keep-file",
+        f".config/tool/site.header:{kept}",
+    )
+    assert "kept no ~/.config/tool/site.header: it is a link" in done.stderr
+    assert not kept.exists()
+    assert "hidden-from-the-box" not in done.stdout + done.stderr
+
+
+def test_keep_file_with_no_such_file_says_so_and_keeps_nothing(tmp_path, env):
+    kept = tmp_path / "site.header"
+    done = drive(
+        env,
+        "run",
+        scenario(tmp_path, turns=["hi"]),
+        "--harness",
+        "claude",
+        "--name",
+        "jason155",
+        "--out",
+        tmp_path / "out",
+        "--keep-file",
+        f".config/tool/site.header:{kept}",
+    )
+    assert "kept no ~/.config/tool/site.header" in done.stderr
+    assert not kept.exists()
+
+
+@pytest.mark.parametrize(
+    "spec, why",
+    [
+        ("site.header", "REL:DEST"),
+        ("/etc/passwd:{dest}", "relative"),
+        ("../x:{dest}", "relative"),
+        ("a/../../x:{dest}", "relative"),
+        (":{dest}", "REL:DEST"),
+        ("a:", "REL:DEST"),
+        ("a:{exists}", "exists"),
+        ("a:{nowhere}", "no folder"),
+    ],
+)
+def test_keep_file_it_cant_take_is_refused_before_the_run(tmp_path, env, spec, why):
+    exists = tmp_path / "exists"
+    exists.touch()
+    spec = spec.format(
+        dest=tmp_path / "dest",
+        exists=exists,
+        nowhere=tmp_path / "no" / "dest",
+    )
+    out = tmp_path / "out"
+    done = drive(
+        env,
+        "run",
+        scenario(tmp_path, turns=["hi"]),
+        "--harness",
+        "claude",
+        "--name",
+        "jason156",
+        "--out",
+        out,
+        "--keep-file",
+        spec,
+        check=False,
+    )
+    assert done.returncode == 2 and why in done.stderr, done.stderr
+    assert not out.exists()

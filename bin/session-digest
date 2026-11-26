@@ -93,9 +93,12 @@ import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from sessionlogs import agent_logs, config_dir, read_jsonl, timestamp
 
 TEXT_LIMIT = 400
 # --whole-text: the assistant's text whole, and a user turn up to WHOLE_USER_LIMIT.
@@ -378,15 +381,6 @@ def hook_failure(attachment: dict) -> tuple[str, str] | None:
     return hook, output.splitlines()[-1]
 
 
-def timestamp(record: dict) -> datetime | None:
-    """The record's time; one without a zone is read as UTC, as the logs write it."""
-    try:
-        when = datetime.fromisoformat(str(record["timestamp"]))
-    except (KeyError, ValueError):
-        return None
-    return when if when.tzinfo else when.replace(tzinfo=UTC)
-
-
 def clock(seconds: float) -> str:
     """A span as 3m12s, or as 1h05m from an hour."""
     minutes, secs = divmod(int(seconds), 60)
@@ -419,16 +413,6 @@ def clip(text: str) -> str:
     tail = ERROR_LIMIT - ERROR_HEAD
     cut = len(text) - ERROR_LIMIT
     return f"{text[:ERROR_HEAD]}\n…[{cut} chars]…\n{text[-tail:]}"
-
-
-def read_jsonl(path: Path) -> list[dict]:
-    records = []
-    for line in path.read_text().splitlines():
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return records
 
 
 def hook_line(failure: tuple[str, str]) -> str:
@@ -676,41 +660,6 @@ def find_session(config: Path, cwd: str | None, session: str | None) -> Path | N
     return logs[-1] if logs else None
 
 
-def load_subagents(session: Path) -> list[tuple[str, dict, list[dict]]]:
-    return load_subagents_in(session.with_suffix("") / "subagents")
-
-
-def load_subagents_in(folder: Path) -> list[tuple[str, dict, list[dict]]]:
-    found = []
-    # By when each was last written; logs written at once by name, so the order holds.
-    logs = sorted(
-        folder.glob("agent-*.jsonl"), key=lambda p: (p.stat().st_mtime, p.name)
-    )
-    for log in logs:
-        meta_path = log.with_suffix(".meta.json")
-        meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
-        found.append((log.stem, meta, read_jsonl(log)))
-    return found
-
-
-def load_workflow_agents(session: Path) -> list[tuple[str, dict, list[dict]]]:
-    """Agents of the session's workflow runs, named <run>:<label> (run id without wf_),
-    plus #<agent id tail> when two agents in one run share a label."""
-    folder = session.with_suffix("") / "subagents" / "workflows"
-    found = []
-    for run in sorted(folder.glob("*/"), key=lambda p: p.stat().st_mtime):
-        agents = load_subagents_in(run)
-        labels = [meta.get("description") or name for name, meta, _ in agents]
-        for (name, meta, records), label in zip(agents, labels, strict=True):
-            suffix = (
-                f"#{name.removeprefix('agent-')[:6]}" if labels.count(label) > 1 else ""
-            )
-            found.append(
-                (f"{run.name.removeprefix('wf_')}:{label}{suffix}", meta, records)
-            )
-    return found
-
-
 def summary(agents: list[Agent]) -> list[str]:
     width = max(24, *(len(a.name) for a in agents))  # workflow names run long
     row = f"{{:<{width}}} {{:>6}} {{:>6}} {{:>9}} {{:>10}} {{:>8}} {{:>8}} {{:>4}} {{:>5}}"
@@ -862,7 +811,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--errors doesn't go with --whole-text or --tails")
     view = View(whole_text=args.whole_text, tails=args.tails)
 
-    config = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+    config = config_dir()
     session = find_session(config, args.cwd, args.session)
     if session is None:
         print(
@@ -872,17 +821,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    subagents = load_subagents(session)
+    logs = agent_logs(session)
     spawned = {
-        meta["toolUseId"]: name for name, meta, _ in subagents if "toolUseId" in meta
+        log.meta["toolUseId"]: log.name
+        for log in logs
+        if not log.workflow and "toolUseId" in log.meta
     }
     agents = [digest(Agent("main", "main"), read_jsonl(session), spawned, view)]
-    for name, meta, records in subagents:
-        label = f"{meta.get('agentType', '?')}: {meta.get('description', '')}"
-        agents.append(digest(Agent(name, label), records, spawned, view))
-    for name, meta, records in load_workflow_agents(session):
-        label = f"workflow phase {meta.get('workflowPhase', '?')}"
-        agents.append(digest(Agent(name, label, workflow=True), records, spawned, view))
+    for log in logs:
+        if log.workflow:
+            label = f"workflow phase {log.meta.get('workflowPhase', '?')}"
+        else:
+            label = (
+                f"{log.meta.get('agentType', '?')}: {log.meta.get('description', '')}"
+            )
+        agent = Agent(log.name, label, workflow=log.workflow)
+        agents.append(digest(agent, read_jsonl(log.path), spawned, view))
 
     print(f"session {session.stem}  ({session})")
     print("\n".join(summary(agents)))

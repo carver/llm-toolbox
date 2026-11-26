@@ -21,6 +21,7 @@ from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import NamedTuple
 
+import heavyjobs
 import heavyqueue
 import passrecord
 from fifo import Holder
@@ -242,12 +243,14 @@ def named(sha):
 def passes_in_a_job(argv, env, top, front):
     """Run the check `argv` inside a heavy job, where the gate's run starts at once;
     whether it passed. A queue that can't be used leaves the check to queue for
-    itself, as the gate does."""
+    itself, as the gate does. One that fails in a job names what ran beside it, from
+    heavy's record."""
     print(
         f"It needs heavy's queue, so it runs in a job{' at its front' if front else ''}.",
         flush=True,
     )
     cores = os.sched_getaffinity(0)
+    begun = time.time()
     with ExitStack() as stack:
         stack.callback(restore_cores, cores)
         asked = time.monotonic()
@@ -269,7 +272,33 @@ def passes_in_a_job(argv, env, top, front):
         passed = run_stoppable(argv, env, cwd=top) == 0
         if job is not None:
             job.exited(0 if passed else 1)  # a passing run goes into heavy's history
-        return passed
+    if job is not None and not passed:
+        print_load_beside(begun)
+    return passed
+
+
+def print_load_beside(begun):
+    """For a check that failed in this process's heavy job, begun no earlier than
+    `begun` and now ended, so on heavy's record with the CPU other work used on its
+    cores: a summary of what ran beside it and its heaviest jobs, so a test that ran
+    out of time reads as load, not a flaky test. Nothing here may stop the landing's
+    cleanup: any failure is a one-line note."""
+    pid = os.getpid()
+    try:
+        lines = heavyjobs.beside(heavyqueue.base(), pid, begun)
+    except Exception as error:  # noqa: BLE001 - a bad record mustn't skip cleanup
+        print(f"heavy: can't read its record ({type(error).__name__}: {error}).")
+        return
+    if not lines:
+        return
+    print(
+        "The check failed in a heavy job; if a test ran past its time limit, load may"
+        " be why: say so and run it again before calling the test flaky.",
+        *lines,
+        f"`heavy history --overlapping {pid}` lists them all.",
+        sep="\n",
+        flush=True,
+    )
 
 
 def restore_cores(cores):

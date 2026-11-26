@@ -26,6 +26,7 @@ SCRIPT = ROOT / "bin" / "heavy"
 sys.path.insert(0, str(ROOT / "lib"))
 import cores
 import fifo
+import heavyjobs
 
 
 def set_busy(busy, share):
@@ -2158,3 +2159,427 @@ def test_a_measure_it_cannot_take_is_a_note_not_a_failure(outside):
     assert done.returncode == 0, done.stderr
     assert "Traceback" not in done.stderr
     assert "can't tell what other work" in done.stderr
+
+
+# The record of the jobs heavy ran, and `heavy history`.
+
+
+def history(env, *args, **extra):
+    done = heavy(env, "history", *args, **extra)
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+def record_lines(tmp_path):
+    path = tmp_path / "heavy" / "jobs.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def ended(tmp_path):
+    """Each job's whole record, start and end merged, by its id, from the file."""
+    jobs = {}
+    for line in record_lines(tmp_path):
+        jobs.setdefault(line["id"], {}).update(line)
+    return list(jobs.values())
+
+
+def line_of(text, needle):
+    found = [ln for ln in text.splitlines() if needle in ln]
+    assert len(found) == 1, text
+    return found[0]
+
+
+def test_history_lists_each_job_with_its_status_folder_and_command(box):
+    tmp_path, _, env = box
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    heavy(env, "--", "true", "first")
+    heavy(env, "--", "sh", "-c", "exit 3", cwd=elsewhere)
+    shown = history(env)
+
+    first, failed = line_of(shown, "true first"), line_of(shown, "sh -c")
+    assert "exit 0" in first and str(tmp_path) in first, shown
+    assert "exit 3" in failed and str(elsewhere) in failed, shown
+    assert "s-test" in first and "normal" in first, shown
+    assert shown.index("true first") < shown.index("sh -c"), shown
+
+
+@pytest.mark.parametrize(
+    "argv, shown",
+    [
+        (["true", "run", "--token", "s3cret", "more"], "true run --token"),
+        (["true", "run", "--token=s3cret", "more"], "true run"),
+        (["env", "TOKEN=s3cret", "true"], "env"),
+        (["true", "clone", "https://me:s3cret@example.com/x"], "true clone"),
+        (["mysql", "-ps3cret", "db"], "mysql"),
+        (["curl", "-HAuthorization: Bearer s3cret", "x"], "curl"),
+        (["true", "-v", "--dry-run", "-ks3cret"], "true -v --dry-run"),
+        (["true", "--to.ken", "s3cret"], "true"),
+    ],
+)
+def test_a_command_is_recorded_only_up_to_its_first_value(box, argv, shown):
+    tmp_path, _, env = box
+
+    heavy(env, "--", *argv)
+
+    text = (tmp_path / "heavy" / "jobs.jsonl").read_text()
+    assert "s3cret" not in text and "more" not in text, text
+    (job,) = ended(tmp_path)
+    assert job["cmd"] == shown, job
+    assert "s3cret" not in history(env)
+
+
+def test_a_command_with_an_unbalanced_quote_is_recorded_as_typed():
+    assert heavyjobs.shown("wt-ship's checks") == ("wt-ship's checks", False)
+
+
+def write_record(queue, *lines):
+    queue.mkdir(parents=True, exist_ok=True)
+    text = "".join(json.dumps({"v": 1} | line) + "\n" for line in lines)
+    (queue / heavyjobs.NAME).write_text(text)
+
+
+def test_beside_finds_only_the_pids_job_that_started_since(tmp_path):
+    write_record(
+        tmp_path,
+        {"id": "old", "pid": 42, "at_start": 100.0, "at_end": 200.0, "cmd": "old"},
+        {"id": "x", "pid": 7, "at_start": 150.0, "at_end": 160.0, "cmd": "x"},
+    )
+
+    assert heavyjobs.beside(tmp_path, 42, since=1000.0, now=2000.0) == []
+    assert len(heavyjobs.beside(tmp_path, 42, since=100.0, now=2000.0)) == 2
+
+
+def test_beside_sums_up_and_lists_only_the_heaviest_jobs(tmp_path):
+    mine = {"id": "me", "pid": 42, "at_start": 100.0, "at_end": 200.0}
+    others = [
+        {"id": f"j{n}", "pid": n, "at_start": 150.0, "at_end": 160.0}
+        | {"cmd": f"job{n}", "cpu": float(n), "nice": 10 if n % 2 else 0}
+        for n in range(1, 6)
+    ]
+    write_record(tmp_path, mine | {"other_cpu": 300.0}, *others)
+
+    lines = heavyjobs.beside(tmp_path, 42, since=100.0, now=2000.0)
+
+    assert lines[0].startswith("heavy: 5 jobs overlapped it (2 at full priority)")
+    assert "other work used 300s on its cores (3.0 cores)" in lines[0]
+    assert [line.rsplit(" ", 1)[-1] for line in lines[1:]] == ["job5", "job4", "job3"]
+
+
+def test_a_long_command_is_cut_to_its_first_words(box):
+    tmp_path, _, env = box
+
+    heavy(env, "--", "true", *(["word"] * 100))
+
+    (job,) = ended(tmp_path)
+    assert job["cmd"].startswith("true word") and len(job["cmd"]) <= heavyjobs.CHARS
+    assert job["cut"] is True, job
+
+
+def test_a_record_says_when_the_job_joined_started_and_ended(box, background):
+    tmp_path, _, _ = box
+    first, second = blocker(tmp_path, "a"), blocker(tmp_path, "b")
+    a = background("--", *first[0])
+    wait_until(first[1].exists, "a to start")
+    b = background("--", *second[0], session="s-waiter")
+    wait_until(lambda: entries(tmp_path), "b to queue")
+    first[2].touch()
+    wait_until(second[1].exists, "b to start")
+    second[2].touch()
+    for proc in (a, b):
+        finish(proc)
+
+    one, two = sorted(ended(tmp_path), key=lambda job: job["joined"])
+    assert one["joined"] <= one["at_start"] <= one["at_end"] <= two["at_start"]
+    assert two["joined"] < one["at_end"], (one, two)
+    assert (two["session"], two["pid"], two["exit"]) == ("s-waiter", b.pid, 0)
+    assert two["how"] == "slot" and two["lane"] == "normal", two
+
+
+def test_a_running_job_shows_in_history_as_running(box, background):
+    tmp_path, _, env = box
+    command, started, release = blocker(tmp_path, "a")
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+
+    shown = history(env)
+    release.touch()
+    finish(a)
+
+    assert "running" in line_of(shown, f"pid {a.pid}"), shown
+    assert "exit 0" in line_of(history(env), f"pid {a.pid}")
+
+
+def test_a_stopped_job_is_recorded_as_stopped(box, background):
+    tmp_path, _, env = box
+    command, started, _ = blocker(tmp_path, "a")
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+
+    a.send_signal(signal.SIGTERM)
+    finish(a)
+
+    (job,) = ended(tmp_path)
+    assert job["signal"] == signal.SIGTERM and job["exit"] is None, job
+    assert "stopped by signal 15" in line_of(history(env), f"pid {a.pid}")
+
+
+def test_a_command_that_cant_be_found_is_recorded_with_its_status(box):
+    tmp_path, _, _ = box
+
+    heavy(box[2], "--", "no-such-command-anywhere")
+
+    (job,) = ended(tmp_path)
+    assert job["exit"] == 127, job
+
+
+def test_a_heavy_inside_a_job_adds_no_record_of_its_own(box):
+    tmp_path, _, env = box
+
+    done = heavy(env, "--", str(SCRIPT), "--", "true")
+
+    assert done.returncode == 0, done.stderr
+    assert len(ended(tmp_path)) == 1
+
+
+def test_a_few_seconds_job_outside_the_queue_is_recorded_so(box):
+    tmp_path, _, env = box
+    meminfo(tmp_path / "meminfo", 16)  # room to run outside the queue
+
+    heavy(env, "--few-seconds", "--", "true")
+
+    (job,) = ended(tmp_path)
+    assert (job["how"], job["quick"], job["nice"]) == ("outside", True, 10), job
+    assert "outside the queue" in line_of(history(env), "true")
+
+
+def test_a_sharers_record_names_the_holder_it_started_beside(box, background, sharing):
+    tmp_path, _, env = box
+    holder, sharer = job_report(tmp_path, "holder"), job_report(tmp_path, "sharer")
+    h = background("--", *holder[0])
+    wait_until(holder[1].exists, "the holder to start")
+    s = background("--share", "--", *sharer[0])
+    wait_until(sharer[1].exists, "the waiter to share")
+    holder[2].touch()
+    sharer[2].touch()
+    for proc in (h, s):
+        finish(proc)
+
+    job = next(job for job in ended(tmp_path) if job["pid"] == s.pid)
+    assert job["how"] == "share" and job["beside"]["pid"] == h.pid, job
+    assert f"beside pid {h.pid}" in line_of(history(env), f"pid {s.pid}")
+
+
+def test_a_record_counts_the_cpu_other_work_used_on_the_jobs_cores(outside, box):
+    tmp_path, _, _ = box
+
+    outside(4200)  # not --alone: every job's record measures it
+
+    (job,) = ended(tmp_path)
+    assert (job["cpu"], job["other_cpu"]) == (0.0, 42.0), job
+
+
+def test_overlapping_a_pid_lists_the_jobs_that_ran_beside_it(box, background):
+    tmp_path, _, env = box
+    meminfo(tmp_path / "meminfo", 16)  # room for the --few-seconds job beside a
+    command, started, release = blocker(tmp_path, "a")
+    before = heavy(env, "--", "true", "before")
+    a = background("--", *command)
+    wait_until(started.exists, "a to start")
+    beside = heavy(env, "--few-seconds", "--", "true", "beside")
+    release.touch()
+    finish(a)
+    after = heavy(env, "--", "true", "after")
+    assert {before.returncode, beside.returncode, after.returncode} == {0}
+
+    shown = history(env, "--overlapping", str(a.pid))
+
+    assert "true beside" in shown, shown
+    assert "true before" not in shown and "true after" not in shown, shown
+    assert shown.splitlines()[0].startswith("heavy: 1 job overlapped"), shown
+
+
+# Whole hours a little more than 6 hours ago: a test's times come after it, all of them
+# past, so a time of day given as HH:MM, which names its latest past moment, finds them.
+BASE = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0)
+BASE -= timedelta(hours=6)
+
+
+def at(hour, minute=0):
+    """An epoch time hour:minute after BASE."""
+    return (BASE + timedelta(hours=hour, minutes=minute)).timestamp()
+
+
+def clock(moment):
+    """An epoch time as HH:MM, local."""
+    return datetime.fromtimestamp(moment).astimezone().strftime("%H:%M")
+
+
+def write_jobs(tmp_path, jobs):
+    """Write a record of whole jobs, each (name, start, end): end None for one whose
+    end isn't recorded, by a process that has ended."""
+    folder = tmp_path / "heavy"
+    folder.mkdir(exist_ok=True)
+    lines = []
+    for number, (name, start, end) in enumerate(jobs):
+        ident = f"{number}"
+        lines.append(
+            {"v": 1, "id": ident, "at_start": start, "joined": start, "pid": 999999}
+            | {"cmd": name, "cwd": "/w", "lane": "normal", "how": "slot"}
+            | {"session": "s-x", "proc_start": "1", "host": socket.gethostname()}
+        )
+        if end is not None:
+            lines.append({"v": 1, "id": ident, "at_end": end, "exit": 0})
+    text = "".join(json.dumps(line) + "\n" for line in lines)
+    (folder / "jobs.jsonl").write_text(text)
+
+
+def test_overlapping_a_time_range_lists_the_jobs_that_ran_in_it(box):
+    tmp_path, _, env = box
+    write_jobs(
+        tmp_path,
+        [
+            ("early", at(1), at(1, 30)),
+            ("across", at(1, 50), at(2, 20)),
+            ("inside", at(2, 5), at(2, 10)),
+            ("late", at(3), at(3, 5)),
+            ("lost", at(2, 40), None),
+        ],
+    )
+
+    shown = history(env, "--overlapping", f"{clock(at(2))}..{clock(at(2, 30))}")
+    lost = history(env, "--overlapping", clock(at(2, 45)))
+
+    assert "across" in shown and "inside" in shown, shown
+    assert "early" not in shown and "late" not in shown, shown
+    assert "lost" in lost and "no end recorded" in lost, lost
+
+
+def test_since_leaves_out_the_jobs_that_started_before(box):
+    tmp_path, _, env = box
+    write_jobs(
+        tmp_path, [("stale", at(0, 5), at(0, 6)), ("fresh", at(0, 20), at(0, 21))]
+    )
+    moment = datetime.fromtimestamp(at(0, 10)).astimezone().isoformat()
+
+    shown = history(env, "--since", moment)
+
+    assert "fresh" in shown and "stale" not in shown, shown
+
+
+def test_history_by_default_shows_the_last_hour(box):
+    tmp_path, _, env = box
+    now = time.time()
+    write_jobs(
+        tmp_path, [("stale", now - 7200, now - 7100), ("fresh", now - 60, now - 50)]
+    )
+
+    shown = history(env)
+
+    assert "fresh" in shown and "stale" not in shown, shown
+    assert "1 older" in shown, shown
+
+
+def test_history_with_no_record_says_so(box):
+    _, _, env = box
+    assert "no jobs recorded" in history(env)
+
+
+@pytest.mark.parametrize("args", [["--since", "soon"], ["--overlapping", "x..y"]])
+def test_history_given_a_time_it_cant_read_is_a_usage_error(box, args):
+    _, _, env = box
+    done = heavy(env, "history", *args)
+    assert done.returncode == 2, done.stderr
+
+
+def test_overlapping_a_pid_finds_the_job_by_its_commands_pid_too(box):
+    tmp_path, _, env = box
+    pidfile = tmp_path / "cmdpid"
+
+    heavy(env, "--", "sh", "-c", f'echo $$ > "{pidfile}"')
+
+    cmd_pid = int(pidfile.read_text())
+    (job,) = ended(tmp_path)
+    assert job["cmd_pid"] == cmd_pid, job
+    shown = history(env, "--overlapping", str(cmd_pid))
+    assert shown.startswith(f"heavy: 0 jobs overlapped pid {cmd_pid}'s"), shown
+
+
+def test_history_reads_a_record_whose_fields_have_the_wrong_shape(box):
+    tmp_path, _, env = box
+    write_jobs(tmp_path, [("odd", time.time() - 60, None)])
+    path = tmp_path / "heavy" / "jobs.jsonl"
+    odd = {"v": 1, "id": "0", "beside": "x", "parents": [5, "y", [1]], "how": "share"}
+    odd |= {"session": None, "pid": "x", "signal": "x", "lane": 3, "cpu": "x"}
+    odd |= {"at_end": time.time(), "exit": "z", "other_cpu": [], "cwd": 7}
+    with path.open("a") as out:
+        out.write(json.dumps(odd) + "\n" + json.dumps({"id": "1", "at_start": "x"}))
+        out.write("\n[1]\nnot json\n")
+
+    shown = history(env)
+    assert "odd" in shown, shown
+    assert "odd" in history(env, "--overlapping", "5m..0s")
+    assert "no job recorded" in history(env, "--overlapping", "12345")
+
+
+def test_a_few_seconds_job_from_a_folder_since_removed_still_runs(box):
+    tmp_path, _, env = box
+    meminfo(tmp_path / "meminfo", 16)  # room to run outside the queue
+    script = f'mkdir gone && cd gone && rmdir ../gone && exec "{SCRIPT}" --few-seconds -- sh -c "exit 4"'
+
+    done = subprocess.run(
+        ["sh", "-c", script],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.returncode == 4, done.stderr
+    assert "Traceback" not in done.stderr, done.stderr
+    (job,) = ended(tmp_path)
+    assert job["exit"] == 4 and job["cwd"] is None, job
+
+
+def test_a_record_with_bytes_that_arent_utf8_is_still_cut(box):
+    tmp_path, _, env = box
+    old = json.dumps({"v": 1, "id": "old", "at_start": 1.0, "cmd": "x" * 100}) + "\n"
+    count = heavyjobs.TRIM_BYTES // len(old) + 1
+    (tmp_path / "heavy").mkdir()
+    (tmp_path / "heavy" / "jobs.jsonl").write_bytes(
+        b"\xff\xfe\n" + old.encode() * count
+    )
+
+    done = heavy(env, "--", "true", "newest")
+
+    assert "can't record" not in done.stderr, done.stderr
+    assert len(record_lines(tmp_path)) == heavyjobs.KEEP_LINES + 1
+
+
+def test_a_record_that_cant_be_written_never_fails_the_job(box):
+    tmp_path, _, env = box
+    (tmp_path / "heavy").mkdir()
+    (tmp_path / "heavy" / "jobs.jsonl").mkdir()  # so no line can be appended
+
+    done = heavy(env, "--", "sh", "-c", "echo out; exit 3")
+
+    assert (done.returncode, done.stdout) == (3, "out\n"), done.stderr
+    assert "Traceback" not in done.stderr, done.stderr
+
+
+def test_a_record_past_its_size_keeps_only_its_newest_lines(box):
+    tmp_path, _, env = box
+    old = json.dumps({"v": 1, "id": "old", "at_start": 1.0, "cmd": "x" * 100}) + "\n"
+    count = heavyjobs.TRIM_BYTES // len(old) + 1
+    (tmp_path / "heavy").mkdir()
+    (tmp_path / "heavy" / "jobs.jsonl").write_text(old * count)
+
+    heavy(env, "--", "true", "newest")
+
+    lines = record_lines(tmp_path)
+    # Cut at the start line's write, then the end line comes.
+    assert len(lines) == heavyjobs.KEEP_LINES + 1, len(lines)
+    assert lines[-1]["id"] == lines[-2]["id"] and lines[-2]["cmd"] == "true newest"

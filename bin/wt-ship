@@ -67,10 +67,13 @@ In order, it:
    runs a check that needs no build or test, such as a docs-only landing's, outside
    heavy's queue; then, when it needs the queue, in a heavy job, at the queue's front
    with --local, which checks only under the main tree's claim. A failure stops it,
-   and says when the branch's tip it rebased onto has no pass either. The check runs in
-   place, in the worktree as it is, so a commit made here during it stops the landing
-   too (exit 5), since what was checked is then not what would land; otherwise any
-   change the check left in tracked files is reset away. A marker an older
+   and says when the branch's tip it rebased onto has no pass either; one in a heavy
+   job also prints, from heavy's record, how many jobs ran beside the job and the
+   three that used the most CPU (`heavy history --overlapping PID` lists all), so a
+   test past its time limit reads as load first; a record it can't read is a note.
+   The check runs in place, in the worktree as it is, so a commit made here during it
+   stops the landing too (exit 5), since what was checked is then not what would land;
+   otherwise any change the check left in tracked files is reset away. A marker an older
    wt-ship left in the worktree's git dir, one that checked each earlier commit
    checked out in turn, stops it from step 1: while that run lives, and when it was
    killed before it put the tip back, naming the tip. A repo that keeps the check in its

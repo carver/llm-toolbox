@@ -985,6 +985,66 @@ now uses too. session-digest reads each log whole. session-grep streams it and
 parses only lines that contain `"tool_use"`, and skips a log last written before
 `--since`. A search over all 1.8G of logs took 8.7 s, unmeasured under load.
 
+### session-grep --unfinished-at lists the calls running at a time (2026-11-26)
+
+The sandbox VM died on 2026-11-26 because of a command a session ran.
+sandbox-setup's postmortem listed the commands of the last ten minutes and the
+jobs `heavy` ran, which misses a command started earlier and outside heavy. A
+command running when the VM died is a call with no result logged by then.
+session-grep already reads every agent's calls and masks what it prints, so the
+lookup is its option, and the postmortem calls it.
+
+`--unfinished-at TIME` keeps a call that started at or before TIME and whose
+result was logged after TIME or never. A session resumed after a crash may log a
+result for the call that was cut off, with a later time, so "never" alone would
+miss it. A result's time is the `timestamp` of the `user` record whose
+`tool_result` block has the call's id. Over the logs of four days (36 main, 272
+subagent, about 12,500 calls) every result sat in a `user` record with a
+timestamp, after its call in the same log, except 8 results in main logs with no
+call before them. `api-request-blob` records repeat results and have no
+timestamp. They are not `user` records, so they aren't read.
+
+A background Bash call gets its result at once. That result's record has
+`toolUseResult.backgroundTaskId`: on all 496 launches that worked, where it
+equalled the id in the result's text, and on none of the 5 that failed. The same
+field was on 108 results of calls without `run_in_background`, which went on in
+the background after they started, as a call that outlasts its time limit does.
+Those are the long commands a postmortem wants, so the field marks a background
+call, not the input. A `run_in_background` call with no result at all is marked
+too. The field is the one thing read from a result besides its time.
+
+The task's end is a notification, text that starts `<task-notification>` and
+then the task's `<task-id>`. The main log holds it as a `queue-operation` record
+and then as a `user` record with that text as its content (378 tasks) or an
+`attachment` record with it as `attachment.prompt` (76). A subagent's task was
+enqueued in its session's main log and delivered as an attachment in the
+subagent's own log, within a second, for all 143 that ended. So each log tells
+its own tasks' ends, and the earliest of the three forms is the end. Only the id
+that opens the text counts: one notification quoted a second task's id further
+in. Two notifications were logged before their launch's result, so the order
+within a log doesn't matter. 7 tasks had no notification. One whose agent ended
+first never gets one, and is listed at any later TIME.
+
+`--since` bounds the start, as before, and a log is skipped only when it was
+last written before `--since`: a session that died at TIME last wrote its log
+before TIME. `--until` is refused, since TIME bounds the start. TIME takes the
+forms `--since` takes, so a date alone means the start of that day. The rule that
+holds back a session-grep call has no use here: the call either was running at
+TIME or wasn't. A record without a timestamp can't be placed, so a call in one
+is left out and a result in one counts as not logged.
+
+A job started detached and returned from (`bgrun -o LOG -- CMD` without
+`--wait`, `nohup ... &`) is no call's to wait for. It shows only as the call that
+waited on it, such as `waitone --pid`. A subagent launched in the background
+(the Agent tool) counts as finished at its launch: its result carries no
+background task id, so nothing ties a later notification to the call. The calls
+that subagent makes are still listed, under its own agent. The `[background] `
+prefix goes on any tool's call that went to the background, not only Bash's: the
+rule reads `run_in_background` and `backgroundTaskId` whatever the tool.
+
+On the crash's logs, `--unfinished-at '2026-11-26 08:42:30' --since '2026-11-24
+00:00' .` listed 9 calls in 1.7 s, 4 of them background, unmeasured under load.
+
 ### Rejected: a rebuild only after 40 idle minutes (2026-11-09)
 
 The first rule. It caught all four of the main session's rebuilds, but only one

@@ -1021,7 +1021,16 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   searches another tool's inputs, file contents for Write and Edit;
   `--since`/`--until` take a time or a duration (`2h`); `--project GLOB`,
   `--cwd PATH`; `--max N` (default 50) keeps the newest. The running search
-  doesn't find its own call. It never searches or prints tool output or message
+  doesn't find its own call. `--unfinished-at TIME` keeps only the calls
+  started by TIME with no result logged by then, to learn what ran when the
+  machine died (`session-grep . --unfinished-at '2026-11-26 08:42' --since
+  2d`); a date alone means the start of that day. A call of any tool that went
+  on in the background counts until the notification of its end, and prints
+  after `[background] `. A job started detached (`bgrun` without `--wait`,
+  `nohup ... &`) shows only as the call that waited on it, and a subagent
+  launched in the background (the Agent tool) counts as finished at its launch,
+  since its result carries no background task id. It never searches or prints
+  tool output or message
   text, and prints secret-shaped values (`GH_TOKEN=...`, an Authorization
   header, a `ghp_` key) as `***`, which is best effort. Reads `$CLAUDE_CONFIG_DIR` (default
   `~/.claude`). Its log reading, shared with session-digest, is in

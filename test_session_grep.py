@@ -506,3 +506,308 @@ def test_no_projects_folder_is_no_match(config: Path) -> None:
     proc = grep(config, "x")
     assert proc.returncode == 1
     assert "no session logs" in proc.stderr
+
+
+# 21:10 in Tokyo, which is 12:10 UTC.
+AT = "2026-10-02 21:10"
+EXACTLY = "2026-10-02T12:10:00Z"
+BEFORE = "2026-10-02T12:06:00Z"
+AFTER = "2026-10-02T12:20:00Z"
+DONE = [
+    call("echo done", when="2026-10-02T12:01:00Z"),
+    output("", when="2026-10-02T12:01:05Z", call_id="t-2026-10-02T12:01:00Z"),
+]
+
+
+def started(command: str, minute: int, **tool_input: object) -> dict:
+    """A call started at 12:<minute> UTC, whose id is c<minute>."""
+    record = call(command, when=f"2026-10-02T12:{minute:02d}:00Z", **tool_input)
+    record["message"]["content"][1]["id"] = f"c{minute}"
+    return record
+
+
+def launched(minute: int, task: str, when: str = BEFORE) -> dict:
+    """The result of call c<minute> that says it now runs in the background."""
+    record = output(f"hunter2 says {task} runs", when=when, call_id=f"c{minute}")
+    record["toolUseResult"] = {"stdout": "", "backgroundTaskId": task}
+    return record
+
+
+def notified(task: str, when: str, form: str = "user") -> dict:
+    """A record that says a background task ended, in each form the logs hold."""
+    text = (
+        f"<task-notification>\n<task-id>{task}</task-id>\n"
+        "<summary>ended, after <task-id>quoted</task-id></summary>\n"
+        "</task-notification>"
+    )
+    if form == "user":
+        return {"type": "user", "timestamp": when, "message": {"content": text}}
+    if form == "queue-operation":
+        return {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "timestamp": when,
+            "content": text,
+        }
+    return {
+        "type": "attachment",
+        "timestamp": when,
+        "attachment": {"type": "queued_command", "prompt": text},
+    }
+
+
+def unfinished(config: Path, *args: str) -> list[str]:
+    proc = grep(config, ".", "--unfinished-at", AT, *args)
+    assert proc.returncode in (0, 1), proc.stderr
+    return [line.split("  ", 4)[4] for line in lines(proc)]
+
+
+def test_unfinished_at_lists_a_call_with_no_result_and_not_a_finished_one(
+    config: Path,
+) -> None:
+    session_log(config, *DONE, started("sleep 900", 5))
+    proc = grep(config, ".", "--unfinished-at", AT)
+    assert lines(proc) == ["2026-10-02 21:05:00  11111111  main  /work/repo  sleep 900"]
+    session_log(config, *DONE)
+    assert grep(config, ".", "--unfinished-at", AT).returncode == 1
+
+
+def test_a_result_logged_after_the_time_leaves_the_call_unfinished(
+    config: Path,
+) -> None:
+    session_log(
+        config,
+        *DONE,
+        started("make slow", 5),
+        started("make quick", 6),
+        output("", when="2026-10-02T12:09:59Z", call_id="c6"),
+        output("", when=AFTER, call_id="c5"),
+    )
+    assert unfinished(config) == ["make slow"]
+
+
+def test_a_result_with_no_time_counts_as_not_logged(config: Path) -> None:
+    result = output("", call_id="c5")
+    del result["timestamp"]
+    session_log(config, *DONE, started("make slow", 5), result)
+    assert unfinished(config) == ["make slow"]
+
+
+def test_a_call_started_after_the_time_is_left_out(config: Path) -> None:
+    session_log(config, started("sleep 900", 5), started("sleep 800", 15))
+    assert unfinished(config) == ["sleep 900"]
+
+
+def test_a_call_started_exactly_at_the_time_is_listed(config: Path) -> None:
+    session_log(config, *DONE, started("sleep 900", 10))
+    assert unfinished(config) == ["sleep 900"]
+
+
+def test_a_result_logged_exactly_at_the_time_finishes_the_call(config: Path) -> None:
+    session_log(
+        config,
+        started("sleep 900", 4),
+        started("make quick", 5),
+        output("", when=EXACTLY, call_id="c5"),
+    )
+    assert unfinished(config) == ["sleep 900"]
+
+
+def test_a_notification_logged_exactly_at_the_time_ends_the_task(config: Path) -> None:
+    session_log(
+        config,
+        started("sleep 900", 4),
+        started("sleep 800", 5, run_in_background=True),
+        launched(5, "bt1"),
+        notified("bt1", EXACTLY),
+    )
+    assert unfinished(config) == ["sleep 900"]
+
+
+def test_unfinished_at_a_date_means_the_start_of_that_day(config: Path) -> None:
+    session_log(
+        config,
+        # 23:59 on October 1st in Tokyo, then 00:30 on the 2nd.
+        call("sleep 900", when="2026-10-01T14:59:00Z"),
+        call("sleep 800", when="2026-10-01T15:30:00Z"),
+    )
+    proc = grep(config, ".", "--unfinished-at", "2026-10-02")
+    assert [line.split("  ", 4)[4] for line in lines(proc)] == ["sleep 900"]
+
+
+def test_a_background_call_with_no_notification_is_marked(config: Path) -> None:
+    session_log(
+        config,
+        *DONE,
+        started("sleep 900", 5, run_in_background=True),
+        launched(5, "bt1"),
+        # Cut off before its result.
+        started("sleep 700", 7, run_in_background=True),
+        # Another task's end.
+        notified("bt2", BEFORE),
+    )
+    assert unfinished(config) == ["[background] sleep 900", "[background] sleep 700"]
+
+
+@pytest.mark.parametrize("form", ["user", "queue-operation", "attachment"])
+def test_a_background_call_notified_before_the_time_is_left_out(
+    config: Path, form: str
+) -> None:
+    session_log(
+        config,
+        started("sleep 900", 4, run_in_background=True),
+        launched(4, "bt1"),
+        started("sleep 800", 5, run_in_background=True),
+        launched(5, "bt2"),
+        notified("bt2", "2026-10-02T12:08:00Z", form),
+        # A notification's text can quote another task's id, which ends nothing.
+        started("sleep 700", 6, run_in_background=True),
+        launched(6, "quoted"),
+    )
+    assert unfinished(config) == ["[background] sleep 900", "[background] sleep 700"]
+
+
+def test_a_notification_logged_before_the_launch_result_counts(config: Path) -> None:
+    session_log(
+        config,
+        started("sleep 900", 4),
+        started("true", 5, run_in_background=True),
+        notified("bt1", "2026-10-02T12:05:01Z", "queue-operation"),
+        launched(5, "bt1", when="2026-10-02T12:05:02Z"),
+    )
+    assert unfinished(config) == ["sleep 900"]
+
+
+def test_a_background_call_notified_after_the_time_is_listed(config: Path) -> None:
+    session_log(
+        config,
+        *DONE,
+        started("sleep 900", 5, run_in_background=True),
+        launched(5, "bt1"),
+        notified("bt1", AFTER),
+    )
+    assert unfinished(config) == ["[background] sleep 900"]
+
+
+def test_a_call_sent_to_the_background_later_is_a_background_call(
+    config: Path,
+) -> None:
+    # No run_in_background: the call outlasted its time limit and went on running.
+    session_log(config, *DONE, started("make slow", 5), launched(5, "bt1"))
+    assert unfinished(config) == ["[background] make slow"]
+
+
+def test_a_background_launch_that_failed_is_finished(config: Path) -> None:
+    session_log(
+        config,
+        started("sleep 900", 4),
+        started("slepe 900", 5, run_in_background=True),
+        output("refused", when=BEFORE, call_id="c5"),
+    )
+    assert unfinished(config) == ["sleep 900"]
+
+
+def test_a_subagents_unfinished_call_is_listed_under_its_agent(config: Path) -> None:
+    session_log(config, *DONE)
+    subagent_log(
+        config,
+        "agent-abc",
+        "Fix the bug",
+        *DONE,
+        started("make slow", 5),
+        started("sleep 900", 6, run_in_background=True),
+        launched(6, "bt1"),
+    )
+    proc = grep(config, ".", "--unfinished-at", AT)
+    assert [line.split("  ", 4)[2::2] for line in lines(proc)] == [
+        ["agent-abc (Fix the bug)", "make slow"],
+        ["agent-abc (Fix the bug)", "[background] sleep 900"],
+    ]
+
+
+def test_since_still_bounds_the_start_of_an_unfinished_call(config: Path) -> None:
+    session_log(
+        config,
+        call("sleep 950", when="2026-10-02T11:00:00Z"),
+        *DONE,
+        started("sleep 900", 5),
+    )
+    assert unfinished(config, "--since", "2026-10-02 20:30") == ["sleep 900"]
+    assert unfinished(config) == ["sleep 950", "sleep 900"]
+
+
+def test_unfinished_at_with_until_is_a_usage_error(config: Path) -> None:
+    session_log(config, started("sleep 900", 5))
+    proc = grep(config, ".", "--unfinished-at", AT, "--until", "2026-10-02 21:05")
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "--until" in proc.stderr and "--unfinished-at" in proc.stderr
+
+
+def test_a_bad_unfinished_at_time_is_a_usage_error(config: Path) -> None:
+    session_log(config, started("sleep 900", 5))
+    proc = grep(config, ".", "--unfinished-at", "crash-ish")
+    assert proc.returncode == 2
+    assert "--unfinished-at" in proc.stderr
+
+
+def test_a_log_last_written_before_the_time_is_still_read(config: Path) -> None:
+    # A session that died at the time wrote its log for the last time before it.
+    log = session_log(config, *DONE, started("sleep 900", 5))
+    written = datetime(2026, 10, 2, 12, 5, 30, tzinfo=UTC).timestamp()
+    os.utime(log, (written, written))
+    assert unfinished(config, "--since", "2026-10-02 21:00") == ["sleep 900"]
+
+
+def test_unfinished_calls_are_masked_and_filtered_like_any_search(
+    config: Path,
+) -> None:
+    session_log(
+        config,
+        *DONE,
+        started("GH_TOKEN=s3cr3tvalue sleep 900", 5),
+        started("make slow", 6),
+        started("", 7, name="Read", file_path="/work/slow.txt"),
+    )
+    assert unfinished(config) == ["GH_TOKEN=*** sleep 900", "make slow"]
+    proc = grep(config, "sl[eo]", "--unfinished-at", AT, "--tool", "*", "--max", "2")
+    assert [line.split("  ", 4)[4] for line in lines(proc)] == [
+        "make slow",
+        "Read: file_path=/work/slow.txt",
+    ]
+
+
+def test_a_secret_in_a_background_calls_command_is_masked(config: Path) -> None:
+    session_log(
+        config,
+        *DONE,
+        started("GH_TOKEN=s3cr3tvalue sleep 900", 5, run_in_background=True),
+        launched(5, "bt1"),
+    )
+    assert unfinished(config) == ["[background] GH_TOKEN=*** sleep 900"]
+
+
+def test_unfinished_at_never_searches_or_prints_a_result(config: Path) -> None:
+    session_log(
+        config,
+        started("make slow", 5),
+        output("hunter2 printed late", when=AFTER, call_id="c5"),
+        started("sleep 900", 6, run_in_background=True),
+        launched(6, "bt1"),
+    )
+    proc = grep(config, ".", "--unfinished-at", AT, "--full")
+    head = f"  {PROJECT}  {SESSION}  main  /work/repo"
+    assert lines(proc) == [
+        f"2026-10-02 21:05:00{head}",
+        "    make slow",
+        f"2026-10-02 21:06:00{head}",
+        "    [background] sleep 900",
+    ]
+    assert grep(config, "hunter2", "--unfinished-at", AT).returncode == 1
+
+
+def test_unfinished_at_treats_a_session_grep_call_like_any_other(
+    config: Path,
+) -> None:
+    session_log(config, *DONE, started("session-grep needle", 5))
+    assert unfinished(config) == ["session-grep needle"]

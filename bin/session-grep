@@ -7,6 +7,7 @@
     session-grep pytest --project '*llm-toolbox*' --cwd ~/code/claudedev/llm-toolbox
     session-grep --tool Read 'secrets\\.toml'         # another tool's inputs
     session-grep --full 'wt-ship' --max 5            # whole commands, the newest five
+    session-grep . --unfinished-at '2026-11-26 08:42' --since 2d   # running at a crash
 
 PATTERN is a Python regular expression (-F: a fixed string; -i: either case),
 matched against each tool call's input as the agent typed it, decoded from the
@@ -50,6 +51,25 @@ written before --since isn't read.
 --project GLOB matches the project folder's name (such as -home-me-code-repo);
 --cwd PATH keeps calls whose cwd is PATH or a folder under it.
 
+--unfinished-at TIME (the forms --since takes; a date alone means the start of
+that day) keeps only the calls that started at or before TIME and were still
+running then, to learn what ran when the machine died. A call was running when
+its result was logged after TIME or never. From a result it reads the time it
+was logged and whether the call went on as a background task, nothing else. A
+call of any tool that went on in the background, as a Bash call does by
+run_in_background or by outlasting its time limit, gets its result at once, so
+it was running when no notification of its task's end was logged by TIME; its
+command prints after `[background] `. PATTERN and the other options apply as
+ever (`.` matches every call), except that --until is refused, since TIME
+bounds the start, and that a session-grep call is listed like any other.
+--since still bounds the start, so reach back as far as a call could have run.
+It can't see a job a command started detached and returned from (bgrun without
+--wait, nohup ... &): that shows only as the call that waited on it, such as
+`waitone --pid`. A subagent launched in the background (the Agent tool) counts as
+finished at its launch, since its result carries no background task id. A
+background call whose agent ended before it did has no notification, and is
+listed at any later TIME.
+
 Logs are read from $CLAUDE_CONFIG_DIR (default ~/.claude): projects/<project>/
 <session>.jsonl, and the session's subagents/ and workflow agents beside it.
 
@@ -77,6 +97,17 @@ DESCRIPTION = 30  # a subagent's description is cut to this
 SHORT_ID = 8  # a session's or subagent's id is cut to this, except under --full
 # A command that runs session-grep: its own call is logged before it runs.
 RUNS_SELF = re.compile(r"(?:^|[\s;&|(`/])session-grep(?=\s|$)")
+# A background task's end, as its agent is told: the text opens with the task's id.
+# A later <task-id> in it is quoted from somewhere else.
+NOTIFIES = b"<task-notification>"
+NOTIFICATION = re.compile(r"\s*<task-notification>\s*<task-id>([^<]+)</task-id>")
+# Where each type of record holds a notification's text.
+NOTIFICATION_AT = {
+    "user": ["message", "content"],
+    "queue-operation": ["content"],
+    "attachment": ["attachment", "prompt"],
+}
+BACKGROUND = "[background] "
 MAX = 50
 NEWLINE = " ⏎ "
 MASK = "***"
@@ -146,6 +177,14 @@ class Match(NamedTuple):
     command: str
 
 
+class Found(NamedTuple):
+    """A call the search matched."""
+
+    when: datetime
+    cwd: str
+    text: str  # its input, as the pattern saw it
+
+
 class Search(NamedTuple):
     pattern: re.Pattern
     tool: str
@@ -198,12 +237,58 @@ def under(cwd: str, folder: Path) -> bool:
     return path == folder or folder in path.parents
 
 
-def calls(log: Path, search: Search) -> Iterator[tuple[datetime, str, str]]:
+def blocks(record: dict, kind: str) -> list[dict]:
+    """The record's message's content blocks of one type."""
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return [
+        block
+        for block in (content if isinstance(content, list) else [])
+        if isinstance(block, dict) and block.get("type") == kind
+    ]
+
+
+def input_of(block: dict) -> dict:
+    """A tool_use block's input, or no fields when the log holds something else."""
+    tool_input = block.get("input")
+    return tool_input if isinstance(tool_input, dict) else {}
+
+
+def as_logged(call_id: object) -> bytes:
+    """A call's id as a log line holds it, to find the line of its result unparsed."""
+    return json.dumps(str(call_id)).encode()
+
+
+def matching(record: dict, search: Search) -> Iterator[tuple[dict, Found]]:
+    """Each call in an assistant record that the search matches: its block, and its
+    time, cwd and input's text."""
+    if record.get("type") != "assistant":
+        return
+    moment = timestamp(record)
+    if moment is None:
+        return
+    if (search.since and moment < search.since) or (
+        search.until and moment > search.until
+    ):
+        return
+    cwd = record.get("cwd")
+    if search.cwd and not (isinstance(cwd, str) and under(cwd, search.cwd)):
+        return
+    for block in blocks(record, "tool_use"):
+        name = str(block.get("name", ""))
+        if not fnmatch.fnmatchcase(name, search.tool):
+            continue
+        text = tool_text(name, input_of(block))
+        if search.pattern.search(text):
+            yield block, Found(moment, cwd if isinstance(cwd, str) else "-", text)
+
+
+def calls(log: Path, search: Search) -> Iterator[Found]:
     """Each matching call in the log: its time, its cwd and its input's text. A call
     that runs session-grep is held back until its result is logged, and left out
     when none is, since the search running now is one."""
     # Each held-back call's id, as the log writes it, and what it would yield.
-    held: dict[bytes, tuple[datetime, str, str]] = {}
+    held: dict[bytes, Found] = {}
     with log.open("rb") as lines:
         for line in lines:
             for call_id in [i for i in held if i in line]:
@@ -215,36 +300,88 @@ def calls(log: Path, search: Search) -> Iterator[tuple[datetime, str, str]]:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if record.get("type") != "assistant":
-                continue
-            moment = timestamp(record)
-            if moment is None:
-                continue
-            if (search.since and moment < search.since) or (
-                search.until and moment > search.until
-            ):
-                continue
-            cwd = record.get("cwd")
-            if search.cwd and not (isinstance(cwd, str) and under(cwd, search.cwd)):
-                continue
-            content = (record.get("message") or {}).get("content")
-            for block in content if isinstance(content, list) else []:
-                if not (isinstance(block, dict) and block.get("type") == "tool_use"):
-                    continue
-                name = str(block.get("name", ""))
-                if not fnmatch.fnmatchcase(name, search.tool):
-                    continue
-                tool_input = block.get("input")
-                text = tool_text(
-                    name, tool_input if isinstance(tool_input, dict) else {}
-                )
-                if not search.pattern.search(text):
-                    continue
-                found = (moment, cwd if isinstance(cwd, str) else "-", text)
-                if name == "Bash" and RUNS_SELF.search(text):
-                    held[json.dumps(str(block.get("id", ""))).encode()] = found
+            for block, found in matching(record, search):
+                if block.get("name") == "Bash" and RUNS_SELF.search(found.text):
+                    held[as_logged(block.get("id", ""))] = found
                 else:
                     yield found
+
+
+def ended_task(record: dict) -> str | None:
+    """The id of the background task whose end the record tells its agent, if it is
+    such a notification. The log holds one as a user record, as a queue-operation
+    record, or as an attachment, and its text starts with the task's own id."""
+    path = NOTIFICATION_AT.get(str(record.get("type")))
+    if path is None:
+        return None
+    text: object = record
+    for key in path:
+        text = text.get(key) if isinstance(text, dict) else None
+    notification = NOTIFICATION.match(text) if isinstance(text, str) else None
+    return notification[1] if notification else None
+
+
+# Calls with no result yet, by id as the log writes it: what to yield, and whether
+# the call asked to run in the background.
+Running = dict[bytes, tuple[Found, bool]]
+
+
+def finish(record: dict, running: Running, tasks: dict[str, Found]) -> None:
+    """Take the calls whose results the record holds out of running. One whose
+    result says it went on as a background task goes into tasks, under the task's
+    id, which is the one thing read from a result."""
+    if record.get("type") != "user":
+        return
+    result = record.get("toolUseResult")
+    task = result.get("backgroundTaskId") if isinstance(result, dict) else None
+    for block in blocks(record, "tool_result"):
+        call_id = as_logged(block.get("tool_use_id", ""))
+        if call_id not in running:
+            continue
+        found, _ = running.pop(call_id)
+        if isinstance(task, str):
+            tasks[task] = found
+
+
+def unfinished(log: Path, search: Search, at: datetime) -> Iterator[Found]:
+    """Each matching call in the log that started by the time and was still running
+    at it: one with no result logged by then, and one whose result says it went on
+    in the background as a task whose end no record tells by then. The second
+    kind's text starts with BACKGROUND."""
+    search = search._replace(until=at)
+    running: Running = {}
+    tasks: dict[str, Found] = {}  # background task id -> the call that started it
+    ended: set[str] = set()
+    with log.open("rb") as lines:
+        for line in lines:
+            if not (
+                b'"tool_use"' in line
+                or NOTIFIES in line
+                or any(call_id in line for call_id in running)
+            ):
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for block, found in matching(record, search):
+                asked = input_of(block).get("run_in_background") is True
+                running[as_logged(block.get("id", ""))] = (found, asked)
+            moment = timestamp(record)
+            if moment is None or moment > at:
+                continue
+            if task := ended_task(record):
+                ended.add(task)
+            finish(record, running, tasks)
+    for found, asked in running.values():
+        yield found if not asked else in_background(found)
+    for task, found in tasks.items():
+        if task not in ended:
+            yield in_background(found)
+
+
+def in_background(found: Found) -> Found:
+    return found._replace(text=BACKGROUND + found.text)
 
 
 def sessions(project: Path) -> list[Path]:
@@ -255,7 +392,11 @@ def sessions(project: Path) -> list[Path]:
     return [project / f"{name}.jsonl" for name in sorted(names)]
 
 
-def search_all(projects: Path, project_glob: str, search: Search) -> list[Match]:
+def search_all(
+    projects: Path, project_glob: str, search: Search, at: datetime | None
+) -> list[Match]:
+    """Every matching call, in time order. With a time, only the calls unfinished
+    at it."""
     found = []
     for project in sorted(p for p in projects.iterdir() if p.is_dir()):
         if not fnmatch.fnmatchcase(project.name, project_glob):
@@ -269,13 +410,21 @@ def search_all(projects: Path, project_glob: str, search: Search) -> list[Match]
                 try:
                     if search.since and path.stat().st_mtime < search.since.timestamp():
                         continue
-                    hits = list(calls(path, search))
+                    hits = list(
+                        unfinished(path, search, at) if at else calls(path, search)
+                    )
                 except FileNotFoundError:  # deleted since it was listed
                     continue
-                for moment, cwd, text in hits:
+                for hit in hits:
                     found.append(
                         Match(
-                            moment, project.name, session.stem, agent, about, cwd, text
+                            hit.when,
+                            project.name,
+                            session.stem,
+                            agent,
+                            about,
+                            hit.cwd,
+                            hit.text,
                         )
                     )
     return sorted(found, key=lambda m: m.when)
@@ -340,6 +489,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--since", help="a local time or a duration back from now")
     parser.add_argument("--until", help="a local time or a duration back from now")
     parser.add_argument(
+        "--unfinished-at",
+        metavar="TIME",
+        help="only calls started by TIME and not finished by then",
+    )
+    parser.add_argument(
         "--project", default="*", help="a glob on the project folder's name"
     )
     parser.add_argument("--cwd", help="only calls run in this folder or under it")
@@ -366,8 +520,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         since = when(args.since, "--since") if args.since else None
         until = when(args.until, "--until") if args.until else None
+        at = when(args.unfinished_at, "--unfinished-at") if args.unfinished_at else None
     except BadTime as error:
         print(error, file=sys.stderr)
+        return 2
+    if at and until:
+        print(
+            "session-grep: --until doesn't go with --unfinished-at, whose TIME "
+            "already bounds when a call started; drop --until",
+            file=sys.stderr,
+        )
         return 2
     if args.max < 1:
         print("session-grep: --max takes 1 or more", file=sys.stderr)
@@ -379,7 +541,7 @@ def main(argv: list[str] | None = None) -> int:
     if not projects.is_dir():
         print(f"session-grep: no session logs under {projects}", file=sys.stderr)
         return 1
-    found = search_all(projects, args.project, search)
+    found = search_all(projects, args.project, search, at)
     if not found:
         return 1
     if len(found) > args.max:

@@ -17,7 +17,11 @@ and a venv works for only one machine's Python.
 
 `./t` runs the tests with those pins, from the repo root wherever it's called:
 `heavy --few-seconds -- ./t test_wt_ship.py -k push` for a few, in one process, and
-`bgrun --wait -o LOG -- heavy -- ./t` for the whole suite, in parallel.
+`bgrun --wait -o LOG -- heavy -- ./t` for the whole suite, in parallel. Run tests
+through `./t`, never a bare `pytest` or `uv run pytest`: `pytest.ini`'s `-n auto`
+needs pytest-xdist, which only `./t` brings. Run ruff at the same pin,
+`uv run -q --no-project --with-requirements requirements-dev.txt ruff check FILE`:
+a bare `uvx ruff` is newer than the hooks' and flags import orders they accept.
 
 ## Install
 

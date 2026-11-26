@@ -67,12 +67,17 @@ every run's namespace alone; $MUTATE_CHECK_OWN_PIDS names a stand-in for own-pid
 put back. A CMD with a word `heavy` is refused: in the namespace heavy takes other
 sessions' queued jobs for ended ones and drops them, so run `heavy -- mutate-check`.
 A heavy run deeper, from a script or `make`, refuses its shared queue itself, seeing
-the OWN_PIDS that own-pids sets, and mutate-check stops, exit 2, on its line.
+the OWN_PIDS that own-pids sets, and mutate-check stops, exit 2, when heavy's line
+starts a line of the output and the command exits with heavy's 125 or no test
+summary (pytest's, cargo's) says tests ran, as when `make` gives its own status. A
+test's report that quotes the line, as a caught mutant of heavy's refusal does, is
+judged as usual.
 
 It refuses, exit 2, to mutate a file in a repo's main tree, --unisolated or not: other
 sessions run the files there (tools on PATH, git hooks) outside any namespace, so a
 mutant of a kill-all check there kills them all. Run it in a worktree (`git worktree
-add --detach ../REPO-wt-TOPIC`). A file outside any repo is mutated as before.
+add --detach ../REPO-wt-TOPIC`). A file outside any repo is mutated as before, and so
+is one in a bare repo or a new one, with no commit or branch yet.
 
 The command runs with PYTHONDONTWRITEBYTECODE=1. Python takes a .pyc as current when
 its source's size and mtime in whole seconds match, so a same-size mutation put back
@@ -196,10 +201,10 @@ PANICKED = re.compile(r"\bpanicked at \S+:\d+:\d+:\s*$")
 BIN = Path(__file__).resolve().parent
 SHOWN_ERRORS = 3
 STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
-# own-pids' status and the start of its line when it made no namespace.
+# The status own-pids exits with when it made no namespace, and heavy's when it
+# refuses its shared queue inside one; and the start of each one's line saying so.
 NO_NAMESPACE = 125
 NO_NAMESPACE_SAID = "own-pids: no PID namespace"
-# The start of heavy's line when it refuses its shared queue inside own-pids.
 HEAVY_REFUSED = "heavy: refusing the shared queue inside own-pids"
 
 
@@ -311,15 +316,31 @@ def run(command: list[str], timeout: float) -> tuple[int, str]:
         raise TimedOut from e
     # Without colour codes, which CARGO_TERM_COLOR=always or --color puts mid-line
     text = COLOUR.sub("", output.decode(errors="replace"))
-    if child.returncode == NO_NAMESPACE:
-        said = [line for line in text.splitlines() if NO_NAMESPACE_SAID in line]
-        if said:
+    # Only on a line of its own: a test's report can quote either line, as pytest
+    # does a failed assertion's message, and that run is judged. With heavy's line,
+    # also at another status, as `make` gives, when no test summary says tests ran.
+    lines = text.splitlines()
+    for start in (NO_NAMESPACE_SAID, HEAVY_REFUSED):
+        said = [line for line in lines if line.startswith(start)]
+        if said and (
+            child.returncode == NO_NAMESPACE
+            or start == HEAVY_REFUSED
+            and not tests_reported(lines)
+        ):
             raise UsageError(f"mutate-check: stopped: {said[-1]}")
-    # Whatever status reached here, through make or a script: no test judged the run.
-    refused = [line for line in text.splitlines() if HEAVY_REFUSED in line]
-    if refused:
-        raise UsageError(f"mutate-check: stopped: {refused[-1]}")
     return child.returncode, text
+
+
+def not_run_from(found: maintree.Place) -> bool:
+    """Whether a main tree is one no session runs files from: a bare repo, or a new
+    one with no commit or branch yet (an orphan branch in a repo with commits is no
+    new repo)."""
+    if found.exempt == maintree.BARE:
+        return True
+    return (
+        found.exempt == maintree.UNBORN
+        and maintree.git(found.top, "for-each-ref", "--count=1") == ""
+    )
 
 
 def refuse_main_trees(folders: set[Path]) -> None:
@@ -327,7 +348,7 @@ def refuse_main_trees(folders: set[Path]) -> None:
     its files, tools on PATH and hooks among them, and no namespace covers them."""
     for folder in sorted(folders):
         found = maintree.place(folder)
-        if found is not None and found.main:
+        if found is not None and found.main and not not_run_from(found):
             raise UsageError(
                 f"mutate-check: {found.top} is a repo's main tree, whose files other"
                 " sessions run (tools on PATH, hooks) outside any PID namespace, so a"
@@ -434,6 +455,11 @@ def tests_ran(lines: list[str]) -> bool:
     return any(TESTS_RAN.search(line) for line in lines)
 
 
+def tests_reported(lines: list[str]) -> bool:
+    """Whether a runner's summary says tests ran: cargo's or nextest's, or pytest's."""
+    return tests_ran(lines) or any(map(PYTEST_SUMMARY.search, lines))
+
+
 def rust_build_failed(lines: list[str]) -> bool:
     return any(RUST_BUILD_FAILED.match(line) for line in lines)
 
@@ -536,7 +562,7 @@ def judge(code: int, output: str, command: list[str]) -> Verdict:
         report = ["mutate-check: not caught: the command passed with the mutation"]
         return Verdict(MISSED, report, "it passed")
     test_line = tests_ran(lines)
-    ran = test_line or any(map(PYTEST_SUMMARY.search, lines))
+    ran = tests_reported(lines)
     if code in CANT_START and not ran:
         reason = (
             f"it exited {code}, the status a shell or a wrapper such as env gives a"

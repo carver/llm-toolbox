@@ -903,18 +903,100 @@ def test_it_refuses_a_main_tree(project: Path, diff: bool) -> None:
     assert (main_tree / "calc.py").read_text() == LABEL
 
 
-def test_a_heavy_that_refuses_inside_the_namespace_stops_it(repo: Path) -> None:
-    refuses = (
-        "heavy: refusing the shared queue inside own-pids' PID namespace (as"
-        " mutate-check runs its command)"
-    )
-    command = ("sh", "-c", f'echo "{refuses}" >&2; echo "make: *** Error 125"; exit 2')
+HEAVY_REFUSES = (
+    "heavy: refusing the shared queue inside own-pids' PID namespace (as"
+    " mutate-check runs its command)"
+)
+
+
+def test_it_refuses_a_main_tree_but_not_a_new_repos(repo: Path) -> None:
+    # A `git init` scratch repo with nothing committed: no session runs its files.
+    git(repo, "init", "-q")
+
+    result = check(repo, BREAK, "touch", "ran")
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert (repo / "ran").exists()
+    assert (repo / "calc.py").read_text() == CODE
+
+
+def commit_all(root: Path) -> None:
+    git(root, "init", "-q", "-b", "main")
+    git(root, "config", "user.name", "t")
+    git(root, "config", "user.email", "t@example.com")
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "c")
+
+
+def test_it_refuses_a_main_tree_on_an_orphan_branch(repo: Path) -> None:
+    # HEAD is unborn there too, but the repo's commits, and its files, are live.
+    commit_all(repo)
+    git(repo, "checkout", "-q", "--orphan", "fresh")
+
+    result = check(repo, BREAK, "touch", "ran")
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "main tree" in result.stderr
+    assert not (repo / "ran").exists()
+
+
+def test_it_refuses_a_submodules_main_tree(repo: Path, tmp_path: Path) -> None:
+    # A submodule is a repo of its own, where a worktree can be added.
+    commit_all(repo)
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    (outer / "README").write_text("outer\n")
+    commit_all(outer)
+    allow = ("-c", "protocol.file.allow=always")
+    git(outer, *allow, "submodule", "add", "-q", str(repo), "sub")
+    inner = outer / "sub"
+
+    result = check(inner, BREAK, "touch", "ran")
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "main tree" in result.stderr
+    assert not (inner / "ran").exists()
+    assert (inner / "calc.py").read_text() == CODE
+
+
+@pytest.mark.parametrize(
+    "then",
+    ["exit 125", 'echo "make: *** [Makefile:2: test] Error 125"; exit 2'],
+    ids=["heavy's status", "through make"],
+)
+def test_a_heavy_that_refuses_inside_the_namespace_stops_it(
+    repo: Path, then: str
+) -> None:
+    command = ("sh", "-c", f'echo "{HEAVY_REFUSES}" >&2; {then}')
 
     result = check(repo, BREAK, *command)
 
     assert result.returncode == 2, result.stdout
-    assert refuses in result.stderr
+    assert f"mutate-check: stopped: {HEAVY_REFUSES}" in result.stderr
     assert "caught" not in result.stdout
+    assert (repo / "calc.py").read_text() == CODE
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        # pytest's report of a test that asserted heavy's 125, with its stderr
+        f'echo "E       AssertionError: {HEAVY_REFUSES}"; exit 1',
+        # a test's own captured stderr, which pytest prints as it was
+        f'echo "{HEAVY_REFUSES}"; exit 1',
+        f'echo "E       AssertionError: {HEAVY_REFUSES}"; exit 125',
+    ],
+    ids=["quoted", "exit 1", "quoted, exit 125"],
+)
+def test_heavys_refusal_in_a_failing_tests_output_is_a_catch(
+    repo: Path, said: str
+) -> None:
+    # A caught mutant of heavy's refusal prints the refusal in its failing test's
+    # report: that run is judged like any other.
+    result = check(repo, BREAK, "sh", "-c", f"echo '1 failed in 0.40s'; {said}")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "caught" in result.stdout
     assert (repo / "calc.py").read_text() == CODE
 
 

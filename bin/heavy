@@ -229,8 +229,12 @@ Environment:
   HEAVY_SLOT           set for CMD, to the slot it holds (for a --few-seconds job run
                        outside the queue, `outside` and the line naming its heavy)
   OWN_PIDS             set by own-pids inside its PID namespace, where heavy refuses
-                       the shared queue (HEAVY_DIR unset or /tmp/heavy): it would take
-                       other sessions' jobs, whose PIDs it can't see, for ended ones
+                       the shared queue (HEAVY_DIR unset or /tmp/heavy, through any
+                       links): it would take other sessions' jobs, whose PIDs it can't
+                       see, for ended ones
+  HEAVY_SHARED_DIR     a folder that stands in for /tmp/heavy as the shared queue,
+                       HEAVY_DIR's default and one refused inside own-pids, beside
+                       /tmp/heavy itself (tests)
 
 Exit status: CMD's own; 2 a usage error; 3 `heavy waits --until-open` reached
 --max-wait with the queue still held; 125 heavy couldn't use its queue, or refused
@@ -265,7 +269,6 @@ QUICK_WITHOUT = {
     " cores are quiet, and --share is for work without time limits, such as a build.",
 }
 PR_SET_PDEATHSIG = 1
-SHARED_QUEUE = Path("/tmp/heavy")
 
 
 class Stopped(Exception):
@@ -534,7 +537,7 @@ def main(argv=None):
         help="status, speed, history [OPTIONS], waits [OPTIONS], or -- CMD [ARGS...]",
     )
     args = parser.parse_args(argv)
-    if os.environ.get("OWN_PIDS") and heavyqueue.base().resolve() == SHARED_QUEUE:
+    if os.environ.get("OWN_PIDS") and heavyqueue.is_shared(heavyqueue.base()):
         print(
             "heavy: refusing the shared queue inside own-pids' PID namespace (as"
             " mutate-check runs its command), where other sessions' jobs look ended:"

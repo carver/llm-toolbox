@@ -77,6 +77,8 @@ LOOSE = (";", "\n")
 # what comes next.
 LIST_ENDS = (";", "\n", "&", "")
 GIT_SECONDS = 5
+# Place.exempt for what the repo is, rather than what's under way in it.
+BARE, SUBMODULE, UNBORN = "a bare repo", "a submodule", "an unborn HEAD"
 # The files and folders in a git dir that mark an operation in progress.
 IN_PROGRESS = (
     ("MERGE_HEAD", "a merge"),
@@ -459,7 +461,7 @@ def place(directory: Path | None) -> Place | None:
     bare, git_dir, common, hooks = lines[0] == "true", *map(Path, lines[1:])
     main = git_dir.resolve() == common.resolve()
     if bare:
-        return Place(git_dir, main, hooks, None, "a bare repo")
+        return Place(git_dir, main, hooks, None, BARE)
     found = git(
         directory, "rev-parse", "--show-toplevel", "--show-superproject-working-tree"
     )
@@ -471,9 +473,9 @@ def place(directory: Path | None) -> Place | None:
     branch = branch.strip().removeprefix("refs/heads/") if branch else None
     exempt = None
     if len(lines) > 1:
-        exempt = "a submodule"
+        exempt = SUBMODULE
     elif git(directory, "rev-parse", "-q", "--verify", "HEAD^{commit}") is None:
-        exempt = "an unborn HEAD"
+        exempt = UNBORN
     else:
         exempt = next(
             (what for name, what in IN_PROGRESS if (git_dir / name).exists()), None

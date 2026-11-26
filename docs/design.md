@@ -1843,17 +1843,33 @@ takes a holder whose pid isn't in /proc for ended, so heavy inside would drop ot
 sessions' queued jobs, and they would drop its; `heavy -- mutate-check` keeps it
 outside. The word check misses a heavy run deeper, by `sh -c '...'`, `make test` or a
 script, so own-pids sets OWN_PIDS=1 for the command and heavy refuses its shared
-queue (HEAVY_DIR unset or /tmp/heavy) when it sees it, with a line mutate-check stops
-on, exit 2, whatever status reaches it. A heavy with a queue of its own, as
+queue (HEAVY_DIR unset or /tmp/heavy, both resolved) when it sees it, exit 125 with a
+line mutate-check stops on, exit 2. A heavy with a queue of its own, as
 test_heavy.py's runs have, still works there, so the daily run can mutate heavy. The
 word check stays, as the early and clearer error.
+
+The first version stopped on the line wherever it appeared, whatever the status. A
+caught mutant of heavy's refusal then read as stopped (second review of #15): pytest
+prints a failed assertion's message, and test_heavy.py's asserts carry heavy's
+stderr, so the refusal's text shows up in an ordinary failure's report. mutate-check
+now stops only when the line starts a line of output and the status is 125 or no test
+summary (pytest's, cargo's) says tests ran, which covers a refusal under `make`,
+whose status make replaces; a caught mutant of the refusal still prints pytest's
+`1 failed`. test_heavy.py's test of the refusal ran heavy on the live /tmp/heavy,
+so a mutant that defeated it ran real heavy on the shared queue from inside a
+namespace; HEAVY_SHARED_DIR now stands in for /tmp/heavy there, and heavy refuses
+/tmp/heavy itself whatever the variable says.
 
 It refuses a main tree, --unisolated or not. The namespace covers only the command:
 other sessions run the main tree's files themselves, safekill from PATH importing its
 lib/procmatch.py, drive-agent, the git hooks, so a mutant there of a kill-all check
 reaches every session that runs it meanwhile. The crash of 2026-11-26 08:36 was
 mutate-check applying the line-249 mutant to the main tree's live bin/drive-agent.
-The test is lib/maintree.py's (#4): a folder whose git dir is the common one. A file
+The test is lib/maintree.py's (#4): a folder whose git dir is the common one, less a
+bare repo and a new one, whose HEAD is unborn and which has no refs at all: a `git
+init` scratch repo has nothing for a session to run. An unborn HEAD alone doesn't
+do, since an orphan branch (`git checkout --orphan`) in a repo with commits has one
+too, and a submodule is a repo like any other, where a worktree can be added. A file
 outside any repo is allowed, and mutants.yml runs in a worktree of its checkout.
 
 Measured while building own-pids: unshare blocks SIGTERM and SIGINT while it waits,

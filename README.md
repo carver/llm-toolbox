@@ -256,9 +256,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `$MUTATE_CHECK_OWN_PIDS` names a stand-in for own-pids in the tests. It refuses
   a CMD that runs heavy, which can't see other sessions' jobs from inside: run
   `heavy -- mutate-check ...`; a heavy run deeper, from a script or `make`, refuses
-  its shared queue itself, and mutate-check stops on its line. It refuses a repo's
-  main tree, `--unisolated` or not, since other sessions run the files there from
-  PATH: run it in a worktree.
+  its shared queue itself, and mutate-check stops on its line, at exit 125 or with
+  no test summary in the output (a test report quoting the line is judged as
+  usual). It refuses a repo's main tree, `--unisolated` or not, since other
+  sessions run the files there from PATH: run it in a worktree. A bare repo, or a
+  new one with no commit or branch yet, is no main tree to it.
 - **own-pids**: `own-pids -- CMD` runs CMD in a PID namespace of its own, with
   its own /proc, as the same user and groups, in the same folder, with the same
   environment and umask (`sudo -n unshare --pid --mount-proc`, then `setpriv`
@@ -634,7 +636,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   outside the queue, runs at once. The queue and
   its history and record live in `$HEAVY_DIR`
   (`/tmp/heavy`); inside own-pids' namespace (`$OWN_PIDS`), where other
-  sessions' jobs look ended, heavy refuses that shared queue, exit 125. A Ctrl-Z
+  sessions' jobs look ended, heavy refuses that shared queue, exit 125
+  (`$HEAVY_SHARED_DIR` stands in for it in the tests). A Ctrl-Z
   while heavy holds the queue's lock, a moment at each
   look, stops it once it lets go; a wait of `$FIFO_LOCK_SECONDS` (5) for that lock
   names the process holding it, and how to continue it when it's stopped. For

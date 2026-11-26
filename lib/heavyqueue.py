@@ -31,7 +31,8 @@ Each lane is a lib/fifo.py queue in HEAVY_DIR/<lane>/, its holder's slot the fil
 under one lock for both lanes, so a long and a normal job starting together never
 share cores.
 
-It reads HEAVY_DIR, HEAVY_QUIET_SECONDS, HEAVY_POLL (seconds per sample),
+It reads HEAVY_DIR, HEAVY_SHARED_DIR (the tests' stand-in for /tmp/heavy, the shared
+queue), HEAVY_QUIET_SECONDS, HEAVY_POLL (seconds per sample),
 HEAVY_SHARE_SECONDS, HEAVY_STALL_SECONDS (before the PR hint), HEAVY_QUICK_SECONDS,
 HEAVY_QUICK_BUSY, HEAVY_ALONE_OUTSIDE, HEAVY_ALONE_REPORT, HEAVY_BUSY (the tests'
 stand-in for measuring), HEAVY_MEMINFO, HEAVY_VMSTAT, HEAVY_STAT and
@@ -101,8 +102,23 @@ def knob(name, default):
     return float(os.environ.get(name, default))
 
 
+LIVE = Path("/tmp/heavy")
+
+
+def shared():
+    """The queue every session shares, HEAVY_DIR's default: /tmp/heavy, or the tests'
+    stand-in for it."""
+    return Path(os.environ.get("HEAVY_SHARED_DIR", str(LIVE)))
+
+
+def is_shared(folder):
+    """Whether `folder`, through any links, is the shared queue or the live one,
+    whatever HEAVY_SHARED_DIR says."""
+    return folder.resolve() in (shared().resolve(), LIVE.resolve())
+
+
 def base():
-    return Path(os.environ.get("HEAVY_DIR", "/tmp/heavy"))
+    return Path(os.environ.get("HEAVY_DIR", str(shared())))
 
 
 def note(line):

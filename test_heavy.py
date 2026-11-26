@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -27,6 +28,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 import cores
 import fifo
 import heavyjobs
+import heavyqueue
 import machinespeed
 
 
@@ -528,8 +530,13 @@ def test_a_job_that_waited_still_needs_the_quiet_window(box, background):
 def test_a_command_that_reads_the_terminal_isnt_stopped(box):
     # In its own process group, CMD needs the terminal handed over, or a read stops
     # it (SIGTTIN) while it holds the slot.
-    if not Path("/usr/bin/script").exists():
+    if shutil.which("script") is None:
         pytest.skip("needs script(1) for a terminal")
+    if os.environ.get("OWN_PIDS") and not script_feeds_its_command():
+        pytest.skip(
+            "inside own-pids here, script(1) doesn't hand its input to the command"
+            " (sudo's use_pty), so no test can read from a terminal"
+        )
     tmp_path, _, env = box
     out = tmp_path / "got"
     command = f"{SCRIPT} -- sh -c 'read line; echo \"$line\" > {out}'"
@@ -547,6 +554,24 @@ def test_a_command_that_reads_the_terminal_isnt_stopped(box):
 
     assert done.returncode == 0, done.stdout + done.stderr
     assert out.read_text() == "hello\n"
+
+
+def script_feeds_its_command():
+    """Whether script(1) hands its input to the command it runs. Inside own-pids, on a
+    machine whose sudo has `Defaults use_pty`, the command reads an empty line. A
+    probe past 30 s counts as no."""
+    try:
+        done = subprocess.run(
+            ["script", "-qec", "sh -c 'read line; echo \"got:$line\"'", "/dev/null"],
+            input="hello\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return "got:hello" in done.stdout
 
 
 def test_a_second_signal_while_stopping_still_ends_the_command(box, background):
@@ -3081,12 +3106,28 @@ def test_until_open_options_need_until_open(box):
     assert "--until-open" in done.stderr, done.stderr
 
 
-@pytest.mark.parametrize("queue", [None, "/tmp/heavy"])
+@pytest.mark.parametrize(
+    "queue", ["unset", "the shared path", "a link to it", "a shared path via a link"]
+)
 def test_in_an_own_pids_namespace_it_refuses_the_shared_queue(box, queue):
+    # HEAVY_SHARED_DIR stands in for /tmp/heavy, so a heavy that fails to refuse runs
+    # on a queue of the test's, never the live one other sessions share.
     tmp_path, _, env = box
-    env = {k: v for k, v in env.items() if k != "HEAVY_DIR"} | {"OWN_PIDS": "1"}
-    if queue:
-        env["HEAVY_DIR"] = queue
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    shared = tmp_path / "real" / "heavy"
+    env = {k: v for k, v in env.items() if k != "HEAVY_DIR"} | {
+        "OWN_PIDS": "1",
+        "HEAVY_SHARED_DIR": str(shared),
+    }
+    if queue == "the shared path":
+        env["HEAVY_DIR"] = str(shared)
+    elif queue == "a link to it":
+        env["HEAVY_DIR"] = str(tmp_path / "link" / "heavy")
+    elif queue == "a shared path via a link":
+        # As on a machine whose /tmp is a link.
+        env["HEAVY_SHARED_DIR"] = str(tmp_path / "link" / "heavy")
+        env["HEAVY_DIR"] = str(shared)
 
     done = subprocess.run(
         [str(SCRIPT), "--few-seconds", "--", "touch", "ran"],
@@ -3101,6 +3142,16 @@ def test_in_an_own_pids_namespace_it_refuses_the_shared_queue(box, queue):
     assert done.returncode == 125, done.stderr
     assert "heavy -- mutate-check" in done.stderr
     assert not (tmp_path / "ran").exists()
+    assert not shared.exists()
+
+
+def test_the_live_queue_is_shared_whatever_its_stand_in(tmp_path, monkeypatch):
+    # By import: run as a tool, a heavy that failed this would use the live queue.
+    monkeypatch.setenv("HEAVY_SHARED_DIR", str(tmp_path / "heavy"))
+
+    assert heavyqueue.is_shared(Path("/tmp/heavy"))
+    assert heavyqueue.is_shared(tmp_path / "heavy")
+    assert not heavyqueue.is_shared(tmp_path / "other")
 
 
 def test_in_an_own_pids_namespace_a_queue_of_its_own_still_works(box):

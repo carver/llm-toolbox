@@ -26,6 +26,20 @@ Exactly one per issue, as the `overnight` skill defines them: landed, draft + qu
 - End as drafts even when ready: `<sensitive areas>`
 - Other: `<stale claims to take over, anything else>`
 
+## Attribution
+
+Commit messages end with:
+
+```
+<commit attribution lines, such as Co-Authored-By and session lines>
+```
+
+PR bodies end with:
+
+```
+<PR attribution lines>
+```
+
 ## Log
 
-`log.md`: one line per issue, `#N | end state | sha or PR | rerun needed? | note`.
+`log.md`: one line per issue, `#N | end state | sha or PR | rerun needed? | note`, plus, in Workflow mode, a `ready_for_review` line before it from an implementer that stopped for review. An issue's last line holds its end state.

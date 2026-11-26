@@ -91,7 +91,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   It triages a repo's open issues, then loops through them with a fresh agent per
   issue and per review. Each issue lands, becomes a draft PR plus a question,
   gets only a question, or closes with findings, and a morning summary says
-  what the owner must do first.
+  what the owner must do first. Its prototype Workflow mode runs the queue as a
+  script, `overnight.workflow.js`, instead of the loop.
 - **todone**: run by hand (`/todone`) to do a coding to-do from the knowledge-dump
   vault. The commit message gets the to-do's Why and source, and the to-do gets
   ticked with the commit and what was learned doing it.

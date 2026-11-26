@@ -428,6 +428,25 @@ def test_review_prompt_carries_the_build_and_both_code_review_briefs(repo, tmp_p
     assert "coding/standards.md" in prompt
 
 
+def test_review_prompt_leaves_a_measurement_the_brief_owes_to_the_builder(
+    repo, tmp_path
+):
+    # A reviewer waited 11 minutes in heavy's queue for a timing the brief owed, and
+    # killed it with nothing measured.
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Parse dates.\n")
+
+    build_state(
+        repo, "review-prompt", str(brief), "--skill", str(code_review_skill(tmp_path))
+    )
+
+    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").strip())
+    prompt = (git_dir / "build-review-prompt.md").read_text()
+    assert "report it as still owed" in prompt
+
+
 @pytest.mark.parametrize(
     "text, named",
     [

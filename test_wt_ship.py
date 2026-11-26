@@ -2792,8 +2792,12 @@ def test_two_fixups_of_one_landing_commit_fold_and_land(setup):
 
 
 def test_a_landings_wait_for_its_heavy_job_goes_on_the_timings_record(
-    setup, holder, background
+    setup, holder, background, monkeypatch
 ):
+    """A waiter that heads a lane once its holder leaves starts only after its cores
+    have stayed quiet for HEAVY_QUIET_SECONDS (they read quiet here), so the landing
+    waits at least that long, with no sleep in the test."""
+    monkeypatch.setenv("HEAVY_QUIET_SECONDS", "0.5")
     _, main, wt, _ = setup
     alive, lane = hold_the_lane(holder)
     queue_asking_check(main, main.parent / "slots")
@@ -2804,7 +2808,6 @@ def test_a_landings_wait_for_its_heavy_job_goes_on_the_timings_record(
         lambda: any(p.name[:1].isdigit() for p in lane.iterdir()),
         "the landing to queue",
     )
-    time.sleep(1.5)  # fixed sleep: the landing waits behind the held lane this long
     alive.kill()
     alive.wait()
     status, _, err = finish(shipping)
@@ -2814,4 +2817,4 @@ def test_a_landings_wait_for_its_heavy_job_goes_on_the_timings_record(
     record = main / ".git" / "agent-check-timings.tsv"
     row = record.read_text().splitlines()[-1].split("\t")
     assert row[1:3] == ["run", "agent-pre-commit"]
-    assert float(row[6]) >= 1.5
+    assert float(row[6]) >= 0.5

@@ -5,7 +5,6 @@ import os
 import shutil
 import signal
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -1068,23 +1067,22 @@ def test_a_trial_fold_stopped_by_sigterm_removes_its_worktree(repo, tmp_path):
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     started = tmp_path / "rebase-started"
-    # fixed sleep: a rebase that outlasts the test, which stops it long before
-    slow = wrapped_git(tmp_path, f"touch {started}; exec sleep 60")
-    command = [str(SCRIPT), "review-prompt", str(tmp_path / "brief.md")]
-    command += ["--skill", str(code_review_skill(tmp_path))]
-    env = os.environ | slow | {"TMPDIR": str(scratch)}
-    with subprocess.Popen(
-        command, cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    ) as running:
-        deadline = time.monotonic() + 30
-        while not started.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        running.terminate()
-        _, err = running.communicate(timeout=30)
+    # The rebase stops build-state as it starts, then outlasts the test unless killed.
+    # fixed sleep: a rebase that never ends on its own, which build-state must kill
+    slow = wrapped_git(tmp_path, f"touch {started}; kill -TERM $PPID; exec sleep 60")
+
+    stopped = build_state(
+        repo,
+        "review-prompt",
+        str(tmp_path / "brief.md"),
+        "--skill",
+        str(code_review_skill(tmp_path)),
+        env=slow | {"TMPDIR": str(scratch)},
+    )
 
     assert started.exists()
-    assert running.returncode == 128 + signal.SIGTERM, err
-    assert b"Traceback" not in err
+    assert stopped.returncode == 128 + signal.SIGTERM, stopped.stderr
+    assert "Traceback" not in stopped.stderr
     assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
     assert list(scratch.iterdir()) == []
 

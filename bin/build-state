@@ -277,9 +277,54 @@ NOT_SOURCE = [
 def git(
     *args: str, check: bool = True, cwd: Path | None = None
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, check=check
-    )
+    return run(["git", *args], cwd=cwd, check=check)
+
+
+class Stops:
+    """exit_on_signals's record: whether a child is being started, and a stop signal
+    that came meanwhile, held until `run` holds the child and can kill it."""
+
+    starting = False
+    pending: int | None = None
+
+
+def run(
+    command: list[str],
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = False,
+) -> subprocess.CompletedProcess:
+    """subprocess.run with its output captured as text, which kills the child when a
+    signal stops build-state, even one that comes while the child is being started.
+    subprocess.run kills it only once Popen has returned, so a SIGTERM that lands
+    before then leaves it running."""
+    Stops.starting = True
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except BaseException:
+        Stops.starting = False
+        raise
+    with process:
+        try:
+            Stops.starting = False
+            if (signum := Stops.pending) is not None:
+                Stops.pending = None  # so the cleanup's own children still run
+                sys.exit(128 + signum)
+            out, err = process.communicate()
+        except BaseException:
+            process.kill()
+            raise
+    done = subprocess.CompletedProcess(command, process.returncode, out, err)
+    if check:
+        done.check_returncode()
+    return done
 
 
 def state_file() -> Path:
@@ -1131,7 +1176,7 @@ def autosquash(
     conflict. A trial one runs with TRIAL's settings."""
     # ":" accepts the todo list as is, and a squash! commit's combined message.
     env = os.environ | {"GIT_SEQUENCE_EDITOR": ":", "GIT_EDITOR": ":"}
-    return subprocess.run(
+    return run(
         [
             "git",
             *(TRIAL if trial else ()),
@@ -1141,9 +1186,6 @@ def autosquash(
         ],
         cwd=cwd,
         env=env,
-        capture_output=True,
-        text=True,
-        check=False,
     )
 
 
@@ -1209,16 +1251,25 @@ def fold_stop(cwd: Path | None = None) -> FoldStop | None:
 @contextmanager
 def exit_on_signals():
     """While it lasts, SIGTERM, SIGHUP and SIGINT exit with 128 + the signal, without
-    a traceback, so the `finally` blocks inside it still run."""
+    a traceback, so the `finally` blocks inside it still run, and `run` kills the
+    child it holds."""
+
+    def stop_now(signum: int, _frame) -> None:
+        if Stops.starting:
+            Stops.pending = signum
+        else:
+            sys.exit(128 + signum)
+
     stops = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
     before = {stop: signal.getsignal(stop) for stop in stops}
     for stop in stops:
-        signal.signal(stop, lambda signum, _frame: sys.exit(128 + signum))
+        signal.signal(stop, stop_now)
     try:
         yield
     finally:
         for stop, handler in before.items():
             signal.signal(stop, handler)
+        Stops.pending = None
 
 
 def trial_fold(base: str) -> list[str]:

@@ -40,7 +40,8 @@ at once, unless --no-rerun; both rows are kept. A warmup run is never rerun.
 
 Each run's output goes to DIR/NAME-ROUND.log (-ATTEMPT added for a rerun), and its
 row to DIR/results.tsv as it ends: variant, round, attempt, wall seconds (from
-heavy, so time spent in the queue doesn't count), user and sys seconds (CMD's, plus
+heavy, so time spent in the queue doesn't count; `-` when heavy gave no measure,
+and the run counts for nothing), user and sys seconds (CMD's, plus
 heavy's own, which polls once a second while it waits its turn), outside
 CPU-seconds, exit status, flagged, parts. DIR must not hold results already, so
 a stopped bench's rows are never overwritten. At the end a table sums up each
@@ -187,8 +188,8 @@ def limit(parser):
 
 def timed(command, log, cwd=None):
     """Run command as a heavy --alone job, in `cwd`: (exit, wall, user, sys, outside,
-    parts). A stop signal meanwhile goes on to heavy, which stops CMD and frees its
-    place; the run then ends with heavy's 128+N."""
+    parts), wall None when heavy wrote no report. A stop signal meanwhile goes on to
+    heavy, which stops CMD and frees its place; the run then ends with heavy's 128+N."""
     with (
         tempfile.NamedTemporaryFile("r", prefix="heavy-bench-") as report,
         tempfile.NamedTemporaryFile("r", prefix="heavy-bench-parts-") as timings,
@@ -218,14 +219,16 @@ def timed(command, log, cwd=None):
         code = 128 - code if code < 0 else code
         words = Path(report.name).read_text().split()
         written = parts(Path(timings.name))
-    wall, _, outside = (float(w) for w in words) if len(words) == 3 else (0.0, 0.0, 0.0)
+    wall, _, outside = (
+        (float(w) for w in words) if len(words) == 3 else (None, 0.0, 0.0)
+    )
     return code, wall, used.ru_utime, used.ru_stime, outside, written
 
 
 def counted(row):
     """Whether a timed run counts in the table: measured, and neither flagged nor
-    failed."""
-    return row["flagged"] == "0" and row["exit"] == "0" and float(row["wall"]) > 0
+    failed. A run heavy gave no measure for has "-" for its wall."""
+    return row["flagged"] == "0" and row["exit"] == "0" and row["wall"] != "-"
 
 
 class Bench:
@@ -259,18 +262,20 @@ class Bench:
             suffix = "" if attempt == 1 else f"-{attempt}"
             log = self.out / f"{name}-{round_}{suffix}.log"
             code, wall, user, sys_, outside, written = timed(command, log, cwd)
-            if wall == 0 and code not in STOPPED_BY:
+            if wall is None and code not in STOPPED_BY:
                 print(
                     f"heavy-bench: heavy gave no measure for {name} round {round_};"
                     " its log says why.",
                     file=sys.stderr,
                 )
-            flagged = wall > 0 and outside / wall > self.limit
+            flagged = bool(wall) and outside / wall > self.limit
             row = {
                 "variant": name,
                 "round": str(round_),
                 "attempt": str(attempt),
-                "wall": f"{wall:.2f}",
+                # heavy's 3 places: a run under 5 ms isn't 0.00, nor taken for one
+                # heavy gave no measure for.
+                "wall": "-" if wall is None else f"{wall:.3f}",
                 "user": f"{user:.2f}",
                 "sys": f"{sys_:.2f}",
                 "outside": f"{outside:.1f}",

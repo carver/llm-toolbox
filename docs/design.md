@@ -1287,6 +1287,34 @@ the mutants it left out are not retried; only a run that judged none (the suite 
 unmutated on the runner) keeps the base, and fails. Raising MUTANT_MINUTES, as a
 public repo's free minutes would allow, leaves out fewer.
 
+### The daily run gives each mutant's suite a PID namespace (2026-11-26)
+
+Six daily runs, 11-19 to 11-24, all at `bf78929`, passed the unmutated check, then
+died after 2h27m to 2h50m with "The hosted runner lost communication with the
+server" and uploaded nothing. `bf78929` added drive-agent's `kill_tmux_server`, which
+SIGKILLs a stuck tmux server and its children, found by their parent pid in /proc,
+and `test_a_kill_server_that_never_returns_still_ends_the_server_and_says_so` calls
+it for real. The mutant that negates the parent-pid check SIGKILLs every other
+process the user owns, and on a hosted runner that user runs the runner's own agent.
+In a PID namespace, with a `sleep` standing in for the agent, that mutant killed the
+`sleep` and mutate-check itself, which left the mutant in the file. The first guess,
+a mutant growing memory without bound, would have called for a ulimit, which
+wouldn't have stopped it.
+
+So mutants.yml runs each mutant's suite through a small wrapper, `own-pids`: `sudo
+unshare --pid --mount-proc --kill-child`, then `setpriv` back to the runner's user
+and groups. The drive-agent tests call `sudo`, which a user namespace would break.
+`env -i` and the `export -p` taken before sudo give the suite the environment
+mutate-check gave the wrapper, since `sudo --preserve-env` still drops
+`PYTHONDONTWRITEBYTECODE` and the other `PYTHON*` and `LD_*` variables. bash is the
+namespace's init, and reaps what is orphaned there: with `uv` as init, a zombie
+outlived `test_a_timeout_stops_the_commands_children_too`'s wait. The init ignores a
+SIGKILL sent from inside, so the killing mutant reads as caught, exit 137, and
+`--kill-child` ends the namespace when mutate-check stops a run past its timeout.
+
+mutate-check doesn't do this itself, so a local `--diff` run over such a mutant would
+kill the user's own processes, Claude Code sessions included.
+
 ## paper
 
 ### A web page's text comes through pandoc, with stand-ins for what it would lose (2026-11-13)

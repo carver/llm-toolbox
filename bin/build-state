@@ -15,7 +15,13 @@
                             changed since the refactor base. It refuses a build
                             with no review (review-prompt) recorded, no refactor
                             base after it, or a commit between the two that isn't
-                            a fixup!, squash! or amend!. It runs no
+                            a fixup!, squash! or amend!. A history rewritten since
+                            the review, as by a fold or rebase by hand, passes when
+                            HEAD's tree is the tree of the build's tip before the
+                            rewrite (the newest commit in HEAD's reflog holding the
+                            refactor base), and is refused otherwise, naming the
+                            files that differ and the `git diff TREE HEAD --stat`
+                            that shows how. It runs no
                             agent-pre-commit: wt-ship checks the tip of what it
                             lands
     build-state finish --dropped SHA...
@@ -271,9 +277,54 @@ NOT_SOURCE = [
 def git(
     *args: str, check: bool = True, cwd: Path | None = None
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, check=check
-    )
+    return run(["git", *args], cwd=cwd, check=check)
+
+
+class Stops:
+    """exit_on_signals's record: whether a child is being started, and a stop signal
+    that came meanwhile, held until `run` holds the child and can kill it."""
+
+    starting = False
+    pending: int | None = None
+
+
+def run(
+    command: list[str],
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = False,
+) -> subprocess.CompletedProcess:
+    """subprocess.run with its output captured as text, which kills the child when a
+    signal stops build-state, even one that comes while the child is being started.
+    subprocess.run kills it only once Popen has returned, so a SIGTERM that lands
+    before then leaves it running."""
+    Stops.starting = True
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except BaseException:
+        Stops.starting = False
+        raise
+    with process:
+        try:
+            Stops.starting = False
+            if (signum := Stops.pending) is not None:
+                Stops.pending = None  # so the cleanup's own children still run
+                sys.exit(128 + signum)
+            out, err = process.communicate()
+        except BaseException:
+            process.kill()
+            raise
+    done = subprocess.CompletedProcess(command, process.returncode, out, err)
+    if check:
+        done.check_returncode()
+    return done
 
 
 def state_file() -> Path:
@@ -1125,7 +1176,7 @@ def autosquash(
     conflict. A trial one runs with TRIAL's settings."""
     # ":" accepts the todo list as is, and a squash! commit's combined message.
     env = os.environ | {"GIT_SEQUENCE_EDITOR": ":", "GIT_EDITOR": ":"}
-    return subprocess.run(
+    return run(
         [
             "git",
             *(TRIAL if trial else ()),
@@ -1135,9 +1186,6 @@ def autosquash(
         ],
         cwd=cwd,
         env=env,
-        capture_output=True,
-        text=True,
-        check=False,
     )
 
 
@@ -1203,16 +1251,25 @@ def fold_stop(cwd: Path | None = None) -> FoldStop | None:
 @contextmanager
 def exit_on_signals():
     """While it lasts, SIGTERM, SIGHUP and SIGINT exit with 128 + the signal, without
-    a traceback, so the `finally` blocks inside it still run."""
+    a traceback, so the `finally` blocks inside it still run, and `run` kills the
+    child it holds."""
+
+    def stop_now(signum: int, _frame) -> None:
+        if Stops.starting:
+            Stops.pending = signum
+        else:
+            sys.exit(128 + signum)
+
     stops = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
     before = {stop: signal.getsignal(stop) for stop in stops}
     for stop in stops:
-        signal.signal(stop, lambda signum, _frame: sys.exit(128 + signum))
+        signal.signal(stop, stop_now)
     try:
         yield
     finally:
         for stop, handler in before.items():
             signal.signal(stop, handler)
+        Stops.pending = None
 
 
 def trial_fold(base: str) -> list[str]:
@@ -1407,12 +1464,12 @@ def report_tests(refactor_base: str) -> None:
         print(git("diff", "--stat", refactor_base, "HEAD", "--", *tests).stdout, end="")
 
 
-def skipped_steps(state: dict) -> list[str]:
-    """Why the build can't finish yet, when it skipped a step /build runs for each
-    commit: a review of its commits (review-prompt), then the refactor base
-    (refactor), with nothing but fixes committed between them."""
-    reviewed = current(state.get("reviewed"), state.get("reviewed_tree"))
-    refactored = current(state.get("refactor_base"), state.get("refactor_tree"))
+def skipped_steps(state: dict, tip: str = "HEAD") -> list[str]:
+    """Why the build, up to `tip`, can't finish yet, when it skipped a step /build
+    runs for each commit: a review of its commits (review-prompt), then the refactor
+    base (refactor), with nothing but fixes committed between them."""
+    reviewed = current(state.get("reviewed"), state.get("reviewed_tree"), tip)
+    refactored = current(state.get("refactor_base"), state.get("refactor_tree"), tip)
     if "reviewed" not in state:
         return [
             "No review was recorded for this build: run `build-state review-prompt",
@@ -1448,20 +1505,55 @@ def skipped_steps(state: dict) -> list[str]:
     return []
 
 
+def tip_before_rewrite(state: dict) -> str | None:
+    """The build's tip before HEAD was rewritten since the review, as by a fold or a
+    rebase by hand: the newest commit HEAD's reflog holds that has the refactor base
+    in its history (skipped_steps checks the review before it). None when none does.
+    The reflog lives in the git dir, beside the state, so it outlasts a context reset
+    as the state does; nothing of build-state's runs between the last refactor fixup
+    and a fold by hand, so the state can't record that tip."""
+    if (refactored := state.get("refactor_base")) is None:
+        return None
+    reflog = git("reflog", "show", "--format=%H", "HEAD", check=False).stdout.split()
+    return next(
+        (sha for sha in dict.fromkeys(reflog) if ancestor(refactored, sha)), None
+    )
+
+
+def rewrite_refusal(tip: str) -> list[str]:
+    """Why HEAD, rewritten since the review, isn't the reviewed build at `tip`: the
+    paths that differ. Empty when the trees are the same, compared by ID: a diff
+    obeys config such as diff.ignoreSubmodules, so it only lists the paths."""
+    if (tree := tree_of(tip)) == tree_of("HEAD"):
+        return []
+    names = git(
+        *("-c", "diff.ignoreSubmodules=none", "diff", "--no-relative"),
+        *("--ignore-submodules=none", "--name-only", "-z", tip, "HEAD"),
+    ).stdout
+    return [
+        "HEAD was rewritten since the review, and its tree isn't the reviewed",
+        f"build's tip's, {tip[:12]}: no review saw what changed in",
+        *(f"  {name}" for name in names.split("\0") if name),
+        f"Show the difference with `git diff {tree[:12]} HEAD --stat`. Put those",
+        "files back, or run `build-state review-prompt BRIEF` and the review again,",
+        "then `build-state refactor`, then finish.",
+    ]
+
+
 def tree_of(rev: str) -> str:
     return git("rev-parse", f"{rev}^{{tree}}").stdout.strip()
 
 
-def current(sha: str | None, tree: str | None) -> str | None:
-    """Recorded commit `sha` as HEAD's history now holds it: itself, or after a reword,
-    which keeps every tree, the newest commit there with its `tree`; None when neither
-    is there."""
+def current(sha: str | None, tree: str | None, tip: str = "HEAD") -> str | None:
+    """Recorded commit `sha` as `tip`'s history now holds it: itself, or after a
+    reword, which keeps every tree, the newest commit there with its `tree`; None when
+    neither is there."""
     if sha is None:
         return None
-    if ancestor(sha, "HEAD"):
+    if ancestor(sha, tip):
         return sha
     if tree is not None:
-        for line in git("log", "--format=%H %T", "HEAD").stdout.splitlines():
+        for line in git("log", "--format=%H %T", tip).stdout.splitlines():
             commit, commit_tree = line.split()
             if commit_tree == tree:
                 return commit
@@ -1487,7 +1579,16 @@ def finish(args: argparse.Namespace) -> int:
                 for sha, subject in dropped
             ]
     if state.get("checks_steps") and (skipped := skipped_steps(state)):
-        return fail(*skipped)
+        tip = tip_before_rewrite(state)
+        if tip is None or skipped_steps(state, tip):
+            return fail(*skipped)
+        if refusal := rewrite_refusal(tip):
+            return fail(*refusal)
+        print(
+            f"HEAD was rewritten since the review, as by a fold by hand, and its tree is"
+            f" the reviewed build's tip's, {tip[:12]}: the review stands.",
+            flush=True,
+        )
     targets = set(state.get("targets", []))
     others = set(state.get("others", [])) | other_worktree_branches()
     found = (

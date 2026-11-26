@@ -5,7 +5,6 @@ import os
 import shutil
 import signal
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -329,6 +328,99 @@ def test_finish_asks_for_a_new_review_when_the_reviewed_commit_was_rewritten(
     done = build_state(repo, "finish", reviewed=False)
 
     refused_keeping_the_build(repo, done, "review-prompt", "rewritten")
+
+
+def fold_by_hand(repo, base):
+    subprocess.run(
+        ["git", "rebase", "-q", "-i", "--autosquash", base],
+        cwd=repo,
+        env=os.environ | {"GIT_SEQUENCE_EDITOR": ":", "GIT_EDITOR": ":"},
+        check=True,
+        capture_output=True,
+    )
+
+
+def reviewed_then_fixed(repo, tmp_path):
+    """A build reviewed, with a spec fix after the review and a refactor fix after the
+    refactor base, as /build's steps leave it before finish. Returns the base."""
+    base = git(repo, "rev-parse", "HEAD").strip()
+    build_state(repo, "start")
+    first = commit(repo, "a.py", "First")
+    commit(repo, "b.py", "Second")
+    review(repo, tmp_path)
+    commit(repo, "a.py", "spec fix", f"--fixup={first}")
+    assert build_state(repo, "refactor").returncode == 0
+    commit(repo, "a.py", "tidy", f"--fixup={first}")
+    return base
+
+
+def test_finish_takes_a_hand_fold_that_left_the_reviewed_tree_as_it_was(repo, tmp_path):
+    base = reviewed_then_fixed(repo, tmp_path)
+    tip_tree = git(repo, "rev-parse", "HEAD^{tree}")
+    fold_by_hand(repo, base)
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    assert done.returncode == 0, done.stderr
+    assert subjects(repo, base) == ["First", "Second"]
+    assert git(repo, "rev-parse", "HEAD^{tree}") == tip_tree
+    assert "rewritten" in done.stdout
+
+
+def test_finish_refuses_a_hand_fold_that_changed_a_file_naming_it(repo, tmp_path):
+    base = reviewed_then_fixed(repo, tmp_path)
+    tip_tree = git(repo, "rev-parse", "HEAD^{tree}").strip()
+    fold_by_hand(repo, base)
+    (repo / "b.py").write_text("unreviewed\n")
+    (repo / "c.py").write_text("unreviewed\n")
+    git(repo, "add", "c.py")
+    git(repo, "commit", "-q", "-a", "--amend", "--no-edit")
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    refused_keeping_the_build(
+        repo, done, "\n  b.py\n  c.py\n", f"git diff {tip_tree[:12]} HEAD --stat"
+    )
+    assert "a.py" not in done.stderr
+
+
+def test_finish_refuses_a_hand_fold_that_moved_a_submodule_config_hides(repo, tmp_path):
+    git(repo, "config", "diff.ignoreSubmodules", "all")
+    base = reviewed_then_fixed(repo, tmp_path)
+    fold_by_hand(repo, base)
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{base},sub")
+    git(repo, "commit", "-q", "--amend", "--no-edit")
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    refused_keeping_the_build(repo, done, "\n  sub\n")
+
+
+def test_finish_refuses_a_hand_fold_of_a_build_with_a_commit_no_review_saw(
+    repo, tmp_path
+):
+    base = git(repo, "rev-parse", "HEAD").strip()
+    build_state(repo, "start")
+    first = commit(repo, "a.py", "First")
+    review(repo, tmp_path)
+    commit(repo, "c.py", "Unreviewed")
+    commit(repo, "a.py", "spec fix", f"--fixup={first}")
+    build_state(repo, "refactor")
+    fold_by_hand(repo, base)
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    refused_keeping_the_build(repo, done, "rewritten since the review")
+
+
+def test_finish_still_refuses_a_rewrite_that_added_an_unreviewed_commit(repo, tmp_path):
+    base = reviewed_then_fixed(repo, tmp_path)
+    fold_by_hand(repo, base)
+    commit(repo, "c.py", "Unreviewed")
+
+    done = build_state(repo, "finish", reviewed=False)
+
+    refused_keeping_the_build(repo, done, "c.py")
 
 
 def reviewed_three(repo, tmp_path) -> list[str]:
@@ -975,23 +1067,22 @@ def test_a_trial_fold_stopped_by_sigterm_removes_its_worktree(repo, tmp_path):
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     started = tmp_path / "rebase-started"
-    # fixed sleep: a rebase that outlasts the test, which stops it long before
-    slow = wrapped_git(tmp_path, f"touch {started}; exec sleep 60")
-    command = [str(SCRIPT), "review-prompt", str(tmp_path / "brief.md")]
-    command += ["--skill", str(code_review_skill(tmp_path))]
-    env = os.environ | slow | {"TMPDIR": str(scratch)}
-    with subprocess.Popen(
-        command, cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    ) as running:
-        deadline = time.monotonic() + 30
-        while not started.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        running.terminate()
-        _, err = running.communicate(timeout=30)
+    # The rebase stops build-state as it starts, then outlasts the test unless killed.
+    # fixed sleep: a rebase that never ends on its own, which build-state must kill
+    slow = wrapped_git(tmp_path, f"touch {started}; kill -TERM $PPID; exec sleep 60")
+
+    stopped = build_state(
+        repo,
+        "review-prompt",
+        str(tmp_path / "brief.md"),
+        "--skill",
+        str(code_review_skill(tmp_path)),
+        env=slow | {"TMPDIR": str(scratch)},
+    )
 
     assert started.exists()
-    assert running.returncode == 128 + signal.SIGTERM, err
-    assert b"Traceback" not in err
+    assert stopped.returncode == 128 + signal.SIGTERM, stopped.stderr
+    assert "Traceback" not in stopped.stderr
     assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
     assert list(scratch.iterdir()) == []
 

@@ -782,7 +782,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   covers. `finish` first refuses a build whose state `start` marked
   (`checks_steps`) that recorded no review, no refactor base after it, or a
   commit between the two that isn't a fix (commits after the refactor base
-  count as the refactor's own), then leftover conflict markers;
+  count as the refactor's own), then leftover conflict markers. A history
+  rewritten since the review (a fold or rebase by hand) passes when HEAD's
+  tree is that of the build's tip before the rewrite, the newest commit in
+  HEAD's reflog that holds the refactor base, and is refused otherwise,
+  naming the files that differ and the `git diff TREE HEAD --stat` to run;
   `finish --dropped SHA...` takes the review for the commits left after the
   user dropped reviewed ones, when HEAD's commits since the base are the
   reviewed ones without them, by patch-id and in order. It

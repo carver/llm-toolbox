@@ -1641,6 +1641,21 @@ how fast it is must say what was measured, and the speed must keep being measure
 with a warning once it gets much worse (2x or more), so a promise like "tests that
 take seconds" can't turn into many-minute waits unseen.
 
+### /build leaves the full suite to the commit hook or the landing (2026-11-26)
+
+/build's step 2 said to run only the tests you touched "in a repo whose commit hook
+runs the checks". sandbox-setup's hook runs no test at an agent's commit: its
+`agent-commit-check` is `exit 0`, and wt-ship runs `agent-pre-commit`, the whole
+suite, on the tip of each landing. A reviewer reported that hook's `passed (0s)` as
+a suite that had not run. The orchestrating session took that for a gap and told
+its subagents to run the whole suite by hand, seven times over five landings, each
+of which ran it again.
+
+The rule now names the repo by what it has, an `agent-pre-commit`, and says the
+full checks run at the commit or at the landing. It also says a hook that passes
+in 0 s is the rule at work, and that a subagent's brief carries the same rule.
+Step 6 and step 2's "Done when" follow it.
+
 ### A daily run cut off at its time limit still moves the base (2026-11-10)
 
 The brief had a run cover its range only when it judged every mutant. A review found

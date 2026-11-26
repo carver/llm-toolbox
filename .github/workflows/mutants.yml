@@ -78,14 +78,41 @@ jobs:
         # nothing to mutate covers the range too; any other 3 (the suite fails
         # unmutated here, or the first 3 mutants were inconclusive) fails the job and
         # keeps the base.
+        #
+        # Each run of the suite gets a PID namespace of its own, with its own /proc
+        # (own-pids), so a mutant that kills every process it can see kills only that
+        # run's. The 11-19 to 11-24 runs died at the same head with "the hosted runner
+        # lost communication": a mutant of drive-agent's kill_tmux_server, its
+        # parent-pid check negated, SIGKILLed every process of the runner's user, the
+        # runner's own agent included (docs/design.md). The suite runs as the
+        # runner's user, for the tests that call sudo, with the environment
+        # mutate-check gave it, which sudo would trim (PYTHONDONTWRITEBYTECODE among
+        # it). bash is the namespace's init, which reaps the processes orphaned
+        # there; --kill-child ends the namespace when mutate-check stops a run.
         run: |
+          own_pids="$RUNNER_TEMP/own-pids"
+          cat > "$own_pids" <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          saved=$(mktemp)
+          export -p > "$saved"
+          status=0
+          sudo unshare --pid --mount-proc --kill-child -- \
+            setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups -- \
+            env -i bash -c '. "$1"; rm -f "$1"; shift; "$@"; exit $?' own-pids "$saved" "$@" \
+            || status=$?
+          # The suite removes it once read; this is for a sudo that never got there.
+          rm -f "$saved"
+          exit "$status"
+          EOF
+          chmod +x "$own_pids"
           mkdir -p mutants
           printf 'base %s\nhead %s\n' "$BASE" "$(git rev-parse HEAD)" > mutants/range.txt
           started=$SECONDS
           status=0
           timeout --signal=TERM "${MUTANT_MINUTES}m" bin/mutate-check --diff "$BASE" \
             --max 1000 --timeout "$MUTANT_SECONDS" -- \
-            uv run -q --no-project --with-requirements requirements-dev.txt \
+            "$own_pids" uv run -q --no-project --with-requirements requirements-dev.txt \
             pytest -q -p no:cacheprovider -x > mutants/mutate.log 2>&1 || status=$?
           minutes=$(( (SECONDS - started + 59) / 60 ))
           grep -E '^[^ ]+:[0-9]+: ' mutants/mutate.log > mutants/survived.txt || true

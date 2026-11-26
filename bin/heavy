@@ -11,6 +11,9 @@
     heavy status                          each lane's jobs and how busy its cores are
     heavy history [--since TIME] [--overlapping PID|TIME|START..END]
                                           the jobs it ran: when, for whom, how
+    heavy waits [--since TIME] [--lane normal|long] [--json]
+                                          how long jobs waited for their turn, and
+                                          how many wait now
 
 Every session on this VM shares two lanes, each running one job at a time at full
 priority, first come first served. A long job runs on the last quarter of the cores;
@@ -103,6 +106,19 @@ started in the last hour, or since TIME; --overlapping, the jobs that ran beside
 latest job, at TIME, or between START and END. A TIME is ISO (2026-11-24T23:16),
 HH:MM[:SS] (the latest such moment), or an age (90s, 30m, 2h, 1d).
 
+`heavy waits` prints one line: the p50, p90 and longest wait for a turn (from joining
+the queue to starting, by the record) of the jobs that started in the last 30 minutes,
+or since TIME, every session's, in both lanes or the one --lane names; then how many
+jobs wait in the queue now and how long the oldest has waited. A --few-seconds job
+that ran beside a slot, outside the queue, waited for no turn: those are left out and
+counted, since they outnumber the rest and would pull the figures down. Each job still
+waiting counts in p90 and max at its wait so far, a lower bound, so a jam shows before
+any job starts; p50 counts only the jobs that started. --json prints one object
+instead, with seconds as numbers: `since` (epoch), `lane` (null for both),
+`started`, `outside_left_out`, `p50`, `p90`, `max` (each null with nothing to count),
+`waiting`, `waiting_by_lane` (`normal` and `long`, whatever --lane says) and
+`oldest_waiting` (null with none waiting).
+
 A command that fails while /proc/vmstat's oom_kill count rises hears on stderr that the
 out-of-memory killer may have taken one of its processes, and to run it again if the
 failure looks odd.
@@ -157,6 +173,7 @@ by signal N.
 
 import argparse
 import ctypes
+import json
 import os
 import shlex
 import signal
@@ -306,6 +323,32 @@ def history(argv):
     return 0
 
 
+def waits(argv):
+    """`heavy waits [--since TIME] [--lane normal|long] [--json]`."""
+    reader = argparse.ArgumentParser(
+        prog="heavy waits",
+        description="How long jobs waited for their turn: see heavy -h.",
+    )
+    reader.add_argument(
+        "--since", default="30m", help="jobs that started since TIME (default 30m)"
+    )
+    reader.add_argument(
+        "--lane",
+        choices=heavyqueue.LANES,
+        help="only that lane's jobs and waiters (default both)",
+    )
+    reader.add_argument("--json", action="store_true", help="one JSON object")
+    args = reader.parse_args(argv)
+    try:
+        since = heavyjobs.moment(args.since)
+    except ValueError as error:
+        reader.error(f"can't read that time: {error}")
+    waiters = heavyqueue.waiting_since()
+    found = heavyjobs.waits(heavyqueue.base(), since, waiters, args.lane)
+    print(json.dumps(found) if args.json else heavyjobs.waits_line(found))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -339,7 +382,7 @@ def main(argv=None):
     parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
-        help="status, history [OPTIONS], or -- CMD [ARGS...]",
+        help="status, history [OPTIONS], waits [OPTIONS], or -- CMD [ARGS...]",
     )
     args = parser.parse_args(argv)
     if args.quick:
@@ -351,8 +394,10 @@ def main(argv=None):
         return 0
     if args.command[:1] == ["history"]:
         return history(args.command[1:])
+    if args.command[:1] == ["waits"]:
+        return waits(args.command[1:])
     if args.command[:1] != ["--"] or len(args.command) < 2:
-        parser.error("expected `status`, `history` or `-- CMD [ARGS...]`")
+        parser.error("expected `status`, `history`, `waits` or `-- CMD [ARGS...]`")
     for sig in STOPS:
         signal.signal(sig, on_signal)
     try:

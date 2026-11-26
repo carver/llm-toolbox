@@ -2506,6 +2506,210 @@ def test_overlapping_a_pid_finds_the_job_by_its_commands_pid_too(box):
     assert shown.startswith(f"heavy: 0 jobs overlapped pid {cmd_pid}'s"), shown
 
 
+# `heavy waits`: how long jobs waited for their turn, and who waits now.
+
+
+def write_waits(tmp_path, recorded, now):
+    """A record of jobs, each (seconds before now it started, seconds it waited) and
+    optionally a dict of fields to set, such as its lane or how it got in (by default
+    the normal lane's slot), from several sessions, each job's end recorded."""
+    lines = []
+    for number, (ago, waited, *fields) in enumerate(recorded):
+        start = now - ago
+        lines.append(
+            {"v": 1, "id": f"{number}", "at_start": start, "joined": start - waited}
+            | {"pid": 999999, "session": f"s-{number % 3}", "cmd": "make"}
+            | {"lane": "normal", "how": "slot"}
+            | (fields[0] if fields else {})
+        )
+        lines.append({"v": 1, "id": f"{number}", "at_end": start + 1, "exit": 0})
+    folder = tmp_path / "heavy"
+    folder.mkdir(exist_ok=True)
+    text = "".join(json.dumps(line) + "\n" for line in lines)
+    (folder / "jobs.jsonl").write_text(text)
+
+
+def add_waiter(tmp_path, lane_name, waited, pid=None):
+    """A queue entry in lane_name for a live process (this test's, by default) that
+    joined `waited` seconds ago."""
+    pid = os.getpid() if pid is None else pid
+    since = (datetime.now().astimezone() - timedelta(seconds=waited)).isoformat(
+        timespec="seconds"
+    )
+    folder = lane(tmp_path, lane_name)
+    folder.mkdir(parents=True, exist_ok=True)
+    name = f"{time.time_ns() - int(waited * 1e9):020d}-{pid}"
+    (folder / name).write_text(
+        f"s-waiting {since} host={socket.gethostname()} pid={pid}"
+        f" start={fifo.started(str(pid))}\ncwd=/w\ncmd=make\n"
+    )
+
+
+def waits(env, *args):
+    done = heavy(env, "waits", *args)
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+# Waits of ten jobs in the last half hour, 1 to 10 minutes, shuffled: nearest rank
+# puts p50 at the 5th smallest and p90 at the 9th.
+TEN_WAITS = [(60 * n, 60 * w) for n, w in enumerate([3, 9, 1, 10, 5, 2, 8, 4, 7, 6], 1)]
+
+
+def test_waits_gives_the_percentiles_of_the_windows_jobs_and_who_waits_now(box):
+    tmp_path, _, env = box
+    now = time.time()
+    write_waits(tmp_path, [*TEN_WAITS, (3 * 3600, 3600)], now)
+    add_waiter(tmp_path, "normal", 125)
+    add_waiter(tmp_path, "long", 250)
+
+    found = json.loads(waits(env, "--json"))
+
+    assert found["started"] == 10, found
+    # The two waiters, at 2m05s and 4m10s, count in p90 and max, not in p50: 12
+    # waits, so p90 is the 11th smallest.
+    spread = (found["p50"], found["p90"], found["max"])
+    assert spread == pytest.approx((300, 540, 600)), found
+    assert found["waiting"] == 2, found
+    assert found["waiting_by_lane"] == {"normal": 1, "long": 1}, found
+    assert 249 <= found["oldest_waiting"] <= 260, found
+    assert abs(found["since"] - (now - 1800)) < 30, found
+
+
+def test_waits_says_it_all_in_one_line(box):
+    tmp_path, _, env = box
+    write_waits(tmp_path, TEN_WAITS, time.time())
+    add_waiter(tmp_path, "normal", 125)
+
+    shown = waits(env)
+
+    assert len(shown.splitlines()) == 1, shown
+    assert "10 jobs started" in shown, shown
+    assert "p50 5m00s, p90 9m00s, max 10m00s" in shown, shown
+    assert "1 waiting now, the oldest for 2m" in shown, shown
+
+
+def test_waits_since_sets_the_window(box):
+    tmp_path, _, env = box
+    write_waits(tmp_path, TEN_WAITS, time.time())
+
+    found = json.loads(waits(env, "--since", "270s", "--json"))
+
+    assert found["started"] == 4, found  # started 1, 2, 3 and 4 minutes ago
+    assert found["max"] == pytest.approx(600), found
+
+
+def test_waits_with_no_job_and_no_waiter_says_so(box):
+    _, _, env = box
+
+    shown = waits(env)
+    found = json.loads(waits(env, "--json"))
+
+    assert "0 jobs started" in shown and "0 waiting now" in shown, shown
+    assert found["started"] == 0 and found["waiting"] == 0, found
+    assert None is found["p50"] is found["p90"] is found["max"], found
+    assert found["oldest_waiting"] is None, found
+
+
+def test_waits_leaves_out_waiters_that_ended_and_jobs_with_no_join_time(box):
+    tmp_path, _, env = box
+    now = time.time()
+    write_waits(tmp_path, [(60, 30)], now)
+    with (tmp_path / "heavy" / "jobs.jsonl").open("a") as out:
+        out.write(json.dumps({"v": 1, "id": "x", "at_start": now - 10}) + "\n")
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    add_waiter(tmp_path, "normal", 600, pid=gone.pid)
+
+    found = json.loads(waits(env, "--json"))
+
+    assert found["started"] == 1 and found["max"] == pytest.approx(30), found
+    assert found["waiting"] == 0, found
+
+
+def test_a_waiter_whose_join_time_cant_be_read_counts_but_has_no_age(box):
+    tmp_path, _, env = box
+    add_waiter(tmp_path, "normal", 60)
+    (entry,) = lane(tmp_path).iterdir()
+    first, rest = entry.read_text().split("\n", 1)
+    words = first.split()
+    entry.write_text(" ".join([words[0], "not-a-time", *words[2:]]) + "\n" + rest)
+
+    found = json.loads(waits(env, "--json"))
+
+    assert found["waiting"] == 1, found
+    assert found["oldest_waiting"] is None, found
+
+
+def test_few_seconds_jobs_run_beside_a_slot_are_left_out_and_counted(box):
+    tmp_path, _, env = box
+    beside = {"how": "outside"}
+    write_waits(tmp_path, [*TEN_WAITS, *[(30, 0, beside)] * 20], time.time())
+
+    found = json.loads(waits(env, "--json"))
+
+    assert found["started"] == 10, found
+    assert found["outside_left_out"] == 20, found
+    assert found["p90"] == pytest.approx(540), found
+
+
+def test_a_job_still_waiting_counts_in_p90_and_max_before_any_job_starts(box):
+    tmp_path, _, env = box
+    add_waiter(tmp_path, "normal", 400)
+
+    found = json.loads(waits(env, "--json"))
+    shown = waits(env)
+
+    assert found["started"] == 0 and found["p50"] is None, found
+    assert 399 <= found["p90"] <= 410, found
+    assert found["max"] == found["p90"], found
+    assert "p90 6m" in shown and "max 6m" in shown, shown
+    assert "1 waiting now" in shown, shown
+
+
+def test_a_long_wait_still_under_way_raises_p90_and_max(box):
+    tmp_path, _, env = box
+    write_waits(tmp_path, TEN_WAITS, time.time())
+    add_waiter(tmp_path, "normal", 3600)
+
+    found = json.loads(waits(env, "--json"))
+
+    assert found["p50"] == pytest.approx(300), found
+    assert found["p90"] == pytest.approx(600), found  # 11 waits: the 10th smallest
+    assert 3599 <= found["max"] <= 3610, found
+
+
+def test_lane_counts_only_that_lanes_jobs_and_waiters(box):
+    tmp_path, _, env = box
+    long_lane = {"lane": "long"}
+    write_waits(tmp_path, [*TEN_WAITS, (60, 1800, long_lane)], time.time())
+    add_waiter(tmp_path, "long", 2400)
+    add_waiter(tmp_path, "normal", 125)
+
+    normal = json.loads(waits(env, "--lane", "normal", "--json"))
+    long = json.loads(waits(env, "--lane", "long", "--json"))
+    shown = waits(env, "--lane", "normal")
+
+    assert normal["lane"] == "normal" and normal["started"] == 10, normal
+    assert normal["max"] == pytest.approx(600), normal
+    assert normal["waiting"] == 1, normal
+    assert normal["waiting_by_lane"] == {"normal": 1, "long": 1}, normal
+    assert long["started"] == 1 and long["waiting"] == 1, long
+    assert 2399 <= long["max"] <= 2410, long
+    assert "normal lane" in shown, shown
+
+
+def test_lane_must_be_normal_or_long(box):
+    _, _, env = box
+    assert heavy(env, "waits", "--lane", "fast").returncode == 2
+
+
+def test_waits_given_a_window_it_cant_read_is_a_usage_error(box):
+    _, _, env = box
+    done = heavy(env, "waits", "--since", "soon")
+    assert done.returncode == 2, done.stderr
+
+
 def test_history_reads_a_record_whose_fields_have_the_wrong_shape(box):
     tmp_path, _, env = box
     write_jobs(tmp_path, [("odd", time.time() - 60, None)])

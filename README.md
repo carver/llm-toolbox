@@ -552,7 +552,15 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   value (a bare positional token, as in `./deploy prod TOKEN`, is still kept).
   `heavy history` lists the last hour's jobs, or
   those `--since TIME`; `heavy history --overlapping PID|TIME|START..END`, the
-  jobs that ran beside a job or at a time. An `--alone` job ends with a line
+  jobs that ran beside a job or at a time. `heavy waits` prints, in one line,
+  the p50, p90 and longest wait for a turn of every session's jobs that started
+  in the last 30 minutes (or `--since TIME`), in both lanes or the one `--lane`
+  names, how many jobs wait now and the oldest one's wait. It leaves out, and
+  counts, the `--few-seconds` jobs that ran beside a slot, which waited for no
+  turn, and counts each job still waiting in p90 and max at its wait so far, so
+  a jam shows before any job starts. `--json` gives the same as one object, with
+  the waiters per lane, for a script that holds work back while the queue is
+  busy. An `--alone` job ends with a line
   giving the CPU-seconds other work used on its cores while it ran, warning
   past `$HEAVY_ALONE_OUTSIDE` (0.5)
   cores on average that the timing may be off; sccache's server's CPU counts

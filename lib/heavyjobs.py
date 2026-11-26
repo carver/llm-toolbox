@@ -26,6 +26,7 @@ line is written, so one can't be lost to the record.
 """
 
 import json
+import math
 import os
 import re
 import shlex
@@ -45,6 +46,7 @@ CHARS = 120  # of a command's words, at most
 TRIM_BYTES = 2 * 2**20
 KEEP_LINES = 2000  # about a thousand jobs, a busy day's
 PARENTS = 6  # of a job's parent processes, at most
+LANE_NAMES = ("normal", "long")  # heavyqueue.LANES, which imports this module
 STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 BARE_OPTION = re.compile(r"-[A-Za-z0-9]|--[A-Za-z0-9][A-Za-z0-9-]*")
 
@@ -416,3 +418,70 @@ def report(queue, since=None, around=None, now=None):
         f"  {describe(job, now)} (overlap {seconds(overlap)})" for job, overlap in pairs
     ]
     return "\n".join(lines)
+
+
+def nearest_rank(ordered, share):
+    """The value at `share` (0.5 for the median) of an ascending list, by nearest rank:
+    the ceil(share * n)-th smallest."""
+    return ordered[max(0, math.ceil(share * len(ordered)) - 1)]
+
+
+def waits(queue, since, waiters, lane=None, now=None):
+    """What `heavy waits` reports, for one lane or (lane None) both: the queue waits
+    (start less join) of the jobs that started since `since`, every session's, as p50,
+    p90 and max seconds, and how many wait now and the oldest's wait so far, from
+    `waiters`, each live waiter's (lane, join time or None when it can't be read).
+
+    A --few-seconds job run beside a slot (`how` outside) waited for no turn, and they
+    outnumber the jobs that did, so they're left out and counted. Each waiter's wait
+    so far counts in p90 and max, a lower bound, so a jam shows before any job starts;
+    p50 is the started jobs' alone. A value with nothing to give it is None."""
+    now = time.time() if now is None else now
+    took, outside = [], 0
+    for job in jobs(queue):
+        joined = number(job.get("joined"))
+        if job["at_start"] < since or joined is None:
+            continue
+        if lane is not None and job.get("lane") != lane:
+            continue
+        if job.get("how") == "outside":
+            outside += 1
+            continue
+        took.append(job["at_start"] - joined)
+    mine = [joined for at, joined in waiters if lane is None or at == lane]
+    ages = [now - joined for joined in mine if joined is not None]
+    took.sort()
+    upper = sorted(took + ages)
+    return {
+        "since": since,
+        "lane": lane,
+        "started": len(took),
+        "outside_left_out": outside,
+        "p50": nearest_rank(took, 0.5) if took else None,
+        "p90": nearest_rank(upper, 0.9) if upper else None,
+        "max": upper[-1] if upper else None,
+        "waiting": len(mine),
+        "waiting_by_lane": {
+            name: sum(1 for at, _ in waiters if at == name) for name in LANE_NAMES
+        },
+        "oldest_waiting": max(ages) if ages else None,
+    }
+
+
+def waits_line(found):
+    """`heavy waits`'s one line, from what waits() gives."""
+    where = "both lanes" if found["lane"] is None else f"{found['lane']} lane"
+    head = f"heavy, {where}: {plural(found['started'], 'job')} started since"
+    head += f" {clock(found['since'])}"
+    if found["outside_left_out"]:
+        head += f" ({found['outside_left_out']} --few-seconds beside a slot left out)"
+    parts = [] if found["p50"] is None else [f"p50 {seconds(found['p50'])}"]
+    if found["p90"] is not None:
+        parts += [f"p90 {seconds(found['p90'])}", f"max {seconds(found['max'])}"]
+    if parts:
+        head += ", waiting " + ", ".join(parts)
+    tail = f"{found['waiting']} waiting now"
+    if found["oldest_waiting"] is not None:
+        tail += f", the oldest for {seconds(found['oldest_waiting'])}"
+        tail += " (counted in p90 and max)"
+    return f"{head}; {tail}."

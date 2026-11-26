@@ -1063,3 +1063,17 @@ def status():
                 f" {holder.session}{usual(text)}"
             )
     return "\n".join(lines)
+
+
+def waiting_since():
+    """Each live waiter, in every lane, as (its lane, when it joined the queue in epoch
+    seconds, or None when its entry's time can't be read)."""
+    found = []
+    for lane in LANES:
+        for _, text in fifo.ahead(lane_folder(lane), None):
+            try:
+                joined = datetime.fromisoformat(Holder.parse(text).since).timestamp()
+            except ValueError:
+                joined = None
+            found.append((lane, joined))
+    return found

@@ -11,9 +11,12 @@
     heavy status                          each lane's jobs and how busy its cores are
     heavy history [--since TIME] [--overlapping PID|TIME|START..END]
                                           the jobs it ran: when, for whom, how
-    heavy waits [--since TIME] [--lane normal|long] [--json]
+    heavy waits [--since TIME] [--lane normal|long] [--min-jobs N] [--json]
                                           how long jobs waited for their turn, and
                                           how many wait now
+    heavy waits --until-open [--p90 S] [--waiting N] [--max-wait S] [--lane L]
+                                          wait for the queue to be quiet enough to
+                                          start work
 
 Every session on this VM shares two lanes, each running one job at a time at full
 priority, first come first served. A long job runs on the last quarter of the cores;
@@ -113,11 +116,25 @@ jobs wait in the queue now and how long the oldest has waited. A --few-seconds j
 that ran beside a slot, outside the queue, waited for no turn: those are left out and
 counted, since they outnumber the rest and would pull the figures down. Each job still
 waiting counts in p90 and max at its wait so far, a lower bound, so a jam shows before
-any job starts; p50 counts only the jobs that started. --json prints one object
-instead, with seconds as numbers: `since` (epoch), `lane` (null for both),
-`started`, `outside_left_out`, `p50`, `p90`, `max` (each null with nothing to count),
+any job starts; p50 counts only the jobs that started. With fewer than --min-jobs
+jobs started (default 10), it says "too few jobs for percentiles" and gives max
+alone, since with 5 jobs one wait from a throttled spell is p90 and max both. --json
+prints one object instead, with seconds as numbers: `since` (epoch), `lane` (null for
+both), `started`, `min_jobs`, `outside_left_out`, `p50`, `p90` (null with nothing or
+too few to count), `max` (null with nothing to count),
 `waiting`, `waiting_by_lane` (`normal` and `long`, whatever --lane says) and
 `oldest_waiting` (null with none waiting).
+
+`heavy waits --until-open` takes that reading every 30 seconds (HEAVY_WAITS_POLL) until
+the queue is open: p90 under --p90 seconds (default 180; no p90, with nothing or too
+few jobs to count, is under, so the waiting count alone decides) and at most --waiting
+jobs waiting (default 1). It exits 0 then, or 3 once
+--max-wait seconds have passed with the queue still held (default: no limit). It prints
+two lines, its first reading and its last, each `open: ` or `held: ` and then the line
+`heavy waits` prints, or one when the first reading is also the last (open at once, or
+--max-wait 0); --json prints the object instead, with `open` added. An agent that
+can't wait on its own clock, such as an overnight workflow's spawn gate, runs it in
+the background and waits for it to exit.
 
 A command that fails while /proc/vmstat's oom_kill count rises hears on stderr that the
 out-of-memory killer may have taken one of its processes, and to run it again if the
@@ -160,6 +177,8 @@ Environment:
                        hears its timing may be off (default 0.5)
   HEAVY_ALONE_REPORT   a file an --alone job's seconds, own and other CPU-seconds go
                        to, as one line
+  HEAVY_WAITS_POLL     seconds between `heavy waits --until-open`'s readings
+                       (default 30; the tests shorten it)
   FIFO_LOCK_SECONDS    seconds of waiting for the queue's lock before naming its
                        holder (default 5; the tests shorten it)
   HEAVY_BUSY           a file whose number stands in for how busy the cores are (tests)
@@ -173,7 +192,8 @@ Environment:
   HEAVY_SLOT           set for CMD, to the slot it holds (for a --few-seconds job run
                        outside the queue, `outside` and the line naming its heavy)
 
-Exit status: CMD's own; 2 a usage error; 125 heavy couldn't use its queue; 126 CMD
+Exit status: CMD's own; 2 a usage error; 3 `heavy waits --until-open` reached
+--max-wait with the queue still held; 125 heavy couldn't use its queue; 126 CMD
 couldn't be run (a folder, or not executable); 127 CMD wasn't found; 128+N stopped
 by signal N.
 """
@@ -330,8 +350,12 @@ def history(argv):
     return 0
 
 
+HELD = 3  # `heavy waits --until-open` reached --max-wait with the queue held
+
+
 def waits(argv):
-    """`heavy waits [--since TIME] [--lane normal|long] [--json]`."""
+    """`heavy waits [--since TIME] [--lane normal|long] [--min-jobs N] [--json]`, or
+    with --until-open, a wait for an open queue."""
     reader = argparse.ArgumentParser(
         prog="heavy waits",
         description="How long jobs waited for their turn: see heavy -h.",
@@ -344,15 +368,90 @@ def waits(argv):
         choices=heavyqueue.LANES,
         help="only that lane's jobs and waiters (default both)",
     )
+    reader.add_argument(
+        "--min-jobs",
+        type=int,
+        default=heavyjobs.MIN_JOBS,
+        help=f"give p50 and p90 only when this many jobs started"
+        f" (default {heavyjobs.MIN_JOBS})",
+    )
     reader.add_argument("--json", action="store_true", help="one JSON object")
+    reader.add_argument(
+        "--until-open",
+        action="store_true",
+        help="read every HEAVY_WAITS_POLL seconds (30) until the queue is open",
+    )
+    gate = {
+        "--p90": (float, 180.0, "open below this p90, in seconds (default 180)"),
+        "--waiting": (int, 1, "open with at most this many waiting (default 1)"),
+        "--max-wait": (float, None, "exit 3 when still held after this many seconds"),
+    }
+    for flag, (kind, _, text) in gate.items():
+        reader.add_argument(flag, type=kind, help=f"with --until-open: {text}")
     args = reader.parse_args(argv)
+    if args.min_jobs < 0:
+        reader.error("--min-jobs must be 0 or more")
+    if not args.until_open:
+        given = [
+            flag
+            for flag in gate
+            if getattr(args, flag[2:].replace("-", "_")) is not None
+        ]
+        if given:
+            reader.error(f"{', '.join(given)} goes only with --until-open")
     try:
-        since = heavyjobs.moment(args.since)
+        heavyjobs.moment(args.since)
     except ValueError as error:
         reader.error(f"can't read that time: {error}")
-    waiters = heavyqueue.waiting_since()
-    found = heavyjobs.waits(heavyqueue.base(), since, waiters, args.lane)
-    print(json.dumps(found) if args.json else heavyjobs.waits_line(found))
+
+    def reading():
+        # An age (30m) slides with each reading; a moment stays put.
+        since = heavyjobs.moment(args.since)
+        waiters = heavyqueue.waiting_since()
+        return heavyjobs.waits(
+            heavyqueue.base(), since, waiters, args.lane, min_jobs=args.min_jobs
+        )
+
+    if not args.until_open:
+        found = reading()
+        print(json.dumps(found) if args.json else heavyjobs.waits_line(found))
+        return 0
+    try:
+        poll = float(os.environ.get("HEAVY_WAITS_POLL", "30"))
+    except ValueError:
+        reader.error("HEAVY_WAITS_POLL must be a number of seconds")
+    p90 = args.p90 if args.p90 is not None else gate["--p90"][1]
+    most = args.waiting if args.waiting is not None else gate["--waiting"][1]
+    return until_open(reading, p90, most, args.max_wait, poll, args.json)
+
+
+def until_open(reading, p90, most, max_wait, poll, as_json):
+    """Take a reading every `poll` seconds until heavyjobs.is_open; print the first
+    and the last. 0 when open, HELD past `max_wait` seconds (None: no limit)."""
+
+    def show(found, is_open):
+        if as_json:
+            print(json.dumps(found | {"open": is_open}), flush=True)
+        else:
+            verdict = "open" if is_open else "held"
+            print(f"{verdict}: {heavyjobs.waits_line(found)}", flush=True)
+
+    start = time.monotonic()
+    found = reading()
+    is_open = heavyjobs.is_open(found, p90, most)
+    show(found, is_open)
+    first = True
+    while not is_open:
+        if max_wait is not None and time.monotonic() - start >= max_wait:
+            if not first:
+                show(found, is_open)
+            return HELD
+        time.sleep(poll)
+        found = reading()
+        is_open = heavyjobs.is_open(found, p90, most)
+        first = False
+    if not first:
+        show(found, is_open)
     return 0
 
 

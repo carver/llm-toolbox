@@ -25,12 +25,16 @@ wt-ship lists them for each issue a landing closes.
     issue-todo claims                 # "#41  5c618940  3h  Beta backups", one a claim
     issue-todo tick 42 "forecast measure" --note "built in 8d5068e"
     issue-todo tick 42 "Add hub" --undo
+    issue-todo tick 42 "Add hub" --dropped "moved to #50"   # "- [x] ~~Add hub~~ *dropped: moved to #50*"
     issue-todo tick 42 "Add hub" --dry-run
 
 An item is a list line with a box, `- [ ] text`, `1. [x] text` and the like, outside
 fenced code. `tick` finds the one open item (a ticked one with --undo) whose text
 contains MATCH, or equals it, in the body or any comment, ticks it, appends ` *NOTE*`,
-and writes that body or comment back, unless it changed since it was read. No match,
+and writes that body or comment back, unless it changed since it was read. With
+--dropped it ticks an item that won't be done, so no count includes it, and strikes
+its text through, with the reason after it; --undo on a dropped item clears only its
+box, as it leaves a note. No match,
 or several, writes nothing and lists the candidates. It calls `gh`, so it acts as
 gh's logged-in user, in the current directory's repo unless --repo names one.
 
@@ -39,7 +43,9 @@ gh's logged-in user, in the current directory's repo unless --repo names one.
 `--- mentions`, each other issue or pull request of the repo that it mentions as `#N`
 outside code, in order. Each line gives the state, the count of open items, the title
 and any standing claim, such as
-`#25 open, 1 open item: Agents offer to post [claimed by f0436b8b]`; one in another
+`#25 open, 1 open item: Agents offer to post [claimed by f0436b8b]`. A closed issue
+or a merged pull request shows no claim, and counts its unticked items as such,
+`#96 closed, 1 unticked item: ...`, since one there may be work lost. One in another
 repo is `OWNER/REPO#N state: title`, and a parent there just `OWNER/REPO#N`. No issue
 is listed twice. One GraphQL call fetches
 them all, and only an issue with sub-issues costs one REST call more, so a plan issue
@@ -115,17 +121,36 @@ def items(markdown: str) -> list[Item]:
     ]
 
 
-def tick(markdown: str, item: Item, note: str | None, undo: bool = False) -> str:
+def tick(
+    markdown: str,
+    item: Item,
+    note: str | None,
+    undo: bool = False,
+    dropped: str | None = None,
+) -> str:
     """`markdown` with the item's box ticked (or cleared, with `undo`) and ` *NOTE*`
-    after its text. The line keeps its ending, "\\r\\n" included."""
+    after its text. A `dropped` item is ticked with its text struck through and
+    ` *dropped: WHY*` after it. The line keeps its ending, "\\r\\n" included."""
     lines = markdown.split("\n")
     line = lines[item.line]
     cr = "\r" if line.endswith("\r") else ""
     m = BOX.match(line.removesuffix("\r"))
     assert m, f"line {item.line} holds no task-list item"
-    text = m.group(4) + (f" *{note}*" if note else "")
+    text = m.group(4)
+    if dropped is not None:
+        # GitHub closes no ~~ that follows a space.
+        text = f"~~{text.rstrip()}~~ *dropped: {dropped}*"
+    elif note:
+        text += f" *{note}*"
     lines[item.line] = f"{m.group(1)}{' ' if undo else 'x'}{m.group(3)}{text}{cr}"
     return "\n".join(lines)
+
+
+def reason(text: str) -> str:
+    """--dropped's WHY: an item struck with no reason says nothing of why."""
+    if not text.strip():
+        raise argparse.ArgumentTypeError("give a reason")
+    return text.strip()
 
 
 def short(text: str) -> str:
@@ -203,7 +228,8 @@ def mentions(markdown: str) -> list[int]:
 
 def lookup(repo: str, numbers: list[int]) -> dict[int, str] | None:
     """A line for each of `numbers` that names an issue or pull request in `repo`: its
-    state, its open items if it has any, its title, and the claims standing on it. One
+    state, its unticked items if it has any ("open" while it is open), its title, and,
+    while it is open, the claims standing on it. One
     GraphQL call fetches them all. None when the call fails; a number that names
     nothing is left out."""
     owner, name = repo.split("/", 1)
@@ -228,11 +254,13 @@ def lookup(repo: str, numbers: list[int]) -> dict[int, str] | None:
         comments = [c.get("body") or "" for c in node["comments"]["nodes"]]
         texts = [node.get("body") or ""] + comments
         n_open = sum(not item.done for text in texts for item in items(text))
-        count = f", {n_open} open item{'s' if n_open > 1 else ''}" if n_open else ""
-        lines[n] = (
-            f"#{n} {node['state'].lower()}{count}: {node['title']}"
-            f"{claimed_by(comments)}"
-        )
+        # On a closed issue an unticked item is no work in progress, maybe work lost,
+        # and a claim no longer holds anything.
+        is_open = node["state"] == "OPEN"
+        kind = "open" if is_open else "unticked"
+        count = f", {n_open} {kind} item{'s' if n_open > 1 else ''}" if n_open else ""
+        who = claimed_by(comments) if is_open else ""
+        lines[n] = f"#{n} {node['state'].lower()}{count}: {node['title']}{who}"
     return lines
 
 
@@ -523,7 +551,13 @@ def show_titles(repo: str) -> int:
 
 
 def tick_one(
-    repo: str, number: int, match: str, note: str | None, undo: bool, dry_run: bool
+    repo: str,
+    number: int,
+    match: str,
+    note: str | None,
+    undo: bool,
+    dry_run: bool,
+    dropped: str | None = None,
 ) -> int:
     _, found = parts(repo, number)
     every = [(part, item) for part in found for item in items(part.markdown)]
@@ -549,7 +583,7 @@ def tick_one(
             )
         return 1
     part, item = candidates[0]
-    new = tick(part.markdown, item, note, undo)
+    new = tick(part.markdown, item, note, undo, dropped)
     if not dry_run:
         if (json.loads(gh("api", part.path)).get("body") or "") != part.markdown:
             print(
@@ -603,7 +637,18 @@ def main(argv: list[str] | None = None) -> int:
     t = sub.add_parser("tick", parents=[common], help=what, description=what)
     t.add_argument("match", help="text the item contains (case-sensitive)")
     t.add_argument("--note", help="appended to the item, in italics")
-    t.add_argument("--undo", action="store_true", help="clear a ticked item instead")
+    t.add_argument(
+        "--undo",
+        action="store_true",
+        help="clear a ticked item instead; a dropped one keeps its strike and reason",
+    )
+    t.add_argument(
+        "--dropped",
+        metavar="WHY",
+        type=reason,
+        help="tick it as not done: strike its text through and append *dropped: WHY*;"
+        " takes neither --note nor --undo",
+    )
     t.add_argument(
         "--dry-run", action="store_true", help="print the new line, write nothing"
     )
@@ -629,6 +674,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub.add_parser("claims", parents=[where], help=what, description=what)
     args = p.parse_args(argv)
+    if args.cmd == "tick" and args.dropped is not None and (args.note or args.undo):
+        t.error("--dropped takes neither --note nor --undo")
     session = ""
     if args.cmd in ("claim", "release"):
         session = args.name or os.environ.get("CLAUDE_CODE_SESSION_ID", "")[:8]
@@ -649,7 +696,13 @@ def main(argv: list[str] | None = None) -> int:
         "release": lambda: release(repo, args.number, session),
         "claims": lambda: list_claims(repo),
         "tick": lambda: tick_one(
-            repo, args.number, args.match, args.note, args.undo, args.dry_run
+            repo,
+            args.number,
+            args.match,
+            args.note,
+            args.undo,
+            args.dry_run,
+            args.dropped,
         ),
     }
     return commands[args.cmd]()

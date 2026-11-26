@@ -2472,8 +2472,10 @@ def test_a_landing_that_closes_an_issue_lists_its_unticked_items(setup, tmp_path
         f"#46, which {closer} closes, has 2 unticked items:\n"
         "  [ ] The stamp\n"
         "  [ ] The page\n"
-        f"Tick each that this landing did, with `issue-todo tick 46 MATCH --note {closer}`,"
-        " and leave the rest.\n"
+        f"Tick each that this landing did, with `issue-todo tick 46 MATCH --note {closer}`;"
+        " drop each that won't be done, with `--dropped WHY` in place of --note;"
+        " and move each still to do to an issue that stays open, then drop it here"
+        ' with `--dropped "moved to #N"`.\n'
     ) in done.stdout
     assert "#43" not in done.stdout.split("Notice for other sessions:")[0]
     assert (tmp_path / "fakes/calls.log").read_text() == "unticked 46\nunticked 43\n"

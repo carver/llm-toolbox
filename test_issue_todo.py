@@ -777,3 +777,79 @@ def test_a_failed_sub_issue_listing_warns_and_reads_the_next_issue(
     captured = capsys.readouterr()
     assert "--- sub-issues" not in captured.out and "--- parent" in captured.out
     assert "couldn't list #7's sub-issues" in captured.err
+
+
+def test_dropping_an_item_ticks_it_strikes_its_text_and_says_why():
+    (item, *_) = tool.items(BODY)
+    lines = tool.tick(BODY, item, None, dropped="no home for it").splitlines()
+    assert lines[2] == "- [x] ~~The forecast question~~ *dropped: no home for it*"
+    assert lines[3:] == BODY.splitlines()[3:]
+
+
+def test_drop_through_the_command_writes_the_part_and_counts_no_longer(fake, capsys):
+    assert tool.main(["tick", "7", "Add hub", "--dropped", "out of scope"]) == 0
+    assert fake.patched == [
+        (
+            "repos/owner/repo/issues/comments/12",
+            (
+                "## To-dos\n\n- [ ] Replace the forecast measure\n"
+                "- [x] ~~Add hub~~ *dropped: out of scope*"
+            ),
+        )
+    ]
+    assert "- [x] ~~Add hub~~ *dropped: out of scope*" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "other", [["--note", "x"], ["--undo"], ["--undo", "--note", "x"]]
+)
+def test_drop_takes_neither_a_note_nor_undo(fake, capsys, other):
+    with pytest.raises(SystemExit) as exit:
+        tool.main(["tick", "7", "Add hub", "--dropped", "why", *other])
+    assert exit.value.code == 2
+    assert fake.patched == []
+
+
+def test_a_closed_relative_shows_no_claim_and_counts_its_unticked_items(fake, capsys):
+    fake.others[46] = {
+        "state": "CLOSED",
+        "title": "A beta stamp",
+        "body": "- [ ] left behind\n- [x] done",
+        "comments": {"nodes": [{"body": "<!-- issue-todo claim f0436b8b -->"}]},
+    }
+    fake.others[47] = {
+        "state": "MERGED",
+        "title": "A merged pull request",
+        "body": "- [ ] one\n- [ ] two",
+        "comments": {"nodes": [{"body": "<!-- issue-todo claim abc12345 -->"}]},
+    }
+    fake.issue["body"] = "See #46 and #47."
+
+    assert tool.main(["read", "7"]) == 0
+
+    assert capsys.readouterr().out.endswith(
+        "--- mentions\n"
+        "#46 closed, 1 unticked item: A beta stamp\n"
+        "#47 merged, 2 unticked items: A merged pull request\n"
+    )
+
+
+def test_a_dropped_items_trailing_space_stays_outside_the_strike():
+    # GitHub closes no ~~ that follows a space.
+    body = "- [ ] trailing \n"
+    (item,) = tool.items(body)
+    assert tool.tick(body, item, None, dropped="why") == (
+        "- [x] ~~trailing~~ *dropped: why*\n"
+    )
+
+
+def test_an_empty_reason_to_drop_is_refused(fake):
+    with pytest.raises(SystemExit) as exit:
+        tool.main(["tick", "7", "Add hub", "--dropped", " "])
+    assert exit.value.code == 2
+    assert fake.patched == []
+
+
+def test_undo_still_takes_a_note(fake):
+    assert tool.main(["tick", "7", "Starred", "--undo", "--note", "not yet"]) == 0
+    assert "* [ ] Starred and capital X *not yet*" in fake.patched[0][1]

@@ -90,7 +90,9 @@ In order, it:
    commit's message closes with one of GitHub's keywords ("Closes #46", "fixes:
    #43"), it lists the issue's task-list items still unticked, from `issue-todo
    unticked`, with the `issue-todo tick` command and the landed commit's ID to note,
-   so the session ticks what it did before the issue closes. It asks about the
+   so the session ticks what it did before the issue closes, drops what won't be
+   done (`--dropped`), and moves what's left to an open issue, dropping it there
+   once moved. It asks about the
    GitHub repo of the remote it pushed to (origin for --local), else the one gh
    picks. It only warns: a lookup that fails says so in a line, all of them share
    one deadline (WT_SHIP_UNTICKED_TIMEOUT), and no closing keyword means no lookup.
@@ -878,8 +880,9 @@ def closed_issues(old, new):
 
 def warn_unticked(old, new, remote):
     """For each issue the landing closes, its task-list items still unticked, through
-    `issue-todo unticked` on `remote`'s GitHub repo, so the session ticks what it did
-    before the issue closes with boxes open. A failed lookup says so; nothing here
+    `issue-todo unticked` on `remote`'s GitHub repo, so the session ticks what it did,
+    drops what won't be done and moves what's left, before the issue closes with boxes
+    open. A failed lookup says so; nothing here
     stops the run, and all of it shares one deadline."""
     closed = closed_issues(old, new)
     if not closed:
@@ -921,7 +924,9 @@ def warn_unticked(old, new, remote):
             print(f"  [ ] {item}")
         print(
             f"Tick each that this landing did, with `issue-todo tick {number} MATCH"
-            f" --note {sha}`, and leave the rest."
+            f" --note {sha}`; drop each that won't be done, with `--dropped WHY` in"
+            " place of --note; and move each still to do to an issue that stays open,"
+            ' then drop it here with `--dropped "moved to #N"`.'
         )
 
 

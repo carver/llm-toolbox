@@ -63,7 +63,9 @@ reads the event on stdin, checks the promises of its cwd's repo and llm-toolbox'
 prints each broken or flagged promise, and each file it can't read, as a line in hook
 JSON, for the owner (`systemMessage`) and the agent (`additionalContext`): `perf
 promise broken in REPO: NAME median 312 s over its last 5 runs, 2.6x the 120 s
-promised (SOURCE); perf-promises status`. It prints nothing when all hold.
+promised (SOURCE); perf-promises status`. While machine-speed's cron probes hold a slow
+spell open, its first line says the host CPU runs slow (machine-speed -h). It prints
+nothing when all hold and the machine isn't slow.
 
 Each repo's runs are logged in its git common dir, perf-promises/NAME.tsv, shared by
 its worktrees, a tab-separated line a run (its end in UTC, seconds, exit or sigN, load,
@@ -87,6 +89,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import machinespeed
 import perfpromises
 
 
@@ -96,7 +99,10 @@ def session_start():
         folder = json.loads(sys.stdin.read())["cwd"]
         lines = perfpromises.alarm_lines(folder)
     except Exception:  # noqa: BLE001 - a session's start must never fail on it
-        return 0
+        lines = []
+    slow = machinespeed.slow_warning()
+    if slow is not None:
+        lines.insert(0, slow)
     if lines:
         text = "\n".join(lines)
         context = {"hookEventName": "SessionStart", "additionalContext": text}

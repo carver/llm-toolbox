@@ -943,7 +943,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   line, which `install.py` sets in the sandbox when none is set: `cpu 0.9x`,
   `cpu 0.4x slow` under 0.5x, from the newest probe of the last 15 minutes whose
   speed is known, even when a newer one's isn't, `cpu ?` with none, and
-  `(mail failed)` while a mail it owes has failed. For the tests,
+  `(mail failed)` while a mail it owes has failed. While a slow spell is open
+  and cron's newest probe of known speed is at most 20 minutes old and under
+  1/3x (3x slower), `heavy status`, `heavy waits` (on stderr) and
+  `perf-promises --session-start` lead with one line:
+  `WARNING: host CPU running 7x slower than usual (0.14x its usual speed, slow
+  since 10:15 PST): check the host for throttling (PROCHOT).` For the tests,
   `$MACHINE_SPEED_SENDER` stands in for the sender and `$MACHINE_SPEED_NOW` for
   the clock; `$PERF_PROMISES_DIR`, `$HEAVY_SPEED_PROBE`, `$HEAVY_STAT` and
   `$HEAVY_DIR` are heavy's.

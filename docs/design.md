@@ -281,7 +281,7 @@ heavy's record put that throttling at roughly 0.1 to 0.2x from about 10:20 to 12
 It was a lower clock or a power cap, not steal: steal since boot came to about 3,900 CPU-seconds, about one core-hour, where descheduling to 0.1 to 0.2x on 16 vCPUs for 2 hours would be about 25. So a timed probe is the only signal.
 The owner's decisions:
 
-- Two channels: an email, which reaches the owner away from any session, and a Claude Code status line, live at a session. No session-start message.
+- Two channels: an email, which reaches the owner away from any session, and a Claude Code status line, live at a session. No session-start message (since reversed for one line: the next entry).
 - A cron job probes every 5 minutes, beside heavy's job-end probes, through the Purelymail account the email skill uses.
 - The thresholds, split after measuring that day: an email when three probes in a row, within about 20 minutes, read under 0.25x; a recovery email when three read 0.5x or above, only after a slow email went out. The status line says `slow` under 0.5x.
 - Load buckets, not quiet probes: "How would it even measure quiet machine probes? There are often long stretches where the machine is loaded without a break". Every cron probe counts, busy or not, at its load-adjusted factor (heavy's speed probe: against probes on the same vCPU under the same load), pinned to vCPU 0 so its cells fill fast. A cell with under 20 probes gives no judgment, so a machine loaded in a way it never was before is silent for about 100 minutes.
@@ -295,6 +295,19 @@ The builder's and the brief review's choices:
 - The status line shows the newest probe of the last 15 minutes whose speed is known, any probe's, rounded down to a tenth, so `0.4x` is never shown beside a factor of 0.5 or more. It always prints one line and exits 0, since Claude Code blanks the bar on a non-zero exit or no output, and refreshes every 60 s (`refreshInterval`), since its events stop while a session is idle.
 - `install.py` adds the cron line and the status line only in the sandbox (SANDBOX_VM_ID or /etc/sandbox-secrets.sh), where the credentials and cron live, and sets the status line only when none is set.
 - Limits, said in `-h`: throttling that lasts past the speed file's 3-day window becomes the usual speed; new hardware is a new machine, silent until its cells fill; a sandbox recreate loses the crontab and settings until install.py runs again.
+
+### A slow spell is one line in `heavy status`, `heavy waits` and the session start (2026-11-26)
+
+On 2026-11-26 the host held the VM's cores at 400 MHz (PROCHOT) from about 10:11 to 12:50, about 7 to 10 times slower, and agents read `heavy status` and `heavy waits` all that time without a word of it (#25's comment).
+In the night's retrospective the owner asked for one loud line in both and in the session-start hook, with a threshold above 3x, since 3x under load is plausible on this power-bound host, or judged within the probe's load bucket.
+That reverses the entry above's "no session-start message" for this one line: the owner's later word.
+
+- The line reuses machine-speed's judgment rather than a second one: it shows while the alert state holds a slow spell open, three cron probes in a row under 0.25x (4x slower), each against probes on its vCPU under its own load, until three at 0.5x or above. So it is both above 3x and judged within the load bucket, and it says what the mail says.
+- It shows only while cron's newest probe of known speed is at most 20 minutes old (`SPELL_FRESH`, the streak's span): a crontab lost to a sandbox recreate, or a probe that keeps failing, would otherwise leave a spell open for good. Where cron isn't installed there is no line, as there is no mail.
+- It shows only while that probe reads under 1/3x (`SLOW_SHOWN`, the owner's 3x). A spell closes only after three probes at 0.5x or above, so through its recovery tail the line said `running 1x slower` or `2x slower`, which is no warning (second review, 2026-11-26).
+- The factor is that probe's, shown as `Nx slower` (1 over it, rounded) and as the factor.
+- `heavy status` prints it as its first line. `heavy waits` prints it on stderr, since its stdout is one line, or JSON, that scripts and the overnight gate read; `--until-open` the same, once. The session start puts it first among perf-promises' lines, for the owner and the agent.
+- Reading it must never fail what prints it: a missing or broken state is no line.
 
 ## pipefail-lint
 

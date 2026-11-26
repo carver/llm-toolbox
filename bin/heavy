@@ -112,6 +112,11 @@ fewer, the speed is unknown. `heavy speed` prints them. The probes go on a file 
 the perf promises' logs (lib/machinespeed.py says where and how), and a probe or file
 that fails is at most the job's one perf-promises note.
 
+While machine-speed's cron probes hold a slow spell open (3 in a row under 0.25x),
+`heavy status` and `heavy waits` lead with one line saying how many times slower than
+usual the host CPU runs and to check the host for throttling (PROCHOT); `waits`
+prints it on stderr, so its stdout stays one line, or JSON.
+
 A command's usual cores come from its last 5 runs that exited 0: the most CPU time
 any of them used per second of its run, counting CMD and the processes it waited for.
 Every worktree of a repo shares one history, in HEAVY_DIR/history.json.
@@ -449,6 +454,9 @@ def waits(argv):
         heavyjobs.moment(args.since)
     except ValueError as error:
         reader.error(f"can't read that time: {error}")
+    slow = machinespeed.slow_warning()
+    if slow is not None:
+        heavyqueue.note(slow)  # on stderr: stdout stays one line, or JSON
 
     def reading():
         # An age (30m) slides with each reading; a moment stays put.
@@ -550,7 +558,8 @@ def main(argv=None):
             if getattr(args, option.removeprefix("--")):
                 parser.error(f"--few-seconds can't go with {option}: {why}")
     if args.command == ["status"]:
-        print(heavyqueue.status())
+        slow = machinespeed.slow_warning()
+        print(heavyqueue.status() if slow is None else f"{slow}\n{heavyqueue.status()}")
         return 0
     if args.command == ["speed"]:
         print(machinespeed.table())

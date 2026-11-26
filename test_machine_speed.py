@@ -378,3 +378,139 @@ def test_help_is_the_docstring():
     assert done.returncode == 0
     assert "machine-speed probe" in done.stdout
     assert "machine-speed line" in done.stdout
+
+
+# The slow spell's warning in `heavy status`, `heavy waits` and the session start.
+
+HEAVY = ROOT / "bin" / "heavy"
+PERF_PROMISES = ROOT / "bin" / "perf-promises"
+
+
+def spell(factor, minutes_ago, slow=True):
+    """machine-speed's state as its cron leaves it: three probes 5 minutes apart, the
+    newest `minutes_ago` minutes ago at `factor`, and a slow spell open or not."""
+    newest = datetime.now(UTC) - timedelta(minutes=minutes_ago)
+    readings = [
+        {"at": (newest - timedelta(minutes=5 * n)).isoformat(), "factor": factor}
+        for n in (2, 1, 0)
+    ]
+    state = {"readings": readings, "slow": slow, "since": readings[0]["at"]}
+    path = machinespeed.alert_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state))
+
+
+def surfaces(tmp_path):
+    """What `heavy status`, `heavy waits`, `heavy waits --json` and perf-promises'
+    session start print, each as one text, stdout and stderr together."""
+    env = os.environ | {"HEAVY_DIR": str(tmp_path / "heavy")}
+
+    def run(tool, *args, stdin=""):
+        done = subprocess.run(
+            [str(tool), *args],
+            env=env,
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            cwd=tmp_path,
+        )
+        assert done.returncode == 0, done.stderr
+        return done
+
+    hook = run(PERF_PROMISES, "--session-start", stdin=json.dumps({"cwd": "/"}))
+    return {
+        "status": run(HEAVY, "status"),
+        "waits": run(HEAVY, "waits"),
+        "waits --json": run(HEAVY, "waits", "--json"),
+        "session start": hook,
+    }
+
+
+def test_a_slow_spell_is_one_loud_line_in_heavy_status_waits_and_session_start(
+    tmp_path,
+):
+    spell(0.14, 2)
+
+    shown = surfaces(tmp_path)
+
+    warning = "WARNING: host CPU running 7x slower than usual (0.14x its usual speed"
+    status = shown["status"].stdout.splitlines()
+    assert status[0].startswith(warning), status
+    assert status[0].endswith("check the host for throttling (PROCHOT)."), status
+    for name in ("waits", "waits --json"):
+        # On stderr, so that stdout stays waits' one line, or its JSON.
+        assert shown[name].stderr.startswith(warning), shown[name].stderr
+        assert warning not in shown[name].stdout, shown[name].stdout
+    json.loads(shown["waits --json"].stdout)
+    hook = json.loads(shown["session start"].stdout)
+    assert hook["systemMessage"].startswith(warning), hook
+    assert hook["hookSpecificOutput"]["additionalContext"].startswith(warning), hook
+
+
+@pytest.mark.parametrize(
+    "state",
+    [(0.14, 21, True), (0.6, 1, False), None],
+    ids=["cron stopped 21 minutes ago", "no spell open", "no state"],
+)
+def test_without_a_fresh_slow_spell_nothing_warns(tmp_path, state):
+    if state is not None:
+        spell(*state)
+
+    shown = surfaces(tmp_path)
+
+    for name, done in shown.items():
+        assert "WARNING" not in done.stdout + done.stderr, name
+    assert shown["session start"].stdout == ""
+
+
+@pytest.mark.parametrize(
+    ("factors", "warns"),
+    [
+        ([0.14, 0.2, 0.3], True),
+        ([0.14, 0.2, 0.4], False),
+        ([0.2, 0.2, None], True),
+        ([0.2, 0.45, None], False),
+    ],
+    ids=["still slow", "recovering", "newest unknown", "recovering, newest unknown"],
+)
+def test_a_spell_warns_while_its_newest_known_factor_is_under_a_third(factors, warns):
+    """A spell stays open until 3 probes at 0.5x or above, but by then the host runs
+    at most 2x slower: the line would say `1x slower` through the recovery."""
+    now = datetime.now(UTC)
+    readings = [
+        {"at": (now - timedelta(minutes=minutes)).isoformat(), "factor": factor}
+        for minutes, factor in zip((10, 5, 0), factors, strict=True)
+    ]
+    path = machinespeed.alert_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"readings": readings, "slow": True, "since": readings[0]["at"]})
+    )
+
+    assert (machinespeed.slow_warning(now) is not None) == warns
+
+
+def test_a_spell_whose_known_factors_are_stale_gives_no_warning():
+    # Cron still runs, but its probes have failed for 21 minutes.
+    now = datetime.now(UTC)
+    readings = [
+        {"at": (now - timedelta(minutes=minutes)).isoformat(), "factor": factor}
+        for minutes, factor in ((26, 0.14), (21, 0.14), (1, None))
+    ]
+    path = machinespeed.alert_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"readings": readings, "slow": True, "since": readings[0]["at"]})
+    )
+
+    assert machinespeed.slow_warning(now) is None
+
+
+@pytest.mark.parametrize("text", ["{not json", "[]", '{"slow": true}'])
+def test_a_broken_state_gives_no_warning(text):
+    path = machinespeed.alert_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    assert machinespeed.slow_warning() is None

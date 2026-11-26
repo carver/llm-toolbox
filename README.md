@@ -114,7 +114,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **bgrun**: `bgrun -o LOG -- CMD` starts CMD in the background, in its own
   session with stdin from /dev/null and its output in LOG, and prints CMD's
   own PID. `$!` after `cd DIR && nohup CMD &` is a subshell's PID, and killing
-  it leaves CMD running. `-C DIR` sets CMD's directory. `--stdin` gives CMD
+  it leaves CMD running. `-C DIR` sets CMD's directory. Folders on LOG's path
+  that don't exist yet are made (`mkdir -p`), and removed again if CMD then
+  can't start. `--stdin` gives CMD
   bgrun's own stdin instead, read to its end first, for a heredoc such as a
   commit message (`git commit -F -`); without it, bgrun warns when its stdin
   is a pipe or a non-empty file that CMD won't see. A non-empty LOG from

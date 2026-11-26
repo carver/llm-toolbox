@@ -26,7 +26,8 @@ instead, after a "=== bgrun TIME: CMD" line; --truncate replaces its contents.
 
 For a pipeline or a redirection, start a shell: bgrun -o LOG -- sh -c '...'.
 The PID is then that shell's. LOG is relative to the caller's directory, not
-to -C.
+to -C. Folders on LOG's path that don't exist yet are made, as mkdir -p does,
+and removed again when CMD then fails to start.
 
 With --wait, bgrun stays after printing the PID, waits for CMD, then prints
 "PID exited with status N after Xs" and LOG's last lines, and exits with CMD's
@@ -184,9 +185,12 @@ def start(
         moved = None if mode == APPEND else rotate(log)
     except OSError as e:
         return cant(f"can't move {str(log)!r} aside: {e.strerror}")
+    made: list[Path] = []
     try:
+        made = make_folders(log.parent)
         out = log.open("ab" if mode == APPEND else "wb")
     except OSError as e:
+        remove_folders(made)
         put_back(moved, log)
         return cant(f"can't open {str(log)!r}: {e.strerror}")
     with out:
@@ -209,12 +213,45 @@ def start(
             if mode == APPEND:
                 out.truncate(size)
             put_back(moved, log)
+            if made:
+                log.unlink()
+                remove_folders(made)
             return cant(f"can't start {command[0]!r}: {e.strerror}")
     if moved and mode == TRUNCATE:
         moved.unlink()
     elif moved:
         print(f"bgrun: moved {log} to {moved}", file=sys.stderr)
     return proc
+
+
+def make_folders(folder: Path) -> list[Path]:
+    """Make folder and its missing parents, as mkdir -p does, and return the ones
+    made, deepest first. One another process makes meanwhile counts as there, not
+    made. A failure removes the ones made before it."""
+    missing = []
+    while not os.path.lexists(folder):  # "/" and "." always exist
+        missing.append(folder)
+        folder = folder.parent
+    made: list[Path] = []
+    try:
+        for each in reversed(missing):
+            try:
+                each.mkdir()
+            except FileExistsError:
+                continue
+            made.insert(0, each)
+    except OSError:
+        remove_folders(made)
+        raise
+    return made
+
+
+def remove_folders(made: list[Path]) -> None:
+    """Undo make_folders() after a failed start: the folders it made, deepest first,
+    each only while it is empty."""
+    for folder in made:
+        with contextlib.suppress(OSError):
+            folder.rmdir()
 
 
 def cant(problem: str) -> None:

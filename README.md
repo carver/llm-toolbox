@@ -512,8 +512,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   process group,
   with SIGKILL after `$HEAVY_GRACE` seconds. `heavy status` shows each lane's
   holder, sharer, waiters, their usual cores and how busy the lane's cores
-  are. A third job in a lane, or a head stalled for `$HEAVY_STALL_SECONDS`
-  (600), gets a hint to push a topic branch and open a PR for CI's results
+  are. An `--alone` job ends with a line giving the CPU-seconds other work
+  used on its cores while it ran, warning past `$HEAVY_ALONE_OUTSIDE` (0.5)
+  cores on average that the timing may be off; sccache's server's CPU counts
+  as the job's own, and the line names it. `$HEAVY_ALONE_REPORT` names a file
+  that gets the numbers. A third job in a lane, or a head stalled for
+  `$HEAVY_STALL_SECONDS` (600), gets a hint to push a topic branch and open a PR for CI's results
   instead. A heavy inside a job (`$HEAVY_SLOT`), or inside a `--few-seconds` run
   outside the queue, runs at once. The queue and
   its history live in `$HEAVY_DIR`
@@ -521,8 +525,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   look, stops it once it lets go; a wait of `$FIFO_LOCK_SECONDS` (5) for that lock
   names the process holding it, and how to continue it when it's stopped. For
   the tests, `$HEAVY_BUSY` names a file that stands in for how busy the cores
-  are, `$HEAVY_MEMINFO` and `$HEAVY_VMSTAT` ones for `/proc/meminfo` and
-  `/proc/vmstat`, and `$HEAVY_CORES_USED` a run's measured cores. A command that fails while the out-of-memory killer ends a process
+  are, `$HEAVY_MEMINFO`, `$HEAVY_VMSTAT` and `$HEAVY_STAT` ones for
+  `/proc/meminfo`, `/proc/vmstat` and `/proc/stat`, `$HEAVY_SCCACHE_CPU` one
+  for sccache's server's CPU time, and `$HEAVY_CORES_USED` a run's measured
+  cores. A command that fails while the out-of-memory killer ends a process
   hears so, and to run it again if the failure looks odd.
 - **issue-todo**: a GitHub issue's task-list items across its body and every
   comment (`issue-todo show N`), which `gh issue view` splits between two

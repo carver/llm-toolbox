@@ -58,6 +58,15 @@ landings are fewer full checks per landing and cheaper ones, not more at once.
 The script and its raw results (hyperfine JSON, vmstat logs) are in
 `/home/carver/code/claudedev/keep/heavy-lane-exp/` on the host disk, outside git.
 
+### An --alone job reports the other work its cores did (2026-11-25)
+
+`--alone` keeps other heavy jobs off a timing's cores, but not work outside the queue: agent-commit-gate's `checks-needed` runs before it asks for a place, and an agent can run a build bare.
+In filedrawer #137's benchmark (2026-11-25), one of nine `bin/tests` runs took 179 s where the same setup's others took 102 and 114, and nothing recorded what else ran then; the owner had to point out an agent working outside heavy.
+So each `--alone` job ends with a line giving the CPU-seconds other work used on its cores, from /proc/stat less the job's own CPU time, and a warning past `HEAVY_ALONE_OUTSIDE` cores on average (0.5).
+A process CMD started and left running counts as other work, since getrusage sees only reaped children.
+sccache's server is the exception made: it runs a cargo job's compiles without being its child, so its CPU time during the job counts as the job's, and the line says how much; the server is the VM's, so another session's compiles then hide inside that figure, the lesser error for a timing of a build.
+`HEAVY_ALONE_REPORT` writes the numbers to a file, for a tool that times many runs.
+
 ### heavy's `--quick` is named `--few-seconds` (2026-11-24)
 
 Agents ran `heavy --quick` for runs of minutes: in one session, a whole test file of

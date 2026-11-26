@@ -2046,3 +2046,115 @@ def test_an_empty_entry_a_crash_left_holds_no_job_up(box):
 
     assert done.returncode == 0, done.stderr
     assert not leftover.exists()
+
+
+def proc_stat(busy_on_first):
+    """A /proc/stat whose first core of this process's has `busy_on_first` user ticks
+    and every core 1000 idle ones."""
+    cpus = sorted(os.sched_getaffinity(0))
+    lines = ["cpu  0 0 0 0 0 0 0 0"]
+    for cpu in cpus:
+        user = busy_on_first if cpu == cpus[0] else 0
+        lines.append(f"cpu{cpu} {user} 0 0 1000 0 0 0 0")
+    return "\n".join(lines) + "\n"
+
+
+@pytest.fixture
+def outside(box):
+    """An --alone run whose CMD moves HEAVY_STAT from a quiet snapshot to `after`, so
+    heavy sees that much busy time on the job's cores while it ran, none of it the
+    job's own (HEAVY_CORES_USED=0)."""
+    tmp_path, _, env = box
+    stat, after, report = (
+        tmp_path / "stat",
+        tmp_path / "stat.after",
+        tmp_path / "report",
+    )
+    sccache = tmp_path / "sccache"
+
+    def run(busy_ticks, *flags, **extra):
+        """extra may hold HEAVY_SCCACHE_AFTER, the sccache server's CPU-seconds once
+        CMD has run (0 before), HEAVY_ALONE_SLEEP, seconds CMD sleeps, and
+        HEAVY_ALONE_EXIT, its exit status: all three are read by CMD, not heavy."""
+        stat.write_text(proc_stat(0))
+        after.write_text(proc_stat(busy_ticks))
+        sccache.write_text("0\n")
+        script = (
+            'cp "$1" "$HEAVY_STAT"; echo "${HEAVY_SCCACHE_AFTER:-0}" > "$HEAVY_SCCACHE_CPU";'
+            ' sleep "${HEAVY_ALONE_SLEEP:-0}"; exit "${HEAVY_ALONE_EXIT:-0}"'
+        )
+        command = ["sh", "-c", script, "sh", str(after)]
+        return heavy(
+            env,
+            *flags,
+            "--",
+            *command,
+            HEAVY_STAT=str(stat),
+            HEAVY_SCCACHE_CPU=str(sccache),
+            **{"HEAVY_ALONE_REPORT": str(report), "HEAVY_CORES_USED": "0"} | extra,
+        )
+
+    run.report = report
+    return run
+
+
+def test_an_alone_job_says_how_much_outside_work_shared_its_cores(outside):
+    done = outside(4200, "--alone")
+    assert done.returncode == 0, done.stderr
+    assert "other work used 42.0 CPU-seconds of its cores" in done.stderr
+    assert "the timing may be off; run it again." in done.stderr
+    seconds, own, other = outside.report.read_text().split()
+    assert (float(own), float(other)) == (0.0, 42.0)
+    assert float(seconds) > 0
+
+
+def test_an_alone_job_on_quiet_cores_hears_no_warning(outside):
+    done = outside(0, "--alone")
+    assert "other work used 0.0 CPU-seconds of its cores" in done.stderr
+    assert "may be off" not in done.stderr
+
+
+def test_the_warning_waits_for_the_threshold(outside):
+    done = outside(4200, "--alone", HEAVY_ALONE_OUTSIDE="1e9")
+    assert "other work used 42.0 CPU-seconds" in done.stderr
+    assert "may be off" not in done.stderr
+
+
+def test_a_job_not_run_alone_says_nothing_of_outside_work(outside):
+    done = outside(4200)
+    assert done.returncode == 0, done.stderr
+    assert "other work used" not in done.stderr
+    assert not outside.report.exists()
+
+
+def test_a_report_file_it_cannot_write_is_named_and_the_job_still_passes(
+    outside, tmp_path
+):
+    done = outside(0, "--alone", HEAVY_ALONE_REPORT=str(tmp_path))
+    assert done.returncode == 0, done.stderr
+    assert f"can't write HEAVY_ALONE_REPORT {tmp_path}" in done.stderr
+
+
+def test_the_jobs_own_cpu_is_not_counted_as_other_work(outside):
+    # 1000 cores for a run of at least 0.2 s is 200 CPU-seconds, past the 42 busy.
+    done = outside(4200, "--alone", HEAVY_CORES_USED="1000", HEAVY_ALONE_SLEEP="0.2")
+    assert "other work used 0.0 CPU-seconds of its cores" in done.stderr
+
+
+def test_a_failed_alone_job_still_reports_and_keeps_its_exit_status(outside):
+    done = outside(4200, "--alone", HEAVY_ALONE_EXIT="3")
+    assert done.returncode == 3
+    assert "other work used 42.0 CPU-seconds" in done.stderr
+
+
+def test_the_sccache_servers_cpu_counts_as_the_jobs_own(outside):
+    done = outside(4200, "--alone", HEAVY_SCCACHE_AFTER="40")
+    assert "other work used 2.0 CPU-seconds of its cores" in done.stderr
+    assert "40.0 more went to the sccache server" in done.stderr
+
+
+def test_a_measure_it_cannot_take_is_a_note_not_a_failure(outside):
+    done = outside(4200, "--alone", HEAVY_ALONE_OUTSIDE="lots")
+    assert done.returncode == 0, done.stderr
+    assert "Traceback" not in done.stderr
+    assert "can't tell what other work" in done.stderr

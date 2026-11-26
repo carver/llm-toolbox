@@ -62,6 +62,17 @@ CARGO_BUILD_JOBS at the cores the holder leaves of that three quarters. It stays
 niced to the end, since only root can undo a nice. A job run with --alone never
 shares, and no job shares beside it: time things with it.
 
+Work outside the queue can still share an --alone job's cores once it has started, so
+when one ends, pass or fail, heavy says on stderr how many CPU-seconds other work used
+on its cores while it ran, and how many cores that is on average: their busy time in
+/proc/stat less the job's own (CMD and what it waited for; a process CMD left running
+counts as other work) and less what sccache's server used meanwhile, which the line
+names: the server runs a cargo job's compiles but isn't its child, and since every
+session shares it, another session's compiles then count as the job's. Past
+HEAVY_ALONE_OUTSIDE cores the line warns that the timing may be off. A measure that
+can't be taken is a note, and CMD's status stands. HEAVY_ALONE_REPORT names a file that gets the numbers as one line,
+`seconds own_cpu_seconds other_cpu_seconds`, for a tool that times runs.
+
 A command's usual cores come from its last 5 runs that exited 0: the most CPU time
 any of them used per second of its run, counting CMD and the processes it waited for.
 Every worktree of a repo shares one history, in HEAVY_DIR/history.json.
@@ -100,11 +111,19 @@ Environment:
   HEAVY_QUICK_MAX      seconds a --few-seconds job runs before it hears to drop the
                        flag (default 60)
   HEAVY_GRACE          seconds CMD gets to stop before SIGKILL (default 5)
+  HEAVY_ALONE_OUTSIDE  cores of other work, on average, past which an --alone job
+                       hears its timing may be off (default 0.5)
+  HEAVY_ALONE_REPORT   a file an --alone job's seconds, own and other CPU-seconds go
+                       to, as one line
   FIFO_LOCK_SECONDS    seconds of waiting for the queue's lock before naming its
                        holder (default 5; the tests shorten it)
   HEAVY_BUSY           a file whose number stands in for how busy the cores are (tests)
   HEAVY_MEMINFO        a file that stands in for /proc/meminfo (tests)
   HEAVY_VMSTAT         a file that stands in for /proc/vmstat (tests)
+  HEAVY_STAT           a file that stands in for /proc/stat, for an --alone job's
+                       other work (tests)
+  HEAVY_SCCACHE_CPU    a file whose number stands in for the CPU-seconds sccache's
+                       server has used (tests)
   HEAVY_CORES_USED     a number that stands in for the cores a run used (tests)
   HEAVY_SLOT           set for CMD, to the slot it holds (for a --few-seconds job run
                        outside the queue, `outside` and the line naming its heavy)

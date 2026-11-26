@@ -33,8 +33,10 @@ share cores.
 
 It reads HEAVY_DIR, HEAVY_QUIET_SECONDS, HEAVY_POLL (seconds per sample),
 HEAVY_SHARE_SECONDS, HEAVY_STALL_SECONDS (before the PR hint), HEAVY_QUICK_SECONDS,
-HEAVY_QUICK_BUSY, HEAVY_BUSY (the tests' stand-in for measuring), HEAVY_MEMINFO and
-HEAVY_VMSTAT (the tests' stand-ins for /proc/meminfo and /proc/vmstat), as bin/heavy's
+HEAVY_QUICK_BUSY, HEAVY_ALONE_OUTSIDE, HEAVY_ALONE_REPORT, HEAVY_BUSY (the tests'
+stand-in for measuring), HEAVY_MEMINFO, HEAVY_VMSTAT, HEAVY_STAT and
+HEAVY_SCCACHE_CPU (the tests' stand-ins for /proc/meminfo, /proc/vmstat, /proc/stat
+and sccache's CPU time), as bin/heavy's
 -h describes them; HEAVY_SLOT, which a job's environment carries so a heavy inside it
 runs at once; and RUSTC_WRAPPER, to start sccache's server before pinning.
 """
@@ -134,6 +136,95 @@ def busy_now(cpus):
     before = cores.snapshot()
     time.sleep(poll)
     return cores.busy(before, cores.snapshot(), cpus)
+
+
+ALONE_OUTSIDE = 0.5  # cores of outside work, on average, past which a timing may be off
+
+
+def busy_seconds(cpus):
+    """The CPU-seconds cpus have spent busy since boot, from /proc/stat (or the
+    HEAVY_STAT file, the tests' stand-in)."""
+    text = cores.snapshot(os.environ.get("HEAVY_STAT") or "/proc/stat")
+    found = cores.counters(text)
+    return sum(found[cpu][0] for cpu in cpus if cpu in found) / os.sysconf("SC_CLK_TCK")
+
+
+def sccache_seconds():
+    """The CPU-seconds sccache's servers and the compilers they reaped have used, from
+    /proc (or the HEAVY_SCCACHE_CPU file, the tests' stand-in)."""
+    fake = os.environ.get("HEAVY_SCCACHE_CPU")
+    if fake:
+        return float(Path(fake).read_text())
+    ticks = 0
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        with suppress(OSError):
+            text = stat.read_text()
+            name, _, rest = text.partition(" (")[2].rpartition(") ")
+            if name == "sccache":
+                # utime, stime, cutime, cstime: fields 14 to 17, 12 to 15 after ")".
+                ticks += sum(int(field) for field in rest.split()[11:15])
+    return ticks / os.sysconf("SC_CLK_TCK")
+
+
+class Outside:
+    """What other work an --alone job's cores did while it ran: their busy time minus
+    the job's own (CMD and what it waited for, so a process CMD left running counts as
+    other work) and the sccache server's, which runs a cargo job's compiles but isn't
+    its child. The server is the VM's, so another session's compiles then count as
+    the job's own. A measure that can't be taken is a note, never a failure: the job
+    has run."""
+
+    def __init__(self, cpus):
+        self.cpus = cpus
+        try:
+            self.limit = knob("HEAVY_ALONE_OUTSIDE", ALONE_OUTSIDE)
+            self.before = busy_seconds(cpus), sccache_seconds()
+        except (OSError, ValueError) as error:
+            self.before = None
+            note(
+                f"heavy: can't tell what other work shares this --alone job ({error})."
+            )
+
+    def report(self, run):
+        """Say it on stderr, with a warning past HEAVY_ALONE_OUTSIDE cores, and write
+        `seconds own other` to the HEAVY_ALONE_REPORT file when one is named."""
+        if self.before is None:
+            return
+        used, seconds = run.cores()
+        try:
+            busy, compiles = busy_seconds(self.cpus), sccache_seconds()
+        except (OSError, ValueError) as error:
+            note(
+                f"heavy: can't tell what other work shared this --alone job ({error})."
+            )
+            return
+        compiles -= self.before[1]
+        own = used * seconds
+        other = max(0.0, busy - self.before[0] - own - compiles)
+        average = other / seconds if seconds > 0 else 0.0
+        line = (
+            f"heavy: while this --alone job ran ({seconds:.1f} s), other work used"
+            f" {other:.1f} CPU-seconds of its cores, {average:.2f} cores on average."
+        )
+        if compiles > 0:
+            line += (
+                f" {compiles:.1f} more went to the sccache server, counted as the"
+                " job's, though other sessions' compiles go there too."
+            )
+        if average > self.limit:
+            line += (
+                f" That's more than {self.limit:g} cores: the timing may be off;"
+                " run it again."
+            )
+        note(line)
+        target = os.environ.get("HEAVY_ALONE_REPORT")
+        if target:
+            try:
+                Path(target).write_text(f"{seconds:.3f} {own:.3f} {other:.3f}\n")
+            except OSError as error:
+                note(
+                    f"heavy: can't write HEAVY_ALONE_REPORT {target}: {error.strerror}."
+                )
 
 
 def free_memory():
@@ -431,7 +522,10 @@ def turn(
         }
         job = Job(started.cpus, env, nice=started.nice)
         run = heavyhistory.Run()
+        outside = Outside(started.cpus) if alone else None
         yield job
+        if outside is not None:
+            outside.report(run)
         if job.status == 0:
             heavyhistory.record(base(), known_as, *run.cores())
     finally:

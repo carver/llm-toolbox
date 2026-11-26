@@ -214,7 +214,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   error, such as unused code under `-D warnings`), pytest collected nothing (not
   pytest-xdist's exit 2 for `-x` after a failure, which is a catch), a
   `cargo test` or `cargo nextest` run failed without running a test (a filter
-  nextest refused or that matched nothing), a `cargo test` passed without running
+  nextest refused or that matched nothing), a shell or wrapper such as `heavy`
+  exited 126 or 127 (the program it runs can't start: not found, not
+  executable, no shebang) with no test run, a `cargo test` passed without running
   one or pytest passed with every test skipped, or CMD ran past `--timeout` (600
   seconds by default). Stopping CMD stops its process group: SIGTERM, then
   SIGKILL after `$MUTATE_CHECK_GRACE` seconds. CMD runs with

@@ -162,6 +162,37 @@ def test_a_command_that_wont_start_is_a_usage_error_not_a_miss(repo: Path) -> No
     assert (repo / "calc.py").read_text() == CODE
 
 
+@pytest.mark.parametrize(
+    ("status", "says"),
+    [
+        (126, "heavy: can't run ./m.sh: Exec format error."),
+        (127, "sh: 1: no-such-command-xyz: not found"),
+    ],
+)
+def test_a_wrapper_that_says_its_command_cant_start_is_inconclusive_not_a_catch(
+    repo: Path, status: int, says: str
+) -> None:
+    says_then_exits = ("sh", "-c", 'echo "$1"; exit "$2"', "sh", says, str(status))
+
+    result = check(repo, BREAK, *says_then_exits)
+
+    assert result.returncode == 3, result.stdout
+    assert f"exited {status}" in result.stdout
+    assert "can't start" in result.stdout
+    assert result.stdout.splitlines()[-1].strip() == says
+    assert (repo / "calc.py").read_text() == CODE
+
+
+@pytest.mark.parametrize(
+    "ran",
+    ["test result: FAILED. 0 passed; 1 failed; 0 ignored", "1 failed in 0.12s"],
+)
+def test_a_126_after_tests_ran_is_still_a_catch(repo: Path, ran: str) -> None:
+    result = check(repo, BREAK, "sh", "-c", f"echo '{ran}'; exit 126")
+
+    assert result.returncode == 0, result.stdout
+
+
 def test_output_that_isnt_utf8_is_still_read(repo: Path) -> None:
     result = check(repo, BREAK, "sh", "-c", r"printf 'bad \377 byte\n'; exit 1")
 
@@ -1203,6 +1234,18 @@ def test_a_command_that_fails_unmutated_runs_no_mutant(project: Path) -> None:
     assert result.stdout.splitlines() == [f"{NO_MUTANT_RAN} it exited 1", "  broken"]
     assert log.read_text() == "run\n"
     assert (project / "calc.py").read_text() == LABEL
+
+
+def test_an_unmutated_run_whose_command_cant_start_says_so(project: Path) -> None:
+    (project / "calc.py").write_text(LABEL)
+
+    result = diff_check(project, "sh", "-c", "no-such-command-xyz")
+
+    assert result.returncode == 3, result.stdout + result.stderr
+    first, *rest = result.stdout.splitlines()
+    assert first.startswith(f"{NO_MUTANT_RAN} it exited 127"), first
+    assert "can't start" in first
+    assert "no-such-command-xyz" in rest[-1]
 
 
 def test_a_command_that_passes_unmutated_with_no_test_run_runs_no_mutant(

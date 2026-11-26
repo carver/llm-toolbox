@@ -41,7 +41,8 @@ and sccache's CPU time), as bin/heavy's
 runs at once; and RUSTC_WRAPPER, to start sccache's server before pinning.
 
 Every job that takes a slot or runs outside the queue goes on lib/heavyjobs.py's
-record, with its own CPU time and that of other work on its cores (Tally).
+record, with its own CPU time and that of other work on its cores (Tally), and is
+measured against its repo's perf promises (lib/perfpromises.py) as it ends.
 """
 
 import math
@@ -60,6 +61,7 @@ import cores
 import fifo
 import heavyhistory
 import heavyjobs
+import perfpromises
 from fifo import Holder
 
 LANES = ("normal", "long")
@@ -385,6 +387,9 @@ class Job:
     status: int | None = None
     oom_kills_at_start: int | None = field(default_factory=oom_kills)
     command_pid: int | None = None  # CMD's, for the record, once its caller starts it
+    # lib/perfpromises.py's note on the run, which it prints unless tell_promise is off
+    promise_note: str | None = None
+    tell_promise: bool = True
 
     def pin(self):
         """Pin this process to the job's cores, and nice it for a sharer; what it
@@ -634,6 +639,7 @@ def recorded(job, asked, how, beside=None):
             }
 
         heavyjobs.ended(base(), ident, end)
+        perfpromises.after_job(job, asked["cwd"], command, how, stopped_by, tally)
 
 
 class Snapshot(NamedTuple):

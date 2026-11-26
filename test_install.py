@@ -277,6 +277,16 @@ def test_the_session_start_hooks_register_once_each_on_every_source(settings):
                 }
             ],
         },
+        {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{install.BIN_DST / 'perf-promises'} --session-start",
+                    "timeout": 10,
+                }
+            ],
+        },
     ]
 
 

@@ -66,4 +66,4 @@ Done when every repo the session worked in has been asked, and each item it list
 
 ## 5. Pitch
 
-Make no changes yet. Present a numbered list, biggest payoff first. Each item: the finding with its evidence from the transcript, the proposed fix, and its size. Ask questions wherever you're unsure. Then stop: the user picks which ones to follow through on now.
+Make no changes yet. Present a numbered list, biggest payoff first. Each item: the finding with its evidence from the transcript, the proposed fix, and its size. A fix that adds work to every build, commit or landing states that work's running time for a whole run, measured (heavy's record, `heavy history`, or a timed run), and names each earlier decision against such a step in docs/design.md, as "/build no longer runs --diff; a daily CI run does (2026-11-10)" is for mutate-check. Reason: a pitch that sold mutants as rerunning "tests that take seconds" measured nothing and cited none of that entry, and its runs took a median 8.2 minutes. Ask questions wherever you're unsure. Then stop: the user picks which ones to follow through on now.

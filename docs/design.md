@@ -186,6 +186,34 @@ as a build.
 Measured in the first entry: the same throughput as one lane, with each job 1.5 to
 2.6 times slower.
 
+## perf-promises
+
+### A promised running time is measured on every run through heavy (2026-11-26)
+
+An /upskill pitch put `mutate-check --diff` back into every /build (030df63), saying each mutant "reruns tests that take seconds".
+Measured the next day, its runs took a median 8.2 minutes (p90 27.5), held heavy's long lane for about 63% of the VM's uptime, and made other jobs wait up to 54 minutes (mutate-check's entry, /build's --diff run is dropped again).
+The owner: "If performance is promised, it should be measured ongoing and warn if the performance gets significantly worse (2x or more?)".
+The owner's decisions:
+
+- A repo declares its promises in `perf-promises.toml` at its top. llm-toolbox's own file also covers jobs in every repo, since its tools and skills run everywhere; runs matching one are logged under llm-toolbox, which is found as the repo holding the running lib/perfpromises.py, not by a workspace path. In llm-toolbox itself the tree's own copy stands, so a worktree's new promise works there.
+- Only running time counts, from a job's start to its end, never its wait in the queue. The 030df63 runs took 317 to 3425 s against a promise of seconds, so running time alone catches that case.
+- A run of twice its promise or more gets the agent that ran it one line. A promise is broken when the median of its last 5 counted runs is twice its seconds or more, and a SessionStart hook then shows it to every new session, as `systemMessage` for the owner and `additionalContext` for the agent. One slow run gives a note, never an alarm.
+- It measures only work that runs through heavy: builds, test suites, mutate-check and commit checks. Work outside heavy is out of scope for now, and so is a commit check's first pass outside the queue (agent-commit-gate's `run_outside_first`), which makes no heavy job.
+
+The builder's and the brief review's choices, which the owner hasn't overruled:
+
+- The hook is where heavyqueue writes a job's end line (`recorded`), the one path that `heavy -- CMD`, the gate's checks and wt-ship's job all share. A job is matched on the command words heavy records, which for a gate check are its name (`agent-pre-commit`, `wt-ship's checks`), with the first word cut to its last path part. A heavy inside a job records nothing, and adds nothing here.
+- The time is the job's Tally's monotonic seconds, so a suspended machine doesn't count.
+- A run counts when its exit status is in the promise's `counts` (`[0]` by default; `[0, 1]` for mutate-check, whose 1 is a surviving mutant) or a signal stopped it, at least its elapsed time. A run that shared a lane (`--share`), or beside other work that used over half its cores (Tally's `other` over its seconds times its cores), is logged but left out, and its note says so: below half, load alone can't double a run's time, so a 2x run is the job's own.
+- Only runs of the last 14 days count, and only log lines that carry the promise's current seconds and a hash of its command, so a worktree's edited promise doesn't skew main's. Below 5 counted runs a promise isn't judged.
+- The log is per repo in its git common dir (`perf-promises/NAME.tsv`), shared by its worktrees, as check timings chose over keep/ and /tmp (Each check run reports and records its parts' timings). Lines are appended in one write; past 400 a lock is taken to cut it to 200, and a line appended during the cut can be lost, as in heavy's record.
+- Dodges: a promise over 3 times its `measured_seconds`, or one that matched jobs once but none in 7 days (its pattern likely broke), is flagged by `status` and at session start. One that never matched isn't flagged, only shown as `never matched` in `status`, since a tripwire such as the `mutate-check --diff` seed is meant never to match. /build's review prompt asks for an entry here when a diff removes a promise or raises its seconds. A promise names a whole run's time, never a per-item one: the pitch's "seconds" was per mutant.
+- The gate hides a passing check's output, and subagents read only its pass line, so a check's note goes in that line.
+- Nothing in it fails a job: a file or entry it can't read, or a failure of its own, is the job's one note.
+  A pathological `command` regex could still hang heavy while it holds a slot, since Python's `re` has no timeout; that is accepted, since promise files are written by the owner or through review.
+
+llm-toolbox's seed is a tripwire for `mutate-check --diff`, at 120 s, the whole run a /build use would need (40 mutants at about 3 s each), against the median of 861 s that heavy's record measured that day. Its own landing check, which the README says takes about half a minute and heavy's record shows at a median of 262 s over 7 runs that day, has no promise: llm-toolbox's file covers every repo's jobs, and that job's words, `wt-ship's checks`, are the same in each.
+
 ## pipefail-lint
 
 ### tree-sitter-bash, repaired where it runs lines together (2026-11-09)

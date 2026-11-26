@@ -565,7 +565,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   past `$HEAVY_ALONE_OUTSIDE` (0.5)
   cores on average that the timing may be off; sccache's server's CPU counts
   as the job's own, and the line names it. `$HEAVY_ALONE_REPORT` names a file
-  that gets the numbers. A third job in a lane, or a head stalled for
+  that gets the numbers. A job that ran twice a perf promise's time or more
+  hears so as it ends (`perf-promises`). A third job in a lane, or a head stalled for
   `$HEAVY_STALL_SECONDS` (600), gets a hint to push a topic branch and open a PR for CI's results
   instead. A heavy inside a job (`$HEAVY_SLOT`), or inside a `--few-seconds` run
   outside the queue, runs at once. The queue and
@@ -816,6 +817,23 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   a run failed, 2 usage, 3 no run in time, 4 gh kept failing, 5 a run needs
   approval. Unlike `gh pr checks --watch`, it doesn't fail when run before
   GitHub has queued the runs.
+- **perf-promises**: a repo's `perf-promises.toml` promises how long a command
+  run through `heavy` takes, as `[[promise]]` tables of `name`, `command` (a
+  regex over the job's command words, or a commit check's name), `seconds` (the
+  whole run's), `measured`, `measured_seconds` and `source`, and optionally
+  `counts`, the exit statuses that count (`[0]`). llm-toolbox's own file covers
+  jobs in every repo. heavy measures each job's running time against them as
+  it ends, without its queue wait, logs it in the repo's git common dir
+  (`perf-promises/NAME.tsv`, or under `$PERF_PROMISES_DIR`), and gives a run of
+  twice its promise or more a one-line note (in a commit check's pass line).
+  `perf-promises status [-C DIR]` lists each promise with its runs, the median
+  of its last 5 counted runs and the p90, and BROKEN at twice the promise or
+  more; runs beside other work or sharing a lane are logged but not counted. It
+  flags a promise over 3 times its `measured_seconds`, or one that matched jobs
+  once but none in 7 days; one that never matched shows only in `status`.
+  `install.py` registers `perf-promises --session-start` as a SessionStart hook,
+  which shows those lines to the owner and the agent. `$PERF_PROMISES_GLOBAL`
+  stands in for llm-toolbox's file in the tests.
 
 - **build-state**: `/build`'s bookkeeping. `start` records the base commit
   (HEAD, or `--base REV`) and the repo's fingerprint (every other ref but the

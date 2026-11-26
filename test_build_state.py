@@ -698,6 +698,24 @@ def test_review_prompt_leaves_a_measurement_the_brief_owes_to_the_builder(
     assert "report it as still owed" in prompt
 
 
+def test_review_prompt_asks_why_a_perf_promise_was_dropped_or_raised(repo, tmp_path):
+    # A promise that gets slower should be a decision someone wrote down, not a quiet
+    # edit that keeps the alarm off.
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Parse dates.\n")
+
+    build_state(
+        repo, "review-prompt", str(brief), "--skill", str(code_review_skill(tmp_path))
+    )
+
+    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").strip())
+    prompt = (git_dir / "build-review-prompt.md").read_text()
+    assert "perf-promises.toml" in prompt
+    assert "docs/design.md entry" in prompt
+
+
 @pytest.mark.parametrize(
     "text, named",
     [

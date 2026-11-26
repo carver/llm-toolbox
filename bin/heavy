@@ -130,6 +130,13 @@ is an entry whose first line isn't whole, as a crash can leave one. Stopping hea
 (SIGINT, SIGTERM, SIGHUP) stops CMD's process group, with SIGKILL after HEAVY_GRACE
 seconds, and frees its place; CMD also gets SIGTERM should heavy die.
 
+As a job ends, heavy measures its running time, without its wait in the queue,
+against the perf promises of its repo and llm-toolbox's (perf-promises -h): a run that
+took twice its promise or more hears so in one line on stderr, `heavy: NAME ran 312 s,
+2.6x its promised 120 s (REPO/perf-promises.toml): perf-promises status`, and every
+run a promise matches goes on its log. A promise file it can't read is that line
+instead; neither changes CMD's status.
+
 heavy takes the queue's lock for a moment at each look, and a Ctrl-Z that comes while
 it holds it stops heavy only once it lets go. A heavy that has waited
 FIFO_LOCK_SECONDS for the lock names the process holding it on stderr, and when that

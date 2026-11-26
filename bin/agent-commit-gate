@@ -133,7 +133,10 @@ timings to, a line each: a name of one word and its seconds (`nextest 106.2`). T
 pass line then ends with them, after the base (`passed (124s, given CHECK_BASE
 abc123; bin-tests 5s, nextest 106s)`), and says `waited Ns` when the check waited
 a second or more in heavy's queue; a failing check's timings go on a line of their
-own (`NAME: took 300s (bin-tests 5s, nextest 289s)`) before the refusal. Lines that
+own (`NAME: took 300s (bin-tests 5s, nextest 289s)`) before the refusal. A check run
+in heavy's queue that took twice a perf promise's time or more (perf-promises -h)
+gets heavy's note after its pass line's parenthesis, `; heavy: NAME ran ...`, or on
+a line before the refusal. Lines that
 aren't a name and a number are left out, at most 32 kept, names cut to 40
 characters. Every check the gate runs, passing or failing, also goes on a record in
 the repo's common git dir, agent-check-timings.tsv, a tab-separated line each, its
@@ -797,6 +800,7 @@ class Run(NamedTuple):
     timings: list[tuple[str, float]]
     outside: bool = False
     waited: float = 0.0
+    promise: str | None = None  # the heavy job's perf promise note, if any
 
     @property
     def code(self):
@@ -854,12 +858,15 @@ def report(name, base, run):
         given = f", given CHECK_BASE {base[:12]}" if base else ""
         wait = f", waited {run.waited:.0f}s" if run.waited >= 1 else ""
         parts = f"; {timings_shown(run.timings)}" if run.timings else ""
+        promise = f"; {run.promise}" if run.promise else ""
         print(
-            f"{name}: passed ({run.took:.0f}s{where}{given}{wait}{parts})",
+            f"{name}: passed ({run.took:.0f}s{where}{given}{wait}{parts}){promise}",
             file=sys.stderr,
         )
     else:
         sys.stderr.write(run.process.stdout.decode(errors="replace"))
+        if run.promise:
+            print(run.promise, file=sys.stderr)
         if run.timings:
             print(
                 f"{name}: took {run.took:.0f}s ({timings_shown(run.timings)})",
@@ -1021,6 +1028,7 @@ def run_quiet(path, name, base, queue=True):
         try:
             if queue:
                 job = stack.enter_context(heavyqueue.turn(command=name, hint=False))
+                job.tell_promise = False  # its note goes in the pass line
                 job.pin()  # the check inherits the job's cores
                 env = job.env
         except heavyqueue.QueueError as error:
@@ -1032,6 +1040,8 @@ def run_quiet(path, name, base, queue=True):
         run = run_once(path, check_env(env, base))._replace(waited=waited)
         if job is not None:
             job.exited(run.code)  # a passing check goes into heavy's history
+    if job is not None:
+        run = run._replace(promise=job.promise_note)
     return report(name, base, run)
 
 

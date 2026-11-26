@@ -1,0 +1,19 @@
+# llm-toolbox's performance promises: how long the commands its tools and skills run
+# through heavy take. This file covers jobs in every repo, since the tools run
+# everywhere; each repo's own perf-promises.toml covers its own jobs. `perf-promises
+# -h` gives the keys and how runs are judged. Removing a promise or raising its seconds
+# takes a docs/design.md entry saying why.
+
+# A tripwire: /build ran `mutate-check --diff` before each commit from 030df63, sold
+# as mutants that each "rerun tests that take seconds". A /build use needs the whole
+# run back in about the time of a commit's check: 40 mutants (its --max) at about 3 s
+# each is 120 s. It ran for many minutes instead, and was dropped (docs/design.md,
+# 2026-11-26); a reintroduction that's still that slow shows as broken after 5 runs.
+[[promise]]
+name = "mutate-check-diff"
+command = '^mutate-check --diff'
+seconds = 120
+measured = "median 861 s of the 6 runs in heavy's record on 2026-11-26 that exited 0 or 1 or were stopped by a signal (15.6, 317, 641, 1082, 1261, 3425 s); a seventh exited 143 after 412 s"
+measured_seconds = 861
+source = "030df63; docs/design.md, /build's --diff run is dropped again (2026-11-26)"
+counts = [0, 1]

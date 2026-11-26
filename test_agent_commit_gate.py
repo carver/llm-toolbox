@@ -2762,3 +2762,25 @@ def test_a_measured_wait_that_isnt_a_seconds_count_counts_for_nothing(installed,
     assert run.returncode == 0, run.stderr
     [row] = timings_record(installed)
     assert float(row[6]) < 1
+
+
+def test_a_checks_perf_promise_note_goes_in_its_pass_line(installed):
+    # Subagents read only the pass line; a note on its own line would sit apart.
+    hook(installed, "agent-pre-commit", "exit 0")
+    (installed / "perf-promises.toml").write_text(
+        "[[promise]]\n"
+        'name = "agent-check"\n'
+        "command = '^agent-pre-commit$'\n"
+        "seconds = 0.0001\n"  # no run keeps it, so no sleep is needed
+        'measured = "by hand"\n'
+        "measured_seconds = 0.0001\n"
+        'source = "test"\n'
+    )
+    run = recheck(installed)
+    assert run.returncode == 0, run.stderr
+    (line,) = [ln for ln in run.stderr.splitlines() if "promise" in ln]
+    assert line.startswith("agent-pre-commit: passed (")
+    assert re.search(
+        r"\); heavy: agent-check ran \d+(\.\d)? s, \d+\.\dx its promised", line
+    )
+    assert line.endswith(": perf-promises status")

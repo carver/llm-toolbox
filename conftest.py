@@ -155,6 +155,10 @@ def private_heavy_queue(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("HEAVY_MEMINFO", str(folder / "meminfo"))
     monkeypatch.setenv("HEAVY_QUIET_SECONDS", "0")
     monkeypatch.setenv("HEAVY_POLL", "0.01")
+    # Perf promises' logs, and llm-toolbox's own promises, which cover every repo:
+    # none, unless a test names a file of its own.
+    monkeypatch.setenv("PERF_PROMISES_DIR", str(folder / "perf-promises"))
+    monkeypatch.setenv("PERF_PROMISES_GLOBAL", str(folder / "no-global-promises.toml"))
     for name in ("HEAVY_SLOT", "HEAVY_CORES_USED", "RUSTC_WRAPPER"):
         monkeypatch.delenv(name, raising=False)
 

@@ -1717,7 +1717,9 @@ case no test reaches from the code. {test_command}`--few-seconds` is for runs of
 run a whole file, a property test or anything longer than a minute as \
 `bgrun -o LOG -- heavy -- CMD`, then `waitone --pid PID -t 170` until it exits. A \
 measurement the brief owes, such as a timing, a benchmark or a size, is the builder's \
-to take: report it as still owed, and start no run for it.
+to take: report it as still owed, and start no run for it. A diff to a \
+perf-promises.toml that removes a promise or raises its seconds needs a docs/design.md \
+entry saying why: report one that comes without it.
 {checked_at_landing}
 Run two separate reviews and report them under the headings `## Standards` and `## Spec`. \
 Don't merge or rerank findings across the two.

@@ -113,6 +113,9 @@ HOOKS = [
     # A line per workflow failing on the default branch on GitHub; its own deadline
     # (CI_STATUS_TIMEOUT, 5 s) comes well before this one.
     ("SessionStart", "*", "ci-status --session-start", {"timeout": 10}),
+    # A line per broken or flagged perf promise of the session's repo and
+    # llm-toolbox's; it reads only local files and runs two git calls.
+    ("SessionStart", "*", "perf-promises --session-start", {"timeout": 10}),
     # Records each skill loaded (by the Skill tool or a slash command), then notes the
     # ones changed on disk since, before the agent's next Bash or Agent call.
     ("PostToolUse", "Skill", "skill-change-hint", {"timeout": 10}),

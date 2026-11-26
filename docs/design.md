@@ -570,6 +570,31 @@ as before: a conflict is for fixing before landing, not a reason to hold the rev
   one core). A bigger checkout costs more, as the worktree checks out every file. A
   build with no fix commits skips it.
 
+### build-state finish takes a hand fold that left the reviewed tree as it was (#11, 2026-11-26)
+
+After a review in a build on 2026-11-23, the session folded its fixups by hand,
+resolving conflicts, and left the tree byte for byte the reviewed one plus the fixes
+the review asked for. finish refused, since the reviewed commit and its tree were
+gone from HEAD's history, and the session went on with `start --force`, which drops
+the record of the review. Now, when the step checks fail, finish looks for the
+build's tip before the rewrite: the newest commit in HEAD's reflog that holds the
+refactor base. When that tip passes the step checks and its tree is HEAD's, the
+review stands, and finish says so; when the trees differ, it refuses, naming the
+files and the `git diff TREE HEAD --stat` that shows the change.
+
+- The reflog, not a tree recorded in the state (the issue left the choice): both
+  live in the git dir and outlast a context reset. No build-state command runs
+  between the refactor's last fixup and a fold by hand, so the state would need a
+  commit hook to record each tip, and that hook runs only where it is installed and
+  enabled for agents; the reflog also sees a commit made from the host. With
+  `core.logAllRefUpdates` off there is no reflog, and finish refuses as before.
+- What else reads the reviewed commit doesn't need it in HEAD's history: the fold
+  (`fold_base`, the autosquash, `foldable` and `Fold-check: keep`) reads only the
+  base, HEAD and the branch it lands on, and the test-file report diffs the refactor
+  base's tree. `--dropped` matches HEAD's commits to the review's by patch-id, which
+  a fold by hand changes, so a drop and a hand fold together still need a new
+  review.
+
 ### wt-ship --remove keeps a worktree that processes still run in (2026-11-25)
 
 In a filedrawer session the agent stopped `bin/live-preview`, which it had started in

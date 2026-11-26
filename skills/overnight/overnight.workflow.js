@@ -16,7 +16,8 @@ export const meta = {
 //   run_folder: '<keep/<project>/overnight-<date>>',  // protocol.md, implementer.md, reviewer.md, log.md
 //   repo: '<main tree path>',
 //   items: [{issue: 41, end_state_hint: 'landed' | 'draft' | 'question' | 'findings',
-//            triage_note: '<the triage line>', files: ['path', ...]}, ...],   // in queue.md's order
+//            triage_note: '<the triage line>', files: ['path', ...],
+//            goes_live: '<link from the main tree | install.py rerun and restart | push>'}, ...],   // in queue.md's order
 //   max_in_flight: 3,      // optional, 1 to 4, default 3
 // }
 const RUN = args.run_folder
@@ -58,7 +59,7 @@ const IMPLEMENTED = {
     probe: { type: 'string', description: 'what the reviewer should probe' },
     sha: { type: 'string', description: 'landed sha, or empty' },
     pr: { type: 'string', description: 'draft PR URL, or empty' },
-    rerun: { type: 'string', description: 'any server rerun or other step the owner must take, or empty' },
+    rerun: { type: 'string', description: 'any server rerun, timing (its exact command) or other step the owner must take, or empty' },
     note: { type: 'string', description: 'anything surprising, in at most 3 lines; for gave_up, where you stopped' },
   },
   required: ['status', 'intended_end_state', 'worktree', 'base', 'review_prompt', 'built', 'chose', 'probe', 'sha', 'pr', 'rerun', 'note'],
@@ -84,12 +85,13 @@ const REVIEWED = {
     deletes_data: { type: 'boolean', description: 'the change deletes or moves stored data' },
     contradicts_issue: { type: 'boolean', description: "the change contradicts the issue's text" },
     sensitive_area: { type: 'boolean', description: 'it touches an area protocol.md says ends as a draft' },
+    shared_tool: { type: 'boolean', description: 'the diff changes a commit or git gate, a hook, or a tool every session runs from PATH' },
     recommend: { type: 'string', enum: ['land', 'draft_question'] },
     sound: { type: 'string', description: 'what you checked and found sound, briefly' },
     gave_up: { type: 'boolean', description: 'true when you stopped at the deadline' },
     stopped_at: { type: 'string', description: 'for gave_up, where you stopped' },
   },
-  required: ['findings', 'changes_promise', 'deletes_data', 'contradicts_issue', 'sensitive_area', 'recommend', 'sound', 'gave_up'],
+  required: ['findings', 'changes_promise', 'deletes_data', 'contradicts_issue', 'sensitive_area', 'shared_tool', 'recommend', 'sound', 'gave_up'],
 }
 
 const END_STATES = ['landed', 'draft_question', 'question', 'findings', 'found_existing', 'gave_up', 'claim_refused']
@@ -104,6 +106,16 @@ const OUTCOME = {
     note: { type: 'string', description: 'at most 3 lines; for gave_up, where you stopped' },
   },
   required: ['issue', 'end_state', 'sha', 'pr', 'rerun', 'note'],
+}
+// A fixer told to stop for a second review returns ready_for_review with these.
+const FIXED = {
+  type: 'object',
+  properties: {
+    ...OUTCOME.properties,
+    end_state: { type: 'string', enum: ['ready_for_review', ...END_STATES] },
+    fix_base: { type: 'string', description: 'for ready_for_review, the head sha before your fixups; else empty' },
+  },
+  required: [...OUTCOME.required, 'fix_base'],
 }
 const OUTCOMES = {
   type: 'object',
@@ -267,6 +279,7 @@ function implementPrompt(item, avoid) {
 Triage note: ${item.triage_note}
 Triage's end state: ${item.end_state_hint}. Files it expects: ${item.files.join(', ') || 'unknown'}.
 Issues in flight, whose files to stay out of: ${avoid || 'none'}.
+How the change goes live: ${item.goes_live || "not given: read it from the repo's install docs"}.
 ${alreadyDone([item.issue], true)}
 ${deadline([item.issue], 'implement')}
 For a change that needs review, stop at step 4: append \`#${item.issue} | ready_for_review | | <rerun step, or none> | <worktree>\` to ${RUN}/log.md, so the rerun step survives a lost run, and return status ready_for_review with the worktree, base and the exact review-prompt text. A trivial change finishes through step 7. Your structured result is your report.`
@@ -283,20 +296,31 @@ Also answer: should this land, or become a draft + question for the owner? It is
 ${deadline([item.issue], 'review')} For you, returning gave_up means gave_up true, with stopped_at.`
 }
 
-function fixPrompt(item, impl, review, endState) {
-  const findings = review.findings.map((f) => `- [${f.severity}] ${f.where}: ${f.defect} (${f.scenario})`).join('\n')
+const findingLines = (findings) => findings.map((f) => `- [${f.severity}] ${f.where}: ${f.defect} (${f.scenario})`).join('\n')
+
+function fixPrompt(item, impl, review, endState, second) {
   return `Follow ${RUN}/implementer.md as the fixer for issue #${item.issue}, in the repo whose main tree is ${REPO}.
-Worktree: ${impl.worktree}. Base: ${impl.base}. End state: ${endState}.
+Worktree: ${impl.worktree}. Base: ${impl.base}. End state: ${endState}.${second ? `
+Second review: the change touches a commit or git gate, a hook, or a tool every session runs from PATH. Stop after your fixups and return end_state ready_for_review with fix_base; a lander finishes it after a fresh review.` : ''}
 The implementer's report: built ${impl.built}; chose ${impl.chose}; rerun ${impl.rerun || 'none'}; note ${impl.note || 'none'}.
 ${alreadyDone([item.issue], false)}
 ${deadline([item.issue], 'fix')}
 Findings to fix:
-${findings}
+${findingLines(review.findings)}
 Return the end state you reached as your structured result, with issue ${item.issue}.`
 }
 
-function landPrompt(item, impl, endState) {
-  return `Finish issue #${item.issue} of an overnight run; its review found nothing to fix. Repo main tree ${REPO}, worktree ${impl.worktree}, base ${impl.base}, end state ${endState}.
+function secondReviewPrompt(item, impl, fix, review) {
+  return `Follow ${RUN}/reviewer.md for issue #${item.issue}, as its second review.
+Worktree: ${impl.worktree}. Base: ${fix.fix_base}, the head before the fixer's fixups; review ${fix.fix_base}..HEAD alone.
+The fixups are meant to fix these findings:
+${findingLines(review.findings.filter((f) => f.severity === 'important'))}
+Set the booleans from what you found. Your structured result is your report.
+${deadline([item.issue], 'second review')} For you, returning gave_up means gave_up true, with stopped_at.`
+}
+
+function landPrompt(item, impl, endState, reviewed = 'its review found nothing to fix') {
+  return `Finish issue #${item.issue} of an overnight run; ${reviewed}. Repo main tree ${REPO}, worktree ${impl.worktree}, base ${impl.base}, end state ${endState}.
 ${alreadyDone([item.issue], false)}
 ${deadline([item.issue], 'land')}
 Otherwise do only steps 5 and 6 of ${RUN}/implementer.md: ${endState === 'landed' ? 'land it with wt-ship' : 'open the draft PR and post the question'}, then tick, release the claim and append the log.md line. Return the end state you reached, with issue ${item.issue}, the sha or PR, and rerun: ${impl.rerun || 'none'}.`
@@ -340,12 +364,29 @@ async function runBuild(item, avoid) {
   const nits = review.findings.filter((f) => f.severity === 'nit').map((f) => `${f.where}: ${f.defect}`)
   gate = await admit(item, 'finish')
   if (gate !== 'open') return refused(gate, 'finish', midway)
-  // A clean review, or nits only, goes to a low-effort lander; important findings to a fixer.
+  // A clean review, or nits only, goes to a low-effort lander; important findings to a
+  // fixer, which stops for a second review when the change is in a tool every session runs.
+  const second = important.length > 0 && review.shared_tool
   const finisher = important.length === 0
     ? { prompt: landPrompt(item, impl, endState), label: `land #${n}`, effort: 'low' }
-    : { prompt: fixPrompt(item, impl, review, endState), label: `fix #${n}` }
-  const done = await spawn(finisher.prompt, { label: finisher.label, phase: 'Finish', schema: OUTCOME, ...(finisher.effort ? { effort: finisher.effort } : {}) })
+    : { prompt: fixPrompt(item, impl, review, endState, second), label: `fix #${n}` }
+  let done = await spawn(finisher.prompt, { label: finisher.label, phase: 'Finish', schema: second ? FIXED : OUTCOME, ...(finisher.effort ? { effort: finisher.effort } : {}) })
   if (!done) return redoStage(item, 'finish')
+  if (second && done.end_state === 'ready_for_review') {
+    gate = await admit(item, 'second review')
+    if (gate !== 'open') return refused(gate, 'second review', midway)
+    const again = await spawn(secondReviewPrompt(item, impl, done, review), { label: `review fix #${n}`, phase: 'Review', schema: REVIEWED })
+    if (!again) return redoStage(item, 'second review')
+    const bounced = again.findings.filter((f) => f.severity === 'important')
+    if (again.gave_up || bounced.length) {
+      const why = again.gave_up ? `second review deadline: ${again.stopped_at || 'no detail'}` : `second review bounced: ${bounced.map((f) => `${f.where}: ${f.defect}`).join('; ')}`
+      return [result(n, 'gave_up', { ...midway, note: why })]
+    }
+    gate = await admit(item, 'finish')
+    if (gate !== 'open') return refused(gate, 'finish', midway)
+    done = await spawn(landPrompt(item, impl, endState, "a fixer's fixups passed their second review"), { label: `land #${n}`, phase: 'Finish', schema: OUTCOME, effort: 'low' })
+    if (!done) return redoStage(item, 'finish')
+  }
   return [result(n, done.end_state, {
     sha: done.sha, pr: done.pr, rerun: done.rerun || impl.rerun, note: done.note,
     extra: { decided: endState, findings: review.findings.length, nits },

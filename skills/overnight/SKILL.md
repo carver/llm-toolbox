@@ -37,7 +37,7 @@ It then gets the `needs-owner` label, and the implementer releases its claim.
    4. draft + question
    5. large landings
 
-   An issue whose payoff is `unmeasured` gets a measurement item, with its build queued right after it. Run a measurement while at most one other agent runs, since the night's own agents spoil a timing, and give an A/B a control arm. Build only on a gain beyond noise; a gain within noise doesn't pay for added machinery, so the issue closes with the numbers as findings and its branch is pushed for reference. Performance issues run one at a time, each measured on top of the previous one's landing: a gain the previous landing already delivered shows as noise.
+   An issue whose payoff is `unmeasured` gets a measurement item, with its build queued right after it. Measurements run with section 2's End-of-run timings, since the night's own work spoils a timing, and an A/B gets a control arm. Build only on a gain beyond noise; a gain within noise doesn't pay for added machinery, so the issue closes with the numbers as findings and its branch is pushed for reference. Performance issues run one at a time, each measured on top of the previous one's landing: a gain the previous landing already delivered shows as noise.
    Leave out owner-only work, umbrellas, claimed issues and issues waiting on a date. Mark which landings need a server rerun or other follow-up from the user.
 6. Ask the user to veto or opt in to the costly items (anything that spends shared CI, money or a staging quota, or touches a stale claim), and which sensitive areas (auth, privacy, data deletion) should end as drafts even when ready to land.
    Record each answer in `protocol.md`.
@@ -57,14 +57,15 @@ The Workflow tool loads a `scriptPath` only from the session's working directory
 ```
 Workflow({script: "<the file's full text>",
           args: {run_folder: "<run folder>", repo: "<main tree>", max_in_flight: 3,
-                 items: [{issue: 41, end_state_hint: "landed", triage_note: "<triage line>", files: ["<path>"]}]}})
+                 items: [{issue: 41, end_state_hint: "landed", triage_note: "<triage line>", files: ["<path>"],
+                          goes_live: "<link from the main tree | install.py rerun and restart | push>"}]}})
 ```
 
 The result names the file the tool saved the script to; a rerun or resume passes that path as `scriptPath`.
 
-`items` follow `queue.md`'s order; `end_state_hint` is `landed`, `draft`, `question` or `findings`. Leave out measurement items and performance issues, which need the machine nearly to themselves: run those through the loop after the workflow ends.
+`items` follow `queue.md`'s order; `end_state_hint` is `landed`, `draft`, `question` or `findings`; `goes_live` is step 2.2's how-it-goes-live. Leave out measurement items and performance issues, which need the machine nearly to themselves: run those through the loop after the workflow ends, with the end-of-run timings.
 
-Question and findings items go 3 to 5 to an agent. Each other item gets an implementer, a fresh reviewer, then a fresh fixer for important findings or a low-effort lander for a clean review or nits only. Every agent first checks what an earlier one already did for its issue (a landing, a draft PR, a `log.md` line, a worktree) and reports that rather than redo it. Where the loop differs:
+Question and findings items go 3 to 5 to an agent. Each other item gets an implementer, a fresh reviewer, then a fresh fixer for important findings or a low-effort lander for a clean review or nits only. A fixer whose findings were important and whose fix changes a commit or git gate, a hook, or a tool every session runs from PATH stops for a short second review of its fixups, as step 2.4 says; a clean one goes to a lander, and important findings end the item as `gave_up` with its worktree, which you push as a draft PR at hand-off, as End states says. Every agent first checks what an earlier one already did for its issue (a landing, a draft PR, a `log.md` line, a worktree) and reports that rather than redo it. Where the loop differs:
 
 - **Gate**: before each spawn of build work, one gate agent, shared by every waiting worker, runs `heavy waits --until-open` (`heavy -h`) with step 2.1's rule, for at most 25 minutes, and appends its first and last reading to `waits.md`. A gate run that ends open admits up to 3 of the spawns waiting on it, and its admissions end there: a later spawn, an item's review or finish included, reads the gate again. While the queue is busy, workers take question batches first; an item that waits through 8 busy gate runs, about 3 hours, ends as `deferred`. heavy exits 0 open and 3 held; any other status, or a gate agent that dies twice in a row, means the gate itself is broken: the script logs it and admits no more build work that run, so every build item not yet finished ends `gave_up` with the error, while question batches go on.
 - **Draft or land** is decided in code from the reviewer's answers, by step 2.4's rule plus the sensitive areas in `protocol.md`.
@@ -80,24 +81,27 @@ It returns one object per issue (`end_state`, `sha`, `pr`, `rerun`, `note`, plus
 Start the bundled `loop` skill in dynamic mode (no interval) with a prompt naming the run folder, then for each round:
 
 1. Take the next item from `queue.md` whose files overlap least with the issues in flight. Run 3 or 4 agents at once, of every kind. Before each spawn, run `heavy waits --lane normal`, which counts every session's jobs on this machine, and append its reading and your decision as one line to `waits.md` in the run folder. Spawn **build work** (anything that commits or runs queued jobs, reviews included, since reviewers run `heavy` and `mutate-check`) only while the p90 wait is under 3 minutes and at most one job is waiting. Otherwise spawn queue-free work (questions only, findings) and hold builds until the queue drains. Reason: every agent's builds, tests and commits wait in that one queue, and more agents only lengthen each wait.
-2. Spawn a fresh implementer: "Follow `<run folder>/implementer.md` for issue #N", plus that issue's triage note and the in-flight issues whose files to stay out of. Batch several question-only or findings issues into one agent.
+2. Spawn a fresh implementer: "Follow `<run folder>/implementer.md` for issue #N", plus that issue's triage note, the in-flight issues whose files to stay out of, and how the change goes live, read from the repo's install docs: through a link from the main tree (live on landing, in every session), through `install.py` (after the owner reruns it and restarts the sessions), or through a push (CI). That decides the rerun the summary lists; one night two briefs said `install.py` for linked tools. Where the brief names a method, for a timing or a wait, it names the rule the method falls under, such as the user's CLAUDE.md Profiling section, rather than inventing one, since the implementer runs the method its brief names. Batch several question-only or findings issues into one agent.
 3. When it reports `READY FOR REVIEW`, spawn a **fresh** reviewer with `reviewer.md`, the review-prompt pointer from the report, the worktree, the base and the questions you want probed. Give it the code, not your conclusion.
 4. Read the findings and decide the end state: land, or draft + question. A finding that changes what the user is promised, deletes data, or contradicts the issue's text turns a landing into a draft + question. For a clean review or a one- or two-line fix, send the decision to the implementer with `SendMessage`. Otherwise spawn a **fresh fixer**: "Follow `<run folder>/implementer.md` as the fixer for issue #N", with the worktree, the base, the implementer's report, the findings to fix and the end state. Reason: a resumed agent resends its whole context on every call, and eleven resumed implementers peaked at 200k to 303k tokens a call.
+   When the fix for important findings changes a commit or git gate, a hook, or a tool every session runs from PATH, the fixer's brief says **second review**: it stops after its fixups, a fresh reviewer gives the fixups alone one short review (the fixer's base and HEAD, with no review-prompt pointer), and you send the fixer the verdict with `SendMessage`. On a second review with important findings the fixer ends the issue as gave up. Reason: two fixer rewrites of commit and git gates landed unreviewed, and later reviews found wrong refusals for relative worktree `cd`s and a caught mutant that aborted a whole `mutate-check` run.
 5. Re-arm `ScheduleWakeup` at 3600 s as a fallback heartbeat. Agent notifications are the real wake signal, and each wake resends your whole context.
 
 Relay only what bears on a decision or the summary. An agent's report keeps to its brief's line limit; one that runs over gets read for its end state and sha, not copied.
 
 On each heartbeat and each agent notification, check every in-flight agent for progress: its worktree, commits and `log.md` line.
-One with nothing for 60 minutes gets a status message. At 90 minutes with nothing, stop it with `TaskStop`, release its claim, log the stall, and restart the issue as question-only with a short brief. A stopped agent's last command may have been a hung fetch or a permission prompt it couldn't answer, so the restart's brief passes on nothing the stalled agent fetched or concluded unchecked.
+One with nothing for 60 minutes gets a status message, which it answers in its final report: a subagent can't `SendMessage` you by name. At 90 minutes with nothing, stop it with `TaskStop`, release its claim, log the stall, and restart the issue as question-only with a short brief. A stopped agent's last command may have been a hung fetch or a permission prompt it couldn't answer, so the restart's brief passes on nothing the stalled agent fetched or concluded unchecked.
 
 When a finding applies to every agent (a shared file, a misread rule), fix the briefs in the run folder and message the agents in flight.
 
-Done when the queue is empty and no agent is running.
+**End-of-run timings**: implementers commit without timing and put each timing's exact command in their report and `log.md` line. Once no other agent of the run is in flight, run those commands one at a time, each only when `heavy status` shows both lanes empty, no job running or waiting from any session, and their cores mostly idle. Other sessions share the queue: while they keep it busy, check again a heartbeat later rather than start beside them. A timing that heavy warns about outside load is no timing. Measurement items run here too: run each, then spawn its build if the gain is beyond noise, each timed on top of the previous landing.
+
+Done when the queue is empty, no agent is running, and the timings, with the builds measurements earned, have run or are listed as not run.
 
 ## 3. Hand-off
 
 1. Write `SUMMARY.md` in the run folder:
-   - **Do first**: the push, each server rerun with its stage, installs to run, cleanup.
+   - **Do first**: the push, each server rerun with its stage, installs to run, timings not run (each with its command), cleanup.
    - **Landed**: the issues, and how far the default branch is ahead of origin.
    - **Drafts**: each PR with its issue, plus the collisions between drafts (migration numbers, skill or package versions) and which to renumber at merge.
    - **Questions only.**

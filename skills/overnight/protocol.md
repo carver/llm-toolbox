@@ -42,4 +42,4 @@ PR bodies end with:
 
 ## Log
 
-`log.md`: one line per issue, `#N | end state | sha or PR | rerun needed? | note`, plus, in Workflow mode, a `ready_for_review` line before it from an implementer that stopped for review. An issue's last line holds its end state.
+`log.md`: one line per issue, `#N | end state | sha or PR | rerun needed? | note`, where a timing left for the end of the run goes under rerun as its exact command, plus, in Workflow mode, a `ready_for_review` line before it from an implementer that stopped for review. An issue's last line holds its end state.

@@ -16,5 +16,7 @@ When the orchestrator passes a review-prompt pointer, read the prompt file it na
 Check every claim the change rests on against the source, the issue's own premise included. Run a targeted test when a claim hinges on it.
 Answer each question the orchestrator asked, including whether the change should land or become a draft + question for the owner.
 
-Report in at most 25 lines, findings most severe first. Each one gives file:line, the defect, a concrete failure scenario and a severity (important or nit).
+A **second review** covers a fixer's fixups alone, from the head before them, and comes with no review-prompt pointer: check that they fix the findings the orchestrator names and break nothing else, and report in at most 10 lines.
+
+Otherwise report in at most 25 lines, findings most severe first. Each one gives file:line, the defect, a concrete failure scenario and a severity (important or nit).
 Then list what you checked and found sound. Say "no findings" if none survive.

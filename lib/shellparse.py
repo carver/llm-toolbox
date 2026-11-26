@@ -285,7 +285,7 @@ def _scan(text, first_mark):
             continue
         elif quote is None and char == "\n" and opened:
             opener = text[line_start:i]
-            read, i = heredoc_bodies(text, i + 1, [d for d, _ in opened])
+            read, i = heredoc_bodies(text, i + 1, opened)
             found += [
                 _Heredoc(opener, d, dash, lines, closed)
                 for (d, dash), (lines, closed) in zip(opened, read)
@@ -331,18 +331,29 @@ def _scan(text, first_mark):
     return "".join(out), substitutions, found
 
 
+def closes_heredoc(line: str, delimiter: str, dash: bool) -> bool:
+    """Whether ``line`` closes a heredoc as bash reads it: a line that is the delimiter
+    exactly, or, for <<-, after its leading tabs. A space before or after it, or a tab
+    under plain <<, leaves the line in the body. A CR that ends the line is part of
+    bash's delimiter in a CRLF command, which HEREDOC's word leaves out, so it counts
+    as none here."""
+    line = line.removesuffix("\r")
+    return (line.lstrip("\t") if dash else line) == delimiter
+
+
 def heredoc_bodies(
-    text: str, start: int, delimiters: list[str]
+    text: str, start: int, delimiters: list[tuple[str, bool]]
 ) -> tuple[list[tuple[list[str], bool]], int]:
-    """(each heredoc one line opened, read from ``start`` on: its body's lines and
-    whether its closing line came; where the text after the last one's closing line
-    starts). A heredoc left open takes the rest."""
+    """(each heredoc one line opened, given as its delimiter and whether it is <<-,
+    read from ``start`` on: its body's lines and whether its closing line came; where
+    the text after the last one's closing line starts). A heredoc left open takes the
+    rest."""
     read, body, i = [], [], start
     while i < len(text) and len(read) < len(delimiters):
         end = text.find("\n", i)
         end = len(text) if end == -1 else end
         line, i = text[i:end], end + 1
-        if line.strip() == delimiters[len(read)]:
+        if closes_heredoc(line, *delimiters[len(read)]):
             read.append((body, True))
             body = []
         else:
@@ -395,7 +406,7 @@ def substitution_end(text: str, start: int, opener: str) -> int:
             delimiters = []
             continue
         elif heredoc := HEREDOC.match(text, i):
-            delimiters.append(delimiter_of(heredoc.group(2)))
+            delimiters.append((delimiter_of(heredoc.group(2)), bool(heredoc.group(1))))
             i = heredoc.end()
             continue
         elif opener == "`":

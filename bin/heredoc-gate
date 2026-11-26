@@ -1,0 +1,106 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""A Claude Code PreToolUse hook that refuses a Bash command whose heredoc closed early.
+
+A heredoc ends at the first line that holds its delimiter alone. When the text meant
+for it holds such a line, as edit blocks for a file with a heredoc of its own do, the
+heredoc closes there and bash runs the rest of the text as commands: in one session
+those lines included `diff <(one) >(two)`, which hung for 10 minutes. So it refuses a
+command that, with its heredoc bodies and comments dropped, still has a line holding
+only one of its heredocs' delimiters, or only an apply-edits marker (`<<<<<<< SEARCH`,
+`=======`, `>>>>>>> REPLACE`), which no shell line is. Two heredocs that share a
+delimiter, each closed in turn, pass, and so does every command without a heredoc.
+The refusal names the delimiter and says to pick one the text lacks; like every gate's,
+it saves the command and its heredoc bodies for the next call to reuse. install.py
+registers it in ~/.claude/settings.json.
+
+    heredoc-gate < hook-input.json    # as Claude Code calls it
+
+Exit status: 0 the command may run; 2 refused, with the reason on stderr.
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import refused
+import shellparse
+
+MARKER = re.compile(r"<{7} SEARCH|={7}|>{7} REPLACE")
+
+
+def shell_lines(text: str) -> list[str]:
+    """The lines of `text` (prepare()'s, its substitutions already placeholders) that
+    bash reads as shell, stripped: each that starts outside quotes, and each in a
+    quote left open at the end, as text cut short by an early close leaves it, where
+    bash runs every command before the quote and then fails."""
+    shell, quoted, quote = [], [], None
+    for line in text.split("\n"):
+        (quoted if quote else shell).append(line.strip())
+        if quote is None:
+            quoted = []
+        i = 0
+        while i < len(line):
+            char = line[i]
+            if quote is None and char in "'\"":
+                quote = char
+            elif char == quote:
+                quote = None
+            elif char == "\\" and quote != "'":
+                i += 1
+            i += 1
+    return shell + (quoted if quote else [])
+
+
+def early_close(command: str) -> str | None:
+    """Why `command`'s heredoc closed before its writer meant it to, or None."""
+    if "<<" not in command:
+        return None
+    delimiters = {delimiter for delimiter, _ in shellparse.heredocs(command)}
+    if not delimiters:
+        return None
+    lines = shell_lines(shellparse.prepare(command)[0])
+    # The delimiter first: it says which heredoc to fix.
+    for text in lines:
+        if text in delimiters:
+            return (
+                f"a line of this command holds only {text!r}, a heredoc's delimiter, "
+                "after the heredoc closed: its text holds that line, so the heredoc "
+                "ended there and bash would run the rest as commands"
+            )
+    named = " or ".join(repr(d) for d in sorted(delimiters))
+    for text in lines:
+        if MARKER.fullmatch(text):
+            return (
+                f"the apply-edits marker {text!r} is a line of shell, outside any "
+                f"heredoc: the heredoc meant to hold it, {named}, closed early, at a "
+                "line that holds its delimiter alone"
+            )
+    return None
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if any(arg in ("-h", "--help") for arg in argv):
+        print(__doc__)
+        return 0
+    event = json.load(sys.stdin)
+    if event.get("tool_name") != "Bash":
+        return 0
+    why = early_close(event.get("tool_input", {}).get("command", ""))
+    if why is None:
+        return 0
+    print(
+        f"Refused: {why}. Pick a delimiter its text lacks, such as <<'BLOCKS'. "
+        f"{refused.ending(event)}",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

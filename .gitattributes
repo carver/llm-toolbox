@@ -1,3 +1,4 @@
 # Fixtures that hold conflict markers on purpose: a longer marker size keeps git diff --check
 # (and build-state finish) from flagging them.
 test_conflicts.py conflict-marker-size=32
+test_heredoc_gate.py conflict-marker-size=32

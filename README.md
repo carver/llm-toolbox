@@ -913,6 +913,21 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   is), `--candidates-only` skips verifying. Also lists each line where an agent
   set something aside ("left for later", "out of scope", "TODO").
 
+- **session-grep**: `session-grep PATTERN` searches the commands every session,
+  subagent and workflow agent ran, across projects, decoded from the logs'
+  JSON so a pattern matches the command as typed. One line a match: local time,
+  the session's and subagent's ids cut to 8 characters, the call's cwd, and the
+  command cut to 160 characters around the match; `--full` prints the whole
+  ids, the project folder and the whole command. `--tool NAME` (a glob)
+  searches another tool's inputs, file contents for Write and Edit;
+  `--since`/`--until` take a time or a duration (`2h`); `--project GLOB`,
+  `--cwd PATH`; `--max N` (default 50) keeps the newest. The running search
+  doesn't find its own call. It never searches or prints tool output or message
+  text, and prints secret-shaped values (`GH_TOKEN=...`, an Authorization
+  header, a `ghp_` key) as `***`, which is best effort. Reads `$CLAUDE_CONFIG_DIR` (default
+  `~/.claude`). Its log reading, shared with session-digest, is in
+  `lib/sessionlogs.py`.
+
 - **yt-transcript**: prints a YouTube video's captions, or the ones around
   the URL's timestamp (90 seconds before, 60 after, by default), each line
   prefixed with its clock time. For finding what a video said at a moment

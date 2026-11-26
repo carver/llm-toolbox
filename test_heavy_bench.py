@@ -25,6 +25,7 @@ FIELDS = [
     "outside",
     "exit",
     "flagged",
+    "parts",
 ]
 
 
@@ -280,3 +281,217 @@ def test_a_run_heavy_could_not_measure_is_kept_but_counts_for_nothing(bench):
     assert (row["wall"], row["flagged"]) == ("0.00", "0")
     assert "heavy gave no measure for a round 1" in done.stderr
     assert table_line(done, "a")[1:3] == ["0", "-"]
+
+
+# A run's parts: lines `NAME SECONDS` it writes to $BENCH_TIMINGS.
+
+
+def test_a_run_writes_its_parts_and_the_table_gives_each_parts_mean(bench):
+    parts = 'printf "build 2.0\\ntest 1.0\\nnot a timing\\n" >> "$BENCH_TIMINGS"'
+    other = 'printf "build 4.0\\ntest 3.0\\n" >> "$BENCH_TIMINGS"'
+    done = bench("--rounds", "2", f"a={parts}", f"b={other}")
+
+    assert done.returncode == 0, done.stderr
+    assert [r["parts"] for r in bench.rows()] == [
+        "build=2.0,test=1.0",
+        "build=4.0,test=3.0",
+    ] * 2
+    assert "a parts: build 2.0, test 1.0" in done.stdout
+    assert "b parts: build 4.0, test 3.0" in done.stdout
+
+
+def test_a_run_that_writes_no_parts_leaves_the_column_empty(bench):
+    done = bench("--rounds", "1", "a=true")
+
+    assert done.returncode == 0, done.stderr
+    assert bench.rows()[0]["parts"] == ""
+    assert "parts:" not in done.stdout
+
+
+def git(cwd, *args):
+    return subprocess.run(
+        ["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def repo(bench):
+    """bench's folder as a git repo with two commits of the file v: one, then two."""
+    git(bench.tmp, "init", "-q", "-b", "main")
+    (bench.tmp / ".gitignore").write_text("out/\nbusy\nmeminfo\nstat*\nheavy/\n")
+    (bench.tmp / "v").write_text("one\n")
+    git(bench.tmp, "add", "-A")
+    git(bench.tmp, "commit", "-qm", "one")
+    (bench.tmp / "v").write_text("two\n")
+    git(bench.tmp, "commit", "-qam", "two")
+    return bench.tmp
+
+
+def bench_tree(repo, name):
+    return repo.parent / f"{repo.name}-wt-bench-{name}"
+
+
+def test_a_variant_at_a_commit_runs_in_a_worktree_there_removed_after(bench, repo):
+    order = repo / "order"
+    done = bench(
+        "--rounds",
+        "1",
+        "--prepare",
+        f'pwd >> "{order}"',
+        "old@HEAD~1=cat v",
+        "new@HEAD=cat v",
+        "here=cat v",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert (bench.out / "old-1.log").read_text().startswith("one\n")
+    assert (bench.out / "new-1.log").read_text().startswith("two\n")
+    assert (bench.out / "here-1.log").read_text().startswith("two\n")
+    assert order.read_text().splitlines() == [
+        str(bench_tree(repo, "old")),
+        str(bench_tree(repo, "new")),
+        str(repo),
+    ]
+    assert [r["variant"] for r in bench.rows()] == ["old", "new", "here"]
+    assert not bench_tree(repo, "old").exists()
+    assert not bench_tree(repo, "new").exists()
+    assert git(repo, "worktree", "list").count("\n") == 0
+
+
+def test_an_unknown_commit_is_a_usage_error_before_any_run(bench, repo):
+    done = bench("--rounds", "1", "a=true", "b@nosuchrev=true")
+
+    assert done.returncode == 2
+    assert "nosuchrev" in done.stderr
+    assert not (bench.out / "results.tsv").exists()
+
+
+def test_a_bench_worktree_path_already_taken_is_refused(bench, repo):
+    bench_tree(repo, "old").mkdir()
+
+    done = bench("--rounds", "1", "old@HEAD~1=true")
+
+    assert done.returncode == 2
+    assert str(bench_tree(repo, "old")) in done.stderr
+
+
+def test_a_variant_at_a_commit_outside_a_repo_is_a_usage_error(bench):
+    done = bench("--rounds", "1", "old@HEAD=true")
+
+    assert done.returncode == 2
+    assert "repo" in done.stderr
+
+
+def test_a_warmups_parts_count_for_nothing(bench):
+    # Each run writes its own number as the part, so the warmup's is 1.
+    counter = bench.tmp / "n"
+    count = (
+        f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n + 1)); '
+        f'echo "$n" > "{counter}"; echo "p $n" >> "$BENCH_TIMINGS"'
+    )
+    done = bench("--rounds", "2", "--warmup", f"a={count}")
+
+    assert done.returncode == 0, done.stderr
+    assert "a parts: p 2.5" in done.stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes a read-only folder")
+def test_a_worktree_git_cant_add_stops_the_bench_saying_why(bench, repo):
+    # git can't record the worktree in a read-only .git/worktrees, so it fails.
+    records = repo / ".git" / "worktrees"
+    records.mkdir()
+    records.chmod(0o555)
+    try:
+        done = bench("--rounds", "1", "old@HEAD~1=true")
+    finally:
+        records.chmod(0o755)
+
+    assert done.returncode == 1, done.stderr
+    assert "couldn't add" in done.stderr
+    assert "ermission denied" in done.stderr  # git's own reason
+    assert bench.rows() == []
+
+
+def test_a_failing_run_still_removes_the_worktrees(bench, repo):
+    done = bench("--rounds", "1", "old@HEAD~1=false")
+
+    assert done.returncode == 1
+    assert not bench_tree(repo, "old").exists()
+
+
+def test_a_stopped_bench_removes_its_worktrees(bench, repo):
+    started = repo / "started"
+    proc = subprocess.Popen(
+        [
+            str(SCRIPT),
+            "--out",
+            str(bench.out),
+            "--rounds",
+            "2",
+            f"old@HEAD~1=touch {started}; sleep 30",
+        ],
+        env=bench.env,
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 30
+    while not started.exists():
+        assert time.monotonic() < deadline, "the run never started"
+        time.sleep(0.05)
+    proc.send_signal(signal.SIGTERM)
+    _, err = proc.communicate(timeout=60)
+
+    assert proc.returncode == 128 + signal.SIGTERM, err
+    assert "Traceback" not in err
+    assert not bench_tree(repo, "old").exists()
+
+
+def test_a_part_name_holding_the_columns_separators_is_left_out(bench):
+    parts = 'printf "x=y 1.0\\na,b 2.0\\nok 3.0\\n" >> "$BENCH_TIMINGS"'
+    done = bench("--rounds", "1", f"a={parts}")
+
+    assert done.returncode == 0, done.stderr
+    assert bench.rows()[0]["parts"] == "ok=3.0"
+    assert "a parts: ok 3.0" in done.stdout
+
+
+def test_from_a_folder_of_the_repo_a_variant_at_a_commit_runs_in_that_folder(
+    bench, repo, monkeypatch
+):
+    (repo / "sub").mkdir()
+    (repo / "sub/f").write_text("x\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "sub")
+    done = subprocess.run(
+        [
+            str(SCRIPT),
+            "--out",
+            str(bench.out),
+            "--rounds",
+            "1",
+            "old@HEAD=basename $PWD",
+            "here=basename $PWD",
+        ],
+        env=bench.env,
+        cwd=repo / "sub",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert (bench.out / "old-1.log").read_text().startswith("sub\n")
+    assert (bench.out / "here-1.log").read_text().startswith("sub\n")
+
+
+def test_help_says_to_change_a_files_bytes_not_touch_it():
+    done = subprocess.run(
+        [str(SCRIPT), "-h"], capture_output=True, text=True, check=False
+    )
+
+    assert "touch" in done.stdout and "sccache" in done.stdout

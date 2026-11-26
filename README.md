@@ -549,7 +549,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   whose cores did more than `$HEAVY_ALONE_OUTSIDE` (0.5) cores of other work is
   flagged and run once more, unless `--no-rerun`. Rows go to `DIR/results.tsv`
   as each run ends, output to a log per run, and a table sums up each variant
-  over its clean runs. It refuses to run inside a heavy job (`$HEAVY_SLOT`),
+  over its clean runs, with each part's mean when runs write `name seconds`
+  lines to `$BENCH_TIMINGS`. A variant named `NAME@REV` runs in a worktree
+  detached at REV, made beside the main tree and removed at the end, so
+  `old@HEAD~1=CMD new@HEAD=CMD` times a change against its parent. It refuses
+  to run inside a heavy job (`$HEAVY_SLOT`),
   where heavy measures nothing, and an `--out` that holds results already;
   stopped, it stops its heavy job and still prints the table.
 - **profile-top**: `profile-top PROFILE` sums up a samply profile (recorded with

@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Tell the owner when the host runs this machine extra slow: a probe cron runs every
+5 minutes, which mails when the machine stays slow, and a status line for Claude Code.
+
+    machine-speed probe   probe the machine's speed once, log it, mail if it's due
+    machine-speed line    the status line: `cpu 0.9x`, `cpu 0.4x slow`, `cpu ?`
+
+The host can throttle this VM's CPU, for power, heat or another VM, and nothing in
+the sandbox shows it but a timed loop (heavy -h; lib/machinespeed.py). The owner
+(2026-11-26): "I would want to be notified when the machine is running extra slow,
+even if it's not a broken promise of the code. I want to be able to address it on the
+host machine."
+
+`probe` runs heavy's speed probe pinned to vCPU 0, judged against probes on vCPU 0
+under the same load, and appends it to heavy's speed file, so cron's probes also give
+heavy a recent speed for a long job's end. Then it judges the last three of its own
+probes. Three under 0.25x, all known and the first and last at most 20 minutes apart,
+start a slow spell, and it mails `HOST: machine at 0.20x its usual speed`; three at
+0.5x or above end the spell, and it mails `HOST: machine back to 0.90x`, only when a
+slow mail went out for that spell. A probe whose speed is unknown (fewer than 20
+probes in its vCPU and load bucket) breaks a streak. The caps: a slow mail at most
+once every 3 hours, which a new spell waits out while it lasts; at most 4 sends in
+any 24 hours, a failed one counted too once it reached the sender with a recipient
+and credentials, since a timeout or a dropped connection may come after delivery; a
+mail that failed is tried again at most hourly. So at most 4 mails a day. Each mail gives the probes with their factor, load and the host's steal since
+the probe before, when the slow spell began, heavy's queue (`heavy status`), and what
+it means.
+
+It mails as the email skill does, through its send_email.py
+(~/.claude/skills/email/scripts/) with the credentials it reads from the
+environment, which `/etc/sandbox-persistent.sh` gives a login shell, to the address
+`git config --global llm-toolbox.newsEmail` holds, as skills-news's weekly job does.
+The cron line runs through `bash -lc` for that. Neither the address nor the sender's
+output is printed: a failure is logged as its error's class only, such as
+`SMTPAuthenticationError` or `no recipient`.
+
+It prints one line on stdout for each thing that changed: a spell begun or ended, a
+mail sent or failed; nothing otherwise. Its state, the last probes and the mails, is
+`speed-<machine>.alert.json` beside the speed file, written whole each run.
+
+`line` prints the speed of the newest probe of the last 15 minutes whose speed is
+known, any probe's, heavy's or cron's: `cpu 0.9x` (rounded down to a tenth), `cpu
+0.4x slow` under 0.5x, `cpu ?` with none, and ` (mail failed)` after it while a mail
+it owes has failed. So when the newest probe's speed is unknown (its vCPU and load
+bucket has under 20 probes yet), it shows an older known one from those 15 minutes. It runs no probe and no git but the one call that finds the speed
+file, reads its stdin (Claude Code's session JSON) and ignores it, prints one line,
+and exits 0 whatever goes wrong, since Claude Code blanks the bar on a non-zero exit
+or no output. install.py sets it as Claude Code's statusLine, refreshed every 60 s,
+when none is set.
+
+`install.py` installs the cron line (`*/5`, its log `~/.cache/machine-speed/cron.log`)
+in the sandbox only (SANDBOX_VM_ID set, or /etc/sandbox-secrets.sh there), and the
+status line there too. Known limits:
+  - Throttling that lasts longer than the speed file's window (3 days) becomes the
+    usual speed.
+  - New hardware is a new machine, silent for its first 20 probes in each load
+    bucket (about 100 minutes at one probe every 5).
+  - A sandbox recreate loses the crontab and settings until install.py runs again.
+
+Environment:
+  MACHINE_SPEED_SENDER  a script run in send_email.py's place (`--to`, `--subject`,
+                       `--body-file`), for the tests; while PERF_PROMISES_DIR is set
+                       and it isn't, no mail is sent (it fails as `no sender`)
+  MACHINE_SPEED_NOW    an ISO time standing in for now when judging and capping
+                       (tests; read only while PERF_PROMISES_DIR is set)
+  PERF_PROMISES_DIR    the folder the speed file and its alert state live in
+                       (default: perf-promises/ in llm-toolbox's git common dir)
+  HEAVY_SPEED_PROBE    the probe's stand-in (heavy -h)
+  HEAVY_STAT           a file that stands in for /proc/stat, for the steal and the
+                       load (heavy -h)
+  HEAVY_DIR            heavy's queue, for the mail's `heavy status`
+
+Exit status: 0 done; 1 the probe couldn't run at all; 2 a usage error. `line`
+always exits 0.
+"""
+
+import json
+import math
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+# lib/'s modules are imported where they're used, so that `line` prints `cpu ?`
+# and exits 0 even when they're broken.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+PROBE_CPU = 0
+SLOW = 0.25  # under this, three in a row mail
+RECOVERED = 0.5  # at or above this, three in a row end the spell
+LINE_SLOW = 0.5  # under this, the status line says slow
+STREAK = 3
+STREAK_SPAN = timedelta(minutes=20)
+SLOW_MAIL_EVERY = timedelta(hours=3)
+DAY_MAILS = 4
+RETRY_EVERY = timedelta(hours=1)
+LINE_WITHIN = 15 * 60
+KEPT = 10  # readings kept in the state
+SEND_TIMEOUT = 120
+SEND_EMAIL = Path.home() / ".claude" / "skills" / "email" / "scripts" / "send_email.py"
+RECIPIENT_KEY = "llm-toolbox.newsEmail"
+NO_CREDENTIALS = "no credentials"  # send_email.py found none: it sent nothing
+MEANING = (
+    "What it means: the host is throttling this VM's CPU: its power or heat limits, a"
+    " laptop on battery, or another VM taking the cores. Each probe is judged against"
+    " probes on the same vCPU under the same load, so load inside the VM doesn't read"
+    " as slow. Look on the host."
+)
+
+
+def under_tests():
+    return bool(os.environ.get("PERF_PROMISES_DIR"))
+
+
+def now():
+    fake = os.environ.get("MACHINE_SPEED_NOW") if under_tests() else None
+    return datetime.fromisoformat(fake) if fake else datetime.now(UTC)
+
+
+def state_file():
+    import machinespeed
+
+    path = machinespeed.speed_file()
+    return None if path is None else path.with_name(path.stem + ".alert.json")
+
+
+def load_state(path):
+    try:
+        found = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def save_state(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, prefix=f".{path.name}.", delete=False
+    ) as out:
+        json.dump(state, out, indent=1)
+    os.replace(out.name, path)
+
+
+def when(text):
+    return datetime.fromisoformat(text) if text else None
+
+
+def local(moment):
+    return moment.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+def steal_since(state):
+    """The host's steal share of every vCPU's time since the last probe, or None,
+    and the counters for the next one."""
+    import cores
+
+    path = os.environ.get("HEAVY_STAT") or "/proc/stat"
+    try:
+        ticks = cores.counters(cores.snapshot(path)).values()
+    except (OSError, ValueError):
+        return None, None
+    counters = [sum(t.steal for t in ticks), sum(t.total for t in ticks)]
+    before = state.get("stat")
+    share = None
+    if isinstance(before, list) and len(before) == 2:
+        passed = counters[1] - before[1]
+        if passed > 0:
+            share = max(0, counters[0] - before[0]) / passed
+    return share, counters
+
+
+def streak(readings, test):
+    """Whether the last STREAK readings are all known, pass test, and span at most
+    STREAK_SPAN."""
+    last = readings[-STREAK:]
+    if len(last) < STREAK or any(r["factor"] is None for r in last):
+        return False
+    if when(last[-1]["at"]) - when(last[0]["at"]) > STREAK_SPAN:
+        return False
+    return all(test(r["factor"]) for r in last)
+
+
+def judge(state, say):
+    """Start or end a slow spell from the readings, and set the mail it owes."""
+    readings = state["readings"]
+    if not state.get("slow") and streak(readings, lambda f: f < SLOW):
+        state.update(slow=True, since=readings[-STREAK]["at"], mailed=False)
+        state["owed"] = "slow"
+        say(f"slow since {local(when(state['since']))}: {readings[-1]['factor']:.2f}x")
+    elif state.get("slow") and streak(readings, lambda f: f >= RECOVERED):
+        # A slow mail that never went is owed no more, and nor is its retry.
+        state.update(slow=False, failed=None)
+        state["owed"] = "back" if state.get("mailed") else None
+        say(f"back to {readings[-1]['factor']:.2f}x")
+
+
+def may_mail(state, moment):
+    if len(day_tries(state, moment)) >= DAY_MAILS:
+        return False
+    tried = when(state.get("tried"))
+    if state.get("failed") and tried and moment - tried < RETRY_EVERY:
+        return False
+    last_slow = when(state.get("last_slow"))
+    return not (
+        state.get("owed") == "slow"
+        and last_slow
+        and moment - last_slow < SLOW_MAIL_EVERY
+    )
+
+
+def compose(state):
+    host = socket.gethostname()
+    readings = state["readings"]
+    factor = readings[-1]["factor"]
+    if state["owed"] == "slow":
+        subject = f"{host}: machine at {factor:.2f}x its usual speed"
+        opening = (
+            f"{host} has run at under {SLOW}x its usual speed in its last {STREAK}"
+            f" probes, since {local(when(state['since']))}."
+        )
+    else:
+        subject = f"{host}: machine back to {factor:.2f}x"
+        opening = (
+            f"{host} is back to {factor:.2f}x its usual speed, after a slow spell"
+            f" since {local(when(state['since']))}."
+        )
+    lines = [opening, "", "Its last probes (cron's, every 5 minutes, on vCPU 0):"]
+    for reading in readings[-5:]:
+        parts = [local(when(reading["at"])), fmt(reading["factor"], "{:.2f}x")]
+        parts.append("load " + fmt(reading.get("load"), "{:.1f} vCPUs"))
+        parts.append("steal " + fmt(reading.get("steal"), "{:.0%}"))
+        lines.append("  " + "  ".join(parts))
+    lines += ["", MEANING, "", "heavy's queue now (`heavy status`):", queue()]
+    return subject, "\n".join(lines) + "\n"
+
+
+def day_tries(state, moment):
+    """The times of the last day's sends that reached the sender, failed or not."""
+    tries = state.get("tries", [])
+    return [t for t in tries if moment - when(t) < timedelta(days=1)]
+
+
+def fmt(value, form):
+    return "?" if value is None else form.format(value)
+
+
+def queue():
+    try:
+        import heavyqueue
+
+        return heavyqueue.status()
+    except Exception as error:  # noqa: BLE001 - the mail goes without it
+        return f"(can't read it: {type(error).__name__})"
+
+
+def recipient():
+    try:
+        found = subprocess.run(
+            ["git", "config", "--global", "--get", RECIPIENT_KEY],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return found.stdout.strip() or None
+
+
+def sender():
+    knob = os.environ.get("MACHINE_SPEED_SENDER")
+    if knob:
+        return Path(knob)
+    return None if under_tests() else SEND_EMAIL
+
+
+def send(subject, body):
+    """(None when sent, else the failure's class; whether the send got past the
+    recipient and credentials, so it may have delivered though it failed, as a
+    timeout after DATA can). The sender's output is never shown: send_email.py
+    prints the address."""
+    to, script = recipient(), sender()
+    if to is None:
+        return "no recipient", False
+    if script is None:
+        return "no sender", False
+    with tempfile.NamedTemporaryFile("w", suffix=".txt") as text:
+        text.write(body)
+        text.flush()
+        try:
+            done = subprocess.run(
+                [sys.executable, str(script), "--to", to, "--subject", subject]
+                + ["--body-file", text.name],
+                capture_output=True,
+                text=True,
+                timeout=SEND_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return "timeout", True
+        except OSError as error:
+            return type(error).__name__, False
+    if done.returncode == 0:
+        return None, True
+    failed = failure(done.stderr, done.returncode)
+    return failed, failed != NO_CREDENTIALS
+
+
+def failure(stderr, code):
+    """An error's class from a failed send's stderr, never its text."""
+    if "not set" in stderr and "PURELYMAIL" in stderr:
+        return NO_CREDENTIALS
+    for raw in reversed(stderr.splitlines()):
+        found = re.match(
+            r"([A-Za-z_][\w.]*(?:Error|Exception|Refused|Disconnected))\b", raw
+        )
+        if found:
+            return found[1].rsplit(".", 1)[-1]
+    return f"exit {code}"
+
+
+def mail(state, moment, say):
+    if not state.get("owed") or not may_mail(state, moment):
+        return
+    subject, body = compose(state)
+    failed, reached = send(subject, body)
+    state["tried"] = moment.isoformat()
+    if reached:
+        state["tries"] = [*day_tries(state, moment), moment.isoformat()]
+    if failed:
+        say(f"mail failed: {failed}")
+        state["failed"] = failed
+        return
+    if state["owed"] == "slow":
+        state.update(mailed=True, last_slow=moment.isoformat())
+    state.update(owed=None, failed=None)
+    say(f"mailed: {subject}")
+
+
+def probe():
+    import machinespeed
+
+    reading = machinespeed.measure([PROBE_CPU])
+    if reading.wall is None:
+        print(reading.problem.replace("heavy:", "machine-speed:", 1), file=sys.stderr)
+        return 1
+    if reading.problem:
+        print(reading.problem.replace("heavy:", "machine-speed:", 1), file=sys.stderr)
+    path = state_file()
+    if path is None:
+        return 0
+    state = load_state(path)
+    moment = now()
+    steal, counters = steal_since(state)
+    state["stat"] = counters
+    readings = [r for r in state.get("readings", []) if isinstance(r, dict)]
+    readings.append(
+        {
+            "at": moment.isoformat(),
+            "factor": reading.factor,
+            "load": reading.load,
+            "steal": steal,
+        }
+    )
+    state["readings"] = readings[-KEPT:]
+    judge(state, print)
+    mail(state, moment, print)
+    save_state(path, state)
+    return 0
+
+
+def line():
+    try:
+        if not sys.stdin.isatty():
+            sys.stdin.read()
+    except (OSError, ValueError):
+        pass
+    try:
+        import machinespeed
+
+        found = machinespeed.latest(within=LINE_WITHIN)
+        if found.factor is None:
+            text = "cpu ?"
+        else:
+            text = f"cpu {math.floor(found.factor * 10) / 10:.1f}x"
+            if found.factor < LINE_SLOW:
+                text += " slow"
+        path = state_file()
+        state = load_state(path) if path else {}
+        if state.get("failed") and state.get("owed"):
+            text += " (mail failed)"
+    except Exception:  # noqa: BLE001 - a non-zero exit blanks the status bar
+        text = "cpu ?"
+    print(text)
+    return 0
+
+
+def main(argv):
+    if argv in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    if argv == ["probe"]:
+        return probe()
+    if argv == ["line"]:
+        return line()
+    print("machine-speed: expected `probe` or `line` (-h for help)", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

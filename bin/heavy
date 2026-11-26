@@ -97,9 +97,10 @@ job's cores, takes the load while the loop ran instead when that was busier, as 
 the next job has ramped up meanwhile, writes the result, and exits, within 10 s at most
 (its own alarm stops it then), so it needs no stopping. While one runs, a job that ends
 starts none. The job itself is judged by the newest probe of the last 5 minutes whose
-speed is known, any job's, and with none counts as at an unknown speed. No probe runs
-on a schedule yet, only as jobs end, so a job that runs past 5 minutes while no other
-job ends counts at its raw time, as a quiet machine's `mutate-check --diff` runs do. An
+speed is known, any job's or cron's, and with none counts as at an unknown speed. In
+the sandbox, `machine-speed probe` also probes every 5 minutes from cron (install.py),
+so a job that runs past 5 minutes while no other job ends is judged too; where that
+cron job isn't installed, such a job counts at its raw time. An
 --alone job probes inline instead, as it starts, reusing the last second of its wait
 for the load, and as it ends, before it frees its place. The machine's speed factor is
 the loop's usual process time over its time now: 1.0 is the usual speed, 0.4 is 2.5

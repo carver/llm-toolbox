@@ -460,26 +460,36 @@ def test_crontab_keeps_other_jobs_and_replaces_ours():
         "7 * * * * other-job # rental-finder scan\n"
         "1 1 * * 1 old skills-news # llm-toolbox weekly skills-news\n"
     )
-    ours = install.cron_lines("me@example.org")
+    ours = install.cron_lines("me@example.org", sandbox=True)
     merged = install.merged_crontab(current, ours)
     assert merged.splitlines() == ["7 * * * * other-job # rental-finder scan", *ours]
     assert install.merged_crontab(merged, ours) == merged
 
 
 def test_crontab_from_empty():
-    ours = install.cron_lines("me@example.org")
+    ours = install.cron_lines("me@example.org", sandbox=True)
     assert install.merged_crontab("", ours) == "\n".join(ours) + "\n"
 
 
 def test_the_skills_news_job_mails_the_configured_address():
-    (line,) = install.cron_lines("me@example.org")
+    (line,) = install.cron_lines("me@example.org", sandbox=False)
     assert "skills-news --email me@example.org " in line
     assert line.endswith(f"{install.CRON_MARKER} weekly skills-news")
 
 
+def test_the_machine_speed_probe_runs_every_5_minutes_in_the_sandbox_only():
+    _news, probe = install.cron_lines("me@example.org", sandbox=True)
+    assert probe.startswith("*/5 * * * * bash -lc '")
+    assert "machine-speed probe" in probe
+    assert probe.endswith(f"{install.CRON_MARKER} machine-speed probe")
+    assert install.cron_lines(None, sandbox=True) == [probe]
+    assert install.cron_lines(None, sandbox=False) == []
+    assert "@" not in probe  # it reads the address when it mails, not from here
+
+
 def test_with_no_address_there_is_no_job_and_ours_go():
     current = "1 1 * * 1 old skills-news # llm-toolbox weekly skills-news\n"
-    assert install.cron_lines(None) == []
+    assert install.cron_lines(None, sandbox=False) == []
     assert install.merged_crontab(current, []) == ""
 
 
@@ -497,6 +507,112 @@ def test_the_address_comes_from_the_global_git_config(tmp_path, monkeypatch):
     assert install.news_email() is None
     config.write_text("[llm-toolbox]\n\tnewsEmail = --help@x.org\n")
     assert install.news_email() is None
+
+
+@pytest.fixture
+def crontab(tmp_path, monkeypatch):
+    """A fake crontab on PATH over a file, a global git config with or without an
+    address, and the sandbox's marks set by the test: (table file, git config)."""
+    table, fake = tmp_path / "crontab.txt", tmp_path / "bin" / "crontab"
+    fake.parent.mkdir()
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = -l ]; then cat "{table}" 2>/dev/null || exit 1;'
+        f' else cat > "{table}"; fi\n'
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake.parent}{os.pathsep}{os.environ['PATH']}")
+    config = tmp_path / "gitconfig"
+    config.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.delenv("SANDBOX_VM_ID", raising=False)
+    monkeypatch.setattr(install, "SANDBOX_SECRETS", tmp_path / "no-secrets.sh")
+    return table, config
+
+
+def test_the_sandbox_gets_the_probe_without_an_address(crontab, monkeypatch, capsys):
+    table, _ = crontab
+    table.write_text("7 * * * * other-job # rental-finder scan\n")
+    monkeypatch.setenv("SANDBOX_VM_ID", "box")
+    assert install.install_cron() == 0
+    lines = table.read_text().splitlines()
+    assert lines[0] == "7 * * * * other-job # rental-finder scan"
+    assert [line.rsplit("# ", 1)[1] for line in lines[1:]] == [
+        "llm-toolbox machine-speed probe"
+    ]
+    out = capsys.readouterr().out
+    assert "installed the cron job: machine-speed probe" in out
+    assert "removed" not in out
+
+    assert install.install_cron() == 0
+    assert table.read_text().splitlines() == lines
+    assert "installed" not in capsys.readouterr().out
+
+
+def test_the_secrets_file_marks_the_sandbox_too(crontab, monkeypatch, tmp_path):
+    table, _ = crontab
+    secrets = tmp_path / "secrets.sh"
+    secrets.write_text("")
+    monkeypatch.setattr(install, "SANDBOX_SECRETS", secrets)
+    assert install.install_cron() == 0
+    assert "machine-speed probe" in table.read_text()
+
+
+def test_off_the_sandbox_only_the_news_job_goes_and_says_so(crontab, capsys):
+    table, config = crontab
+    probe = install.cron_lines(None, sandbox=True)[0]
+    config.write_text("[llm-toolbox]\n\tnewsEmail = me@example.org\n")
+    table.write_text(probe + "\n")
+    assert install.install_cron() == 0
+    assert "skills-news" in table.read_text()
+    assert "machine-speed" not in table.read_text()
+    out = capsys.readouterr().out
+    assert "installed the cron job: weekly skills-news" in out
+    assert "removed the cron job: machine-speed probe" in out
+
+
+def test_a_removed_job_with_no_name_is_named_without_its_line(crontab, capsys):
+    table, _ = crontab
+    table.write_text("17 8 * * 1 skills-news --email me@example.com # llm-toolbox\n")
+    assert install.install_cron() == 0
+    assert table.read_text() == ""
+    out = capsys.readouterr().out
+    assert "removed the cron job: (unnamed)" in out
+    assert "example.com" not in out
+
+
+def test_the_status_line_is_set_when_none_is(settings, monkeypatch, capsys):
+    monkeypatch.setenv("SANDBOX_VM_ID", "box")
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"model": "opus"}))
+    assert install.set_status_line() == 0
+    data = json.loads(settings.read_text())
+    assert data["model"] == "opus"
+    assert data["statusLine"] == {
+        "type": "command",
+        "command": f"{install.BIN_DST / 'machine-speed'} line",
+        "refreshInterval": 60,
+    }
+    assert "statusLine" in capsys.readouterr().out
+    assert install.set_status_line() == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_a_status_line_of_its_own_is_left_with_a_hint(settings, monkeypatch, capsys):
+    monkeypatch.setenv("SANDBOX_VM_ID", "box")
+    settings.parent.mkdir(parents=True)
+    existing = {"type": "command", "command": "my-line"}
+    settings.write_text(json.dumps({"statusLine": existing}))
+    assert install.set_status_line() == 0
+    assert json.loads(settings.read_text())["statusLine"] == existing
+    assert "machine-speed line" in capsys.readouterr().out
+
+
+def test_off_the_sandbox_no_status_line_is_set(settings, monkeypatch, tmp_path):
+    monkeypatch.delenv("SANDBOX_VM_ID", raising=False)
+    monkeypatch.setattr(install, "SANDBOX_SECRETS", tmp_path / "no-secrets.sh")
+    assert install.set_status_line() == 0
+    assert not settings.exists()
 
 
 def test_update_passes_every_listed_skill(third_party, monkeypatch):
@@ -607,6 +723,7 @@ def test_links_only_links_tools_and_skills_and_nothing_else(dirs, tools, monkeyp
         "link_guidelines",
         "register_hooks",
         "set_settings",
+        "set_status_line",
         "install_third_party_skills",
         "enable_git_hooks",
         "install_cron",

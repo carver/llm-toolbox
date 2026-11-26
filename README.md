@@ -54,7 +54,10 @@ It also installs other authors' skills, listed in `THIRD_PARTY_SKILLS` in
 updates them only with `--update`. It also installs a weekly cron job (Mondays
 08:17) that runs `skills-news`, which emails what changed upstream to the address
 in `git config --global llm-toolbox.newsEmail` (without one, there's no job); read that,
-then run `python3 install.py --update`. An update replaces a skill whose
+then run `python3 install.py --update`. In the sandbox it also installs a cron
+job that runs `machine-speed probe` every 5 minutes, which emails when the host
+throttles the CPU, and sets Claude Code's status line to `machine-speed line`
+when none is set. An update replaces a skill whose
 upstream changed, along with any hand edits to it, so keep those edits as
 patches in `skill-patches/` (see `skill-patch`): `install.py` puts each one
 back on after installing or updating, and reports one that no longer fits.
@@ -609,7 +612,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   busy of the job's cores (the load being the busier of that second and the
   loop's run), one such child at a time, each done within 10 s;
   a job is judged by the newest probe of the last 5 minutes whose speed is
-  known, and an `--alone` job probes inline at its start and end. The probe
+  known, cron's every 5 minutes included (`machine-speed`), and an `--alone`
+  job probes inline at its start and end. The probe
   gives the machine's speed
   factor, its usual time over its time now, since the host can throttle the
   VM's CPU where the sandbox can't see it: the usual time is the fastest tenth of the
@@ -915,6 +919,25 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `install.py` registers `perf-promises --session-start` as a SessionStart hook,
   which shows those lines to the owner and the agent. `$PERF_PROMISES_GLOBAL`
   stands in for llm-toolbox's file in the tests.
+- **machine-speed**: tells the owner when the host runs the machine extra slow.
+  `machine-speed probe`, which `install.py`'s cron job runs every 5 minutes in
+  the sandbox, takes heavy's speed probe on vCPU 0 (judged against probes there
+  under the same load) and adds it to heavy's speed file. Three of its probes
+  in a row, within 20 minutes, under 0.25x their usual speed mail
+  `HOST: machine at 0.20x its usual speed`, and three at 0.5x or above after
+  that mail `HOST: machine back to 0.90x`; a slow mail goes at most every 3
+  hours, a failed one is tried again hourly, and at most 4 sends go in a day,
+  failed ones included, since a send that fails may have delivered. It
+  mails through the email skill's `send_email.py` to the address in
+  `git config --global llm-toolbox.newsEmail`, prints neither, and logs a
+  failure by its error's class. `machine-speed line` is Claude Code's status
+  line, which `install.py` sets in the sandbox when none is set: `cpu 0.9x`,
+  `cpu 0.4x slow` under 0.5x, from the newest probe of the last 15 minutes whose
+  speed is known, even when a newer one's isn't, `cpu ?` with none, and
+  `(mail failed)` while a mail it owes has failed. For the tests,
+  `$MACHINE_SPEED_SENDER` stands in for the sender and `$MACHINE_SPEED_NOW` for
+  the clock; `$PERF_PROMISES_DIR`, `$HEAVY_SPEED_PROBE`, `$HEAVY_STAT` and
+  `$HEAVY_DIR` are heavy's.
 
 - **build-state**: `/build`'s bookkeeping. `start` records the base commit
   (HEAD, or `--base REV`) and the repo's fingerprint (every other ref but the

@@ -272,6 +272,30 @@ The builder's and the brief review's choices:
 
 A CFS quota makes short probes bimodal, which the steal over a whole job catches better; that is unverified for host kernels that throttle per task.
 
+## machine-speed
+
+### The owner hears when the machine runs extra slow (2026-11-26)
+
+The owner, after the afternoon the host throttled the VM: "Also, of course, I would want to be notified when the machine is running extra slow, even if it's not a broken promise of the code. I want to be able to address it on the host machine."
+heavy's record put that throttling at roughly 0.1 to 0.2x from about 10:20 to 12:40 PST: wt-ship's checks used 5,200 to 6,350 CPU-seconds against 850 to 1,800 before and after, and `./t test_heavy.py -k` 35 to 48 against 1 to 9.
+It was a lower clock or a power cap, not steal: steal since boot came to about 3,900 CPU-seconds, about one core-hour, where descheduling to 0.1 to 0.2x on 16 vCPUs for 2 hours would be about 25. So a timed probe is the only signal.
+The owner's decisions:
+
+- Two channels: an email, which reaches the owner away from any session, and a Claude Code status line, live at a session. No session-start message.
+- A cron job probes every 5 minutes, beside heavy's job-end probes, through the Purelymail account the email skill uses.
+- The thresholds, split after measuring that day: an email when three probes in a row, within about 20 minutes, read under 0.25x; a recovery email when three read 0.5x or above, only after a slow email went out. The status line says `slow` under 0.5x.
+- Load buckets, not quiet probes: "How would it even measure quiet machine probes? There are often long stretches where the machine is loaded without a break". Every cron probe counts, busy or not, at its load-adjusted factor (heavy's speed probe: against probes on the same vCPU under the same load), pinned to vCPU 0 so its cells fill fast. A cell with under 20 probes gives no judgment, so a machine loaded in a way it never was before is silent for about 100 minutes.
+- Caps: a slow email at most once every 3 hours, at most 4 emails a day per machine, the hostname in the subject.
+
+The builder's and the brief review's choices:
+
+- `machine-speed probe` writes heavy's speed file, so cron's probes give heavy a recent speed for a long job on an idle machine too, which 04f5573 left counting at its raw time. The alert judges cron's own probes only, from its state beside the speed file, so the streak's spacing is cron's.
+- A new slow spell within 3 hours of the last slow email waits the cap out while it lasts, then mails; a spell that ends first mails nothing, nor its recovery. So the worst case is a slow and a recovery email every 3 hours, which the daily cap holds to 4.
+- The email goes through the email skill's `send_email.py`, called by path with its output captured, since it prints the address; a failure is logged as its error's class, tried again at most hourly, and shown on the status line as `(mail failed)`. The address is `git config --global llm-toolbox.newsEmail`, as skills-news's; the credentials come from the login shell's environment (`bash -lc`). llm-toolbox is public, so neither is in it.
+- The status line shows the newest probe of the last 15 minutes whose speed is known, any probe's, rounded down to a tenth, so `0.4x` is never shown beside a factor of 0.5 or more. It always prints one line and exits 0, since Claude Code blanks the bar on a non-zero exit or no output, and refreshes every 60 s (`refreshInterval`), since its events stop while a session is idle.
+- `install.py` adds the cron line and the status line only in the sandbox (SANDBOX_VM_ID or /etc/sandbox-secrets.sh), where the credentials and cron live, and sets the status line only when none is set.
+- Limits, said in `-h`: throttling that lasts past the speed file's 3-day window becomes the usual speed; new hardware is a new machine, silent until its cells fill; a sandbox recreate loses the crontab and settings until install.py runs again.
+
 ## pipefail-lint
 
 ### tree-sitter-bash, repaired where it runs lines together (2026-11-09)

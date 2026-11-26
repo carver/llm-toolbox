@@ -23,7 +23,10 @@ Third-party skills: only missing ones are installed; it never removes one,
 and updates them only with --update, which then prints what the update
 changed in each skill (bin/skills-news --since). Installs a weekly cron job that runs
 bin/skills-news, which emails what changed upstream, so you know when an
---update is worth running.
+--update is worth running. In the sbx sandbox (SANDBOX_VM_ID set, or
+/etc/sandbox-secrets.sh there) it also installs a cron job that runs
+`machine-speed probe` every 5 minutes, which emails when the host throttles the
+CPU, and sets Claude Code's statusLine to `machine-speed line` when none is set.
 
     python3 install.py [--update]
 """
@@ -181,18 +184,64 @@ CRON_MARKER = "# llm-toolbox"
 NEWS_EMAIL_KEY = "llm-toolbox.newsEmail"
 
 
-def cron_lines(address: str | None) -> list[str]:
+# Its presence, or SANDBOX_VM_ID, marks the sbx sandbox, where the machine-speed
+# probe runs; the owner's host gets neither it nor its status line.
+SANDBOX_SECRETS = Path("/etc/sandbox-secrets.sh")
+# Claude Code's status line: the machine's speed (bin/machine-speed).
+STATUS_LINE_TOOL = "machine-speed"
+STATUS_LINE_REFRESH = 60
+
+
+def in_sandbox() -> bool:
+    return bool(os.environ.get("SANDBOX_VM_ID")) or SANDBOX_SECRETS.exists()
+
+
+def cron_lines(address: str | None, sandbox: bool) -> list[str]:
     """This repo's cron lines: the weekly skills-news job, when there's an address
-    to mail it to."""
-    if not address:
-        return []
-    return [
-        (
+    to mail it to, and in the sandbox the machine-speed probe every 5 minutes, which
+    reads its address when it mails."""
+    lines = []
+    if address:
+        lines.append(
             "17 8 * * 1 bash -lc 'mkdir -p ~/.cache/skills-news && skills-news"
             f" --email {address} >> ~/.cache/skills-news/cron.log 2>&1'"
             f" {CRON_MARKER} weekly skills-news"
         )
-    ]
+    if sandbox:
+        lines.append(
+            "*/5 * * * * bash -lc 'mkdir -p ~/.cache/machine-speed && machine-speed"
+            " probe >> ~/.cache/machine-speed/cron.log 2>&1'"
+            f" {CRON_MARKER} machine-speed probe"
+        )
+    return lines
+
+
+def set_status_line() -> int:
+    """In the sandbox, set Claude Code's statusLine to machine-speed's line when
+    none is set; one already set is left, with how to add the segment. Returns 1
+    when the settings file cannot be read as JSON."""
+    if not in_sandbox():
+        return 0
+    settings = load_settings("status line not set")
+    if settings is None:
+        return 1
+    command = f"{BIN_DST / STATUS_LINE_TOOL} line"
+    if "statusLine" in settings:
+        existing = settings["statusLine"]
+        if not isinstance(existing, dict) or existing.get("command") != command:
+            say(
+                "statusLine is set already -- left alone; to show the machine's speed,"
+                f" have its command print the output of `{STATUS_LINE_TOOL} line` too"
+            )
+        return 0
+    settings["statusLine"] = {
+        "type": "command",
+        "command": command,
+        "refreshInterval": STATUS_LINE_REFRESH,
+    }
+    save_settings(settings)
+    say(f"set statusLine to `{command}`, the machine's speed")
+    return 0
 
 
 def news_email() -> str | None:
@@ -462,7 +511,7 @@ def install_cron() -> int:
             "no weekly skills-news cron job: give it an address with"
             f" `git config --global {NEWS_EMAIL_KEY} ADDRESS`"
         )
-    wanted = merged_crontab(current, cron_lines(address))
+    wanted = merged_crontab(current, cron_lines(address, in_sandbox()))
     if wanted == current:
         return 0
     written = subprocess.run(
@@ -471,12 +520,20 @@ def install_cron() -> int:
     if written.returncode:
         say(f"FAILED cron: {written.stderr.strip()}")
         return 1
-    say(
-        "installed the weekly skills-news cron job"
-        if address
-        else "removed the weekly skills-news cron job"
-    )
+    before, after = set(current.splitlines()), set(wanted.splitlines())
+    for line in wanted.splitlines():
+        if CRON_MARKER in line and line not in before:
+            say(f"installed the cron job: {cron_name(line)}")
+    for line in current.splitlines():
+        if CRON_MARKER in line and line not in after:
+            say(f"removed the cron job: {cron_name(line)}")
     return 0
+
+
+def cron_name(line: str) -> str:
+    """What one of this repo's cron lines is, from the words after its marker, or
+    `(unnamed)`: never the line, which can hold the owner's address."""
+    return line.rpartition(CRON_MARKER)[2].strip() or "(unnamed)"
 
 
 def apply_skill_patches() -> int:
@@ -556,6 +613,7 @@ def main(argv=None):
         + link_guidelines()
         + register_hooks()
         + set_settings()
+        + set_status_line()
     )
     failures = install_third_party_skills() + enable_git_hooks() + install_cron()
     failures += update_third_party_skills() if args.update else apply_skill_patches()

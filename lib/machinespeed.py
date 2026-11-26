@@ -7,10 +7,12 @@ showed `nr_throttled 0`, /proc/cpuinfo a fixed 2496 MHz, and there is no cpufreq
 "The CPU was throttled really low, so I wouldn't trust that 262 s number right now."
 So heavy times the probe, a fixed pure-Python loop, after every job, in a child it
 leaves running once the job's slot is free (probe_after_exit), and inline at the
-start and end of an `--alone` one; a job's end is judged by the newest probe of the
-last RECENT_SECONDS whose factor is known (latest), and the speed factor is the probe's
-usual process time over its process time now: 1.0 is the usual speed, 0.4 is 2.5 times
-slower. Process time, since this guest's kernel charges stolen time to the running
+start and end of an `--alone` one, and bin/machine-speed probes from cron every 5
+minutes, pinned to vCPU 0, to mail the owner when the machine stays slow; a job's end
+is judged by the newest probe of the last RECENT_SECONDS whose factor is known
+(latest), and the speed factor is the probe's usual process time over its process time
+now: 1.0 is the usual speed, 0.4 is 2.5 times slower. Process time, since this guest's
+kernel charges stolen time to the running
 task (CONFIG_PARAVIRT_TIME_ACCOUNTING is unset), so both kinds of host throttling, a
 lower clock and a descheduled vCPU, slow it, where wall time also counts in-guest
 load. The wall time is logged only.
@@ -98,10 +100,11 @@ class Reading(NamedTuple):
     process: float | None = None
     problem: str | None = None
     age: float | None = None  # seconds since a logged probe was taken; None: just now
+    load: float | None = None  # busy vCPUs the probe was judged under, when known
 
 
-def latest(now=None):
-    """The newest probe of the last RECENT_SECONDS that counts (no fakes, unless
+def latest(now=None, within=RECENT_SECONDS):
+    """The newest probe of the last `within` seconds that counts (no fakes, unless
     HEAVY_SPEED_PROBE is read) and whose factor is known, as logged: a Reading of
     its factor and its age; with none, a Reading of an unknown factor."""
     try:
@@ -115,7 +118,7 @@ def latest(now=None):
     except Exception as error:  # noqa: BLE001 - a probe must never fail a job
         return Reading(None, problem=why(error))
     now = now or datetime.now(UTC)
-    since = now - timedelta(seconds=RECENT_SECONDS)
+    since = now - timedelta(seconds=within)
     for raw in reversed(text.splitlines()):
         parts = raw.split("\t")
         if len(parts) < 8 or parts[7] not in marks():
@@ -393,8 +396,8 @@ def measure(cpus, steal=None, stoppable=False):
     except Exception as error:
         if stoppable and getattr(error, "signum", None) is not None:
             raise
-        return Reading(None, wall, process, why(error))
-    return Reading(factor, wall, process)
+        return Reading(None, wall, process, why(error), load=load)
+    return Reading(factor, wall, process, load=load)
 
 
 def table(now=None):

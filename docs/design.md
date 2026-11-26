@@ -1892,6 +1892,28 @@ sudo's use_pty gives it a session of its own. bash runs with
 environment goes through a 0600 file the init's first process deletes, as JSON, not
 `export -p`, since it is exec'd whole. Each run costs about 0.1 s.
 
+### safekill's tests can signal only what they started (#17, 2026-11-26)
+
+A mutant that drops `matches`' name test (lib/procmatch.py) matches every process but
+the caller's ancestors, and safekill is the only tool on `matches` that signals
+(safeps lists, waitone waits). Its tests then sent SIGTERM to everything in reach:
+in a PID namespace, the `sleep` started beside them and pytest. A local run outside
+one would reach every session on the machine.
+
+So test_safekill.py runs safekill through `signal_guard_testing.py`, which replaces `os.kill`
+and `os.killpg` with ones that refuse any target without the test's pid among its
+parents, and exits 86 at the first refusal, before the signal is sent. safekill
+signals in pid order, so a widened match stops at the first process outside the
+test's tree, kernel threads and other sessions included, and the tests' status
+checks fail. Checked with a stand-in mutant that adds one outside `sleep` to the
+matches (the real one was never run): 15 of the 24 tests failed on exit 86, and the
+`sleep` lived. Inside a namespace, where every process may be in the test's tree,
+`test_no_match_signals_nothing` still fails on its exit status and bystander.
+
+A fake /proc was the other way: procmatch would read it from a variable, which
+production code then carries for the tests, and safekill would still signal the
+real pids it lists.
+
 ## paper
 
 ### A web page's text comes through pandoc, with stand-ins for what it would lose (2026-11-13)

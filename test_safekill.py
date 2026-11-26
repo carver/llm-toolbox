@@ -1,6 +1,12 @@
-"""safekill signals one (--one) or every (--all) matching process, never its own caller."""
+"""safekill signals one (--one) or every (--all) matching process, never its own caller.
+
+Every run goes through signal_guard_testing.py, which refuses a signal to any process this
+test didn't start: a mutant of lib/procmatch.py's `matches` that matches every process
+then fails the test instead of signalling every session on the machine (#17).
+"""
 
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -14,12 +20,20 @@ import pytest
 from conftest import started_child
 
 SCRIPT = Path(__file__).resolve().parent / "bin" / "safekill"
+GUARD = Path(__file__).resolve().parent / "signal_guard_testing.py"
+
+
+def guarded(tool: Path, root: int | None = None) -> list[str]:
+    """The argv that runs `tool` able to signal only processes under `root`, by
+    default this test's own."""
+    root = os.getpid() if root is None else root
+    return [sys.executable, str(GUARD), str(root), str(tool)]
 
 
 def safekill(*args: str, shell: bool = False) -> subprocess.CompletedProcess[str]:
     if shell:
         # The pattern sits in the calling shell's own command line, which is what trips pkill -f.
-        command = " ".join([str(SCRIPT), *args])
+        command = shlex.join(guarded(SCRIPT)) + " " + " ".join(args)
         return subprocess.run(
             ["bash", "-c", command + "; echo shell-survived"],
             text=True,
@@ -27,7 +41,7 @@ def safekill(*args: str, shell: bool = False) -> subprocess.CompletedProcess[str
             check=False,
         )
     return subprocess.run(
-        [str(SCRIPT), *args], text=True, capture_output=True, check=False
+        [*guarded(SCRIPT), *args], text=True, capture_output=True, check=False
     )
 
 
@@ -99,10 +113,38 @@ def test_all_with_one_match_signals_it(sleepers: list[subprocess.Popen[bytes]]) 
 
 
 @pytest.mark.parametrize("mode", ["--one", "--all"])
-def test_no_match(mode: str) -> None:
+def test_no_match_signals_nothing(
+    sleepers: list[subprocess.Popen[bytes]], mode: str
+) -> None:
+    bystander = start(sleepers, uuid.uuid4().hex)
     result = safekill(mode, "-f", uuid.uuid4().hex)
-    assert result.returncode == 1
+    assert result.returncode == 1, result.stderr
     assert "no process matches" in result.stderr
+    assert bystander.poll() is None
+
+
+def test_the_guard_refuses_a_process_outside_its_tree(
+    sleepers: list[subprocess.Popen[bytes]], tmp_path: Path
+) -> None:
+    # Both are this test's children, so a guard that let the signal through would
+    # stop only the test's own sleeper.
+    root, outside = start(sleepers, "root"), start(sleepers, "outside")
+    tool = tmp_path / "kill.py"
+    tool.write_text("import os, sys\nos.kill(int(sys.argv[1]), 15)\n")
+    refused = subprocess.run(
+        [*guarded(tool, root.pid), str(outside.pid)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert refused.returncode == 86, refused.stderr
+    assert f"refused signal 15 to {outside.pid}" in refused.stderr
+    assert outside.poll() is None
+    sent = subprocess.run(
+        [*guarded(tool), str(outside.pid)], text=True, capture_output=True, check=False
+    )
+    assert sent.returncode == 0, sent.stderr
+    assert outside.wait(timeout=5) == -15
 
 
 @pytest.mark.parametrize("mode", ["--one", "--all"])

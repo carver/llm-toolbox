@@ -1852,6 +1852,104 @@ def test_a_quick_check_that_asks_for_the_queue_waits_its_turn_too(
     assert "needs a build: src/main.rs" in err
 
 
+def seconds_check(repo):
+    """Make the repo's agent check one whose queued work takes seconds: run with
+    CHECK_SECONDS_EXIT set, it notes `seconds`, says why, and exits with it; run
+    without, it notes its nice, whether HEAVY_SLOT marks a run outside the queue, and
+    `agent`, then passes. It names CHECK_QUEUE_EXIT, which opts it in."""
+    hook(
+        repo,
+        "agent-pre-commit",
+        '# names $CHECK_QUEUE_EXIT\nlog="$(git rev-parse --git-dir)/ran"\n'
+        'if [ -n "${CHECK_SECONDS_EXIT:-}" ]; then\n'
+        '  echo seconds >> "$log"\n'
+        "  echo 'needs a lint: src/main.rs'\n"
+        '  exit "$CHECK_SECONDS_EXIT"\n'
+        "fi\n"
+        'echo "nice-$(nice)" >> "$log"\n'
+        'case "${HEAVY_SLOT:-}" in "outside "*) echo outside >> "$log" ;; esac\n'
+        'echo agent >> "$log"',
+    )
+
+
+@pytest.fixture
+def roomy(monkeypatch):
+    """Free memory enough for a --few-seconds job to run outside the queue."""
+    meminfo = Path(os.environ["HEAVY_DIR"]).parent / "roomy"
+    meminfo.write_text("MemAvailable: 16777216 kB\n")
+    monkeypatch.setenv("HEAVY_MEMINFO", str(meminfo))
+
+
+def test_a_check_whose_queued_work_takes_seconds_runs_beside_a_holder_on_quiet_cores(
+    installed, held_lane, committing, roomy
+):
+    seconds_check(installed)
+    commit_run = committing(installed)
+    finishes(commit_run)
+    err = commit_run.err()
+
+    assert commit_run.returncode == 0, err
+    assert ran(installed) == ["fast", "seconds", f"nice-{max(os.nice(0), 10)}"] + [
+        "outside",
+        "agent",
+    ]
+    assert err.index("needs a lint: src/main.rs") < err.index("passed (")
+    assert "agent-pre-commit: passed (" in err and "a --few-seconds job" in err
+    assert timings_record(installed)[-1][8] == "seconds"
+
+
+def test_a_seconds_check_that_runs_long_hears_so_after_its_pass_line(
+    installed, monkeypatch
+):
+    seconds_check(installed)
+    monkeypatch.setenv("HEAVY_QUICK_MAX", "0")
+
+    run = commit(installed)
+
+    assert run.returncode == 0, run.stderr
+    lines = run.stderr.splitlines()
+    assert lines[-2].startswith("agent-pre-commit: passed (")
+    assert lines[-1].startswith("agent-pre-commit: said its queued work takes seconds")
+
+
+def test_a_check_whose_queued_work_takes_seconds_waits_at_the_queues_front(
+    installed, held_lane, committing
+):
+    # Too little memory to run outside the queue (the private queue's default).
+    seconds_check(installed)
+    commit_run = committing(installed)
+    joined = wait_or_warn(
+        lambda: in_queue(held_lane.lane), "the check never joined the queue"
+    )
+    assert "agent" not in ran(installed), commit_run.err()
+    if not joined:
+        return
+    (entry,) = [p for p in held_lane.lane.iterdir() if p.name[:1].isdigit()]
+    assert "front=1" in entry.read_text() and "quick=1" in entry.read_text()
+    held_lane.kill()
+    if not finishes_or_warns(commit_run):
+        return
+
+    assert commit_run.returncode == 0, commit_run.err()
+    assert ran(installed)[-1] == "agent"
+
+
+def test_an_inherited_check_seconds_exit_reaches_no_check(installed):
+    # [X] keeps the check from naming CHECK_QUEUE_EXIT, which would opt it in.
+    hook(
+        installed,
+        "agent-pre-commit",
+        "env | sed -n 's/^CHECK_SECONDS_E[X]IT=/inherited-/p'"
+        ' >> "$(git rev-parse --git-dir)/ran"\n'
+        'echo agent >> "$(git rev-parse --git-dir)/ran"',
+    )
+
+    run = commit(installed, env={"CHECK_SECONDS_EXIT": "76"})
+
+    assert run.returncode == 0, run.stderr
+    assert ran(installed) == ["fast", "agent"]
+
+
 def test_a_check_that_fails_as_the_oom_killer_acts_says_to_run_it_again(
     installed, monkeypatch
 ):
@@ -2103,6 +2201,15 @@ def test_no_queue_exits_75_when_the_check_asks_for_the_queue(installed):
 
     assert done.returncode == 75, done.stderr
     assert ran(installed) == ["ask"]
+
+
+def test_no_queue_exits_75_when_the_checks_queued_work_takes_seconds(installed):
+    seconds_check(installed)
+
+    done = run_no_queue(installed)
+
+    assert done.returncode == 75, done.stderr
+    assert ran(installed) == ["seconds"]
 
 
 def test_no_queue_runs_a_check_that_needs_no_queue(installed):

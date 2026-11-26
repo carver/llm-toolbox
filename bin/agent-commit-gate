@@ -128,6 +128,16 @@ from loading the machine. Beyond that the queue works on trust, as the --no-veri
 refusal below does: a check that names the variable and never exits with its code
 never waits.
 
+That first run also gets CHECK_SECONDS_EXIT=76, for queued work of seconds, such as
+filedrawer's clippy on a build its check slot already holds. A check that exits with
+it, after printing why, runs again as heavy runs a `--few-seconds` job (`heavy -h`):
+at once outside the queue, at nice 10, while the normal lane's cores are quiet,
+whoever holds the lane, else from the queue's front, ahead of every ordinary waiter.
+Its pass line then says `a --few-seconds job`. One that ran past HEAVY_QUICK_MAX
+seconds (60) prints, after its pass line, that the check's seconds rule needs a look
+(the time counts any wait for a lock the check takes). This too is on trust. --no-queue exits 75 for it, as for the queue exit, and a
+check that finds the variable unset, under an older gate, asks with CHECK_QUEUE_EXIT.
+
 Each check also gets CHECK_TIMINGS, the path of an empty file it may write its parts'
 timings to, a line each: a name of one word and its seconds (`nextest 106.2`). The
 pass line then ends with them, after the base (`passed (124s, given CHECK_BASE
@@ -144,8 +154,9 @@ last 5000 kept: the UTC time, `commit` for a git commit's check or `run` for
 another (wt-ship's), the check's name, HEAD and the tree checked (12 hex digits
 each), its exit status, the seconds it waited in the queue (for wt-ship's landing
 check, the wait for the heavy job it runs in, which wt-ship passes on as
-AGENT_CHECK_WAITED and the check doesn't see) and ran, `queue` or
-`outside` the queue, CHECK_BASE, and its timings as `name=seconds` joined by commas.
+AGENT_CHECK_WAITED and the check doesn't see) and ran, `queue`, `outside` the queue
+or `seconds` for a --few-seconds job, CHECK_BASE, and its timings as `name=seconds`
+joined by commas.
 `--timings [--since TIME]` sums it up: the runs and the span they cover, then by
 check, its runs, the seconds it ran in all and on average, the seconds it waited and
 its failed runs, and by part, its runs and seconds in all and on average, longest
@@ -226,7 +237,9 @@ no stdin: exit 0 means the check will queue, anything else, or a run past 5 s, t
 it won't, so a broken predictor never blocks a commit. It gets CHECK_BASE as the
 commit's check would, the nearest commit that passed it, or none, when every check
 runs. A repo without one is untouched. filedrawer's runs its checks-needed on the
-paths that differ from that base.
+paths that differ from that base. A check that will run as a --few-seconds job
+counts as one that waits: on busy cores it waits at the queue's front for the
+running job, which can take minutes.
 
     agent-commit-gate --install REPO...    # add the lines to each repo's hooks
     agent-commit-gate --run HOOK           # as the pre-commit line calls it
@@ -402,6 +415,10 @@ COMMIT_CHECK_NAME = "agent-commit-check"
 # QUEUE_EXIT, the exit status that asks for the queue (sysexits' EX_TEMPFAIL).
 QUEUE_EXIT_NAME = "CHECK_QUEUE_EXIT"
 QUEUE_EXIT = commitcheck.QUEUE_EXIT
+# Such a check also gets this variable, set to SECONDS_EXIT, the exit status that asks
+# for the queue for seconds of work: it runs again as heavy runs a --few-seconds job.
+SECONDS_EXIT_NAME = "CHECK_SECONDS_EXIT"
+SECONDS_EXIT = 76
 # A repo's optional script beside its hooks that says whether a commit's check will
 # wait in heavy's queue: exit 0 if so, 1 if not; past PREDICTOR_SECONDS, not.
 PREDICTOR_NAME = "commit-needs-queue"
@@ -758,7 +775,8 @@ def check_env(env, base):
     out, so nothing the check starts takes itself for a commit's, nor WAITED_NAME, a
     wait already counted."""
     gone = {
-        *("CHECK_BASE", QUEUE_EXIT_NAME, AT_COMMIT, "BASH_ENV", WAITED_NAME),
+        *("CHECK_BASE", QUEUE_EXIT_NAME, SECONDS_EXIT_NAME, AT_COMMIT, "BASH_ENV"),
+        WAITED_NAME,
         *secrets_file_names(env),
     }
     env = {k: v for k, v in env.items() if k not in gone and not secret_named(k)}
@@ -793,12 +811,14 @@ def on_one_core():
 
 class Run(NamedTuple):
     """A check's run: its process, how long it took, the timings it wrote, whether it
-    ran outside heavy's queue, and how long it waited for its turn there."""
+    ran outside heavy's queue or as a --few-seconds job, and how long it waited for its
+    turn there."""
 
     process: subprocess.CompletedProcess
     took: float
     timings: list[tuple[str, float]]
     outside: bool = False
+    seconds: bool = False
     waited: float = 0.0
     promise: str | None = None  # the heavy job's perf promise note, if any
 
@@ -855,6 +875,7 @@ def report(name, base, run):
     refusal; return the run."""
     if run.code == 0:
         where = ", outside heavy's queue" if run.outside else ""
+        where += ", a --few-seconds job" if run.seconds else ""
         given = f", given CHECK_BASE {base[:12]}" if base else ""
         wait = f", waited {run.waited:.0f}s" if run.waited >= 1 else ""
         parts = f"; {timings_shown(run.timings)}" if run.timings else ""
@@ -893,7 +914,7 @@ def record_timings(name, base, run, code, kind, tree):
         str(code),
         f"{run.waited:.1f}",
         f"{run.took:.1f}",
-        "outside" if run.outside else "queue",
+        "outside" if run.outside else "seconds" if run.seconds else "queue",
         (base or "")[:12],
         timings_recorded(run.timings),
     ]
@@ -990,19 +1011,24 @@ def show_timings(since):
 
 def run_outside_first(path, name, base, queue=True):
     """Run the check as run_quiet does, but first outside heavy's queue, on one core,
-    with CHECK_QUEUE_EXIT set. That run's outcome is the check's, unless it exits with
-    QUEUE_EXIT: then what it printed shows, as its reason, and it runs again in the
-    queue, or without queue, returns None for the caller to run it there."""
+    with CHECK_QUEUE_EXIT and CHECK_SECONDS_EXIT set. That run's outcome is the
+    check's, unless it exits with QUEUE_EXIT or SECONDS_EXIT: then what it printed
+    shows, as its reason, and it runs again in the queue, for SECONDS_EXIT as a
+    --few-seconds job; or, without queue, it returns None for the caller to run it
+    there."""
     env = check_env(os.environ, base) | {
         QUEUE_EXIT_NAME: str(QUEUE_EXIT),
+        SECONDS_EXIT_NAME: str(SECONDS_EXIT),
         "CARGO_BUILD_JOBS": "1",
     }
     with on_one_core():
         run = run_once(path, env)._replace(outside=True)
-    if run.code != QUEUE_EXIT:
+    if run.code not in (QUEUE_EXIT, SECONDS_EXIT):
         return report(name, base, run)
     sys.stderr.write(run.process.stdout.decode(errors="replace"))
-    return run_quiet(path, name, base) if queue else None
+    if not queue:
+        return None
+    return run_quiet(path, name, base, seconds=run.code == SECONDS_EXIT)
 
 
 def waited_before():
@@ -1016,18 +1042,21 @@ def waited_before():
     return seconds if math.isfinite(seconds) and seconds >= 0 else 0.0
 
 
-def run_quiet(path, name, base, queue=True):
+def run_quiet(path, name, base, queue=True, seconds=False):
     """Run the check at `path`, named `name` in what it prints, with CHECK_BASE set to
     `base` (None: unset, whatever this process inherited), and return its Run.
     Its output shows only when it fails: agents filtered a noisy pass with greps, and
     the greps hid failed commits. With queue, it runs once it's its turn in heavy's
-    queue, whose waiting lines print as they come."""
+    queue, whose waiting lines print as they come; with seconds too, as heavy runs a
+    --few-seconds job: at once outside the queue, niced, while the lane's cores are
+    quiet, else from the queue's front."""
     with ExitStack() as stack:
         env, job = os.environ, None
         asked = time.monotonic()
         try:
             if queue:
-                job = stack.enter_context(heavyqueue.turn(command=name, hint=False))
+                turn = heavyqueue.turn(command=name, hint=False, quick=seconds)
+                job = stack.enter_context(turn)
                 job.tell_promise = False  # its note goes in the pass line
                 job.pin()  # the check inherits the job's cores
                 env = job.env
@@ -1037,12 +1066,23 @@ def run_quiet(path, name, base, queue=True):
                 file=sys.stderr,
             )
         waited = time.monotonic() - asked + waited_before()
-        run = run_once(path, check_env(env, base))._replace(waited=waited)
+        run = run_once(path, check_env(env, base))._replace(
+            waited=waited, seconds=job is not None and seconds
+        )
         if job is not None:
             job.exited(run.code)  # a passing check goes into heavy's history
     if job is not None:
         run = run._replace(promise=job.promise_note)
-    return report(name, base, run)
+    report(name, base, run)
+    limit = heavyqueue.knob("HEAVY_QUICK_MAX", 60)
+    if run.seconds and run.took > limit:
+        print(
+            f"{name}: said its queued work takes seconds ({SECONDS_EXIT_NAME}), but"
+            f" ran past {limit:g} s as a --few-seconds job: the rule it says so by"
+            " needs a look.",
+            file=sys.stderr,
+        )
+    return run
 
 
 class Check(NamedTuple):

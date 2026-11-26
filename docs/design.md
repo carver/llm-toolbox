@@ -366,6 +366,38 @@ design). The running job isn't stopped. The front goes only to a landing under t
 claim and, since 2026-11-09, to a `heavy --quick` job (above), and works on trust, as
 the queue does. Since #7 a landing has one check, the tip's, so the job holds one.
 
+### A commit check whose queued work takes seconds runs as a --few-seconds job (filedrawer #155, 2026-11-26)
+
+In filedrawer's record (#148), commit checks of seconds waited minutes: since its
+check slot (#146), the 29 queued clippy checks without the routes test waited 8,130 s
+to run 770 s, up to 1,034 s for one 21 s check. They joined the back of the queue,
+behind the holder and every landing and `--few-seconds` job that came after them.
+
+The check itself now says so: its first run, outside the queue, gets
+CHECK_SECONDS_EXIT beside CHECK_QUEUE_EXIT, and exits with it when what it would
+queue takes seconds; the gate runs it again with `heavyqueue.turn(quick=True)`. The
+check already decides there what it needs and why, and filedrawer's "seconds" rule
+reads the check slot, which only its check knows. A check that never uses the new
+exit, and a gate that doesn't set it, keep the old behaviour, so nothing breaks
+either way.
+
+Passed over:
+
+- The issue's plan, a third answer from `commit-needs-queue` (exit 2: queues, but
+  seconds). It changes an old answer's meaning (anything but 0 meant "won't queue";
+  dash exits 2 on a syntax error, which would then hold a foreground commit), the
+  gate would run the predictor a second time inside the hook, and the predictor would
+  repeat the check's reading of the slot. The foreground refusal needs no third answer:
+  a --few-seconds check on busy cores still waits for the running job, minutes, so the
+  predictor says "queues" for it as before.
+- Every commit check at the queue's front, beside landings. It needs no rule, and ends
+  the jumps (3,455 s of #148's first record), but not the wait behind the holder, and
+  long checks would jump ordinary jobs too.
+
+Unmeasured at landing: what such a check costs a holder it runs beside at nice 10
+(#148's second item). It runs as any `--few-seconds` job does, whose design (above)
+took that cost as small for seconds of work.
+
 ### build-state finish only folds (8f13e99, 2026-11-08)
 
 wt-ship checked a fold's new trees when it landed them, so finish's own run of the

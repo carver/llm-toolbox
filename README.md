@@ -536,7 +536,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   core with `CARGO_BUILD_JOBS=1`, with that variable set to 75. Before it starts
   a build or a test it exits 75, printing why, and waits its turn to run again
   in the queue; any other exit is its outcome. This holds for
-  `agent-quick-check` too, which otherwise runs outside the queue.
+  `agent-quick-check` too, which otherwise runs outside the queue. For queued
+  work of seconds, such as a clippy on a build the check slot holds, it exits
+  `$CHECK_SECONDS_EXIT` (76) instead, and runs again as heavy runs a
+  `--few-seconds` job: at once beside the lane's holder, niced, on quiet cores,
+  else from the queue's front.
 - **heavy**: `heavy -- CMD` runs a CPU-heavy command once it's its turn and its
   cores are quiet. Every session on the VM shares two lanes, each running one
   job at a time at full priority, first come first served: `heavy --long` jobs

@@ -2230,6 +2230,43 @@ def test_a_command_is_recorded_only_up_to_its_first_value(box, argv, shown):
     assert "s3cret" not in history(env)
 
 
+def test_a_command_with_an_unbalanced_quote_is_recorded_as_typed():
+    assert heavyjobs.shown("wt-ship's checks") == ("wt-ship's checks", False)
+
+
+def write_record(queue, *lines):
+    queue.mkdir(parents=True, exist_ok=True)
+    text = "".join(json.dumps({"v": 1} | line) + "\n" for line in lines)
+    (queue / heavyjobs.NAME).write_text(text)
+
+
+def test_beside_finds_only_the_pids_job_that_started_since(tmp_path):
+    write_record(
+        tmp_path,
+        {"id": "old", "pid": 42, "at_start": 100.0, "at_end": 200.0, "cmd": "old"},
+        {"id": "x", "pid": 7, "at_start": 150.0, "at_end": 160.0, "cmd": "x"},
+    )
+
+    assert heavyjobs.beside(tmp_path, 42, since=1000.0, now=2000.0) == []
+    assert len(heavyjobs.beside(tmp_path, 42, since=100.0, now=2000.0)) == 2
+
+
+def test_beside_sums_up_and_lists_only_the_heaviest_jobs(tmp_path):
+    mine = {"id": "me", "pid": 42, "at_start": 100.0, "at_end": 200.0}
+    others = [
+        {"id": f"j{n}", "pid": n, "at_start": 150.0, "at_end": 160.0}
+        | {"cmd": f"job{n}", "cpu": float(n), "nice": 10 if n % 2 else 0}
+        for n in range(1, 6)
+    ]
+    write_record(tmp_path, mine | {"other_cpu": 300.0}, *others)
+
+    lines = heavyjobs.beside(tmp_path, 42, since=100.0, now=2000.0)
+
+    assert lines[0].startswith("heavy: 5 jobs overlapped it (2 at full priority)")
+    assert "other work used 300s on its cores (3.0 cores)" in lines[0]
+    assert [line.rsplit(" ", 1)[-1] for line in lines[1:]] == ["job5", "job4", "job3"]
+
+
 def test_a_long_command_is_cut_to_its_first_words(box):
     tmp_path, _, env = box
 

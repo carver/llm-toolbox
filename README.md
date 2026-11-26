@@ -276,7 +276,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   tip, so the check covers the whole landing: first outside `heavy`'s queue
   (`--no-queue`), so a docs-only landing never waits, then, when it needs the
   queue, in a `heavy` job, at the queue's front when it lands under the main
-  tree's claim. A failure stops it. One commit lands as it is; two or more land as a merge
+  tree's claim. A failure stops it; one in a `heavy` job also prints, from
+  heavy's record, how many jobs ran beside the job and the three that used the
+  most CPU, so a test past its time limit reads as load first. One commit lands as it is; two or more land as a merge
   commit (`Merge TOPIC (N commits)`, TOPIC from the `REPO-wt-TOPIC` folder,
   the commits' subjects in its body) whose tree is the tip's, so the commits
   inside it get no check at landing, and `git bisect --first-parent` walks

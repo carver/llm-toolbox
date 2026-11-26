@@ -61,9 +61,9 @@ def shown(command):
     value (`-pSECRET`); and within CHARS. A secret that isn't a value, a bare word
     after the subcommand (`./deploy prod TOKEN`), is still kept."""
     try:
-        words = shlex.split(command)
-    except ValueError:
-        words = command.split()
+        words, join = shlex.split(command), shlex.join
+    except ValueError:  # unbalanced quotes, as in "wt-ship's checks": shown as typed
+        words, join = command.split(), " ".join
     kept = []
     for word in words:
         if kept and (
@@ -73,10 +73,10 @@ def shown(command):
             or (kept[-1].startswith("-") and not word.startswith("-"))
         ):
             break
-        if len(shlex.join([*kept, word])) > CHARS:
+        if len(join([*kept, word])) > CHARS:
             break
         kept.append(word)
-    return shlex.join(kept), len(kept) < len(words)
+    return join(kept), len(kept) < len(words)
 
 
 def parents(pid):
@@ -338,6 +338,43 @@ def describe(job, now=None):
 
 def plural(count, word):
     return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def brief(job, now):
+    """A short line for a job: its start, length, how it ran, its CPU, and its
+    command in its folder's last name."""
+    begun, done = span_of(job, now)
+    used = f", cpu {cpu(job['cpu'])}" if number(job.get("cpu")) is not None else ""
+    folder = os.path.basename(str(job.get("cwd") or "?").rstrip("/")) or "/"
+    return (
+        f"{clock(begun)} {seconds(done - begun)} {mode(job)}{used}; {who(job)}"
+        f" in {folder}: {job.get('cmd', '?')}"
+    )
+
+
+def beside(queue, pid, since, most=3, now=None):
+    """Lines for what ran beside pid's job that started at or after since: a summary
+    (how many jobs overlapped it, how many of them at full priority, the CPU other
+    work used on its cores) and the `most` that used the most CPU. Empty when no such
+    job is on the record."""
+    now = time.time() if now is None else now
+    found = jobs(queue)
+    mine = [job for job in found if job.get("pid") == pid and job["at_start"] >= since]
+    if not mine:
+        return []
+    target = mine[-1]
+    start, end = span_of(target, now)
+    pairs = overlapping([job for job in found if job is not target], start, end, now)
+    full = sum(1 for job, _ in pairs if not job.get("nice"))
+    line = f"heavy: {plural(len(pairs), 'job')} overlapped it ({full} at full priority)"
+    other = number(target.get("other_cpu"))
+    if other is not None:
+        cores = other / max(end - start, 1e-9)
+        line += f"; other work used {cpu(other)} on its cores ({cores:.1f} cores)"
+    heaviest = sorted(pairs, key=lambda pair: -(number(pair[0].get("cpu")) or 0))
+    lines = [line + "."]
+    lines += [f"  {brief(job, now)}" for job, _ in heaviest[:most]]
+    return lines
 
 
 def report(queue, since=None, around=None, now=None):

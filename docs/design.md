@@ -1282,6 +1282,12 @@ DEST must not exist and is opened with `O_EXCL | O_NOFOLLOW`, so a run never ove
 `~/REL` is read as the box's user but outside bwrap, where a link the agent planted would reach a file the box hides from it, such as `/etc/sandbox-persistent.sh`, and the caller would then send that file on (filedrawer sends the kept header to its site). So the read opens one folder at a time with `O_NOFOLLOW` and takes only a regular file; a link anywhere on the way keeps nothing and says so.
 A wait turn's NAME is a bare file name, none drive-agent writes in the run folder (`turns.md` would end the wait at once) and no earlier wait turn's (the file is already there); print mode, which sends one turn, refuses one. turns.md logs the wait as it starts, so a run stopped mid-wait shows what it waited for.
 
+### A stuck tmux server is killed by its own tree, and only while it is one (#16, 2026-11-26)
+
+When `tmux kill-server` doesn't return, `kill_tmux_server` SIGKILLs the server's pid and every process under it, read from `/proc/PID/task/*/children` one level at a time, the whole tree before the first signal.
+Reason: the first version scanned every `/proc/*/stat` for the server's pid as parent, so a single negated comparison made every process the user owns a victim: the mutant that killed six daily mutants runs and, applied to the main tree's live file, the VM (see mutate-check's PID namespace entries). Read from the server's own tree, no inverted or dropped test can reach outside it. It also takes a pane's grandchildren, which the parent-pid scan left running.
+It signals nothing unless `/proc/PID/comm` still reads `tmux: server`, so a pid the ended server left to another process is spared.
+
 ### Rejected: a separate user without bwrap (2026-11-10)
 
 It blocks writes but not reads of the workspace, which is world-readable, and leaves `/proc` and `/var/tmp` shared between runs.

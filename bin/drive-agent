@@ -256,23 +256,36 @@ class Usage(Exception):
     """A usage error: exit 2."""
 
 
+def tree(pid: int) -> list[int]:
+    """`pid` and every process under it, parents first, read from each one's
+    /proc/PID/task/*/children: only that tree, never all of /proc, so no broken
+    test can widen it to every process."""
+    found = [pid]
+    for parent in found:
+        for children in Path(f"/proc/{parent}/task").glob("*/children"):
+            try:
+                kids = children.read_text().split()
+            except OSError:
+                continue
+            found += [int(kid) for kid in kids if int(kid) not in found]
+    return found
+
+
 def kill_tmux_server(pid: int | None) -> list[int]:
-    """SIGKILLs the tmux server `pid` and its panes' processes, its children, and
-    returns the pids killed. By pid, not socket name: a name repeats in every
-    TMUX_TMPDIR, another run's included."""
+    """SIGKILLs the tmux server `pid` and every process under it, its panes' and
+    theirs, and returns the pids killed. By pid, not socket name: a name repeats in
+    every TMUX_TMPDIR, another run's included. Nothing, when `pid` is no longer a
+    tmux server, as when it ended and the pid went to another process."""
     if pid is None:
         return []
-    victims = [pid]
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            # The parent pid is the field after the command, which may hold spaces.
-            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-        except (OSError, IndexError):
-            continue
-        if fields[1:2] == [str(pid)]:
-            victims.append(int(entry.name))
+    try:
+        if Path(f"/proc/{pid}/comm").read_text().strip() != "tmux: server":
+            return []
+    except OSError:
+        return []
+    # The whole tree before the first signal: a killed parent's children move to
+    # another parent.
+    victims = tree(pid)
     killed = []
     for victim in victims:
         try:

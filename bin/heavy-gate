@@ -12,7 +12,14 @@ names it too. That wait can pass the Bash tool's default limit of two minutes, s
 hook refuses a foreground call that runs it unless the call's own timeout is the
 tool's longest, 600000 ms; a `timeout` command around heavy doesn't count.
 Background call or not, it refuses heavy around bgrun (`heavy -- bgrun ...`), and
-around git commit and wt-ship, which queue their own checks and run bare. install.py
+around git commit and wt-ship, which queue their own checks and run bare, and heavy
+without --long around `mutate-check --diff`, which runs its command once per mutant and
+would hold the normal lane, ahead of every commit's checks, for minutes; the refusal
+names `bgrun --wait -o LOG -- heavy --long -- mutate-check --diff ...` as a background
+call. It looks for --diff among mutate-check's options, the words before its `--`, and
+counts an expansion there as --diff; inside heavy, a shell's -c script counts too. A
+mutate-check of edits, `--edits FILE` or blocks on stdin, runs once and goes under heavy
+like any other command. install.py
 registers it in ~/.claude/settings.json. A subagent's call (the event has an agent_id)
 gets the same verdict, but its refusal names the blocking form, plain bgrun in the
 foreground and then waitone, since a subagent doesn't end its turn to wait for a job
@@ -68,9 +75,16 @@ FOREGROUND = (
 )
 WRONG_ORDER = f"Refused: heavy goes inside bgrun, not around it: {RIGHT_FORM}."
 RUN_BARE = "Refused: git commit and wt-ship queue their own checks; run them bare, not under heavy."
+MUTATE_LONG = (
+    "Refused: mutate-check --diff runs its command once per mutant and holds a lane "
+    "for minutes, so it goes in the long lane, beside the commit checks rather than "
+    "ahead of them: run bgrun --wait -o <scratchpad>/LOG -- heavy --long -- "
+    "mutate-check --diff ..., as a background call (run_in_background: true)."
+)
 LONGEST_TIMEOUT_MS = 600000
 # heavy's flag for seconds of work, and the old name it still takes.
 QUICK_FLAGS = ("--few-seconds", "--quick")
+LONG_FLAGS = ("--long",)
 QUICK_TIMEOUT = (
     "Refused: heavy --few-seconds can wait minutes at the queue's front, past this "
     "call's time limit (two minutes by default). Set the Bash tool's timeout parameter to "
@@ -78,7 +92,7 @@ QUICK_TIMEOUT = (
     "background (run_in_background: true)."
 )
 # Most specific first: the first that applies is the one printed.
-REFUSALS = (RUN_BARE, WRONG_ORDER, FOREGROUND, QUICK_TIMEOUT)
+REFUSALS = (RUN_BARE, WRONG_ORDER, MUTATE_LONG, FOREGROUND, QUICK_TIMEOUT)
 # A subagent's prompt cache lasts five minutes, and its parent spends a turn on each of
 # its stops, so it blocks on the job rather than wait for a background call's
 # notification; its Bash calls go to the background after 180 s.
@@ -95,6 +109,13 @@ SUBAGENT = {
         f"--few-seconds -- CMD with the call's timeout at {LONGEST_TIMEOUT_MS}."
     ),
     WRONG_ORDER: f"Refused: heavy goes inside bgrun, not around it: {SUBAGENT_FORM}.",
+    MUTATE_LONG: (
+        "Refused: mutate-check --diff runs its command once per mutant and holds a lane "
+        "for minutes, so it goes in the long lane, beside the commit checks rather than "
+        "ahead of them. In a subagent, run bgrun -o <scratchpad>/LOG -- heavy --long -- "
+        "mutate-check --diff ... in the foreground, which prints the job's PID at once, "
+        "then `waitone --pid PID -t 170`, again until it exits, and read LOG."
+    ),
     QUICK_TIMEOUT: (
         "Refused: heavy --few-seconds can wait minutes at the queue's front, past this "
         "call's time limit (two minutes by default). Set the Bash tool's timeout "
@@ -152,9 +173,39 @@ def judge(words: list[str], blocks: bool) -> set[str]:
         return {RUN_BARE}
     if inner_name == "bgrun":
         return {WRONG_ORDER}
-    if not blocks:
-        return set()
-    return {QUICK_TIMEOUT} if asks_quick(args) else {FOREGROUND}
+    found = set()
+    if not asks(args, LONG_FLAGS) and mutates_a_diff(queued):
+        found.add(MUTATE_LONG)
+    if blocks:
+        found.add(QUICK_TIMEOUT if asks(args, QUICK_FLAGS) else FOREGROUND)
+    return found
+
+
+def mutates_a_diff(words: list[str]) -> bool:
+    """Whether a command heavy queues runs `mutate-check --diff`, itself or in a shell's
+    -c script. mutate-check takes its options whole, never abbreviated or as --diff=, so
+    --diff is the exact word among the words before its `--`; an expansion there could
+    be --diff, so it counts as one. `mutate-check -h` returns at once."""
+    words, _ = command_of(words)
+    if not words:
+        return False
+    name, args = Path(words[0]).name, words[1:]
+    if name in SHELLS:
+        script = shell_script(words)
+        return script is not None and script_mutates_a_diff(script)
+    if name != "mutate-check" or args[:1] in (["-h"], ["--help"]):
+        return False
+    options = args[: args.index("--")] if "--" in args else args
+    return any(word == "--diff" or "$" in word for word in options)
+
+
+def script_mutates_a_diff(script: str) -> bool:
+    """Whether a shell script runs `mutate-check --diff`, in its own commands or its
+    command substitutions."""
+    cleaned, substitutions, _ = prepare(script)
+    return any(mutates_a_diff(simple.words) for simple in commands(cleaned)) or any(
+        map(script_mutates_a_diff, substitutions)
+    )
 
 
 def heavy_command(args: list[str]) -> list[str] | None:
@@ -169,12 +220,12 @@ def heavy_command(args: list[str]) -> list[str] | None:
     return args if any("$" in word for word in args) else None
 
 
-def asks_quick(args: list[str]) -> bool:
-    """Whether heavy's options, the words before its `--`, ask for --few-seconds or its
-    old name --quick, whole or abbreviated as heavy's parser accepts."""
+def asks(args: list[str], flags: tuple[str, ...]) -> bool:
+    """Whether heavy's options, the words before its `--`, ask for one of flags, whole
+    or abbreviated as heavy's parser accepts."""
     options = args[: args.index("--")] if "--" in args else []
     return any(
-        len(word) > 2 and any(flag.startswith(word) for flag in QUICK_FLAGS)
+        len(word) > 2 and any(flag.startswith(word) for flag in flags)
         for word in options
     )
 

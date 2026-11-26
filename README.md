@@ -709,7 +709,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   of seconds, which passes in the foreground only when the call's own timeout is
   600000 ms (a `timeout` command doesn't count), since it may wait minutes for
   the running job. Background or not,
-  it refuses heavy around bgrun, git commit or wt-ship. It reads the command as
+  it refuses heavy around bgrun, git commit or wt-ship, and heavy without
+  `--long` around `mutate-check --diff`, which would hold the normal lane, where
+  the commit checks queue, for minutes; a mutate-check of edits runs once and
+  passes. It reads the command as
   shell words and looks only at what runs, through wrappers such as `timeout`
   and `nice`, `bash -c`, a heredoc fed to a shell and `$(...)`. A word that only
   mentions heavy passes, as do `heavy status`, `heavy -h`, `bgrun` without

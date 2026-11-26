@@ -218,7 +218,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   Python and shell lines added or changed since BASE (its merge base with HEAD,
   work tree included; tests and their helpers left alone): a statement deleted, a
   condition negated, an and/or operand dropped, `==`/`!=` and `True`/`False`
-  swapped, a string that's a value changed, a shell default changed. It runs CMD
+  swapped, a string that's a value changed, a shell default changed, each shell
+  redirection dropped in turn (`8>&-`, `2>&1`, `>FILE`, `< <(cmd)`). It runs CMD
   unmutated first, and runs no mutant unless that run passes with tests run. Then
   it runs CMD once per mutant, each statement's first before any second, up to
   `--max` (40), each with a timeout of ten times the unmutated run, at least 30

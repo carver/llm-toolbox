@@ -78,7 +78,9 @@ file stem such as tests, test_x, x_test, x_testing or test-x. On those lines:
   shell   a command becomes `:`, and a `cmd || {` group up to its `}` too; a
           one-line if, elif, while or until condition is negated; = or == and !=,
           -eq and -ne swap inside [ ] or [[ ]]; W in ${N:-W}, ${N-W}, ${N:=W} or
-          ${N=W} becomes XXWXX.
+          ${N=W} becomes XXWXX; each redirection is dropped in turn (`8>&-`,
+          `2>&1`, `>FILE`, `<FILE`, `&>FILE`), but not a heredoc, a here-string
+          or a process substitution, nor a > in quotes, [[ ]] or arithmetic.
 
 Left out as changing nothing a test sees: a return of nothing that ends a function, a
 continue that ends a loop, a final `exit 0`, True and False in a decorator (as
@@ -872,6 +874,18 @@ SHELL_TEST = re.compile(r"\[\[?\s.*?\s\]\]?")
 SHELL_COMPARISON = re.compile(r"(?<=\s)(==|!=|=|-eq|-ne)(?=\s)")
 SHELL_OPPOSITE = {"==": "!=", "=": "!=", "!=": "=", "-eq": "-ne", "-ne": "-eq"}
 SHELL_DEFAULT = re.compile(r"\$\{\w+:?[-=]([^}]+)\}")
+# A redirection's operator, with its fd or &: not a heredoc's or here-string's <<,
+# nor process substitution's <( or >(. Matched where quotes, comments, arithmetic
+# and [[ ]] are blanked out, so a > there is no redirection.
+SHELL_REDIRECT = re.compile(
+    r"(?<![\w<>&|$}])(?:\d+|&|\{\w+\})?(?:>>|>&|<&|>\||<>|>|<)(?![<(])"
+)
+# The word a redirection names, read from the line itself.
+# A backslash counts only as an escape: one that ends the line continues it, and the
+# word is on the next line.
+SHELL_WORD = re.compile(r"""\s*(?:"(?:\\.|[^"\\])*"|'[^']*'|\\.|[^\s;|&()<>"'\\])+""")
+# A process substitution as a redirection's word, as in `done < <(cmd)`.
+SHELL_SUBSTITUTION = re.compile(r"\s*[<>]\(")
 # Settings, and messages to stderr: deleting them runs last.
 SHELL_LATE = re.compile(r"(set|shopt)\s|(echo|printf)\s.*>&2")
 CONTINUED = ("\\", "|", "&&")
@@ -912,6 +926,7 @@ class ShellFile:
         """Each command's first and last line, counted from 0, with continued lines
         joined. Comments, blank lines and heredocs are left out."""
         found, index = [], 0
+        self.bodies: set[int] = set()
         while index < len(self.lines):
             first = index
             while index + 1 < len(self.lines) and continues(self.lines[index]):
@@ -920,6 +935,8 @@ class ShellFile:
             text = self.lines[first].strip()
             if text and not text.startswith("#") and body_end is None:
                 found.append((first, index))
+            if body_end is not None:
+                self.bodies.update(range(index + 1, body_end + 1))
             index = (index if body_end is None else body_end) + 1
         return found
 
@@ -941,6 +958,7 @@ class ShellFile:
 
     def mutants(self) -> list[Mutant]:
         commands = self.commands()
+        self.code = shell_code(self.lines, self.bodies)
         return [
             mutant
             for number, (first, last) in enumerate(commands)
@@ -949,7 +967,7 @@ class ShellFile:
         ]
 
     def command_mutants(self, first: int, last: int, ends_file: bool) -> list[Mutant]:
-        found = list(self.defaults(first, last))
+        found = [*self.defaults(first, last), *self.redirections(first, last)]
         line = self.lines[first]
         condition = SHELL_CONDITION.fullmatch(line) if first == last else None
         if condition:
@@ -1051,6 +1069,41 @@ class ShellFile:
                 description = f"{op[1]} -> {new}: {short(test[0])}"
                 yield self.mutant(index, op.span(), SWAP, new, description, index)
 
+    def redirections(self, first: int, last: int) -> Iterator[Mutant]:
+        """Each redirection, with the space before it, is dropped: `8>&-`, `2>&1`,
+        `>FILE`, `<FILE`, `&>FILE`."""
+        late = SHELL_LATE.match(self.text(first, last)) is not None
+        for index in range(first, last + 1):
+            line = self.lines[index]
+            for op in SHELL_REDIRECT.finditer(self.code[index]):
+                end = self.word_end(index, op.end())
+                if end is None:
+                    continue
+                start = len(line[: op.start()].rstrip())
+                redirect = line[op.start() : end]
+                description = f"dropped: {redirect}"
+                # Like deleting the message itself, dropping its >&2 runs last.
+                last_run = late and redirect == ">&2"
+                yield self.mutant(
+                    index, (start, end), DROP, "", description, first, late=last_run
+                )
+
+    def word_end(self, index: int, at: int) -> int | None:
+        """Where the word a redirection names, from column `at` of line `index`, ends:
+        a process substitution to its closing paren. None when the line holds none,
+        as when a backslash continues it."""
+        line = self.lines[index]
+        sub = SHELL_SUBSTITUTION.match(line, at)
+        if sub:
+            depth, code = 1, self.code[index]
+            for col in range(sub.end(), len(line)):
+                depth += {"(": 1, ")": -1}.get(code[col], 0)
+                if depth == 0:
+                    return col + 1
+            return None
+        word = SHELL_WORD.match(line, at)
+        return word.end() if word else None
+
     def defaults(self, first: int, last: int) -> Iterator[Mutant]:
         """W in ${N:-W}, ${N-W}, ${N:=W} or ${N=W} becomes XXWXX."""
         for index in range(first, last + 1):
@@ -1060,6 +1113,77 @@ class ShellFile:
                 description = f"{default[0]} -> {head}{word}}}"
                 cols = default.span(1)
                 yield self.mutant(index, cols, STRING, word, description, first)
+
+
+def shell_code(lines: list[str], bodies: set[int]) -> list[str]:
+    """`lines` with every character bash reads as no part of a command blanked: quoted
+    text, comments, arithmetic and `[[ ]]`, but not a `$( )` inside them, which is code
+    again. One pass over the whole script, so a string that spans lines stays one; the
+    heredoc bodies, lines `bodies`, are blanked whole."""
+    out = []
+    stack = ["code"]  # code, sub, paren, sq, dq, arith, test
+    for index, line in enumerate(lines):
+        if index in bodies:
+            out.append(" " * len(line))
+            continue
+        chars, i = list(line), 0
+        while i < len(line):
+            top, rest = stack[-1], line[i:]
+            starts_word = i == 0 or line[i - 1] in " \t;|&()"
+            code = top in ("code", "sub", "paren")
+            step, hide = 1, not code
+            if top == "sq":
+                if rest[0] == "'":
+                    stack.pop()
+            elif top in ("dq", "test") and rest.startswith("$(("):
+                stack.append("arith")
+                step = 3
+            elif top in ("dq", "test") and rest.startswith("$("):
+                stack.append("sub")
+                step, hide = 2, False
+            elif top == "dq":
+                if rest[0] == "\\":
+                    step = 2
+                elif rest[0] == '"':
+                    stack.pop()
+            elif top == "test":
+                if rest.startswith("]]"):
+                    stack.pop()
+                    step = 2
+                elif rest[0] in "'\"":
+                    stack.append("sq" if rest[0] == "'" else "dq")
+            elif top == "arith":
+                if rest.startswith("))"):
+                    stack.pop()
+                    step = 2
+            elif rest[0] == "\\":
+                step = 2
+            elif rest[0] == "#" and starts_word:
+                for j in range(i, len(line)):
+                    chars[j] = " "
+                break
+            elif rest[0] in "'\"":
+                stack.append("sq" if rest[0] == "'" else "dq")
+                hide = True
+            elif rest.startswith("$((") or (rest.startswith("((") and starts_word):
+                stack.append("arith")
+                step, hide = (3 if rest[0] == "$" else 2), True
+            elif rest.startswith("$("):
+                stack.append("sub")
+                step = 2
+            elif rest.startswith("[[") and starts_word:
+                stack.append("test")
+                step, hide = 2, True
+            elif rest[0] == "(":
+                stack.append("paren")
+            elif rest[0] == ")" and top in ("sub", "paren"):
+                stack.pop()
+            if hide:
+                for j in range(i, min(i + step, len(line))):
+                    chars[j] = " "
+            i += step
+        out.append("".join(chars))
+    return out
 
 
 def continues(line: str) -> bool:

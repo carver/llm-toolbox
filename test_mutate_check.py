@@ -938,9 +938,50 @@ def test_diff_makes_one_mutant_per_operator_and_site_in_shell(
             "run.sh:18: ${DIR:-keep/data} -> ${DIR:-XXkeep/dataXX}",
             'run.sh:19: deleted: [ -d "$dir" ] || { echo "no $dir" >&2 }',
             'run.sh:20: deleted: echo "no $dir" >&2',
+            "run.sh:20: dropped: >&2",
         ]
     ), result.stdout + result.stderr
-    assert result.stdout.splitlines()[-1] == SUMMARY.format(0, 13, 0, 0)
+    assert result.stdout.splitlines()[-1] == SUMMARY.format(0, 14, 0, 0)
+
+
+REDIRECTS = """\
+#!/bin/bash
+exec 8>"$slot/lock"
+run() { cargo "$@" 8>&-; }
+check >"$logs/out" 2>&1 || cat "$logs/out"
+while read -r name; do
+  echo "$name" >>names.txt
+done <"$list"
+sort <input &>sorted
+cat <<'EOF'
+a > b
+EOF
+grep x <<<"$text"
+diff <(one) >(two)
+[[ $a > $b ]]
+echo "1 > 2" '3 < 4'
+n=$(( a > b ))
+"""
+
+
+def test_diff_drops_each_redirection_in_turn(project: Path) -> None:
+    add(project, {"redirects.sh": REDIRECTS})
+
+    result = diff_check(project, "true")
+
+    dropped = [line for line in result.stdout.splitlines() if "dropped:" in line]
+    assert sorted(dropped) == sorted(
+        [
+            'redirects.sh:2: dropped: 8>"$slot/lock"',
+            "redirects.sh:3: dropped: 8>&-",
+            'redirects.sh:4: dropped: >"$logs/out"',
+            "redirects.sh:4: dropped: 2>&1",
+            "redirects.sh:6: dropped: >>names.txt",
+            'redirects.sh:7: dropped: <"$list"',
+            "redirects.sh:8: dropped: <input",
+            "redirects.sh:8: dropped: &>sorted",
+        ]
+    ), result.stdout + result.stderr
 
 
 def test_diff_mutates_code_files_by_name_or_shebang_and_skips_tests(
@@ -1429,3 +1470,91 @@ def test_a_base_with_no_history_in_common_says_so(project: Path) -> None:
     assert result.returncode == 2, result.stdout + result.stderr
     assert "no history in common with HEAD" in result.stderr
     assert not (project / "ran").exists()
+
+
+def test_a_redirection_whose_word_is_on_the_next_line_is_left_alone(
+    project: Path,
+) -> None:
+    add(project, {"wrapped.sh": "#!/bin/bash\nprintf '%s\\n' one >\\\n  out.txt\n"})
+
+    result = diff_check(project, "true")
+
+    # Only the printf's deletion: no redirection mutant, and no crash.
+    assert result.stdout.splitlines()[-1] == SUMMARY.format(0, 1, 0, 0), (
+        result.stdout + result.stderr
+    )
+    assert not [line for line in result.stdout.splitlines() if "dropped:" in line]
+
+
+MORE_REDIRECTS = """\
+#!/bin/bash
+exec 3<&0 4<&- 5>|five 6<>six
+done_list=x
+while read -r f; do :; done < <(find . -name '*.sh')
+h=$(sha256sum < "$path" | cut -c1-8)
+v="$(find . 2>/dev/null)"
+[[ $(git rev-parse HEAD 2>/dev/null) == x ]]
+exec {fd}>&-
+usage="run it
+  with < binary on stdin"
+python3 -c 'print(1 >= 2)'
+cat <<-'END'
+	a > b
+	END
+(( n > 2 )) && echo big # a > b
+echo "$v" >&2
+"""
+
+
+def test_diff_drops_redirections_wherever_bash_reads_them(project: Path) -> None:
+    add(project, {"more.sh": MORE_REDIRECTS})
+
+    result = diff_check(project, "true")
+
+    dropped = [line for line in result.stdout.splitlines() if "dropped:" in line]
+    assert sorted(dropped) == sorted(
+        [
+            "more.sh:2: dropped: 3<&0",
+            "more.sh:2: dropped: 4<&-",
+            "more.sh:2: dropped: 5>|five",
+            "more.sh:2: dropped: 6<>six",
+            "more.sh:4: dropped: < <(find . -name '*.sh')",
+            'more.sh:5: dropped: < "$path"',
+            "more.sh:6: dropped: 2>/dev/null",
+            "more.sh:7: dropped: 2>/dev/null",
+            "more.sh:8: dropped: {fd}>&-",
+            "more.sh:16: dropped: >&2",
+        ]
+    ), result.stdout + result.stderr
+
+
+def test_a_dropped_redirection_takes_the_space_before_it(project: Path) -> None:
+    add(project, {"one.sh": "#!/bin/bash\nprintf x 2>&1\n"})
+
+    result = diff_check(
+        project, "sh", "-c", 'grep -q "^printf x$" one.sh && exit 1; exit 0'
+    )
+
+    # The command fails only for the mutant that leaves `printf x` exactly.
+    assert result.stdout.splitlines()[-1].startswith("mutate-check: 1 caught"), (
+        result.stdout + result.stderr
+    )
+    assert "one.sh:2: dropped: 2>&1" not in result.stdout, result.stdout + result.stderr
+
+
+def test_a_redirection_to_stderr_from_a_message_runs_last(project: Path) -> None:
+    add(
+        project,
+        {"msg.sh": "#!/bin/bash\nmake build\necho 'it failed' >&2\nmake test\n"},
+    )
+
+    result = diff_check(project, "true")
+
+    survived = result.stdout.splitlines()[:-1]
+    assert survived[-2:] == [
+        "msg.sh:3: deleted: echo 'it failed' >&2",
+        "msg.sh:3: dropped: >&2",
+    ] or survived[-2:] == [
+        "msg.sh:3: dropped: >&2",
+        "msg.sh:3: deleted: echo 'it failed' >&2",
+    ], result.stdout

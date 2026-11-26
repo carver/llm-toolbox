@@ -3100,10 +3100,128 @@ def test_until_open_refuses_a_poll_interval_it_cant_read(box):
 def test_until_open_options_need_until_open(box):
     _, _, env = box
 
-    done = heavy(env, "waits", "--max-wait", "10")
+    done = heavy(env, "waits", "--p90", "10")
 
     assert done.returncode == 2, done.stdout
     assert "--until-open" in done.stderr, done.stderr
+
+
+# `heavy waits --until-quiet`: wait for an empty queue on a quiet machine, as the
+# end of a night's timing runs does.
+
+
+def until_quiet(box, *args, load="0.50"):
+    """Run `heavy waits --until-quiet` with its readings 0.05 s apart and the 1-minute
+    load average `load`."""
+    tmp_path, _, env = box
+    loadavg = tmp_path / "loadavg"
+    loadavg.write_text(f"{load} 3.00 2.00 1/300 1234\n")
+    return heavy(
+        env,
+        "waits",
+        "--until-quiet",
+        *args,
+        HEAVY_WAITS_POLL="0.05",
+        HEAVY_LOADAVG=str(loadavg),
+    )
+
+
+def test_until_quiet_on_an_empty_queue_and_a_quiet_machine_exits_0(box):
+    done = until_quiet(box)
+
+    assert done.returncode == 0, done.stderr
+    (line,) = done.stdout.splitlines()
+    assert line == "quiet: 0 running, 0 waiting, load 0.50 (under 2)", line
+
+
+def test_until_quiet_holds_for_a_waiter_in_either_lane(box):
+    tmp_path, _, _ = box
+    add_waiter(tmp_path, "long", 1)
+
+    done = until_quiet(box, "--max-wait", "0")
+
+    assert done.returncode == 3, done.stderr
+    (line,) = done.stdout.splitlines()
+    assert line == "busy: 0 running, 1 waiting, load 0.50 (under 2)", line
+
+
+def test_until_quiet_holds_for_a_high_load_average_unless_load_allows_it(box):
+    busy = until_quiet(box, "--max-wait", "0.2", load="4.40")
+    allowed = until_quiet(box, "--load", "5", load="4.40")
+
+    assert busy.returncode == 3, busy.stderr
+    assert all(line.startswith("busy: ") for line in busy.stdout.splitlines())
+    assert "load 4.40 (2 or more)" in busy.stdout, busy.stdout
+    assert allowed.returncode == 0, allowed.stderr
+    assert "load 4.40 (under 5)" in allowed.stdout, allowed.stdout
+
+
+def test_until_quiet_counts_a_few_seconds_job_running_outside_the_queue(box):
+    tmp_path, _, _ = box
+    folder = tmp_path / "heavy"
+    folder.mkdir()
+    pid = os.getpid()  # alive while the test runs
+    job = {"v": 1, "id": "q", "at_start": time.time(), "pid": pid, "how": "outside"}
+    job |= {"proc_start": fifo.started(str(pid)), "host": socket.gethostname()}
+    gone = job | {"id": "g", "pid": 999999}  # its heavy ended with no end line
+    (folder / "jobs.jsonl").write_text(json.dumps(job) + "\n" + json.dumps(gone) + "\n")
+
+    done = until_quiet(box, "--max-wait", "0", "--json")
+
+    assert done.returncode == 3, done.stderr
+    found = json.loads(done.stdout)
+    assert found == {
+        "quiet": False,
+        "running": 1,
+        "waiting": 0,
+        "load": 0.5,
+        "load_under": 2.0,
+    }, found
+
+
+def test_until_quiet_waits_for_the_running_job_to_end(box, background):
+    tmp_path, _, _ = box
+    loadavg = tmp_path / "loadavg"
+    loadavg.write_text("0.10 0.10 0.10 1/300 1234\n")
+    command, started, release = blocker(tmp_path, "a")
+    holder = background("--", *command)
+    wait_until(started.exists, "a to start")
+    waiter = background(
+        "waits",
+        "--until-quiet",
+        HEAVY_WAITS_POLL="0.05",
+        HEAVY_LOADAVG=str(loadavg),
+    )
+    first = waiter.stdout.readline()
+    release.touch()
+    finish(holder)
+
+    code, out, err = finish(waiter)
+
+    assert first == "busy: 1 running, 0 waiting, load 0.10 (under 2)\n", first
+    assert code == 0, err
+    assert out == "quiet: 0 running, 0 waiting, load 0.10 (under 2)\n", out
+
+
+@pytest.mark.parametrize(
+    ("args", "named"),
+    [
+        (["--until-quiet", "--until-open"], "--until-open"),
+        (["--until-quiet", "--p90", "10"], "--p90"),
+        (["--until-quiet", "--lane", "long"], "--lane"),
+        (["--until-quiet", "--since", "1h"], "--since"),
+        (["--until-quiet", "--min-jobs", "3"], "--min-jobs"),
+        (["--load", "3"], "--until-quiet"),
+        (["--max-wait", "10"], "--until-quiet"),
+    ],
+)
+def test_until_quiet_refuses_options_that_dont_go_with_it(box, args, named):
+    _, _, env = box
+
+    done = heavy(env, "waits", *args)
+
+    assert done.returncode == 2, done.stdout
+    assert named in done.stderr.splitlines()[-1], done.stderr  # not just the usage
 
 
 @pytest.mark.parametrize(

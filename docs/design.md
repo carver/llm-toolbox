@@ -78,6 +78,13 @@ It doesn't keep every secret out: a bare positional token, as in `./deploy prod 
 The other option the issue named, redacting what looks like a secret and keeping the rest, fails open: every shape it doesn't know (a header after `-H`, a positional token, a new tool's flag) is kept in full. Cutting fails closed: what it drops can't leak, and the first words still name the tool, its subcommand and its folder, enough to say which job overlapped.
 The cost is detail: `sh -c 'pytest -n 8'` shows as `sh -c`, and `pytest -k name` as `pytest -k`. The record's `key`, history.json's hash of the repo and the whole command, still tells two runs of one command from runs of another.
 
+### `heavy waits --until-quiet` waits for empty lanes and a low load average (2026-11-26)
+
+The night's end-of-run timings waited for `heavy status` to show both lanes empty, as the protocol said, and started at a 1-minute load average of 4.4 to 6.5: the agents' own load (Claude Code sessions, their hooks, git and grep outside heavy, about 3 cores at 11:55 by #25's sample) shows in no lane.
+`--until-quiet` waits for both: no job running in either lane (holders, sharers, and --few-seconds jobs running outside the queue, which take no slot and are found in the record by a live PID), none waiting, and the load average under `--load`, default 2.
+The load average, not heavy's busy share: it counts runnable tasks over a minute, so it settles past a burst of hooks, and it is the number the night's runs were judged by. The default of 2 is the owner's ("about 2"), unmeasured; `--load` changes it.
+It is the queue's state once, not a promise: a job can start the moment it exits, so a timing still runs under `--alone`, whose closing line reports outside work.
+
 ### heavy-bench: a benchmark is many short --alone jobs, interleaved (2026-11-25)
 
 In filedrawer #137's benchmark (2026-11-25), `heavy --alone -- hyperfine` over three variants of a 2-minute suite held heavy's queue for about 25 minutes, so every session's commit checks waited behind it; the owner asked for it split.

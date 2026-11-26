@@ -18,6 +18,9 @@
     heavy waits --until-open [--p90 S] [--waiting N] [--max-wait S] [--lane L]
                                           wait for the queue to be quiet enough to
                                           start work
+    heavy waits --until-quiet [--load N] [--max-wait S]
+                                          wait for an empty queue on a quiet
+                                          machine, as before a timing
 
 Every session on this VM shares two lanes, each running one job at a time at full
 priority, first come first served. A long job runs on the last quarter of the cores;
@@ -171,6 +174,16 @@ two lines, its first reading and its last, each `open: ` or `held: ` and then th
 can't wait on its own clock, such as an overnight workflow's spawn gate, runs it in
 the background and waits for it to exit.
 
+`heavy waits --until-quiet` waits, the same way, for no job running or waiting in
+either lane, from any session (holders, sharers, and --few-seconds jobs running
+outside the queue, which the record shows), with the 1-minute load average under
+--load (default 2), as before an end-of-night timing run: empty lanes alone said
+nothing of the agents' own load, and one such run started at a load of 4.4 to 6.5.
+Each reading is a line, `quiet: 0 running, 0 waiting, load 1.20 (under 2)` or `busy:
+...`, first and last as --until-open prints them; --json prints objects with `quiet`,
+`running`, `waiting`, `load` and `load_under`. It exits 0 once quiet, or 3 past
+--max-wait. It takes no --lane, --p90, --waiting, --since or --min-jobs.
+
 A command that fails while /proc/vmstat's oom_kill count rises hears on stderr that the
 out-of-memory killer may have taken one of its processes, and to run it again if the
 failure looks odd.
@@ -219,8 +232,9 @@ Environment:
                        PERF_PROMISES_DIR is set)
   HEAVY_SPEED_AFTER_EXIT  0: start no speed probe after a job exits (tests; read
                        only while PERF_PROMISES_DIR is set)
-  HEAVY_WAITS_POLL     seconds between `heavy waits --until-open`'s readings
-                       (default 30; the tests shorten it)
+  HEAVY_WAITS_POLL     seconds between `heavy waits --until-open`'s or
+                       `--until-quiet`'s readings (default 30; the tests shorten it)
+  HEAVY_LOADAVG        a file that stands in for /proc/loadavg (tests)
   FIFO_LOCK_SECONDS    seconds of waiting for the queue's lock before naming its
                        holder (default 5; the tests shorten it)
   HEAVY_BUSY           a file whose number stands in for how busy the cores are (tests)
@@ -241,8 +255,9 @@ Environment:
                        HEAVY_DIR's default and one refused inside own-pids, beside
                        /tmp/heavy itself (tests)
 
-Exit status: CMD's own; 2 a usage error; 3 `heavy waits --until-open` reached
---max-wait with the queue still held; 125 heavy couldn't use its queue, or refused
+Exit status: CMD's own; 2 a usage error; 3 `heavy waits --until-open` or
+`--until-quiet` reached --max-wait with the queue still held; 125 heavy couldn't use
+its queue, or refused
 the shared one inside own-pids; 126 CMD
 couldn't be run (a folder, or not executable); 127 CMD wasn't found; 128+N stopped
 by signal N.
@@ -401,7 +416,43 @@ def history(argv):
     return 0
 
 
-HELD = 3  # `heavy waits --until-open` reached --max-wait with the queue held
+HELD = 3  # `heavy waits --until-open` or `--until-quiet` reached --max-wait
+QUIET_LOAD = 2.0  # `heavy waits --until-quiet`'s default 1-minute load average limit
+
+
+def load_average():
+    """The 1-minute load average, from /proc/loadavg (or the HEAVY_LOADAVG file, the
+    tests' stand-in)."""
+    path = os.environ.get("HEAVY_LOADAVG") or "/proc/loadavg"
+    return float(Path(path).read_text().split()[0])
+
+
+def quiet_reading(load_under):
+    """What `heavy waits --until-quiet` reads: the jobs running and waiting in every
+    lane, the 1-minute load average, and whether that is quiet."""
+    running, waiting = heavyqueue.jobs_now()
+    load = load_average()
+    quiet = running == 0 and waiting == 0 and load < load_under
+    return {
+        "quiet": quiet,
+        "running": running,
+        "waiting": waiting,
+        "load": load,
+        "load_under": load_under,
+    }
+
+
+def quiet_line(found):
+    """`heavy waits --until-quiet`'s line for one reading."""
+    limit = f"{found['load_under']:g}"
+    against = (
+        f"under {limit}" if found["load"] < found["load_under"] else f"{limit} or more"
+    )
+    verdict = "quiet" if found["quiet"] else "busy"
+    return (
+        f"{verdict}: {found['running']} running, {found['waiting']} waiting,"
+        f" load {found['load']:.2f} ({against})"
+    )
 
 
 def waits(argv):
@@ -411,9 +462,7 @@ def waits(argv):
         prog="heavy waits",
         description="How long jobs waited for their turn: see heavy -h.",
     )
-    reader.add_argument(
-        "--since", default="30m", help="jobs that started since TIME (default 30m)"
-    )
+    reader.add_argument("--since", help="jobs that started since TIME (default 30m)")
     reader.add_argument(
         "--lane",
         choices=heavyqueue.LANES,
@@ -422,34 +471,68 @@ def waits(argv):
     reader.add_argument(
         "--min-jobs",
         type=int,
-        default=heavyjobs.MIN_JOBS,
         help=f"give p50 and p90 only when this many jobs started"
         f" (default {heavyjobs.MIN_JOBS})",
     )
     reader.add_argument("--json", action="store_true", help="one JSON object")
-    reader.add_argument(
+    modes = reader.add_mutually_exclusive_group()
+    modes.add_argument(
         "--until-open",
         action="store_true",
         help="read every HEAVY_WAITS_POLL seconds (30) until the queue is open",
     )
+    modes.add_argument(
+        "--until-quiet",
+        action="store_true",
+        help="read every HEAVY_WAITS_POLL seconds (30) until no job runs or waits in"
+        " either lane and the load average is under --load",
+    )
     gate = {
         "--p90": (float, 180.0, "open below this p90, in seconds (default 180)"),
         "--waiting": (int, 1, "open with at most this many waiting (default 1)"),
-        "--max-wait": (float, None, "exit 3 when still held after this many seconds"),
     }
     for flag, (kind, _, text) in gate.items():
         reader.add_argument(flag, type=kind, help=f"with --until-open: {text}")
+    reader.add_argument(
+        "--load",
+        type=float,
+        help="with --until-quiet: quiet below this 1-minute load average"
+        f" (default {QUIET_LOAD:g})",
+    )
+    reader.add_argument(
+        "--max-wait",
+        type=float,
+        help="with --until-open or --until-quiet: exit 3 when still held after this"
+        " many seconds",
+    )
     args = reader.parse_args(argv)
-    if args.min_jobs < 0:
-        reader.error("--min-jobs must be 0 or more")
-    if not args.until_open:
+    if args.until_quiet:
         given = [
             flag
-            for flag in gate
+            for flag in ("--since", "--min-jobs")
             if getattr(args, flag[2:].replace("-", "_")) is not None
         ]
         if given:
+            reader.error(
+                f"{', '.join(given)} doesn't go with --until-quiet, which reads no"
+                " past jobs"
+            )
+    if args.since is None:
+        args.since = "30m"
+    if args.min_jobs is None:
+        args.min_jobs = heavyjobs.MIN_JOBS
+    if args.min_jobs < 0:
+        reader.error("--min-jobs must be 0 or more")
+    if not args.until_open:
+        given = [flag for flag in gate if getattr(args, flag[2:]) is not None]
+        if given:
             reader.error(f"{', '.join(given)} goes only with --until-open")
+    if not args.until_quiet and args.load is not None:
+        reader.error("--load goes only with --until-quiet")
+    if not (args.until_open or args.until_quiet) and args.max_wait is not None:
+        reader.error("--max-wait goes only with --until-open or --until-quiet")
+    if args.until_quiet and args.lane is not None:
+        reader.error("--lane doesn't go with --until-quiet, which waits on both lanes")
     try:
         heavyjobs.moment(args.since)
     except ValueError as error:
@@ -466,7 +549,7 @@ def waits(argv):
             heavyqueue.base(), since, waiters, args.lane, min_jobs=args.min_jobs
         )
 
-    if not args.until_open:
+    if not (args.until_open or args.until_quiet):
         found = reading()
         print(json.dumps(found) if args.json else heavyjobs.waits_line(found))
         return 0
@@ -474,38 +557,53 @@ def waits(argv):
         poll = float(os.environ.get("HEAVY_WAITS_POLL", "30"))
     except ValueError:
         reader.error("HEAVY_WAITS_POLL must be a number of seconds")
+    if args.until_quiet:
+        load_under = QUIET_LOAD if args.load is None else args.load
+
+        def show_quiet(found):
+            print(json.dumps(found) if args.json else quiet_line(found), flush=True)
+
+        def quiet():
+            found = quiet_reading(load_under)
+            return found, found["quiet"]
+
+        return until(quiet, show_quiet, args.max_wait, poll)
     p90 = args.p90 if args.p90 is not None else gate["--p90"][1]
     most = args.waiting if args.waiting is not None else gate["--waiting"][1]
-    return until_open(reading, p90, most, args.max_wait, poll, args.json)
 
-
-def until_open(reading, p90, most, max_wait, poll, as_json):
-    """Take a reading every `poll` seconds until heavyjobs.is_open; print the first
-    and the last. 0 when open, HELD past `max_wait` seconds (None: no limit)."""
-
-    def show(found, is_open):
-        if as_json:
-            print(json.dumps(found | {"open": is_open}), flush=True)
+    def show_open(found):
+        if args.json:
+            print(json.dumps(found), flush=True)
         else:
-            verdict = "open" if is_open else "held"
+            verdict = "open" if found["open"] else "held"
             print(f"{verdict}: {heavyjobs.waits_line(found)}", flush=True)
 
+    def opened():
+        found = reading()
+        found["open"] = heavyjobs.is_open(found, p90, most)
+        return found, found["open"]
+
+    return until(opened, show_open, args.max_wait, poll)
+
+
+def until(read, show, max_wait, poll):
+    """Take a reading, (found, ready) = read(), every `poll` seconds until it is
+    ready; show the first and the last. 0 when ready, HELD past `max_wait` seconds
+    (None: no limit)."""
     start = time.monotonic()
-    found = reading()
-    is_open = heavyjobs.is_open(found, p90, most)
-    show(found, is_open)
+    found, ready = read()
+    show(found)
     first = True
-    while not is_open:
+    while not ready:
         if max_wait is not None and time.monotonic() - start >= max_wait:
             if not first:
-                show(found, is_open)
+                show(found)
             return HELD
         time.sleep(poll)
-        found = reading()
-        is_open = heavyjobs.is_open(found, p90, most)
+        found, ready = read()
         first = False
     if not first:
-        show(found, is_open)
+        show(found)
     return 0
 
 

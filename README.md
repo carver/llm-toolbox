@@ -605,6 +605,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   (`$HEAVY_WAITS_POLL`) until p90 is under `--p90` (180 s) with at most
   `--waiting` (1) jobs waiting, printing its first and last reading, and exits
   3 if `--max-wait` passes first, for an agent that can't keep time itself.
+  `heavy waits --until-quiet` waits the same way for no job running or waiting
+  in either lane, any session's, and the 1-minute load average under `--load`
+  (2), as before a timing run; `$HEAVY_LOADAVG` stands in for `/proc/loadavg`
+  in the tests.
   An `--alone` job ends with a line
   giving the CPU-seconds other work used on its cores while it ran, warning
   past `$HEAVY_ALONE_OUTSIDE` (0.5)

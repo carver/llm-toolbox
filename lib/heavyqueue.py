@@ -1155,6 +1155,20 @@ def status():
     return "\n".join(lines)
 
 
+def jobs_now():
+    """(running, waiting): how many jobs run now in every lane, holders and sharers
+    and --few-seconds jobs run outside the queue whose heavy lives (by the record,
+    since they take no slot), and how many wait in every lane."""
+    running = sum(slot_text(lane, name) is not None for lane in LANES for name in SLOTS)
+    running += sum(
+        job.get("how") == "outside"
+        and job.get("at_end") is None
+        and heavyjobs.running(job)
+        for job in heavyjobs.jobs(base())
+    )
+    return running, len(waiting_since())
+
+
 def waiting_since():
     """Each live waiter, in every lane, as (its lane, when it joined the queue in epoch
     seconds, or None when its entry's time can't be read)."""

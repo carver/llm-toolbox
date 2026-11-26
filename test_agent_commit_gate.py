@@ -2717,3 +2717,47 @@ def test_timings_without_a_record_says_so_and_prints_no_table(tmp_path, in_repo)
 def test_timings_since_a_time_no_row_reaches_says_since_when(tmp_path):
     lines = timings(make_repo(tmp_path), "--since", "2027")
     assert lines == [["no", "check", "timings", "recorded", "since", "2027"]]
+
+
+def test_a_wait_the_caller_measured_goes_on_the_record_and_not_to_the_check(
+    installed,
+):
+    """wt-ship runs a landing's check inside a heavy job it waited for, and passes
+    that wait on as AGENT_CHECK_WAITED, since the gate there starts at once."""
+    seen = installed / "seen"
+    hook(
+        installed,
+        "agent-pre-commit",
+        f'echo "${{AGENT_CHECK_WAITED:-unset}}" > "{seen}"',
+    )
+    run = subprocess.run(
+        [str(SCRIPT), "--run", str(installed / ".githooks" / "agent-pre-commit")],
+        cwd=installed,
+        env=without_repo_vars(os.environ)
+        | {"AGENT_PRE_COMMIT": "1", "AGENT_CHECK_WAITED": "12.5"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    [row] = timings_record(installed)
+    assert 12.5 <= float(row[6]) < 13.5
+    assert seen.read_text() == "unset\n"
+    assert "waited 12s" in run.stderr or "waited 13s" in run.stderr
+
+
+@pytest.mark.parametrize("value", ["soon", "-3", "", "inf"])
+def test_a_measured_wait_that_isnt_a_seconds_count_counts_for_nothing(installed, value):
+    hook(installed, "agent-pre-commit", "exit 0")
+    run = subprocess.run(
+        [str(SCRIPT), "--run", str(installed / ".githooks" / "agent-pre-commit")],
+        cwd=installed,
+        env=without_repo_vars(os.environ)
+        | {"AGENT_PRE_COMMIT": "1", "AGENT_CHECK_WAITED": value},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    [row] = timings_record(installed)
+    assert float(row[6]) < 1

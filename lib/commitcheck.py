@@ -16,6 +16,7 @@ module's git() for its own commands too.
 import os
 import signal
 import subprocess
+import time
 from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import NamedTuple
@@ -176,6 +177,9 @@ def unchecked(upstream, hook):
 # The exit status agent-commit-gate --run --no-queue gives a check that needs heavy's
 # queue (agent-commit-gate's QUEUE_EXIT).
 QUEUE_EXIT = 75
+# The seconds this waited for the heavy job a landing's check runs in, for the gate
+# to record (agent-commit-gate's WAITED_NAME).
+WAITED_NAME = "AGENT_CHECK_WAITED"
 
 
 class Marker(NamedTuple):
@@ -246,6 +250,7 @@ def passes_in_a_job(argv, env, top, front):
     cores = os.sched_getaffinity(0)
     with ExitStack() as stack:
         stack.callback(restore_cores, cores)
+        asked = time.monotonic()
         try:
             turn = heavyqueue.turn(command="wt-ship's checks", hint=False, front=front)
             job = stack.enter_context(turn)
@@ -259,6 +264,8 @@ def passes_in_a_job(argv, env, top, front):
                 for key in ("HEAVY_SLOT", "CARGO_BUILD_JOBS")
                 if key in job.env
             }
+            # The gate inside the job starts at once, so it records this wait instead.
+            env[WAITED_NAME] = f"{time.monotonic() - asked:.1f}"
         passed = run_stoppable(argv, env, cwd=top) == 0
         if job is not None:
             job.exited(0 if passed else 1)  # a passing run goes into heavy's history

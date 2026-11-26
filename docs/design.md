@@ -266,6 +266,9 @@ or before the refusal, and every run goes on a record in the repo's common git d
 The owner chose there, per repo and shared by its worktrees, over the workspace's
 keep/ (a workspace path in a tool for any project) and heavy's folder (/tmp, wiped
 by a reboot), and chose every run, commit checks included, over landings alone.
+A landing's check runs inside a heavy job wt-ship waited for, where the gate starts
+at once, so wt-ship passes that wait on as AGENT_CHECK_WAITED for the record
+(2026-11-25): until then every landing showed 0 s waited (filedrawer #148).
 
 ### wt-ship --local checks only while it holds the main tree (2026-11-08)
 

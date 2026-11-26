@@ -2789,3 +2789,29 @@ def test_two_fixups_of_one_landing_commit_fold_and_land(setup):
     done = ship(wt, "--local")
     assert done.returncode == 0, done.stderr
     assert git(main, "log", "-1", "--format=%s", "main") == "Add a"
+
+
+def test_a_landings_wait_for_its_heavy_job_goes_on_the_timings_record(
+    setup, holder, background
+):
+    _, main, wt, _ = setup
+    alive, lane = hold_the_lane(holder)
+    queue_asking_check(main, main.parent / "slots")
+    tip = commit(wt, "a.py", "x = 1\n", "Add a")
+
+    shipping = background(wt, "--local")
+    wait_until(
+        lambda: any(p.name[:1].isdigit() for p in lane.iterdir()),
+        "the landing to queue",
+    )
+    time.sleep(1.5)  # fixed sleep: the landing waits behind the held lane this long
+    alive.kill()
+    alive.wait()
+    status, _, err = finish(shipping)
+
+    assert status == 0, err
+    assert main_head(main) == tip
+    record = main / ".git" / "agent-check-timings.tsv"
+    row = record.read_text().splitlines()[-1].split("\t")
+    assert row[1:3] == ["run", "agent-pre-commit"]
+    assert float(row[6]) >= 1.5

@@ -442,7 +442,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   write its parts' seconds to the file `$CHECK_TIMINGS` names, `NAME SECONDS` a
   line, which the pass line, or a line before the refusal, then shows; every
   run also goes on `agent-check-timings.tsv` in the common git dir, with its
-  queue wait and run time (`agent-commit-gate -h` lists the columns), which
+  queue wait (for a landing's check, the wait for wt-ship's heavy job, passed
+  on as `$AGENT_CHECK_WAITED`) and run time (`agent-commit-gate -h` lists the
+  columns), which
   `agent-commit-gate --timings [--since TIME]` sums up by check and by part,
   longest first. A small
   fixup!, squash! or amend! commit (found from the running `git commit`'s

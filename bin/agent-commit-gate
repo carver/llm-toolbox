@@ -139,7 +139,9 @@ characters. Every check the gate runs, passing or failing, also goes on a record
 the repo's common git dir, agent-check-timings.tsv, a tab-separated line each, its
 last 5000 kept: the UTC time, `commit` for a git commit's check or `run` for
 another (wt-ship's), the check's name, HEAD and the tree checked (12 hex digits
-each), its exit status, the seconds it waited in the queue and ran, `queue` or
+each), its exit status, the seconds it waited in the queue (for wt-ship's landing
+check, the wait for the heavy job it runs in, which wt-ship passes on as
+AGENT_CHECK_WAITED and the check doesn't see) and ran, `queue` or
 `outside` the queue, CHECK_BASE, and its timings as `name=seconds` joined by commas.
 `--timings [--since TIME]` sums it up: the runs and the span they cover, then by
 check, its runs, the seconds it ran in all and on average, the seconds it waited and
@@ -200,6 +202,7 @@ paths that differ from that base.
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -435,6 +438,8 @@ TIMING_LINE = re.compile(r"([A-Za-z0-9_.-]+)\s+(\d+(?:\.\d+)?)")
 TIMINGS_MAX, TIMING_NAME_MAX = 32, 40
 # The record of every check run, a tab-separated line each, in the common git dir.
 TIMINGS_RECORD = "agent-check-timings.tsv"
+# The seconds a caller waited for the heavy job the check runs in (lib/commitcheck.py).
+WAITED_NAME = "AGENT_CHECK_WAITED"
 TIMINGS_SIZE = 5000
 
 
@@ -774,9 +779,10 @@ def check_env(env, base):
     variable, every name the secrets file exports and BASH_ENV left out,
     SECRETS_FILE_NAME emptied once read, so a startup file that honours it sources no
     secrets file in a bash the check starts, and CHECK_QUEUE_EXIT and AT_COMMIT left
-    out, so nothing the check starts takes itself for a commit's."""
+    out, so nothing the check starts takes itself for a commit's, nor WAITED_NAME, a
+    wait already counted."""
     gone = {
-        *("CHECK_BASE", QUEUE_EXIT_NAME, AT_COMMIT, "BASH_ENV"),
+        *("CHECK_BASE", QUEUE_EXIT_NAME, AT_COMMIT, "BASH_ENV", WAITED_NAME),
         *secrets_file_names(env),
     }
     env = {k: v for k, v in env.items() if k not in gone and not secret_named(k)}
@@ -1019,6 +1025,17 @@ def run_outside_first(path, name, base, queue=True):
     return run_quiet(path, name, base) if queue else None
 
 
+def waited_before():
+    """The seconds a caller waited for the heavy job this check runs in, as WAITED_NAME
+    gives them (wt-ship's landing check: the gate inside the job starts at once, so
+    it would record no wait); 0 when unset or not a count of seconds."""
+    try:
+        seconds = float(os.environ.get(WAITED_NAME, ""))
+    except ValueError:
+        return 0.0
+    return seconds if math.isfinite(seconds) and seconds >= 0 else 0.0
+
+
 def run_quiet(path, name, base, queue=True):
     """Run the check at `path`, named `name` in what it prints, with CHECK_BASE set to
     `base` (None: unset, whatever this process inherited), and return its Run.
@@ -1038,7 +1055,7 @@ def run_quiet(path, name, base, queue=True):
                 f"heavy: can't use its queue ({error}), so the check runs without it.",
                 file=sys.stderr,
             )
-        waited = time.monotonic() - asked
+        waited = time.monotonic() - asked + waited_before()
         run = run_once(path, check_env(env, base))._replace(waited=waited)
         if job is not None:
             job.exited(run.code)  # a passing check goes into heavy's history

@@ -147,7 +147,11 @@ spent their time. A check skipped because its tree passed already isn't recorded
 `--install` also puts a line first in each repo's post-commit hook, creating the hook
 if needed, which runs `--post-commit` after an agent's `git commit`. It says nothing
 for a rebase, a cherry-pick or a revert, which run that hook too, some through a `git
-commit` of their own (a reword, a `--continue`). When the commit's subject starts
+commit` of their own (a reword, a `--continue`). A commit whose whole message is its
+parent's, word for word, hears so with the amend that fixes it, unless
+SAME_MESSAGE_OK is set (as for an empty commit that reruns CI), or it is a fix commit
+(two fixups of one target repeat a message by design) or a merge; wt-ship refuses to
+land one. When the commit's subject starts
 `fixup! `, `amend! ` or `squash! `, it finds the commit `git rebase --autosquash` would
 fold it into, as git does, from the title (the subject after its prefixes): among the
 commits a rebase onto another branch, a tag or a remote-tracking branch would replay
@@ -1285,6 +1289,33 @@ def split_advice(strays):
     return advice
 
 
+def warn_repeated_message():
+    """After an agent's own `git commit`, with no rebase, cherry-pick or revert under
+    way, warn when its whole message is its parent's, unless SAME_MESSAGE_OK is set or
+    it's a fix commit, two of which for one target repeat a message by design."""
+    if os.environ.get("SAME_MESSAGE_OK"):
+        return
+    if running_commit_args() is None or sequencing():
+        return
+    if len((git_out("rev-list", "--parents", "-n", "1", "HEAD") or "").split()) > 2:
+        return  # a merge, whose message names what it merged
+    mine, parent = (
+        git_out("log", "-1", "--format=%B", rev) for rev in ("HEAD", "HEAD^")
+    )
+    # Not mine: git failed for both, as outside a repo.
+    if not mine or mine != parent or mine.startswith(FIX_PREFIXES):
+        return
+    subject = mine.splitlines()[0]
+    print(
+        "agent-commit-gate: this commit repeats its parent's message word for word"
+        f' ("{subject}"), so its change goes unnamed. Give it its own while it is'
+        " HEAD: `git commit --amend -F FILE`. If the repeat is meant, as for an"
+        " empty commit that reruns CI, set SAME_MESSAGE_OK=1; wt-ship refuses to"
+        " land it otherwise.",
+        file=sys.stderr,
+    )
+
+
 def warn_stray_files():
     """After an agent's own `git commit` of a fix commit, with no rebase, cherry-pick or
     revert under way (they run post-commit too), print a line for each of its
@@ -1334,6 +1365,7 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     if args.post_commit:
+        warn_repeated_message()
         warn_stray_files()
         return 0
     if args.run:

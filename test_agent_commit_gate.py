@@ -2548,3 +2548,62 @@ def test_with_no_commit_that_passed_the_predictor_gets_no_base(
     predicting(installed, f'echo "${{CHECK_BASE-unset}}" > {seen}\nexit 1')
     hook_on(installed, monkeypatch, capsys, "git commit -q -m x")
     assert seen.read_text().strip() == "unset"
+
+
+def repeat_message(repo, env=None):
+    """Commit a change to a.txt under the message of the commit before it, as
+    `git commit -C HEAD` does; the run."""
+    person_commit(repo, "Add a", {"a.txt": "a\n"})
+    write(repo / "a.txt", "a, changed\n")
+    git(repo, "add", "a.txt")
+    return agent_git(repo, "commit", "-q", "-C", "HEAD", env=env)
+
+
+def test_a_commit_that_repeats_its_parents_message_hears_it_at_once(installed):
+    run = repeat_message(installed)
+    [line] = warnings(run)
+    assert 'repeats its parent\'s message word for word ("Add a")' in line
+    assert "git commit --amend -F FILE" in line
+    assert "SAME_MESSAGE_OK=1" in line
+
+
+def test_same_message_ok_quiets_the_warning(installed):
+    assert warnings(repeat_message(installed, env={"SAME_MESSAGE_OK": "1"})) == []
+
+
+def test_two_fixups_of_one_commit_repeat_a_message_without_a_warning(installed):
+    a = a_then_b(installed)
+    for text in ("a fixed\n", "a fixed again\n"):
+        write(installed / "a.txt", text)
+        run = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}")
+    assert warnings(run) == []
+
+
+def test_a_commit_with_a_message_of_its_own_hears_nothing(installed):
+    person_commit(installed, "Add a", {"a.txt": "a\n"})
+    write(installed / "a.txt", "a, changed\n")
+    run = agent_git(installed, "commit", "-q", "-a", "-m", "Change a")
+    assert warnings(run) == []
+
+
+def test_a_persons_commit_that_repeats_a_message_hears_nothing(installed):
+    person_commit(installed, "Add a", {"a.txt": "a\n"})
+    write(installed / "a.txt", "a, changed\n")
+    git(installed, "add", "a.txt")
+    run = agent_git(installed, "commit", "-q", "-C", "HEAD", agent=False)
+    assert warnings(run) == []
+
+
+def test_a_cherry_pick_that_repeats_its_parents_message_hears_nothing(installed):
+    """A cherry-pick runs post-commit too, and repeats a message on purpose here."""
+    person_commit(installed, "Add a", {"a.txt": "a\n"})
+    git(installed, "checkout", "-q", "-b", "side")
+    picked_from = person_commit(installed, "Add a", {"a.txt": "a, on side\n"})
+    git(installed, "checkout", "-q", "-")
+    write(installed / "other.txt", "x\n")
+    person_commit(installed, "Add a", {"other.txt": "x\n"})
+    git(installed, "reset", "-q", "--hard", "HEAD^")
+
+    picked = agent_git(installed, "cherry-pick", picked_from)
+
+    assert warnings(picked) == []

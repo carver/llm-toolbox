@@ -41,7 +41,11 @@ In order, it:
    or a fetch) if it should last.
    It lists each such commit with the IDs it names, newest first, and the fix for
    each, `build-state reword SHA`, to name the commit by its subject instead, run in
-   the order listed. This runs after every rebase, so before any check, and with
+   the order listed. It also refuses a commit whose whole message is its first
+   parent's, word for word, as a slip with `git commit -C HEAD` leaves one, listing
+   each with `build-state reword SHA`, unless SAME_MESSAGE_OK is set, as for an empty
+   commit that reruns CI (`git commit --allow-empty -C HEAD`); a merge, whose message
+   names what it merged, never counts. This runs after every rebase, so before any check, and with
    --local before the wait. After the first rebase only, it then warns of each
    commit that only refines an earlier commit of the landing (lib/foldable.py: 75%
    or more of the lines it changes came from one, lines added in new files counting
@@ -160,6 +164,7 @@ Environment:
   WT_SHIP_PUSH_FETCH_SECONDS
                      seconds the fetch after a --local landing may take before the
                      reminder to push gives up (default 20)
+  SAME_MESSAGE_OK    set, a commit that repeats its parent's message may land
 
 Exit status: 0 shipped, landed or nothing to do; 1 a step failed (the message says
 what to do); 2 a usage error; with --local, 3 another session held the main tree's
@@ -602,6 +607,39 @@ def branch_of(ref):
     return None
 
 
+def repeated_messages(upstream):
+    """The commits after upstream whose whole message is their first parent's, word
+    for word, as `git commit -C HEAD` leaves one, oldest first. Not a merge, whose
+    message names what it merged (two merges of main in a row repeat one), nor a root
+    commit, which has no parent."""
+    found = []
+    for sha in out("rev-list", "--reverse", "--no-merges", f"{upstream}..HEAD").split():
+        mine, parent = (
+            git("log", "-1", "--format=%B", rev, check=False)
+            for rev in (sha, f"{sha}^")
+        )
+        if parent.returncode == 0 and mine.stdout == parent.stdout:
+            found.append(sha)
+    return found
+
+
+def refuse_repeated_messages(upstream):
+    """Stop when a commit repeats its parent's message, unless SAME_MESSAGE_OK is set:
+    the repeat is usually a slip, and the commit's change then goes unnamed."""
+    if os.environ.get("SAME_MESSAGE_OK") or not (found := repeated_messages(upstream)):
+        return
+    raise Stop(
+        "These commits repeat their parent's message word for word, so the change"
+        " each makes goes unnamed. Give each its own, with `build-state reword SHA`"
+        " and the new message on stdin, newest commit first, as listed:\n"
+        + "\n".join(
+            f"  {named(sha)}; build-state reword {sha[:12]}" for sha in reversed(found)
+        )
+        + "\nIf a repeat is meant, as for an empty commit that reruns CI, land with"
+        " SAME_MESSAGE_OK=1."
+    )
+
+
 def refuse_stale_citations(upstream, mode):
     """Stop when a commit message names, by ID, a commit upstream doesn't hold."""
     if found := stale_citations(upstream):
@@ -645,6 +683,7 @@ def rebase_onto(upstream, mode):
         rebase(upstream, mode)
     markers(upstream)
     refuse_stale_citations(upstream, mode)
+    refuse_repeated_messages(upstream)
 
 
 def warn_of_folds(upstream):

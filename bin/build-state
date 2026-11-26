@@ -1367,7 +1367,9 @@ the code behaves on a case, run the tests that reach it, a few at a time, throug
 `heavy --few-seconds -- CMD` as a foreground call with the Bash timeout at 600000; judge a \
 case no test reaches from the code. {test_command}`--few-seconds` is for runs of seconds: \
 run a whole file, a property test or anything longer than a minute as \
-`bgrun -o LOG -- heavy -- CMD`, then `waitone --pid PID -t 170` until it exits.
+`bgrun -o LOG -- heavy -- CMD`, then `waitone --pid PID -t 170` until it exits. A \
+measurement the brief owes, such as a timing, a benchmark or a size, is the builder's \
+to take: report it as still owed, and start no run for it.
 {checked_at_landing}
 Run two separate reviews and report them under the headings `## Standards` and `## Spec`. \
 Don't merge or rerank findings across the two.

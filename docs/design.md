@@ -1052,9 +1052,22 @@ Reason: in filedrawer's usability runs of 2026-11-13 the screen alone misled it.
 An answered dialog stays drawn a moment after Enter, so the turn "ended" while the agent worked and a restart cut its install short (jason86); a dialog of two questions moved to its second tab, which also looked like a turn end, so nothing was submitted (jason82, jason85).
 A dialog of several questions, or a multi-select one, is left through "Chat about this", and the turn is sent as an ordinary message once the agent's reply ends: the script holds one answer and tabs need one each, and a person answering in their own words does the same.
 Checked against Claude Code 2.1.325: the option's number takes effect at once, the call gets a tool_result rejecting it ("The user wants to clarify these questions"), the agent asks what to clarify and ends its turn, and the prompt then takes text.
+A multi-select dialog of one question leaves the same way, checked in one real run against Claude Code 2.1.332 (probe5m, 2026-11-26): the agent asked what to clarify, then took the typed "Cheese and olives." as the choice.
+That dialog draws a tab line of its one question and Submit, as a dialog of several questions does, and its options, "Type something" included, as checkboxes ("4. [ ] Type something"), so a multi-select dialog read from the screen is told by its checkboxes, and its free-text option would take no typed answer.
 The agent sees a declined dialog, not answers, which a usability finding should allow for.
 A session reads only its own transcript: before its first prompt the newest one is the last session's, and the simulated human answered that session's dialog again after a restart (jason86).
-Codex has no such dialog in default mode: `request_user_input` is for Plan mode, and `request_user_input_async` returns at once and shows its question as an agent message.
+Codex has no such dialog in default mode: `request_user_input` is for Plan mode, and `request_user_input_async` returns at once and shows its question as an agent message (next entry).
+
+### Codex's request_user_input_async question ends a turn, answered as a message (2026-11-26)
+
+When Codex calls `request_user_input_async` in a turn that still runs, drive-agent takes that as the end of the agent's turn: the simulated human reads what the agent said since the human's last message, the question included, and the next turn is typed as an ordinary message.
+The turn after it waits for a turn end that follows the answer in the transcript, so a message that reaches the running turn and one that starts a new turn, when the agent ended its turn first, both wait for the turn that holds the answer.
+Reason: in jason97 (filedrawer's usability runs of 2026-11-13) Codex asked whether to attach code, got `{"accepted":true}` at once, worked on, slept 60 s, and posted without an answer ("If you have no preference, I'll submit it without code"). Codex's notify comes only when the whole turn ends, so drive-agent never saw the question, and the notify's message, the turn's last text, may not hold it.
+Checked in one real run against codex-cli 0.164.0 (probe5c, 2026-11-26): a message typed while the agent slept in the same turn reached that turn, as a user message in the rollout before its `task_complete`, and cut the sleep short; the agent wrote the answer and ended the turn.
+A question in a turn that has ended is no turn end of its own: the turn ended already, and the human reads the question with the agent's last message.
+The question goes last in what the human reads, so the prompt's cut to the message's last 6,000 characters keeps it.
+When the next scripted turn is skipped, a conditional one that doesn't hold, drive-agent waits for the turn that asked to end before the turn after it: sent at once, that turn would go into the running turn as the answer. jason97's scenario has that shape, a go-ahead only if asked for, then a turn of its own.
+A user message counts as the human's unless it starts with a tag Codex adds as context (`<environment_context>`, the only one seen in 0.164's rollouts), since a human's answer may itself start with "<".
 
 ### A person's step mid-run is a file the run waits for; a token outlives the run only through --keep-file (2026-11-26)
 

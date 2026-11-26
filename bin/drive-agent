@@ -29,6 +29,13 @@ Claude Code sometimes writes the question to its transcript only with its answer
 a dialog that has shown for DRIVE_AGENT_DIALOG_GRACE with no question there is
 read from the screen, and turns.md says so.
 
+When Codex asks through request_user_input_async, which shows its question as a
+message and lets the agent work on, that ends the agent's turn too: the next turn is
+typed as an ordinary message, which Codex takes into the turn still running, and
+the turn after it waits for the turn that holds the answer to end. When the next
+turn is skipped instead, the run waits for the asking turn to end. The simulated
+human reads the question, which Codex's turn-end message may not hold.
+
 SCENARIO is JSON:
   turns       the human's messages, in order. A string is sent as it is; {NAME} in it
               becomes the driver's variable NAME when --var NAME is given.
@@ -214,6 +221,8 @@ STATE_ROOT = Path("/run/user")
 REGISTRY = Path("/var/lib/drive-agent/users")
 NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")
 DIALOG = "Enter to select"
+# Codex's tool for asking the human in default mode, which returns at once.
+ASYNC_QUESTION = "request_user_input_async"
 READY = ("for shortcuts", "❯", "›")
 COLLECT_LIMIT = 1 << 20
 
@@ -902,9 +911,16 @@ class Harness:
     """What differs between Claude Code and Codex."""
 
     transcript_dir = ""  # under the home
+    # Whether its questions come in a dialog on screen, answered there, rather than
+    # as a message the next one answers.
+    dialog = False
+    # How turns.md says it asks: "The agent asks in a dialog".
+    asks = "in a dialog"
 
     def __init__(self, box: Box):
         self.box = box
+        # The transcripts of earlier sessions, which the current one ignores.
+        self.earlier: set[Path] = set()
 
     @property
     def turns_file(self) -> Path:
@@ -925,18 +941,38 @@ class Harness:
 
     def begin_session(self) -> None:
         """Called as each session starts, so nothing of an earlier one counts as
-        the new one's."""
+        the new one's. A new session may have no transcript until its first
+        prompt, so until then the newest is the last session's."""
+        self.earlier = set(self.transcripts())
+
+    def session_text(self) -> str:
+        """The current session's transcript."""
+        # A subagent's transcript, under <session>/subagents/, may be the newest.
+        paths = [
+            p
+            for p in self.transcripts()
+            if p not in self.earlier and "subagents" not in p.parts
+        ]
+        return (
+            (self.box.read(paths[-1]) or b"").decode(errors="replace") if paths else ""
+        )
 
     def last_message(self) -> str:
         raise NotImplementedError
 
     def pending_question(self) -> dict | None:
-        """The question dialog waiting for the human: {"id", "questions"}."""
+        """The question waiting for the human, {"id", "questions"}, each question
+        {"question", "options": [{"label"}]}."""
         return None
 
     def answered_questions(self) -> int:
         """How many question dialogs the transcript holds an answer to."""
         return 0
+
+    def answer_ended(self, question: dict, answered: bool = True) -> bool:
+        """Whether the turn that holds the human's answer to `question`, sent as a
+        message, has ended; with answered false, the turn that asked it."""
+        return True
 
     def transcripts(self) -> list[Path]:
         """The session transcripts, oldest first."""
@@ -951,11 +987,7 @@ class Harness:
 
 class Claude(Harness):
     transcript_dir = ".claude/projects"
-
-    def __init__(self, box: Box):
-        super().__init__(box)
-        # The transcripts of earlier sessions, which the current one ignores.
-        self.earlier: set[Path] = set()
+    dialog = True
 
     def env(self) -> dict:
         path = Path.home() / ".claude" / ".credentials.json"
@@ -1034,24 +1066,10 @@ class Claude(Harness):
             text,
         ]
 
-    def begin_session(self) -> None:
-        # A new session has no transcript until its first prompt, so until then the
-        # newest is the last session's.
-        self.earlier = set(self.transcripts())
-
     def records(self) -> list[dict]:
         """The current session's transcript records, oldest first."""
-        # A subagent's transcript, under <session>/subagents/, may be the newest.
-        paths = [
-            p
-            for p in self.transcripts()
-            if p not in self.earlier and "subagents" not in p.parts
-        ]
-        text = (
-            (self.box.read(paths[-1]) or b"").decode(errors="replace") if paths else ""
-        )
         found = []
-        for line in text.splitlines():
+        for line in self.session_text().splitlines():
             try:
                 rec = json.loads(line)
             except ValueError:
@@ -1109,6 +1127,7 @@ class Claude(Harness):
 
 class Codex(Harness):
     transcript_dir = ".codex/sessions"
+    asks = f"through {ASYNC_QUESTION}"
 
     def env(self) -> dict:
         return {"CODEX_HOME": str(self.box.home / ".codex")}
@@ -1151,7 +1170,67 @@ class Codex(Harness):
         )
 
     def begin_session(self) -> None:
+        super().begin_session()
         self.box.remove(self.box.state / "last-agent")
+
+    def records(self) -> list[dict]:
+        """The current session's rollout records' payloads, oldest first."""
+        found = []
+        for line in self.session_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("payload"), dict):
+                found.append(rec["payload"])
+        return found
+
+    def unanswered(self) -> tuple[dict | None, bool, list[str]]:
+        """The session's last request_user_input_async question that no human
+        message follows, whether its turn still runs, and what the agent said to
+        the human since the human's last message, the question included."""
+        question, running, said = None, False, []
+        for p in self.records():
+            kind = p.get("type")
+            if kind == "function_call" and p.get("name") == ASYNC_QUESTION:
+                question = {"id": call_id(p), "questions": codex_questions(p)}
+                running = True
+            elif kind == "task_complete":
+                running = False
+            elif kind == "message" and p.get("role") == "assistant":
+                said.append(message_text(p))
+            elif human_message(p):
+                question, said = None, []
+        if question:
+            # Last, so the cut to the human's prompt keeps it.
+            said.append(f"(asks {self.asks}) {questions_text(question)}")
+        return question, running, said
+
+    def pending_question(self) -> dict | None:
+        """An async question in the turn that still runs: Codex shows it as a
+        message, returns at once and works on, and takes a message sent meanwhile
+        into the turn."""
+        question, running, _ = self.unanswered()
+        return question if running else None
+
+    def answer_ended(self, question: dict, answered: bool = True) -> bool:
+        """Whether a human message follows `question`'s call and a turn end follows
+        that message: the message went into the running turn or, when that turn
+        ended first, began a new one. With answered false, whether a turn end
+        follows the call."""
+        state = "asked"
+        for p in self.records():
+            if (
+                state == "asked"
+                and p.get("type") == "function_call"
+                and call_id(p) == question["id"]
+            ):
+                state = "call" if answered else "answered"
+            elif state == "call" and human_message(p):
+                state = "answered"
+            elif state == "answered" and p.get("type") == "task_complete":
+                return True
+        return False
 
     def command(self) -> list[str]:
         return [
@@ -1175,9 +1254,62 @@ class Codex(Harness):
         ]
 
     def last_message(self) -> str:
+        """The turn-end message, or, while an async question waits for an answer,
+        all the agent said since the human's last message: the turn-end message
+        may not hold the question, and a question in a running turn has none."""
+        question, _, said = self.unanswered()
+        if question:
+            return "\n\n".join(said)
         return (self.box.read(self.box.state / "last-agent") or b"").decode(
             errors="replace"
         )
+
+
+def call_id(payload: dict) -> str | None:
+    """A Codex function call's ID: its call_id, which its output names, else its
+    record's own."""
+    return payload.get("call_id") or payload.get("id")
+
+
+def message_text(payload: dict) -> str:
+    return "".join(
+        c.get("text", "") for c in payload.get("content") or [] if isinstance(c, dict)
+    )
+
+
+# The context Codex adds as a user message, by its opening tag: in codex-cli 0.164's
+# rollouts, <environment_context> at each session's start. A human's own message may
+# start with "<" too ("<b>Blue</b>").
+CODEX_CONTEXT = ("<environment_context>",)
+
+
+def human_message(payload: dict) -> bool:
+    """Whether a Codex record is the human's message, not context Codex adds."""
+    return (
+        payload.get("type") == "message"
+        and payload.get("role") == "user"
+        and not message_text(payload).lstrip().startswith(CODEX_CONTEXT)
+    )
+
+
+def codex_questions(call: dict) -> list[dict]:
+    """A request_user_input_async call's questions as {"question", "options":
+    [{"label"}]}; its arguments hold {"questions": [{"title", "options": [str]}]}."""
+    try:
+        given = json.loads(call.get("arguments") or "{}").get("questions") or []
+    except (ValueError, AttributeError):
+        given = []
+    questions = []
+    for q in given if isinstance(given, list) else []:
+        if not isinstance(q, dict):
+            continue
+        options = [
+            o if isinstance(o, dict) else {"label": str(o)}
+            for o in q.get("options") or []
+        ]
+        text = q.get("title") or q.get("question") or ""
+        questions.append({"question": str(text), "options": options})
+    return questions
 
 
 HARNESSES = {"claude": Claude, "codex": Codex}
@@ -1422,7 +1554,10 @@ class Session:
         the transcript holds no answer to, with the dialog on screen. The screen
         alone can't tell: an answered dialog stays drawn a moment after Enter. So
         a dialog the transcript holds no question for is read from the screen only
-        once it has shown for DIALOG_GRACE."""
+        once it has shown for DIALOG_GRACE. Codex's question is in its transcript
+        alone."""
+        if not self.harness.dialog:
+            return self.harness.pending_question()
         # The screen first: reading the transcript costs a find and a cat.
         if not self.dialog_open():
             self.unexplained_dialog = None
@@ -1440,27 +1575,50 @@ class Session:
             shown["answered"] = self.harness.answered_questions()
         return shown
 
-    def wait_turn(self, before: int) -> tuple[bool, dict | None]:
+    def wait_turn(
+        self, before: int, answered: dict | None = None
+    ) -> tuple[bool, dict | None]:
         """Waits for the agent's turn to end (the turn-end hook fired after
-        `before` turns, then held still for SETTLE), or for a question dialog,
-        which waits for the human without ending the turn. Returns whether either
-        came, and the dialog's question if one did."""
+        `before` turns, then held still for SETTLE), or for a question, which
+        waits for the human without ending the turn. With `answered`, a question
+        the human just answered by message, the end counts only once the turn that
+        holds the answer ends, and that question is no new one. Returns whether
+        either came, and the question if one did."""
         deadline = time.time() + TURN_LIMIT
         while time.time() < deadline:
             question = self.asking()
-            if question:
+            if question and not (answered and question["id"] == answered["id"]):
                 time.sleep(SETTLE)
                 return True, question
             seen = self.turns_seen()
             if seen > before:
                 time.sleep(SETTLE)
-                if self.turns_seen() == seen:
+                if self.turns_seen() == seen and (
+                    not answered or self.harness.answer_ended(answered)
+                ):
                     return True, None
+                # The count moved but the answer's turn hasn't ended: a harness
+                # that died meanwhile never ends it.
+                if not self.alive():
+                    return False, None
                 continue
             if not self.alive():
                 return False, None
             time.sleep(min(2, SETTLE))
         return False, None
+
+    def wait_asking_turn(self, question: dict) -> bool:
+        """Waits for the turn that asked `question` by message to end, with no
+        answer sent, then for SETTLE. Returns whether it ended."""
+        deadline = time.time() + TURN_LIMIT
+        while time.time() < deadline:
+            if self.harness.answer_ended(question, answered=False):
+                time.sleep(SETTLE)
+                return True
+            if not self.alive():
+                return False
+            time.sleep(min(2, SETTLE))
+        return False
 
     def send(self, text: str) -> None:
         """Types `text` as the human's message."""
@@ -1532,7 +1690,9 @@ class Session:
 def question_on_screen(screen: str) -> dict | None:
     """Claude Code's question dialog as `screen` shows it, {"id": None, "questions"},
     for one its transcript doesn't hold: a question per tab of the dialog's tab line,
-    or one, with the dialog's text, when it has no tabs. None when the screen's last
+    or one, with the dialog's text, when it has no tabs; multi-select when its
+    options are checkboxes ("1. [ ] Cheese", Claude Code 2.1.332, whose multi-select
+    dialog has a tab line of one question and Submit). None when the screen's last
     dialog offers neither "Type something" nor "Chat about this": another dialog,
     such as a permission prompt, has the same footer."""
     lines = [line.rstrip() for line in screen.splitlines() if line.strip()]
@@ -1558,8 +1718,10 @@ def question_on_screen(screen: str) -> dict | None:
         # A single question's first line may be its header, "☐ Install".
         text = re.sub(r"^[☐☑☒✔✓]\s*\S+\s*", "", " ".join(head))
         questions = [{"question": text}]
+    multi = any(re.match(r"\s*(❯\s*)?\d+\. \[[ x✔✓]\] ", line) for line in dialog)
     for q in questions:
         q["question"] = "(read from the screen) " + q["question"]
+        q["multiSelect"] = multi
     return {"id": None, "questions": questions}
 
 
@@ -1662,18 +1824,42 @@ def interactive(
         last = session.harness.last_message() if history else ""
         text, note = human_turn(turn, scenario, persona, last, history)
         if text is None:
+            # A question asked by message in a turn that still runs: the next turn
+            # sent would go into that turn as its answer (jason97's s4 has a
+            # go-ahead that doesn't hold, then a turn of its own).
+            ended = True
+            if asked and not session.harness.dialog:
+                ended = session.wait_asking_turn(asked)
+                note = (note or "its condition did not hold") + (
+                    "; waited for the turn that asked to end"
+                    if ended
+                    else "; the turn that asked never ended"
+                )
+                asked = None
             with log.open("a") as f:
                 f.write(
                     f"## Turn {n}: skipped, {note or 'its condition did not hold'}\n\n"
                     f"Scripted: {json.dumps(logged)}\n\n{waited}"
                 )
+            if not ended:
+                (session.out / f"screen-{n:02}.txt").write_text(session.last_screen())
+                return why_stuck(session.last_screen())
             continue
         # Only what was sent counts as scripted so far, so a skipped "Yes, post it."
         # approves nothing later.
         history.append(text)
         before = session.turns_seen()
         answered, failed = "", None
-        if asked and leave_for_chat(asked):
+        # A question that the message answers, which the turn's end must follow.
+        by_message = None
+        if asked and not session.harness.dialog:
+            answered = (
+                f"Answered its {ASYNC_QUESTION} question, as a message, "
+                f"to:\n{questions_text(asked)}\n\n"
+            )
+            by_message = asked
+            session.send(fill(text, values))
+        elif asked and leave_for_chat(asked):
             count = len(asked["questions"])
             answered = (
                 f"Left a dialog of {count} question{'s' if count > 1 else ''} "
@@ -1704,9 +1890,10 @@ def interactive(
                 file=sys.stderr,
             )
             return "dialog-unanswered"
-        ended, asked = session.wait_turn(before)
+        ended, asked = session.wait_turn(before, by_message)
         (session.out / f"screen-{n:02}.txt").write_text(session.screen())
-        status = "asks in a dialog" if asked else "ended" if ended else "NO END SEEN"
+        asks = f"asks {session.harness.asks}"
+        status = asks if asked else "ended" if ended else "NO END SEEN"
         with log.open("a") as f:
             f.write(
                 f"## Turn {n} ({status}, "
@@ -1715,11 +1902,7 @@ def interactive(
                 + (f"{note}\n\n" if note else "")
                 + answered
                 + f"Sent: {text}\n\n"
-                + (
-                    f"The agent asks in a dialog:\n{questions_text(asked)}\n\n"
-                    if asked
-                    else ""
-                )
+                + (f"The agent {asks}:\n{questions_text(asked)}\n\n" if asked else "")
             )
         print(
             f"{session.box.name}: turn {n} {'ended' if ended else 'timed out'}",

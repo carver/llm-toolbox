@@ -39,8 +39,9 @@ TOOL = Path(__file__).resolve().parent / "bin" / "drive-agent"
 # gets "done: <line>". Every turn writes ~/seen.json: user, env, cwd.
 # The fake Claude Code also asks in a question dialog, as AskUserQuestion does:
 # "dialog" asks one question, "dialog2" two in one dialog (tabs), "dialogm" one
-# multi-select question, "deaf" one it never takes an answer to, "nochat" two with no
-# "Chat about this"; "late" and "late2" are "dialog" and "dialog2" whose tool_use
+# multi-select question (a tab line and checkboxes, as Claude Code 2.1.332 draws it),
+# "deaf" one it never takes an answer to, "nochat" two with no "Chat about this";
+# "late", "late2" and "latem" are "dialog", "dialog2" and "dialogm" whose tool_use
 # reaches the transcript only with its answer, as Claude Code 2.1.325 sometimes
 # writes it. The dialog writes its tool_use to the transcript and fires no
 # Stop hook, and reads keys as they come, as Claude Code does. Key 3, its free-text
@@ -48,8 +49,16 @@ TOOL = Path(__file__).resolve().parent / "bin" / "drive-agent"
 # a while with the answered dialog still drawn, replies "done: answer <text>" and
 # fires Stop; with several it moves on to the next tab. Key 4, "Chat about this",
 # rejects the call, as Claude Code does, asks what to clarify and fires Stop.
+# The fake Codex asks through request_user_input_async, as Codex 0.164 does, writing
+# the call and its {"accepted":true} output, printing the question and saying it
+# works on meanwhile: "async" then takes a line typed within FAKE_ASYNC_WAIT seconds
+# (default 10, given with --agent-env) as the answer, which it writes as a user
+# message in the same turn ("done: answer <text>"), else goes on without one;
+# "asyncend" ends its turn after asking; "asyncdie" notifies on the answer but exits
+# before its task_complete. Every Codex turn ends in a task_complete record before
+# its notify.
 FAKE_AGENT = r"""#!/usr/bin/env python3
-import json, os, socket, subprocess, sys, termios, time, tty, uuid
+import json, os, select, socket, subprocess, sys, termios, time, tty, uuid
 HARNESS = os.path.basename(sys.argv[0])
 args = sys.argv[1:]
 if args[:1] == ["--version"]:
@@ -113,13 +122,23 @@ QUESTIONS = {
 }
 DIALOGS = {"dialog": ["colour"], "dialog2": ["colour", "animal"], "deaf": ["colour"],
            "dialogm": ["colour"], "nochat": ["colour", "animal"],
-           "late": ["colour"], "late2": ["colour", "animal"]}
+           "late": ["colour"], "late2": ["colour", "animal"], "latem": ["colour"]}
 
 def draw(questions, chat=True, boxed=False):
     # boxed: the question in a box's left edge, with each option described, as
     # Claude Code 2.1.325 draws it.
     first = questions[0]
     print("─" * 40)
+    if first["multiSelect"]:
+        print("←  ☐ " + first["header"] + "  ✔ Submit  →")
+        print("\n" + first["question"] + "\n")
+        for n, option in enumerate(first["options"], 1):
+            print(("❯ " if n == 1 else "  ") + f"{n}. [ ] {option['label']}")
+        print("  3. [ ] Type something\n     Submit")
+        print("─" * 40)
+        print("  4. Chat about this")
+        print("Enter to select · ↑/↓ to navigate · Esc to cancel", flush=True)
+        return
     if len(questions) > 1:
         print("←  " + "  ".join("☐ " + q["header"] for q in questions) + "  ✔ Submit  →")
     else:
@@ -151,7 +170,7 @@ if HARNESS == "claude":
             for rec in records:
                 f.write(json.dumps(rec) + "\n")
     def ask(line):
-        questions = [dict(QUESTIONS[k], multiSelect=line == "dialogm")
+        questions = [dict(QUESTIONS[k], multiSelect=line in ("dialogm", "latem"))
                      for k in DIALOGS[line]]
         tool_id = "toolu_" + uuid.uuid4().hex
         asked = {"type": "assistant", "message": {"content": [
@@ -230,13 +249,53 @@ else:
     os.makedirs(sessions, exist_ok=True)
     transcript = os.path.join(sessions, "rollout-" + session + ".jsonl")
     notify = [json.loads(a.split("=", 1)[1]) for a in args if a.startswith("notify=")]
-    def record(line, text):
+    def message(role, t):
+        write({"type": "response_item", "payload": {
+            "type": "message", "role": role,
+            "content": [{"type": "input_text" if role == "user" else "output_text",
+                         "text": t}]}})
+    def write(*records):
         with open(transcript, "a") as f:
-            for role, t in (("user", line), ("assistant", text)):
-                f.write(json.dumps({"type": "response_item", "payload": {
-                    "type": "message", "role": role,
-                    "content": [{"type": "text", "text": t}]}}) + "\n")
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+    def record(line, text):
+        message("user", line)
+        message("assistant", text)
+    def ask_async(line):
+        message("user", line)
+        message("assistant", "Before I go on, one question.")
+        call_id = "call_" + uuid.uuid4().hex
+        write({"type": "response_item", "payload": {
+                   "type": "function_call", "name": "request_user_input_async",
+                   "call_id": call_id, "arguments": json.dumps({"questions": [
+                       {"title": "Which colour do you prefer?",
+                        "options": ["Red", "Blue"]}]})}},
+              {"type": "response_item", "payload": {
+                   "type": "function_call_output", "call_id": call_id,
+                   "output": '{"accepted":true}'}})
+        print("Which colour do you prefer?\n- Red\n- Blue", flush=True)
+        message("assistant", "I'll work on meanwhile.")
+        if line == "asyncend":
+            text = "Tell me when you've chosen."
+        elif line == "asyncdie":
+            given = sys.stdin.readline().strip()
+            message("user", given)
+            subprocess.run([*notify[0], json.dumps({"input-messages": [given],
+                                                  "last-assistant-message": "x"})])
+            sys.exit(1)
+        elif select.select([sys.stdin], [], [], float(os.environ.get("FAKE_ASYNC_WAIT", 10)))[0]:
+            given = sys.stdin.readline().strip()
+            message("user", given)
+            text = "done: answer " + given
+        else:
+            text = "went on without an answer"
+        message("assistant", text)
+        print(text)
+        turn_end(line, text)
+        print("❯ ", end="", flush=True)
     def turn_end(line, text):
+        write({"type": "event_msg", "payload": {"type": "task_complete",
+                                                "last_agent_message": text}})
         # Codex also notifies for the side thread that names the session.
         title = {"input-messages": ["Generate a concise, single-line task title"],
                  "last-assistant-message": "Title"}
@@ -275,6 +334,9 @@ for line in sys.stdin:
         continue
     if HARNESS == "claude" and line in DIALOGS:
         dialog(line)
+        continue
+    if HARNESS == "codex" and line in ("async", "asyncend", "asyncdie"):
+        ask_async(line)
         continue
     if HARNESS == "claude" and line == "permission":
         # A permission prompt: the question dialog's footer, and no question.
@@ -771,10 +833,16 @@ def test_a_dialog_the_transcript_gets_late_is_read_from_the_screen_and_answered(
     assert json.loads((out / "run.json").read_text())["outcome"] == "done"
 
 
-def test_a_dialog_of_several_questions_the_transcript_gets_late_is_left_for_the_chat(
-    tmp_path, env
+@pytest.mark.parametrize(
+    ("kind", "left"),
+    [("late2", "Left a dialog of 2 questions"), ("latem", "Left a dialog of 1 ")],
+)
+def test_a_dialog_of_several_or_multi_select_questions_the_transcript_gets_late_is_left_for_the_chat(
+    tmp_path, env, kind, left
 ):
-    path = scenario(tmp_path, turns=["late2", "Yes, both.", "after"])
+    # probe5m (Claude Code 2.1.332): a multi-select dialog draws a tab line, as a
+    # dialog of several questions does, and its free-text option is a checkbox.
+    path = scenario(tmp_path, turns=[kind, "Yes, both.", "after"])
     out = tmp_path / "out"
     drive(
         {**env, "DRIVE_AGENT_DIALOG_GRACE": "5"},
@@ -783,11 +851,169 @@ def test_a_dialog_of_several_questions_the_transcript_gets_late_is_left_for_the_
     (records,) = transcript_records(out).values()
     answers = dialog_answers(records)
     assert len(answers) == 1 and "clarify" in answers[0]
-    assert typed(records) == ["late2", "Yes, both.", "after"]
+    assert typed(records) == [kind, "Yes, both.", "after"]
     turn2 = (out / "turns.md").read_text().split("## Turn 2")[1].split("## Turn 3")[0]
-    assert "Left a dialog of 2 questions" in turn2
-    assert "Colour" in turn2 and "Animal" in turn2
+    assert left in turn2
+    assert "Colour" in turn2
     assert json.loads((out / "run.json").read_text())["outcome"] == "done"
+
+
+def codex_human_texts(records):
+    return [
+        "".join(c["text"] for c in rec["payload"]["content"])
+        for rec in records
+        if rec["payload"].get("type") == "message" and rec["payload"]["role"] == "user"
+    ]
+
+
+def test_codex_async_question_ends_the_turn_and_takes_the_next_as_its_answer(
+    tmp_path, env
+):
+    # jason97: Codex asked through request_user_input_async, worked on while it
+    # waited for an answer, and after 60 s posted without one: its notify comes
+    # only when the whole turn ends, so the driver never saw a question.
+    path = scenario(tmp_path, turns=["async", "Blue.", "after"])
+    out = tmp_path / "out"
+    drive(env, "run", path, "--harness", "codex", "--name", "jason70", "--out", out)
+    (records,) = transcript_records(out).values()
+    assert codex_human_texts(records) == ["async", "Blue.", "after"]
+    assert "done: answer Blue." in (out / "screen-02.txt").read_text()
+    log = (out / "turns.md").read_text()
+    turn1, rest = log.split("## Turn 2")
+    turn2 = rest.split("## Turn 3")[0]
+    assert "asks through request_user_input_async" in turn1
+    assert "Which colour do you prefer? (Red / Blue)" in turn1
+    assert "Answered its request_user_input_async question" in turn2
+    assert "Sent: Blue." in turn2
+    # The human judged the question, not the last turn's notify message.
+    (prompt,) = [p for p in human_prompts(env) if "<<<\nBlue.\n>>>" in p]
+    assert "Which colour do you prefer?" in prompt
+    # Turn 3 went only once the answered turn ended, not on the earlier question.
+    assert "<<<\ndone: answer Blue.\n>>>" in human_prompts(env)[-1]
+    assert json.loads((out / "run.json").read_text())["outcome"] == "done"
+
+
+def test_codex_async_question_in_a_turn_that_ended_reaches_the_human(tmp_path, env):
+    # The notify message is the turn's last text, which may not hold the question.
+    path = scenario(tmp_path, turns=["asyncend", "Blue."])
+    out = tmp_path / "out"
+    drive(env, "run", path, "--harness", "codex", "--name", "jason71", "--out", out)
+    (prompt,) = [p for p in human_prompts(env) if "<<<\nBlue.\n>>>" in p]
+    assert "Which colour do you prefer?" in prompt
+    assert "Tell me when you've chosen." in prompt
+    log = (out / "turns.md").read_text()
+    assert "## Turn 1 (ended" in log
+    assert "done: Blue." in (out / "screen-02.txt").read_text()
+
+
+def codex_run(tmp_path, env, turns, name, wait=None, check=True):
+    path = scenario(tmp_path, turns=turns)
+    out = tmp_path / "out"
+    given = {**env, "FAKE_ASYNC_WAIT": wait} if wait else env
+    extra = ("--agent-env", "FAKE_ASYNC_WAIT") if wait else ()
+    done = drive(
+        given,
+        *("run", path, "--harness", "codex", "--name", name, "--out", out, *extra),
+        check=check,
+    )
+    return out, done
+
+
+def test_codex_question_reaches_the_human_last_so_no_cut_drops_it(tmp_path, env):
+    codex_run(tmp_path, env, ["async", "Blue."], "jason74")
+    (prompt,) = [p for p in human_prompts(env) if "<<<\nBlue.\n>>>" in p]
+    last = prompt.split("The agent's last message:\n<<<\n")[1].split("\n>>>")[0]
+    assert last.startswith("Before I go on, one question.")
+    assert "I'll work on meanwhile." in last
+    assert last.endswith("Which colour do you prefer? (Red / Blue)")
+
+
+def test_a_turn_skipped_while_a_codex_question_runs_waits_for_its_turn_to_end(
+    tmp_path, env
+):
+    # The jason97 shape: a conditional go-ahead that doesn't hold after Codex asks.
+    # The next sent turn must not go into the running turn as the answer.
+    out, _ = codex_run(
+        tmp_path,
+        env,
+        ["async", {"text": "Yes, post it.", "only_if": "it asks to post"}, "after"],
+        "jason75",
+        wait="3",
+    )
+    (records,) = transcript_records(out).values()
+    assert codex_human_texts(records) == ["async", "after"]
+    assert "went on without an answer" in (out / "screen-03.txt").read_text()
+    log = (out / "turns.md").read_text()
+    turn2 = log.split("## Turn 2")[1].split("## Turn 3")[0]
+    assert "skipped" in turn2 and "waited for the turn that asked to end" in turn2
+    turn3 = log.split("## Turn 3")[1]
+    assert (
+        "Answered its" not in turn3
+        and "done: after" in (out / "screen-03.txt").read_text()
+    )
+
+
+def test_codex_question_whose_turn_ends_before_the_answer_waits_for_the_answers_turn(
+    tmp_path, env
+):
+    # The fake goes on without an answer after 1.6 s. drive-agent sees the question
+    # at its first or second poll (0 or 1 s), holds it for SETTLE (1 s), and types
+    # the answer for 1.2 s before Enter, so the old turn has ended by then, and the
+    # answer starts a new turn, whose end the next turn waits for.
+    out, _ = codex_run(
+        tmp_path,
+        {**env, "DRIVE_AGENT_SETTLE": "1"},
+        ["async", "Blue.", "after"],
+        "jason76",
+        wait="1.6",
+    )
+    (records,) = transcript_records(out).values()
+    assert codex_human_texts(records) == ["async", "Blue.", "after"]
+    log = (out / "turns.md").read_text()
+    assert "## Turn 1 (asks through request_user_input_async" in log
+    assert "done: Blue." in (out / "screen-02.txt").read_text()
+    (prompt,) = [p for p in human_prompts(env) if "<<<\nafter\n>>>" in p]
+    assert "<<<\ndone: Blue.\n>>>" in prompt
+
+
+def test_a_codex_answer_that_starts_like_markup_is_still_the_answer(tmp_path, env):
+    out, _ = codex_run(tmp_path, env, ["async", "<b>Blue</b>", "after"], "jason77")
+    assert "done: answer <b>Blue</b>" in (out / "screen-02.txt").read_text()
+    assert json.loads((out / "run.json").read_text())["outcome"] == "done"
+
+
+def test_codex_dying_in_the_answered_turn_fails_the_run_at_once(tmp_path, env):
+    began = time.time()
+    out, done = codex_run(
+        tmp_path, env, ["asyncdie", "Blue.", "after"], "jason78", check=False
+    )
+    assert done.returncode == 1
+    # Well under the 20 s turn limit: the dead pane ends the wait.
+    assert time.time() - began < 15
+    assert "NO END SEEN" in (out / "turns.md").read_text()
+
+
+@pytest.mark.parametrize(
+    ("option", "multi"),
+    [("1. [ ] Cheese", True), ("1. [✔] Cheese", True), ("1. [A] Apply", False)],
+)
+def test_only_checkbox_options_make_a_dialog_read_from_the_screen_multi_select(
+    option, multi
+):
+    screen = "\n".join(
+        [
+            "─" * 40,
+            " ☐ Pick",
+            "Which one?",
+            f"❯ {option}",
+            "  2. Type something",
+            "─" * 40,
+            "  3. Chat about this",
+            "Enter to select · ↑/↓ to navigate · Esc to cancel",
+        ]
+    )
+    (question,) = drive_agent.question_on_screen(screen)["questions"]
+    assert question["multiSelect"] is multi
 
 
 def test_a_dialog_that_is_no_question_is_never_answered(tmp_path, env):

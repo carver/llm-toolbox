@@ -71,6 +71,12 @@ HOOKS = [
     (
         "PreToolUse",
         "Bash",
+        "heredoc-gate",
+        {"timeout": 10},
+    ),
+    (
+        "PreToolUse",
+        "Bash",
         "heavy-gate",
         {"timeout": 10},
     ),

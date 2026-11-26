@@ -649,6 +649,15 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   one, or `sys.argv[i]` from the command line, directly or through a name
   bound once; a shell variable counts when it's set once, before the python
   command, to a plain value.
+- **heredoc-gate**: a Claude Code hook, which `install.py` registers, that
+  refuses a Bash command whose heredoc closed early: with the heredoc bodies
+  and comments dropped, a line of shell still holds only one of its heredocs'
+  delimiters, or an apply-edits marker, as when edit blocks for a file with a
+  heredoc of its own close the outer one at the inner `EOF` and bash runs the
+  rest as commands. A line inside a quoted string, such as a `bash -c "..."`
+  script's own heredoc, isn't shell, and a heredoc closes as bash closes it: on
+  its delimiter exactly, or after leading tabs for `<<-`. Replayed over 56,252
+  logged commands, it refused 5, each cut short.
 - **heavy-gate**: a Claude Code hook, which `install.py` registers, that
   refuses a Bash call running `heavy -- CMD` unless it was made with
   `run_in_background: true`, since heavy's queue has no time limit and the

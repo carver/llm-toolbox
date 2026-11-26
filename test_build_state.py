@@ -329,6 +329,163 @@ def test_finish_asks_for_a_new_review_when_the_reviewed_commit_was_rewritten(
     refused_keeping_the_build(repo, done, "review-prompt", "rewritten")
 
 
+def reviewed_three(repo, tmp_path) -> list[str]:
+    """Start a build, commit three changes to files of their own, and review them."""
+    build_state(repo, "start")
+    shas = [
+        commit(repo, "parser.py", "Parse dates"),
+        commit(repo, "format.py", "Format dates"),
+        commit(repo, "zones.py", "Add time zones"),
+    ]
+    review(repo, tmp_path)
+    return shas
+
+
+def drop(repo, sha):
+    git(repo, "rebase", "-q", "--onto", f"{sha}^", sha)
+
+
+@pytest.mark.parametrize("dropped", [2, 1], ids=["top", "middle"])
+def test_finish_takes_a_commit_dropped_after_the_review_when_named(
+    repo, tmp_path, dropped
+):
+    # The user drops reviewed work after the review; what's left, the review saw.
+    shas = reviewed_three(repo, tmp_path)
+    drop(repo, shas[dropped])
+    build_state(repo, "refactor")
+    assert build_state(repo, "finish", reviewed=False).returncode == 1
+
+    done = build_state(repo, "finish", "--dropped", shas[dropped], reviewed=False)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    subject = ["Parse dates", "Format dates", "Add time zones"][dropped]
+    assert f"Dropped after the review: {shas[dropped][:12]} {subject}" in done.stdout
+    assert build_state(repo, "show").returncode == 1
+
+
+def test_finish_refuses_a_dropped_commit_still_in_head(repo, tmp_path):
+    shas = reviewed_three(repo, tmp_path)
+    drop(repo, shas[2])
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", "--dropped", shas[1], reviewed=False)
+
+    refused_keeping_the_build(repo, done, shas[1][:12], "still")
+
+
+def test_finish_refuses_a_dropped_commit_the_review_didnt_cover(repo, tmp_path):
+    before = git(repo, "rev-parse", "HEAD").strip()
+    shas = reviewed_three(repo, tmp_path)
+    drop(repo, shas[2])
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", "--dropped", before, reviewed=False)
+
+    refused_keeping_the_build(repo, done, before[:12], "review")
+
+
+def test_finish_refuses_a_drop_that_leaves_head_unlike_the_review(repo, tmp_path):
+    # Dropped one, and changed another meanwhile: no review saw the result.
+    shas = reviewed_three(repo, tmp_path)
+    drop(repo, shas[2])
+    (repo / "format.py").write_text("changed\n")
+    git(repo, "commit", "-q", "-a", "--amend", "-m", "Format dates")
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", "--dropped", shas[2], reviewed=False)
+
+    refused_keeping_the_build(repo, done, "Format dates")
+    assert "HEAD's is " in done.stderr, done.stderr
+
+
+def test_finish_refuses_a_drop_of_more_commits_than_it_names(repo, tmp_path):
+    shas = reviewed_three(repo, tmp_path)
+    git(repo, "reset", "-q", "--hard", f"{shas[2]}~2")
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", "--dropped", shas[2], reviewed=False)
+
+    refused_keeping_the_build(repo, done, "Format dates", "isn't HEAD's commit 2")
+    assert "HEAD has no commit 2" in done.stderr, done.stderr
+
+
+def test_finish_refuses_a_kept_commit_reindented_after_the_review(repo, tmp_path):
+    # Indentation is code in Python: a patch-id that ignores whitespace would take
+    # a line moved out of its `if` as the reviewed change.
+    build_state(repo, "start")
+    (repo / "guard.py").write_text("if x:\n    guard()\n")
+    git(repo, "add", "guard.py")
+    git(repo, "commit", "-q", "-m", "Guard f")
+    dropped = commit(repo, "zones.py", "Add time zones")
+    review(repo, tmp_path)
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    (repo / "guard.py").write_text("if x:\nguard()\n")
+    git(repo, "commit", "-q", "-a", "--amend", "-m", "Guard f")
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", "--dropped", dropped, reviewed=False)
+
+    refused_keeping_the_build(repo, done, "Guard f")
+
+
+def test_an_empty_reviewed_commit_matches_its_copy_after_a_drop(repo, tmp_path):
+    build_state(repo, "start")
+    commit(repo, "parser.py", "Parse dates")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "Note the plan")
+    dropped = commit(repo, "zones.py", "Add time zones")
+    review(repo, tmp_path)
+    git(repo, "reset", "-q", "--hard", "HEAD~2")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "Note the plan")
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", "--dropped", dropped, reviewed=False)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_commit_added_after_a_drop_still_needs_a_review(repo, tmp_path):
+    shas = reviewed_three(repo, tmp_path)
+    drop(repo, shas[2])
+    commit(repo, "calendar.py", "Add a calendar")
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", "--dropped", shas[2], reviewed=False)
+
+    refused_keeping_the_build(repo, done, "Add a calendar")
+
+
+def test_finish_refuses_a_dropped_name_that_isnt_a_commit(repo, tmp_path):
+    shas = reviewed_three(repo, tmp_path)
+    drop(repo, shas[2])
+    build_state(repo, "refactor")
+
+    done = build_state(repo, "finish", "--dropped", "no-such-ref", reviewed=False)
+
+    refused_keeping_the_build(repo, done, "no-such-ref", "names no commit")
+
+
+def test_dropped_doesnt_stand_in_for_a_review_never_recorded(repo):
+    build_state(repo, "start")
+    sha = commit(repo, "parser.py", "Parse dates")
+    commit(repo, "format.py", "Format dates")
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+
+    done = build_state(repo, "finish", "--dropped", sha, reviewed=False)
+
+    refused_keeping_the_build(repo, done, "No review was recorded")
+
+
+def test_finish_refuses_dropping_every_reviewed_commit(repo, tmp_path):
+    build_state(repo, "start")
+    sha = commit(repo, "parser.py", "Parse dates")
+    review(repo, tmp_path)
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+
+    done = build_state(repo, "finish", "--dropped", sha, reviewed=False)
+
+    refused_keeping_the_build(repo, done, "every")
+
+
 def test_show_says_which_commit_the_review_covered(repo, tmp_path):
     build_state(repo, "start")
     sha = commit(repo, "parser.py", "Parse dates")

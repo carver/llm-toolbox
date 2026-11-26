@@ -479,6 +479,25 @@ the builds it opens (`checks_steps`), and finish checks the steps only of a mark
 build, so a build another session opened before this landed, whose review an older
 `review-prompt` never recorded, finishes as before (the owner's call, 2026-11-09).
 
+### build-state finish --dropped takes the review after a reviewed commit is dropped (2026-11-25)
+
+In an llm-toolbox build on 2026-11-25 the review covered three commits, the owner
+dropped the third, and finish refused: the reviewed commit and its tree were gone,
+though the two commits left were unchanged and reviewed. The agent landed without
+finish rather than record a review that didn't happen. `finish --dropped SHA...`
+(the owner's call, 2026-11-25, from four options) takes the review for what's left
+once it has checked it: each SHA is one of the review's commits and none is still in
+HEAD by patch-id, and HEAD's commits since the base begin with the reviewed ones
+without them, by patch-id (an empty commit by subject) and in order. The last of
+those stands in for the reviewed commit, so the other step checks run as before: a
+commit added after the drop still needs a review. Dropping from the middle works too.
+What a drop can hide is a fix the dropped commit made to one that stays, which the
+review read with the fix beside it; /build's Triage has the agent ask the user that
+and review again when it did. Rejected: accepting any HEAD that is an ancestor of the
+reviewed commit, which can't tell a drop from an accidental reset and misses middle
+drops; a `build-state drop` command, more code for the same check; a review of the
+drop's interactions every time, a subagent for what is usually nothing.
+
 ### wt-ship --remove keeps a worktree that processes still run in (2026-11-25)
 
 In a filedrawer session the agent stopped `bin/live-preview`, which it had started in

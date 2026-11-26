@@ -62,6 +62,8 @@ Sort every finding into one of:
 - **Skip**: a judgement call that doesn't pay here, or one outside this change. Give a one-line reason.
 - **Ask**: a finding that changes a decision the user made. Ask the user before going on.
 
+When the user drops a reviewed commit, as after an Ask, ask whether it fixed anything in a commit that stays. If it did, review again (`build-state review-prompt`), since the review read those commits with the fix beside them. If not, drop it and run `build-state finish --dropped SHA` at step 6, which checks that what's left is the review without it, and name the dropped commit in the report.
+
 Show the user the triage as a short list, then go on without waiting unless something is under Ask.
 
 Done when every finding has a bucket, every spec gap is fixed with checks green, and every Ask is answered.

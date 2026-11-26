@@ -18,6 +18,13 @@
                             a fixup!, squash! or amend!. It runs no
                             agent-pre-commit: wt-ship checks the tip of what it
                             lands
+    build-state finish --dropped SHA...
+                            the same, after the user dropped reviewed commits
+                            SHA... from the build: it takes the review for the
+                            commits left when HEAD's commits since the base are,
+                            by patch-id and in order, the reviewed ones without
+                            SHA..., and none of SHA... is still there; it names
+                            each dropped commit in what it prints
     build-state review-prompt BRIEF
                             record HEAD as the commit the review covers, write
                             the review subagent's prompt for it
@@ -1171,6 +1178,90 @@ def conflict_hint(base: str) -> list[str]:
     ]
 
 
+def change_key(sha: str, subject: str) -> str:
+    """What stays of a commit through a rebase that drops another: its patch-id, or,
+    for an empty commit, which has none, its subject. --verbatim, since whitespace is
+    code in Python and in strings, and no textconv, which could hide a change."""
+    diff = git("show", "--no-textconv", sha).stdout
+    patch = subprocess.run(
+        ["git", "patch-id", "--verbatim"],
+        input=diff,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    return patch[0] if patch else f"subject {subject}"
+
+
+def after_drop(
+    state: dict, names: list[str]
+) -> tuple[str | None, list[tuple[str, str]], list[str]]:
+    """The commit that stands in for the reviewed one after the user dropped commits
+    `names` from the review, those commits with their subjects, and why it can't, if
+    it can't: HEAD's commits since the base must be the reviewed ones without
+    `names`, by patch-id and in order, and none of `names` may be among them. None
+    and no problems when no review was recorded, which skipped_steps refuses."""
+    if (reviewed := state.get("reviewed")) is None:
+        return None, [], []
+    base = state["base"]
+    reviewed_commits = commits(f"{base}..{reviewed}")[::-1]
+    subjects = dict(reviewed_commits)
+    head_commits = commits(f"{base}..HEAD")[::-1]
+    head_keys = [change_key(*c) for c in head_commits]
+    problems, dropped = [], set()
+    for name in names:
+        found = git("rev-parse", "--verify", "-q", f"{name}^{{commit}}", check=False)
+        sha = found.stdout.strip()
+        if found.returncode != 0:
+            problems.append(f"--dropped {name} names no commit.")
+        elif sha not in subjects:
+            problems.append(
+                f"--dropped {sha[:12]} isn't one of the review's commits"
+                f" ({base[:12]}..{reviewed[:12]})."
+            )
+        elif change_key(sha, subjects[sha]) in head_keys:
+            problems.append(
+                f"--dropped {sha[:12]} {subjects[sha]} is still in HEAD's history,"
+                " by its patch: drop it first."
+            )
+        else:
+            dropped.add(sha)
+    if problems:
+        return None, [], problems
+    kept = [c for c in reviewed_commits if c[0] not in dropped]
+    if not kept:
+        return (
+            None,
+            [],
+            [
+                "That drops every commit the review covered: nothing reviewed is left",
+                "to finish.",
+            ],
+        )
+    for place, (sha, subject) in enumerate(kept):
+        if place >= len(head_commits) or head_keys[place] != change_key(sha, subject):
+            there = (
+                f"HEAD's is {head_commits[place][0][:12]} {head_commits[place][1]}"
+                if place < len(head_commits)
+                else f"HEAD has no commit {place + 1}"
+            )
+            return (
+                None,
+                [],
+                [
+                    (
+                        f"The review's {sha[:12]} {subject} isn't HEAD's commit"
+                        f" {place + 1} since the base, unchanged ({there}): HEAD"
+                        " isn't the review without the dropped"
+                    ),
+                    "commits. Run `build-state review-prompt BRIEF` and the review again,",
+                    "then `build-state refactor`, then finish.",
+                ],
+            )
+    gone = [c for c in reviewed_commits if c[0] in dropped]
+    return head_commits[len(kept) - 1][0], gone, []
+
+
 def report_tests(refactor_base: str) -> None:
     changed = git("diff", "--name-only", refactor_base, "HEAD").stdout.splitlines()
     if tests := [name for name in changed if TEST_FILE.search(name)]:
@@ -1247,6 +1338,17 @@ def finish(args: argparse.Namespace) -> int:
     base = state["base"]
     if git("status", "--porcelain", "--untracked-files=no").stdout:
         return fail("There are uncommitted changes: commit or stash them first.")
+    dropped_lines = []
+    if args.dropped:
+        stand_in, dropped, problems = after_drop(state, args.dropped)
+        if problems:
+            return fail(*problems)
+        if stand_in is not None:
+            state = state | {"reviewed": stand_in, "reviewed_tree": tree_of(stand_in)}
+            dropped_lines = [
+                f"Dropped after the review: {sha[:12]} {subject}"
+                for sha, subject in dropped
+            ]
     if state.get("checks_steps") and (skipped := skipped_steps(state)):
         return fail(*skipped)
     targets = set(state.get("targets", []))
@@ -1311,6 +1413,8 @@ def finish(args: argparse.Namespace) -> int:
             "because",
             *why,
         )
+    for line in dropped_lines:
+        print(line)
     if "refactor_base" in state:
         report_tests(state["refactor_base"])
     warn_of_folds()
@@ -1780,9 +1884,17 @@ def main(argv: list[str] | None = None) -> int:
         "refactor", help="record the refactor base; refuses uncommitted changes"
     ).set_defaults(run=refactor)
     commands.add_parser("show", help="print the recorded bases").set_defaults(run=show)
-    commands.add_parser(
+    finish_command = commands.add_parser(
         "finish", help="fold fixups, check the fingerprint, list the commits"
-    ).set_defaults(run=finish)
+    )
+    finish_command.add_argument(
+        "--dropped",
+        nargs="+",
+        metavar="SHA",
+        default=[],
+        help="reviewed commits the user dropped since the review",
+    )
+    finish_command.set_defaults(run=finish)
     prompt_command = commands.add_parser(
         "review-prompt",
         help="write the review subagent's prompt to a file and print a pointer to it",

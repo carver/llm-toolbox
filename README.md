@@ -713,7 +713,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   covers. `finish` first refuses a build whose state `start` marked
   (`checks_steps`) that recorded no review, no refactor base after it, or a
   commit between the two that isn't a fix (commits after the refactor base
-  count as the refactor's own), then leftover conflict markers,
+  count as the refactor's own), then leftover conflict markers;
+  `finish --dropped SHA...` takes the review for the commits left after the
+  user dropped reviewed ones, when HEAD's commits since the base are the
+  reviewed ones without them, by patch-id and in order. It
   folds `fixup!` commits into the commits they fix, leaving every other commit
   separate and the tree as it was (a fix that conflicts gets the later commit
   it was made on top of and the `reword` command that points it there). It

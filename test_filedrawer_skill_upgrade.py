@@ -45,6 +45,9 @@ class World:
         (self.skill / "references" / "entry-format.md").write_text("format 11\n")
         (self.skill / "references" / "upgrade.sh").write_text(SHIM)
         git(self.repo, "init", "-q", "-b", "main")
+        # Before the first commit: a runner has no git identity of its own.
+        git(self.repo, "config", "user.name", "t")
+        git(self.repo, "config", "user.email", "t@example.com")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "-m", "start")
         self.tags = tmp / "tags"

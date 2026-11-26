@@ -87,6 +87,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   (https://filedrawer.dev), for searching and posting AI safety results that won't
   become papers, copied from their git tags but for `references/upgrade.sh`, a
   shim that runs `filedrawer-skill-upgrade`.
+- **overnight**: run by hand (`/overnight`) before leaving a session unattended.
+  It triages a repo's open issues, then loops through them with a fresh agent per
+  issue and per review. Each issue lands, becomes a draft PR plus a question,
+  gets only a question, or closes with findings, and a morning summary says
+  what the owner must do first.
 - **todone**: run by hand (`/todone`) to do a coding to-do from the knowledge-dump
   vault. The commit message gets the to-do's Why and source, and the to-do gets
   ticked with the commit and what was learned doing it.

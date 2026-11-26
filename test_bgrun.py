@@ -1,5 +1,7 @@
 """bgrun starts a command detached, with its output in a log, and prints the command's own PID."""
 
+import importlib.machinery
+import importlib.util
 import os
 import re
 import signal
@@ -311,6 +313,64 @@ def test_a_start_that_fails_after_the_checks_with_a_device_log_is_reported(
     assert result.returncode == 1
     assert "can't start" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_a_log_in_folders_that_dont_exist_yet_gets_them_made(tmp_path, started):
+    log = tmp_path / "new" / "deeper" / "out.log"
+
+    result = bgrun("-o", str(log), "--", "echo", "made")
+
+    assert result.returncode == 0, result.stderr
+    started.append(int(result.stdout))
+    assert wait_for(log, "made") == "made\n"
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_a_failed_start_removes_the_log_folders_it_made(tmp_path, refused):
+    program = "no-such-command-xyz" if refused else str(broken_program(tmp_path))
+
+    result = bgrun("-o", str(tmp_path / "new" / "deeper" / "out.log"), "--", program)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert not (tmp_path / "new").exists()
+
+
+def test_a_folder_another_process_makes_meanwhile_is_neither_an_error_nor_removed(
+    tmp_path, monkeypatch
+):
+    # The race made deterministic: the folder exists, but the check before mkdir saw
+    # it missing, as when another process makes it in between.
+    loader = importlib.machinery.SourceFileLoader("bgrun_module", str(SCRIPT))
+    module = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader("bgrun_module", loader)
+    )
+    loader.exec_module(module)
+    raced = tmp_path / "raced"
+    raced.mkdir()
+    real_lexists = os.path.lexists
+    monkeypatch.setattr(
+        module.os.path, "lexists", lambda p: p != raced and real_lexists(p)
+    )
+
+    made = module.make_folders(raced / "mine")
+    module.remove_folders(made)
+
+    assert made == [raced / "mine"]
+    assert names(tmp_path) == ["raced"]
+
+
+TOO_LONG = "x" * 300  # past any file system's longest name
+
+
+@pytest.mark.parametrize("log", [f"new/{TOO_LONG}", f"new/{TOO_LONG}/out.log"])
+def test_a_log_that_cant_be_made_removes_the_folders_made_for_it(tmp_path, log):
+    result = bgrun("-o", str(tmp_path / log), "--", "true")
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "File name too long" in result.stderr
+    assert names(tmp_path) == []
 
 
 def test_a_missing_directory_is_named_as_the_problem(tmp_path):

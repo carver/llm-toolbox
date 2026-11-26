@@ -94,6 +94,31 @@ A process CMD started and left running counts as other work, since getrusage see
 sccache's server is the exception made: it runs a cargo job's compiles without being its child, so its CPU time during the job counts as the job's, and the line says how much; the server is the VM's, so another session's compiles then hide inside that figure, the lesser error for a timing of a build.
 `HEAVY_ALONE_REPORT` writes the numbers to a file, for a tool that times many runs.
 
+### heavy-gate sends `mutate-check --diff` to the long lane (2026-11-26)
+
+On 2026-11-26 a `heavy -- mutate-check --diff` held the normal lane for 18 minutes,
+with 451 s of CPU in that time, while another session's wt-ship checks waited behind
+it (`heavy history`: 18m01s, normal lane, stopped by signal 15). A `--diff` run
+makes its own mutants and runs its command once for each, so it takes minutes, and
+the normal lane is where every commit's and landing's checks queue. heavy-gate now
+refuses heavy without `--long` around `mutate-check --diff`, background call or not,
+and names the whole form, `bgrun --wait -o LOG -- heavy --long -- mutate-check --diff
+...` as a background call (a subagent's refusal names plain bgrun and then waitone),
+so an agent that follows it isn't refused again for a foreground wait.
+
+The first version refused every mutate-check under heavy without `--long`. The owner
+narrowed it the same day to `--diff`: a reviewer's targeted run, edits from
+`--edits FILE` or stdin, runs its command once, and five
+`heavy --few-seconds -- mutate-check --edits` runs that day took 1.3 to 2.0 s each.
+Such a run goes under heavy like any other command, with the foreground and
+`--few-seconds` timeout rules.
+
+- `--diff` is read among mutate-check's own options, the words before its `--`, as an
+  exact word: its parser takes no abbreviation and no `--diff=`. An expansion there
+  could be `--diff`, so it counts as one.
+- The script of a shell's `-c` under heavy (`heavy -- bash -c '...'`) is searched too.
+- `heavy -- mutate-check -h` passes this rule, since it returns at once.
+
 ### heavy's `--quick` is named `--few-seconds` (2026-11-24)
 
 Agents ran `heavy --quick` for runs of minutes: in one session, a whole test file of

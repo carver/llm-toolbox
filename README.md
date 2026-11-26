@@ -114,7 +114,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 - **bgrun**: `bgrun -o LOG -- CMD` starts CMD in the background, in its own
   session with stdin from /dev/null and its output in LOG, and prints CMD's
   own PID. `$!` after `cd DIR && nohup CMD &` is a subshell's PID, and killing
-  it leaves CMD running. `-C DIR` sets CMD's directory. `--stdin` gives CMD
+  it leaves CMD running. `-C DIR` sets CMD's directory. Folders on LOG's path
+  that don't exist yet are made (`mkdir -p`), and removed again if CMD then
+  can't start. `--stdin` gives CMD
   bgrun's own stdin instead, read to its end first, for a heredoc such as a
   commit message (`git commit -F -`); without it, bgrun warns when its stdin
   is a pipe or a non-empty file that CMD won't see. A non-empty LOG from
@@ -212,7 +214,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   error, such as unused code under `-D warnings`), pytest collected nothing (not
   pytest-xdist's exit 2 for `-x` after a failure, which is a catch), a
   `cargo test` or `cargo nextest` run failed without running a test (a filter
-  nextest refused or that matched nothing), a `cargo test` passed without running
+  nextest refused or that matched nothing), a shell or wrapper such as `heavy`
+  exited 126 or 127 (the program it runs can't start: not found, not
+  executable, no shebang) with no test run, a `cargo test` passed without running
   one or pytest passed with every test skipped, or CMD ran past `--timeout` (600
   seconds by default). Stopping CMD stops its process group: SIGTERM, then
   SIGKILL after `$MUTATE_CHECK_GRACE` seconds. CMD runs with
@@ -705,7 +709,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   of seconds, which passes in the foreground only when the call's own timeout is
   600000 ms (a `timeout` command doesn't count), since it may wait minutes for
   the running job. Background or not,
-  it refuses heavy around bgrun, git commit or wt-ship. It reads the command as
+  it refuses heavy around bgrun, git commit or wt-ship, and heavy without
+  `--long` around `mutate-check --diff`, which would hold the normal lane, where
+  the commit checks queue, for minutes; a mutate-check of edits runs once and
+  passes. It reads the command as
   shell words and looks only at what runs, through wrappers such as `timeout`
   and `nice`, `bash -c`, a heredoc fed to a shell and `$(...)`. A word that only
   mentions heavy passes, as do `heavy status`, `heavy -h`, `bgrun` without

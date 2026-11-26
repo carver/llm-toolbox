@@ -30,7 +30,10 @@ A failure counts as a catch only when tests ran. A mutation that stops the build
 pytest exiting 2, 4 or 5 (collection errors, usage, no tests) with no `N failed` in
 its summary (under pytest-xdist, -x exits 2 after a failure), or a `cargo test` or
 `cargo nextest` run that fails with no line saying a test ran, is inconclusive: no test
-judged it. So is a command that runs past --timeout (default 600 seconds), which is
+judged it. So is an exit of 126 or 127 with no line saying a test ran: a shell, or a
+wrapper such as heavy, gives that when the program it runs can't start (not found,
+not executable, a script with no shebang); its last line, which says why, is shown.
+So is a command that runs past --timeout (default 600 seconds), which is
 stopped: a hang isn't a catch. A cargo test run that passes with no test run (a
 filter that matched none), or a pytest run whose summary counts no test passed (all
 skipped), is inconclusive too.
@@ -60,9 +63,10 @@ second past the mutant's.
 
 Exit status: 0 the command failed, so the mutation was caught; 1 it passed, so the
 tests miss it; 2 usage error, an --edits FILE that can't be read, or blocks that didn't
-apply (the command didn't run);
-3 inconclusive: the build failed, no tests ran, or the command hung; 128+N stopped by
-signal N.
+apply (the command didn't run), or the command itself can't start (not found, not
+executable);
+3 inconclusive: the build failed, no tests ran, a wrapper exited 126 or 127, or the
+command hung; 128+N stopped by signal N.
 
 --diff BASE makes the mutants itself, from the lines added or changed since BASE's
 merge base with HEAD, work tree included: commits since BASE, and edits not yet
@@ -142,6 +146,9 @@ from types import FrameType, ModuleType
 
 CAUGHT, MISSED, USAGE, INCONCLUSIVE = 0, 1, 2, 3
 DEFAULT_TIMEOUT = 600.0
+# The statuses a shell, or a wrapper such as heavy, gives a program it can't start:
+# not executable (or no shebang, a folder), and not found.
+CANT_START = {126, 127}
 # pytest's statuses when no test judged anything: interrupted or collection errors,
 # a usage error, no tests collected.
 PYTEST_NOTHING_RAN = {2, 4, 5}
@@ -431,8 +438,20 @@ def judge(code: int, output: str, command: list[str]) -> Verdict:
     if code == 0:
         report = ["mutate-check: not caught: the command passed with the mutation"]
         return Verdict(MISSED, report, "it passed")
+    test_line = tests_ran(lines)
+    ran = test_line or any(map(PYTEST_SUMMARY.search, lines))
+    if code in CANT_START and not ran:
+        reason = (
+            f"it exited {code}, the status a shell or a wrapper such as heavy gives a"
+            " program it can't start (not found, not executable, no shebang)"
+        )
+        report = [
+            f"mutate-check: inconclusive: {reason}",
+            *(f"  {line}" for line in summary(output)[-1:]),
+        ]
+        return Verdict(INCONCLUSIVE, report, reason)
     # A Rust build that failed, or a cargo test run, with no line saying a test ran
-    no_rust_test = not tests_ran(lines) and (
+    no_rust_test = not test_line and (
         runs_cargo_tests(command) or rust_build_failed(lines)
     )
     errors = rust_errors(lines) if no_rust_test else []

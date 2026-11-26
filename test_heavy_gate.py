@@ -249,6 +249,69 @@ def test_heavy_around_a_self_queueing_command_is_refused_anywhere(command, backg
     assert "bare" in err
 
 
+MUTATE_OUTSIDE_LONG = [
+    "heavy -- mutate-check --diff main -- ./t test_x.py",
+    "bgrun --wait -o log -- heavy -- mutate-check --timeout 60 --diff main -- pytest",
+    "bgrun -o log -- heavy -- mutate-check --diff main -- pytest -q",
+    "heavy --few-seconds -- mutate-check --diff main --max 3 -- pytest -q",
+    "heavy --share -- ~/.local/bin/mutate-check --diff main -- cargo test",
+    "heavy -- nice mutate-check --diff main -- pytest -q",
+    'heavy -- mutate-check "$MODE" main -- pytest -q',
+    "heavy -- bash -c 'mutate-check --diff main -- pytest -q'",
+    "heavy -- sh -c 'cd x && mutate-check --diff main -- pytest -q'",
+    "heavy -- bash -c 'echo $(mutate-check --diff main -- pytest -q)'",
+]
+
+
+@pytest.mark.parametrize("command", MUTATE_OUTSIDE_LONG)
+@pytest.mark.parametrize("background", [True, None])
+@pytest.mark.parametrize("agent", [None, "a1"])
+def test_mutate_check_under_heavy_without_long_is_refused_anywhere(
+    command, background, agent
+):
+    code, err = run_hook(command, background=background, timeout=600000, agent=agent)
+
+    assert code == 2
+    assert "heavy --long -- mutate-check --diff" in err
+    assert ("waitone" in err) == bool(agent)
+    assert ("bgrun --wait" in err) != bool(agent)
+    assert len(err.splitlines()) == 1, err
+    assert err.rstrip().endswith(NOTHING_RAN)
+
+
+def test_a_foreground_mutate_check_hears_about_the_lane_first():
+    code, err = run_hook("heavy -- mutate-check --diff main -- pytest -q")
+
+    assert code == 2
+    assert "heavy --long -- mutate-check --diff" in err
+    assert "--few-seconds" not in err
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bgrun --wait -o log -- heavy --long -- mutate-check --diff main -- pytest -q",
+        "bgrun -o log -- heavy --lo -- mutate-check --diff main -- pytest -q",
+        "mutate-check --diff main -- pytest -q",
+        "heavy -- pytest -q test_mutate_check.py",
+        "bgrun --wait -o log -- heavy -- mutate-check --edits e -- pytest -q",
+        "heavy -- mutate-check -- pytest -q --diff",
+        "heavy -- mutate-check -h",
+        "heavy -- bash -c 'mutate-check --edits e -- pytest -q'",
+        "heavy -- bash -c 'echo mutate-check --diff'",
+    ],
+)
+def test_mutate_check_in_the_long_lane_outside_heavy_or_of_edits_passes(command):
+    assert run_hook(command, background=True) == (0, "")
+
+
+@pytest.mark.parametrize("agent", [None, "a1"])
+def test_a_quick_mutate_check_of_edits_passes_in_the_foreground(agent):
+    command = "heavy --few-seconds -- mutate-check --edits e -- pytest -q"
+
+    assert run_hook(command, timeout=600000, agent=agent) == (0, "")
+
+
 @pytest.mark.parametrize(
     "command",
     [

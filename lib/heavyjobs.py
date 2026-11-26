@@ -426,7 +426,10 @@ def nearest_rank(ordered, share):
     return ordered[max(0, math.ceil(share * len(ordered)) - 1)]
 
 
-def waits(queue, since, waiters, lane=None, now=None):
+MIN_JOBS = 10  # fewer started jobs in the window give no percentiles
+
+
+def waits(queue, since, waiters, lane=None, now=None, min_jobs=MIN_JOBS):
     """What `heavy waits` reports, for one lane or (lane None) both: the queue waits
     (start less join) of the jobs that started since `since`, every session's, as p50,
     p90 and max seconds, and how many wait now and the oldest's wait so far, from
@@ -435,7 +438,9 @@ def waits(queue, since, waiters, lane=None, now=None):
     A --few-seconds job run beside a slot (`how` outside) waited for no turn, and they
     outnumber the jobs that did, so they're left out and counted. Each waiter's wait
     so far counts in p90 and max, a lower bound, so a jam shows before any job starts;
-    p50 is the started jobs' alone. A value with nothing to give it is None."""
+    p50 is the started jobs' alone. A value with nothing to give it is None, and so
+    are p50 and p90 when fewer than `min_jobs` jobs started: with 5 jobs, one wait
+    from a throttled spell is p90 and max both. max stays, being no percentile."""
     now = time.time() if now is None else now
     took, outside = [], 0
     for job in jobs(queue):
@@ -452,13 +457,15 @@ def waits(queue, since, waiters, lane=None, now=None):
     ages = [now - joined for joined in mine if joined is not None]
     took.sort()
     upper = sorted(took + ages)
+    enough = len(took) >= min_jobs
     return {
         "since": since,
         "lane": lane,
         "started": len(took),
+        "min_jobs": min_jobs,
         "outside_left_out": outside,
-        "p50": nearest_rank(took, 0.5) if took else None,
-        "p90": nearest_rank(upper, 0.9) if upper else None,
+        "p50": nearest_rank(took, 0.5) if took and enough else None,
+        "p90": nearest_rank(upper, 0.9) if upper and enough else None,
         "max": upper[-1] if upper else None,
         "waiting": len(mine),
         "waiting_by_lane": {
@@ -466,6 +473,14 @@ def waits(queue, since, waiters, lane=None, now=None):
         },
         "oldest_waiting": max(ages) if ages else None,
     }
+
+
+def is_open(found, p90, waiting):
+    """Whether waits() found the queue open for `heavy waits --until-open`: p90 under
+    `p90` seconds (no p90, with nothing or too few jobs to count, is under) and at most
+    `waiting` waiting."""
+    quick = found["p90"] is None or found["p90"] < p90
+    return quick and found["waiting"] <= waiting
 
 
 def waits_line(found):
@@ -477,11 +492,19 @@ def waits_line(found):
         head += f" ({found['outside_left_out']} --few-seconds beside a slot left out)"
     parts = [] if found["p50"] is None else [f"p50 {seconds(found['p50'])}"]
     if found["p90"] is not None:
-        parts += [f"p90 {seconds(found['p90'])}", f"max {seconds(found['max'])}"]
+        parts.append(f"p90 {seconds(found['p90'])}")
+    if found["max"] is not None:
+        parts.append(f"max {seconds(found['max'])}")
     if parts:
         head += ", waiting " + ", ".join(parts)
+    if found["max"] is not None and found["started"] < found["min_jobs"]:
+        head += f", too few jobs for percentiles (under {found['min_jobs']})"
     tail = f"{found['waiting']} waiting now"
     if found["oldest_waiting"] is not None:
         tail += f", the oldest for {seconds(found['oldest_waiting'])}"
-        tail += " (counted in p90 and max)"
+        tail += (
+            " (counted in p90 and max)"
+            if found["p90"] is not None
+            else " (counted in max)"
+        )
     return f"{head}; {tail}."

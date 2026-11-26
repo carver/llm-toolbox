@@ -2589,6 +2589,34 @@ def test_waits_says_it_all_in_one_line(box):
     assert "1 waiting now, the oldest for 2m" in shown, shown
 
 
+def test_waits_with_too_few_jobs_gives_no_percentiles(box):
+    """13:05 on 2026-11-26: 5 jobs started in the window, so one 12m49s wait from a
+    throttled spell was p90 and max both, and a gate read held with 0 waiting."""
+    tmp_path, _, env = box
+    write_waits(
+        tmp_path, [(60, 30), (120, 40), (180, 20), (240, 769), (300, 10)], time.time()
+    )
+
+    found = json.loads(waits(env, "--json"))
+    shown = waits(env)
+    gate = until_open(env, "--max-wait", "0")
+    enough = json.loads(waits(env, "--json", "--min-jobs", "5"))
+
+    assert found["started"] == 5 and found["min_jobs"] == 10, found
+    assert found["p50"] is None and found["p90"] is None, found
+    assert found["max"] == pytest.approx(769), found  # not a percentile: still shown
+    assert "too few jobs for percentiles (under 10)" in shown, shown
+    assert "p90" not in shown and "max 12m49s" in shown, shown
+    assert gate.returncode == 0 and gate.stdout.startswith("open: "), gate.stdout
+    assert enough["p90"] == pytest.approx(769), enough
+
+
+def test_waits_refuses_a_negative_min_jobs(box):
+    _, _, env = box
+    done = heavy(env, "waits", "--min-jobs", "-1")
+    assert done.returncode == 2 and "--min-jobs" in done.stderr, done.stderr
+
+
 def test_waits_since_sets_the_window(box):
     tmp_path, _, env = box
     write_waits(tmp_path, TEN_WAITS, time.time())
@@ -2657,8 +2685,8 @@ def test_a_job_still_waiting_counts_in_p90_and_max_before_any_job_starts(box):
     tmp_path, _, env = box
     add_waiter(tmp_path, "normal", 400)
 
-    found = json.loads(waits(env, "--json"))
-    shown = waits(env)
+    found = json.loads(waits(env, "--json", "--min-jobs", "0"))
+    shown = waits(env, "--min-jobs", "0")
 
     assert found["started"] == 0 and found["p50"] is None, found
     assert 399 <= found["p90"] <= 410, found
@@ -2787,3 +2815,94 @@ def test_a_record_past_its_size_keeps_only_its_newest_lines(box):
     # Cut at the start line's write, then the end line comes.
     assert len(lines) == heavyjobs.KEEP_LINES + 1, len(lines)
     assert lines[-1]["id"] == lines[-2]["id"] and lines[-2]["cmd"] == "true newest"
+
+
+# `heavy waits --until-open`: wait for a quiet queue, as the overnight gate does.
+
+
+def until_open(env, *args):
+    """Run `heavy waits --until-open` with its readings 0.05 s apart."""
+    return heavy(env, "waits", "--until-open", *args, HEAVY_WAITS_POLL="0.05")
+
+
+def test_until_open_on_a_quiet_queue_exits_0_with_one_reading(box):
+    _, _, env = box
+
+    done = until_open(env)
+
+    assert done.returncode == 0, done.stderr
+    (line,) = done.stdout.splitlines()
+    assert line.startswith("open: heavy, both lanes:"), line
+
+
+def test_until_open_holds_at_p90_over_the_threshold_until_max_wait(box):
+    tmp_path, _, env = box
+    write_waits(tmp_path, TEN_WAITS, time.time())  # p90 9m
+
+    done = until_open(env, "--waiting", "5", "--max-wait", "0.3")
+    loose = until_open(env, "--p90", "600", "--max-wait", "0")
+
+    assert done.returncode == 3, done.stderr
+    # Two lines, or one when the first reading took past --max-wait on a slow machine.
+    lines = done.stdout.splitlines()
+    assert 1 <= len(lines) <= 2, done.stdout
+    assert all(line.startswith("held: ") for line in lines), done.stdout
+    assert "p90 9m00s" in lines[-1], lines
+    assert loose.returncode == 0, loose.stdout
+    assert loose.stdout.startswith("open: "), loose.stdout
+
+
+def test_until_open_counts_waiters_in_the_lane_it_names(box):
+    tmp_path, _, env = box
+    add_waiter(tmp_path, "long", 1)
+    add_waiter(tmp_path, "normal", 1)
+
+    both = until_open(env, "--waiting", "1", "--max-wait", "0")
+    normal = until_open(env, "--waiting", "1", "--max-wait", "0", "--lane", "normal")
+    none = until_open(env, "--waiting", "0", "--max-wait", "0", "--lane", "normal")
+
+    assert both.returncode == 3, both.stdout
+    assert "2 waiting now" in both.stdout, both.stdout
+    assert normal.returncode == 0, normal.stdout
+    assert none.returncode == 3, none.stdout
+
+
+def test_until_open_prints_its_first_and_last_reading_when_the_queue_clears(
+    box, background
+):
+    tmp_path, _, _ = box
+    sleeper = subprocess.Popen(["sleep", "600"])
+    try:
+        add_waiter(tmp_path, "normal", 400, pid=sleeper.pid)  # p90 at least 6m40s
+        proc = background(
+            "waits", "--until-open", "--min-jobs", "0", HEAVY_WAITS_POLL="0.05"
+        )
+        first = proc.stdout.readline()
+        assert first.startswith("held: "), first
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+    out, err = proc.communicate(timeout=60)
+
+    assert proc.returncode == 0, err
+    (last,) = out.splitlines()  # the readings between print nothing
+    assert last.startswith("open: ") and "0 waiting now" in last, last
+
+
+def test_until_open_refuses_a_poll_interval_it_cant_read(box):
+    _, _, env = box
+
+    done = heavy(env, "waits", "--until-open", HEAVY_WAITS_POLL="soon")
+
+    assert done.returncode == 2, done.stdout
+    assert "HEAVY_WAITS_POLL" in done.stderr, done.stderr
+
+
+def test_until_open_options_need_until_open(box):
+    _, _, env = box
+
+    done = heavy(env, "waits", "--max-wait", "10")
+
+    assert done.returncode == 2, done.stdout
+    assert "--until-open" in done.stderr, done.stderr

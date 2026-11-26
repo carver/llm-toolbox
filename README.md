@@ -91,7 +91,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   It triages a repo's open issues, then loops through them with a fresh agent per
   issue and per review. Each issue lands, becomes a draft PR plus a question,
   gets only a question, or closes with findings, and a morning summary says
-  what the owner must do first.
+  what the owner must do first. Its prototype Workflow mode runs the queue as a
+  script, `overnight.workflow.js`, instead of the loop.
 - **todone**: run by hand (`/todone`) to do a coding to-do from the knowledge-dump
   vault. The commit message gets the to-do's Why and source, and the to-do gets
   ticked with the commit and what was learned doing it.
@@ -562,9 +563,16 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   names, how many jobs wait now and the oldest one's wait. It leaves out, and
   counts, the `--few-seconds` jobs that ran beside a slot, which waited for no
   turn, and counts each job still waiting in p90 and max at its wait so far, so
-  a jam shows before any job starts. `--json` gives the same as one object, with
+  a jam shows before any job starts. With fewer than `--min-jobs` (10) jobs
+  started, it gives no p50 or p90, says "too few jobs for percentiles", and
+  `--until-open` goes by the waiting count alone: one throttled spell's wait
+  would otherwise be p90 and max both. `--json` gives the same as one object, with
   the waiters per lane, for a script that holds work back while the queue is
-  busy. An `--alone` job ends with a line
+  busy. `heavy waits --until-open` reads it every 30 seconds
+  (`$HEAVY_WAITS_POLL`) until p90 is under `--p90` (180 s) with at most
+  `--waiting` (1) jobs waiting, printing its first and last reading, and exits
+  3 if `--max-wait` passes first, for an agent that can't keep time itself.
+  An `--alone` job ends with a line
   giving the CPU-seconds other work used on its cores while it ran, warning
   past `$HEAVY_ALONE_OUTSIDE` (0.5)
   cores on average that the timing may be off; sccache's server's CPU counts

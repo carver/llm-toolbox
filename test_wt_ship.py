@@ -2608,7 +2608,10 @@ def test_a_commit_that_only_refines_an_earlier_one_is_warned_of_and_lands(setup,
     assert f"build-state fold --upstream {upstream}" in done.stdout
     landed = main if local else origin
     assert first_parents(landed)[0] == "Merge topic (2 commits)"
-    log = git(landed, "log", "--no-merges", "--format=%s", "-2", "main")
+    # The merge's second parent and down, a linear chain, so commit dates that tie
+    # (commits in one second, as on a fast temp dir) can't reorder it as they could
+    # main's log, which interleaves the merge's two sides by date.
+    log = git(landed, "log", "--format=%s", "-2", "main^2")
     assert log.splitlines() == ["Refine the feature", "Add the feature"]
 
 

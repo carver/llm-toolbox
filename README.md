@@ -259,8 +259,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   but not on the line `git cherry-pick -x` adds when a branch no linked
   worktree has out, a tag or a remote-tracking ref holds the source),
   since a rebase changes an unlanded commit's ID (`build-state reword SHA`
-  rewords it), warns once, before any check, of each commit that only refines
-  an earlier one of the landing (`build-state fold` folds them; a
+  rewords it), refuses a commit whose whole message is its parent's (not a
+  merge) unless `$SAME_MESSAGE_OK` is set, warns once, before any check, of
+  each commit that only refines an earlier one of the landing (`build-state fold` folds them; a
   `Fold-check: keep` trailer silences it), and checks the tip, HEAD, with the
   repo's `agent-pre-commit` when its tree has no pass on record, through
   `agent-commit-gate --run`, which hands it the `CHECK_BASE` of the branch's
@@ -441,7 +442,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   write its parts' seconds to the file `$CHECK_TIMINGS` names, `NAME SECONDS` a
   line, which the pass line, or a line before the refusal, then shows; every
   run also goes on `agent-check-timings.tsv` in the common git dir, with its
-  queue wait and run time (`agent-commit-gate -h` lists the columns). A small
+  queue wait and run time (`agent-commit-gate -h` lists the columns), which
+  `agent-commit-gate --timings [--since TIME]` sums up by check and by part,
+  longest first. A small
   fixup!, squash! or amend! commit (found from the running `git commit`'s
   arguments) runs `agent-quick-check` instead, when the repo keeps one beside
   `agent-pre-commit`, and otherwise skips the check, since `wt-ship` checks
@@ -457,6 +460,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   marks a commit's run with `AGENT_CHECK_AT_COMMIT=1`, and a hook on an older
   line runs the full check, as before.
   `--install` also puts a line first in the post-commit hook. After an agent's
+  commit whose whole message is its parent's, word for word (a `git commit -C
+  HEAD` slip), it warns at once, with the amend that fixes it, unless
+  `$SAME_MESSAGE_OK` is set or the commit is a fix commit. After an agent's
   `fixup!`, `amend!` or `squash!` commit, it finds the target as `git rebase
   --autosquash` would, among the commits a rebase onto another branch would
   replay. For each file the commit changes that neither the target nor the

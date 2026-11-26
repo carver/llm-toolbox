@@ -2548,3 +2548,172 @@ def test_with_no_commit_that_passed_the_predictor_gets_no_base(
     predicting(installed, f'echo "${{CHECK_BASE-unset}}" > {seen}\nexit 1')
     hook_on(installed, monkeypatch, capsys, "git commit -q -m x")
     assert seen.read_text().strip() == "unset"
+
+
+def repeat_message(repo, env=None):
+    """Commit a change to a.txt under the message of the commit before it, as
+    `git commit -C HEAD` does; the run."""
+    person_commit(repo, "Add a", {"a.txt": "a\n"})
+    write(repo / "a.txt", "a, changed\n")
+    git(repo, "add", "a.txt")
+    return agent_git(repo, "commit", "-q", "-C", "HEAD", env=env)
+
+
+def test_a_commit_that_repeats_its_parents_message_hears_it_at_once(installed):
+    run = repeat_message(installed)
+    [line] = warnings(run)
+    assert 'repeats its parent\'s message word for word ("Add a")' in line
+    assert "git commit --amend -F FILE" in line
+    assert "SAME_MESSAGE_OK=1" in line
+
+
+def test_same_message_ok_quiets_the_warning(installed):
+    assert warnings(repeat_message(installed, env={"SAME_MESSAGE_OK": "1"})) == []
+
+
+def test_two_fixups_of_one_commit_repeat_a_message_without_a_warning(installed):
+    a = a_then_b(installed)
+    for text in ("a fixed\n", "a fixed again\n"):
+        write(installed / "a.txt", text)
+        run = agent_git(installed, "commit", "-q", "-a", f"--fixup={a}")
+    assert warnings(run) == []
+
+
+def test_a_commit_with_a_message_of_its_own_hears_nothing(installed):
+    person_commit(installed, "Add a", {"a.txt": "a\n"})
+    write(installed / "a.txt", "a, changed\n")
+    run = agent_git(installed, "commit", "-q", "-a", "-m", "Change a")
+    assert warnings(run) == []
+
+
+def test_a_persons_commit_that_repeats_a_message_hears_nothing(installed):
+    person_commit(installed, "Add a", {"a.txt": "a\n"})
+    write(installed / "a.txt", "a, changed\n")
+    git(installed, "add", "a.txt")
+    run = agent_git(installed, "commit", "-q", "-C", "HEAD", agent=False)
+    assert warnings(run) == []
+
+
+def test_a_cherry_pick_that_repeats_its_parents_message_hears_nothing(installed):
+    """A cherry-pick runs post-commit too, and repeats a message on purpose here."""
+    person_commit(installed, "Add a", {"a.txt": "a\n"})
+    git(installed, "checkout", "-q", "-b", "side")
+    picked_from = person_commit(installed, "Add a", {"a.txt": "a, on side\n"})
+    git(installed, "checkout", "-q", "-")
+    write(installed / "other.txt", "x\n")
+    person_commit(installed, "Add a", {"other.txt": "x\n"})
+    git(installed, "reset", "-q", "--hard", "HEAD^")
+
+    picked = agent_git(installed, "cherry-pick", picked_from)
+
+    assert warnings(picked) == []
+
+
+TIMING_ROWS = [
+    # time, kind, name, HEAD, tree, code, waited, took, where, base, parts
+    "2026-11-24T10:00:00Z\tcommit\tagent-commit-check\th\tt\t0\t0.0\t90.0\tqueue\tb\tclippy=89",
+    "2026-11-25T10:00:00Z\tcommit\tagent-commit-check\th\tt\t0\t2.0\t10.0\tqueue\tb\tclippy=10",
+    (
+        "2026-11-25T11:00:00Z\trun\tagent-pre-commit\th\tt\t0\t1.0\t300.0\tqueue\tb"
+        "\tbin-tests=188,nextest=50,clippy=0"
+    ),
+    # A failed run with no parts column, then parts with no name or no seconds.
+    "2026-11-25T12:00:00Z\tcommit\tagent-quick-check\th\tt\t1\t0.0\t4.0\tqueue\tb",
+    "2026-11-25T12:01:00Z\tcommit\tagent-quick-check\th\tt\t0\t0.0\t6.0\tqueue\tb\t=3,x=",
+    # A short row, and rows with seconds that aren't a number, count for nothing,
+    # not even in part.
+    "junk",
+    "2026-11-25T12:02:00Z\tcommit\tagent-quick-check\th\tt\t0\t0.0\tlots\tqueue\tb",
+    (
+        "2026-11-25T12:03:00Z\tcommit\tagent-commit-check\th\tt\t0\t0.0\t1000\tqueue\tb"
+        "\tclippy=abc"
+    ),
+]
+
+
+def timings(repo, *args):
+    (repo / ".git" / "agent-check-timings.tsv").write_text(
+        "\n".join(TIMING_ROWS) + "\n"
+    )
+    run = subprocess.run(
+        [str(SCRIPT), "--timings", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    return [line.split() for line in run.stdout.splitlines()]
+
+
+CHECK_HEADER = ["check", "runs", "run_s", "mean_s", "waited_s", "failed"]
+
+
+def test_timings_sums_up_each_check_and_each_part_longest_first(tmp_path):
+    lines = timings(make_repo(tmp_path))
+    assert lines[0] == [
+        "5",
+        "runs",
+        "from",
+        "2026-11-24T10:00:00Z",
+        "to",
+        "2026-11-25T12:01:00Z",
+    ]
+    checks = lines[lines.index(CHECK_HEADER) + 1 :][:3]
+    assert checks == [
+        ["run", "agent-pre-commit", "1", "300", "300.0", "1", "0"],
+        ["commit", "agent-commit-check", "2", "100", "50.0", "2", "0"],
+        ["commit", "agent-quick-check", "2", "10", "5.0", "0", "1"],
+    ]
+    parts = lines[lines.index(["part", "runs", "total_s", "mean_s"]) + 1 :]
+    assert parts == [
+        ["bin-tests", "1", "188", "188.0"],
+        ["clippy", "3", "99", "33.0"],
+        ["nextest", "1", "50", "50.0"],
+    ]
+
+
+def test_timings_since_keeps_the_rows_from_that_time_on(tmp_path):
+    lines = timings(make_repo(tmp_path), "--since", "2026-11-25")
+    assert ["commit", "agent-commit-check", "1", "10", "10.0", "2", "0"] in lines
+    assert ["clippy", "2", "10", "5.0"] in lines
+
+
+@pytest.mark.parametrize(
+    "args", [["--since", "2026-11-25"], ["--timings", "--since", "yesterday"]]
+)
+def test_since_needs_timings_and_an_iso_time(tmp_path, args):
+    run = subprocess.run(
+        [str(SCRIPT), *args],
+        cwd=make_repo(tmp_path),
+        input="",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 2
+    assert "--since" in run.stderr
+    assert "Traceback" not in run.stderr
+
+
+@pytest.mark.parametrize("in_repo", [True, False])
+def test_timings_without_a_record_says_so_and_prints_no_table(tmp_path, in_repo):
+    where = make_repo(tmp_path) if in_repo else tmp_path
+    env = without_repo_vars(os.environ) | {
+        "GIT_CEILING_DIRECTORIES": str(tmp_path.parent)
+    }
+    run = subprocess.run(
+        [str(SCRIPT), "--timings"],
+        cwd=where,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 0
+    assert run.stdout == "no check timings recorded\n"
+
+
+def test_timings_since_a_time_no_row_reaches_says_since_when(tmp_path):
+    lines = timings(make_repo(tmp_path), "--since", "2027")
+    assert lines == [["no", "check", "timings", "recorded", "since", "2027"]]

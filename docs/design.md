@@ -196,6 +196,13 @@ commit to them does start it: 0.05 s with uv's cache warm, PyPI with it cold.
 
 ## wt-ship and the commit checks
 
+### A commit that repeats its parent's message: warned at commit, refused at landing (2026-11-25)
+
+A session ran `git commit -q -C HEAD@{0} --reuse-message=HEAD 2>/dev/null`, meant as a retry, and committed its change under the base commit's subject; nothing said so, and it took an amend and three calls to notice and fix.
+Only a commit-msg hook could refuse such a commit as it's made, and that would need every repo's hooks reinstalled, and a commit in repos that track them.
+So the post-commit line every repo already has warns at once, and wt-ship refuses the landing, after its autosquash rebase so two fixups of one target, which repeat a message by design, are gone by then.
+`SAME_MESSAGE_OK=1` lets either through, for a repeat that's meant (the owner's choice of hatch, over a trailer in the message).
+
 The owner's rule until 2026-11-24 was that every commit that reaches remote main
 passes the full check. Since then, only each landing's tip does (below, issue #7).
 In sessions from 2026-11-04 to 11-08 on filedrawer, agents spent about 35 to 40 of

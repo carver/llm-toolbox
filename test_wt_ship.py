@@ -2729,3 +2729,63 @@ def test_local_gives_up_on_a_fetch_that_hangs(setup):
     assert done.returncode == 0, done.stderr
     assert "no answer in 1 seconds" in done.stdout
     assert time.monotonic() - started < 20
+
+
+@pytest.mark.parametrize("args", [(), ("--local",)])
+def test_a_commit_repeating_its_parents_message_is_refused(setup, args):
+    origin, main, wt, _ = setup
+    before = remote_main(origin), main_head(main)
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    repeated = commit(wt, "a.py", "x = 2\n", "Add a")
+
+    done = ship(wt, *args)
+
+    assert done.returncode == 1
+    [line] = [ln for ln in done.stderr.splitlines() if repeated[:12] in ln]
+    assert f"build-state reword {repeated[:12]}" in line
+    assert "SAME_MESSAGE_OK=1" in done.stderr
+    assert (remote_main(origin), main_head(main)) == before
+
+
+def test_same_message_ok_lets_a_repeated_message_land(setup):
+    _, _, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    commit(wt, "a.py", "x = 2\n", "Add a")
+    done = ship(wt, "--local", env={"SAME_MESSAGE_OK": "1"})
+    assert done.returncode == 0, done.stderr
+
+
+def test_each_repeated_message_is_listed_on_its_own_line_newest_first(setup):
+    _, _, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    older = commit(wt, "a.py", "x = 2\n", "Add a")
+    newer = commit(wt, "a.py", "x = 3\n", "Add a")
+
+    done = ship(wt, "--local")
+
+    listed = [ln for ln in done.stderr.splitlines() if ln.startswith("  ")]
+    assert [ln.split()[0] for ln in listed] == [newer[:12], older[:12]]
+
+
+def test_two_merges_of_main_in_a_row_land(setup):
+    """Merging main into a topic twice, with nothing between, repeats `Merge branch
+    'main'`: a merge's message names what it merged, not its change."""
+    _, main, wt, _ = setup
+    commit(wt, "a.py", "x = 1\n", "Add a")
+    for name in ("m1.py", "m2.py"):
+        commit(main, name, "m\n", f"Add {name}")
+        git(wt, "merge", "-q", "--no-ff", "--no-edit", "main")
+    done = ship(wt, "--local")
+    assert "repeat their parent's message" not in done.stderr
+    assert done.returncode == 0, done.stderr
+
+
+def test_two_fixups_of_one_landing_commit_fold_and_land(setup):
+    _, main, wt, _ = setup
+    target = commit(wt, "a.py", "x = 1\n", "Add a")
+    for text in ("x = 2\n", "x = 3\n"):
+        (wt / "a.py").write_text(text)
+        git(wt, "commit", "-q", "-a", f"--fixup={target}")
+    done = ship(wt, "--local")
+    assert done.returncode == 0, done.stderr
+    assert git(main, "log", "-1", "--format=%s", "main") == "Add a"

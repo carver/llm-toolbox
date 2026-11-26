@@ -16,7 +16,8 @@ Exactly one per issue, as the `overnight` skill defines them: landed, draft + qu
 - Umbrella issues are worked through their sub-issues.
 - An issue labelled `needs-owner` is skipped unless the owner has replied since the question.
 - Public repos: no secrets, private data or test-account details in anything posted.
-- A failure that shows only under load gets its mechanism reported. It isn't retried blindly.
+- A test that fails once, under load or not, keeps its full output in a log file. Find its mechanism, report it, and rerun the test many times (a loop of 50 or more, or `HYPOTHESIS_PROFILE=deep`) before `READY FOR REVIEW`: a fake that never read stdin failed 3 times in 4000 calls.
+- Every `curl` gets `--max-time`, and every other fetch a timeout. A hung fetch shows only as an agent that stopped reporting.
 
 ## The owner's answers for this run
 

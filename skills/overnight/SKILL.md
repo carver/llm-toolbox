@@ -28,7 +28,8 @@ It then gets the `needs-owner` label, and the implementer releases its claim.
 1. Read the repo's agent docs (`AGENTS.md` / `CLAUDE.md`) for its rules on pushing, deploys, owner-only work and checks.
 2. Make the run folder, `keep/<project>/overnight-<date>/` (durable, outside the repo). Copy [`protocol.md`](protocol.md), [`implementer.md`](implementer.md) and [`reviewer.md`](reviewer.md) into it, and fill in the repo, the default branch, the commit attribution lines and the repo's own rules. Start `log.md` there with the header `#N | end state | sha or PR | rerun needed? | note`.
 3. Create the `needs-owner` label if the repo lacks it.
-4. **Triage**: split the open issues (`issue-todo open --titles`) across 2 to 4 agents. Each one reads its issues and writes one line per issue to `triage-<batch>.md`: `#N | class | size | files | end state | note`. Classes are agent, investigate, owner-only, umbrella (name its open sub-issues), blocked, wait (dated) and claimed. Sizes are S, M and L.
+4. **Triage**: split the open issues (`issue-todo open --titles`) across 2 to 4 agents. Each one reads its issues and writes one line per issue to `triage-<batch>.md`: `#N | class | size | files | premise | end state | note`. Classes are agent, investigate, owner-only, umbrella (name its open sub-issues), blocked, wait (dated) and claimed. Sizes are S, M and L.
+   **Premise** is what the change rests on and what it would save, checked cheaply against the design docs, timing logs and the issue's own numbers: `holds`, `false` (with the line that says so), or `unmeasured`. A false premise makes the issue a question or findings. Reason: one night built a 175-line guard to replace a 1 to 2 s check, and a 14-file change whose premise the design doc already ruled out.
 5. Compile `queue.md` in this order:
    1. questions only (cheap, and the user sees them first)
    2. small landings
@@ -36,6 +37,7 @@ It then gets the `needs-owner` label, and the implementer releases its claim.
    4. draft + question
    5. large landings
 
+   An issue whose payoff is `unmeasured` gets a measurement item, with its build queued right after it. Run a measurement while at most one other agent runs, since the night's own agents spoil a timing, and give an A/B a control arm. Build only on a gain beyond noise; a gain within noise doesn't pay for added machinery, so the issue closes with the numbers as findings and its branch is pushed for reference. Performance issues run one at a time, each measured on top of the previous one's landing: a gain the previous landing already delivered shows as noise.
    Leave out owner-only work, umbrellas, claimed issues and issues waiting on a date. Mark which landings need a server rerun or other follow-up from the user.
 6. Ask the user to veto or opt in to the costly items (anything that spends shared CI, money or a staging quota, or touches a stale claim), and which sensitive areas (auth, privacy, data deletion) should end as drafts even when ready to land.
    Record each answer in `protocol.md`.
@@ -46,14 +48,16 @@ Done when the user has answered and `queue.md` and `protocol.md` hold the answer
 
 Start the bundled `loop` skill in dynamic mode (no interval) with a prompt naming the run folder, then for each round:
 
-1. Take the next item from `queue.md` whose files overlap least with the issues in flight. Run 3 to 6 agents at once; fewer when the machine's shared queue (`heavy status`) is busy.
+1. Take the next item from `queue.md` whose files overlap least with the issues in flight. Run 3 or 4 agents at once, of every kind. Before each spawn, run `heavy waits --lane normal`, which counts every session's jobs on this machine, and append its reading and your decision as one line to `waits.md` in the run folder. Spawn **build work** (anything that commits or runs queued jobs, reviews included, since reviewers run `heavy` and `mutate-check`) only while the p90 wait is under 3 minutes and at most one job is waiting. Otherwise spawn queue-free work (questions only, findings) and hold builds until the queue drains. Reason: every agent's builds, tests and commits wait in that one queue, and more agents only lengthen each wait.
 2. Spawn a fresh implementer: "Follow `<run folder>/implementer.md` for issue #N", plus that issue's triage note and the in-flight issues whose files to stay out of. Batch several question-only or findings issues into one agent.
-3. When it reports `READY FOR REVIEW`, spawn a **fresh** reviewer with `reviewer.md`, the worktree, the base and the questions you want probed. Give it the code, not your conclusion.
-4. Read the findings and decide, then send the decision to the implementer with `SendMessage`: fix what's real as fixups, then land, or turn it into a draft + question. A finding that changes what the user is promised, deletes data, or contradicts the issue's text turns a landing into a draft + question.
-5. Re-arm `ScheduleWakeup` at about 1500 s as a fallback heartbeat. Agent notifications are the real wake signal.
+3. When it reports `READY FOR REVIEW`, spawn a **fresh** reviewer with `reviewer.md`, the review-prompt pointer from the report, the worktree, the base and the questions you want probed. Give it the code, not your conclusion.
+4. Read the findings and decide the end state: land, or draft + question. A finding that changes what the user is promised, deletes data, or contradicts the issue's text turns a landing into a draft + question. For a clean review or a one- or two-line fix, send the decision to the implementer with `SendMessage`. Otherwise spawn a **fresh fixer**: "Follow `<run folder>/implementer.md` as the fixer for issue #N", with the worktree, the base, the implementer's report, the findings to fix and the end state. Reason: a resumed agent resends its whole context on every call, and eleven resumed implementers peaked at 200k to 303k tokens a call.
+5. Re-arm `ScheduleWakeup` at 3600 s as a fallback heartbeat. Agent notifications are the real wake signal, and each wake resends your whole context.
 
-On each heartbeat, check every in-flight agent for progress: its worktree, commits and `log.md` line.
-One with nothing after about 90 minutes gets a status message. Still nothing by the next heartbeat: stop it with `TaskStop`, release its claim, log the stall, and restart the issue as question-only with a short brief that puts a timeout on every fetch.
+Relay only what bears on a decision or the summary. An agent's report keeps to its brief's line limit; one that runs over gets read for its end state and sha, not copied.
+
+On each heartbeat and each agent notification, check every in-flight agent for progress: its worktree, commits and `log.md` line.
+One with nothing for 60 minutes gets a status message. At 90 minutes with nothing, stop it with `TaskStop`, release its claim, log the stall, and restart the issue as question-only with a short brief. A stopped agent's last command may have been a hung fetch or a permission prompt it couldn't answer, so the restart's brief passes on nothing the stalled agent fetched or concluded unchecked.
 
 When a finding applies to every agent (a shared file, a misread rule), fix the briefs in the run folder and message the agents in flight.
 
@@ -67,15 +71,6 @@ Done when the queue is empty and no agent is running.
    - **Drafts**: each PR with its issue, plus the collisions between drafts (migration numbers, skill or package versions) and which to renumber at merge.
    - **Questions only.**
    - **Investigations.**
-   - **Worth knowing**: surprises, stalls, process fixes made mid-run.
+   - **Worth knowing**: surprises, stalls, process fixes made mid-run, and the night's queue waits from `waits.md`.
 2. Stop the loop, and send one `PushNotification` naming the counts and the summary's path.
 3. Give the user the summary in chat, and offer it as a page in one line.
-
-## Lessons from earlier runs
-
-- Each agent keeps its scratch files in `<scratchpad>/issue-N/`. Agents share one scratchpad, and a shared `msg.txt` once swapped two commit messages.
-- A draft branches from `origin/<default>`, never the local default branch, which holds the night's unpushed landings. If it must stack on them, the PR says so.
-- Drafts collide with each other: two PRs take the same migration number or skill version. Name the collision in each PR and in the summary.
-- A review checks each claim the change rests on against the source, including the issue's own premise. Reviews have found a lifecycle probe that could only answer "yes", a per-account rate limit that a second token on the same account doesn't escape, and a skill description that also fired on non-safety work. Give an A/B a control arm.
-- A measured gain within noise doesn't pay for added machinery. Close the issue with the numbers and push the branch for reference.
-- A flake that shows once gets its mechanism found before landing. A fake that started 40 ms faster exposed a SIGPIPE race.

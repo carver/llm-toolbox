@@ -386,8 +386,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   refuses github.com, api.github.com and loopback. It types each scripted turn once the agent's last turn ends (or, when
   Claude Code asks in its question dialog, into the dialog's free-text option, and turns.md names the question; a
   dialog of several questions, or a multi-select one, is left through "Chat about this" and the turn sent as a message), asks a
-  simulated human (`claude-fresh`) to answer open questions and judge
-  conditional turns (never sent when it fails), and saves screens, transcripts
+  simulated human (`claude-fresh`) to answer open questions, its answer sent
+  before the scripted text and logged apart, and judge conditional turns (one
+  that doesn't hold sends its `else` or nothing, never an answer alone, and none
+  is sent when the human fails), and saves screens, transcripts
   and the files the run made (`~/.config` with the values it was given and
   keys or tokens blanked), then removes the user. `--setup FILE` prepares
   the home first, `--agent-env`/`--setup-env`/`--var` pass named variables

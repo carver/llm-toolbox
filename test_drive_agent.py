@@ -10,9 +10,13 @@ the rules below, writes a transcript in its harness's format and fires the harne
 turn-end hook (Claude Code's Stop hook from settings.json, Codex's notify program).
 What a fake saw (its user, environment, PATH) it writes to a file in its home, which
 the run's `files/` collects. One test runs the real isolation and skips unless
-passwordless sudo and bwrap are there.
+passwordless sudo and bwrap are there. The proxy's tests with no upstream proxy load
+the tool as a module instead (see `load_drive_agent`).
 """
 
+import importlib.machinery
+import importlib.util
+import ipaddress
 import json
 import os
 import re
@@ -1176,6 +1180,195 @@ def test_proxy_refuses_github_and_loopback_and_forwards_the_rest(tmp_path, env):
         assert "fetched: HTTP/1.1 403" in screen, n
     assert "fetched: HTTP/1.1 200" in screens[8]
     assert upstream.seen == ["CONNECT staging.example.org:443 HTTP/1.1"]
+
+
+# The proxy with no upstream proxy connects itself, which a run can't show without
+# reaching the internet: the deny list refuses every local address. These tests load
+# the tool as a module and run its Proxy in the test's process, with 127.0.0.1 let
+# through as if it were public.
+def load_drive_agent():
+    loader = importlib.machinery.SourceFileLoader("drive_agent", str(TOOL))
+    spec = importlib.util.spec_from_loader("drive_agent", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+drive_agent = load_drive_agent()
+PUBLIC = "127.0.0.1"  # the listener the tests run, which the proxy takes as public
+
+
+class Service:
+    """A server for one connection on `host`: it reads until it has `expect`, answers
+    `reply`, and keeps what it read in `got`."""
+
+    def __init__(self, host, expect, reply, port=0):
+        self.sock = socket.socket()
+        self.sock.bind((host, port))
+        self.sock.listen()
+        self.port = self.sock.getsockname()[1]
+        self.expect, self.reply, self.got = expect, reply, b""
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        try:
+            conn, _ = self.sock.accept()
+        except OSError:
+            return
+        with conn:
+            conn.settimeout(10)
+            try:
+                while not self.got.endswith(self.expect):
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        return
+                    self.got += chunk
+                conn.sendall(self.reply)
+                while chunk := conn.recv(4096):
+                    self.got += chunk
+            except OSError:
+                pass
+
+
+def stop_listening(sock):
+    """Closes a listening socket, first waking the thread blocked in its accept(),
+    which close() alone leaves blocked on Linux, holding the port."""
+    sock.shutdown(socket.SHUT_RDWR)
+    sock.close()
+
+
+@pytest.fixture
+def serve():
+    """Starts Services as `serve(host, expect, reply[, port])`, closing them after."""
+    started = []
+
+    def start(*args, **kw):
+        started.append(Service(*args, **kw))
+        return started[-1]
+
+    yield start
+    for service in started:
+        stop_listening(service.sock)
+
+
+@pytest.fixture
+def proxy(monkeypatch):
+    for name in ("HTTPS_PROXY", "https_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    real_local = drive_agent.local
+    monkeypatch.setattr(drive_agent, "local", lambda a: a != PUBLIC and real_local(a))
+    p = drive_agent.Proxy([])
+    yield p
+    stop_listening(p.sock)
+    stop_listening(p.unix)
+    shutil.rmtree(os.path.dirname(p.path), ignore_errors=True)
+
+
+def ask(proxy, request, until):
+    """Sends `request` to the proxy and returns what comes back, read until it ends
+    with `until` or the connection closes."""
+    with socket.create_connection(("127.0.0.1", proxy.port), timeout=10) as conn:
+        conn.sendall(request)
+        got = b""
+        while not got.endswith(until):
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            got += chunk
+        return got
+
+
+def test_proxy_with_no_upstream_answers_connect_and_passes_bytes_both_ways(
+    proxy, serve
+):
+    service = serve(PUBLIC, b"hello", b"pong")
+    request = f"CONNECT {PUBLIC}:{service.port} HTTP/1.1\r\nHost: x\r\n\r\n"
+    with socket.create_connection(("127.0.0.1", proxy.port), timeout=10) as conn:
+        # Bytes sent with the request, before the 200, are the tunnel's first.
+        conn.sendall(request.encode() + b"hello")
+        want = b"HTTP/1.1 200 Connection established\r\n\r\npong"
+        got = b""
+        while len(got) < len(want) and (chunk := conn.recv(4096)):
+            got += chunk
+        assert got == want
+        conn.sendall(b" world")
+        conn.shutdown(socket.SHUT_WR)
+        assert conn.recv(4096) == b""
+    deadline = time.monotonic() + 10
+    while service.got != b"hello world" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert service.got == b"hello world"
+
+
+def test_proxy_with_no_upstream_passes_a_plain_request_on_whole(proxy, serve):
+    answer = b"HTTP/1.1 204 No Content\r\n\r\n"
+    service = serve(PUBLIC, b"\r\n\r\n", answer)
+    head = f"GET http://{PUBLIC}:{service.port}/x HTTP/1.1\r\nHost: {PUBLIC}\r\n\r\n"
+    assert ask(proxy, head.encode(), answer) == answer
+    assert service.got == head.encode()
+
+
+@pytest.mark.parametrize(
+    "method, target, want",
+    [
+        ("GET", "http://example.org/x", ("example.org", 80)),
+        ("GET", "http://example.org:8080/x", ("example.org", 8080)),
+        ("CONNECT", "example.org", ("example.org", 443)),
+        ("CONNECT", "example.org:8443", ("example.org", 8443)),
+        ("CONNECT", "[::1]:8080", ("::1", 8080)),
+        ("CONNECT", "[::1]", ("::1", 443)),
+    ],
+)
+def test_target_of_reads_host_and_port_with_each_methods_default(method, target, want):
+    assert drive_agent.target_of(method, target) == want
+
+
+def outward_address():
+    """This machine's address on its default route, which a UDP connect finds without
+    sending anything, or None with no route."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("192.0.2.1", 9))
+        except OSError:
+            return None
+        return s.getsockname()[0]
+
+
+def test_proxy_listens_on_loopback_only(proxy):
+    address = outward_address()
+    if address is None or ipaddress.ip_address(address).is_loopback:
+        pytest.skip("no address but loopback")
+    socket.create_connection(("127.0.0.1", proxy.port), timeout=10).close()
+    with pytest.raises(ConnectionRefusedError):
+        socket.create_connection((address, proxy.port), timeout=10)
+
+
+@pytest.mark.parametrize("method", ["CONNECT", "GET"])
+def test_proxy_connects_to_the_address_it_checked_not_a_new_lookup(
+    proxy, serve, monkeypatch, method
+):
+    # A name whose first lookup is public and any later one loopback, as a DNS
+    # rebinding attack answers: a second lookup would reach the loopback service.
+    # Each service answers as soon as a connection comes.
+    first = serve(PUBLIC, b"", b"first")
+    serve("127.0.0.2", b"", b"second", port=first.port)
+    real = socket.getaddrinfo
+    lookups = []
+
+    def getaddrinfo(host, port, *args, **kw):
+        if host != "rebind.test":
+            return real(host, port, *args, **kw)
+        lookups.append(host)
+        address = PUBLIC if len(lookups) == 1 else "127.0.0.2"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port or 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    target = f"rebind.test:{first.port}"
+    if method == "GET":
+        target = f"http://{target}/"
+    request = f"{method} {target} HTTP/1.1\r\nHost: rebind.test\r\n\r\n".encode()
+    assert ask(proxy, request, b"first").endswith(b"first")
+    assert lookups == ["rebind.test"]
 
 
 def test_digest_shows_turns_and_tools_and_redacts(tmp_path):

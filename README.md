@@ -552,6 +552,16 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   over its clean runs. It refuses to run inside a heavy job (`$HEAVY_SLOT`),
   where heavy measures nothing, and an `--out` that holds results already;
   stopped, it stops its heavy job and still prints the table.
+- **profile-top**: `profile-top PROFILE` sums up a samply profile (recorded with
+  `--save-only --unstable-presymbolicate`): the samples' share by process, and the
+  top symbols by self and inclusive samples, leaving out frames nearly every stack
+  carries unless `--all`. `--match REGEX` gives the share of samples holding a
+  match, overall and of each process; `--callers REGEX` their nearest named
+  callers. `profile-top record [--rate HZ] [-o FILE] -- CMD` records one command
+  with samply and prints the same summary, the profile in a new file in `$TMPDIR`
+  unless `-o`. It needs samply on `PATH` (sandbox-setup installs it) and
+  `kernel.perf_event_paranoid` at 1 or less, which it checks (from
+  `$PROFILE_TOP_PARANOID` instead, for tests).
 - **issue-todo**: a GitHub issue's task-list items across its body and every
   comment (`issue-todo show N`), which `gh issue view` splits between two
   commands, and ticking one where it lives (`issue-todo tick N MATCH --note

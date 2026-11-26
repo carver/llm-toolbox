@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""Sum up a samply profile: where the samples went, by process and by symbol.
+
+    profile-top PROFILE [-n N] [--match REGEX] [--callers REGEX] [--all]
+    profile-top record [--rate HZ] [-o FILE] [-n N] [--match REGEX]
+        [--callers REGEX] [--all] -- CMD...
+
+PROFILE is what `samply record --save-only --unstable-presymbolicate -o
+PROFILE` wrote, read with the symbol file samply puts beside it, named by replacing
+PROFILE's last suffix with .syms.json (prof.json.gz's is prof.json.syms.json). The
+summary gives the number of samples; each process's share; the biggest threads,
+each with its root, the frame nearest the leaf on 95% of its samples (the test
+under study, say, against the database's worker thread); and the top N symbols
+(20) by self samples and by inclusive samples, each symbol counted once per sample
+however deep it recurs. Inclusive leaves out the frames nearly every stack
+carries, unless --all: thread start, main, std's and tokio's runtime,
+catch_unwind, call_once, and any frame almost never the leaf that is on 95% of all
+samples, or has most of its samples on threads (of 20 samples or more) it's on
+95% of. A frame with no symbol shows as LIB+?, a stripped library's
+fun_<address> as LIB:fun_<address>, a Rust symbol's ::h<hash> is dropped, and a
+name past 160 characters is cut. A stripped binary (the sandbox's python3) names
+its own functions after the nearest exported symbol, which can mislead.
+
+--match REGEX gives the share of samples whose stack holds a frame matching REGEX
+(Python's re.search), overall and of each process's own samples, those it hit
+first, then the largest, 8 in all and one line for the rest: how much of the
+test binary was argon2, say, against how much of the servers it started.
+--callers REGEX gives, for those samples, the nearest caller above the outermost
+matching frame that has a symbol (not LIB+? or a bare 0x address) and isn't
+runtime plumbing (the frames matched by name above; the 95% rules don't apply).
+
+`record` is the short-run mode: it runs `samply record --save-only
+--unstable-presymbolicate --rate HZ (1000) -o FILE -- CMD`, prints where FILE is
+(by default a new file in $TMPDIR), and then its summary; when samply wrote no
+profile, as when CMD didn't start, it prints nothing and removes the file it made.
+samply exits 0 whatever CMD's status, so record's status says whether samply
+worked, not whether CMD did. samply comes from PATH
+(sandbox-setup installs it); it needs kernel.perf_event_paranoid at 1 or less, which
+`record` checks first ($PROFILE_TOP_PARANOID names another file to read, for tests).
+
+Exit status: 0; 1 samply failed or wrote no profile (the summary still printed when
+it wrote one); 2 usage, a profile that can't be read, perf events closed, no samply.
+"""
+
+import argparse
+import bisect
+import functools
+import gzip
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+
+RUST_HASH = re.compile(r"::h[0-9a-f]{16}$")
+# Frames on nearly every stack, which say nothing about where the time went.
+# Searched anywhere in a name, since a generic's name starts with what it wraps
+# (`<std::thread::local::LocalKey<tokio::runtime::...>>::with`).
+RUNTIME = re.compile(
+    r"^((\w+::)*main|_?start|_{1,2}libc_start_(main|call_main)|start_thread|clone3?)$"
+    r"|thread_start|__rust_begin_short_backtrace|_?rust_try|call_once"
+    r"|\bstd::(rt|panicking|panic|thread|sys::backtrace)::|\bcore::panic::"
+    r"|\btokio::runtime::"
+)
+# Inclusive also leaves out a carried frame, such as a stripped library's thread
+# start, which no pattern names: one almost never the leaf (self under ALMOST_NEVER
+# of its inclusive), so a hot loop stays, and either on NEARLY_ALL of all samples or
+# with most of its samples on threads (of BIG_THREAD samples or more) it's on
+# NEARLY_ALL of, so a frame those threads share with busier work stays.
+NEARLY_ALL = 0.95
+BIG_THREAD = 20
+ALMOST_NEVER = 0.05
+# A symbol a stripped library's table names by its address alone.
+UNNAMED = re.compile(r"^fun_[0-9a-f]+$")
+# A frame samply gave only an address.
+RAW_ADDRESS = re.compile(r"^0x[0-9a-f]+$")
+# Names past this many characters are cut, as a long generic's run to hundreds.
+WIDTH = 160
+PARANOID = Path("/proc/sys/kernel/perf_event_paranoid")
+SHOWN_PROCESSES = 8
+
+
+class UsageError(Exception):
+    pass
+
+
+@dataclass
+class Sample:
+    process: str
+    thread: int  # its thread's place in the profile
+    frames: list[str]  # leaf first
+
+
+def symbol_tables(sidecar: dict) -> dict[str, tuple[list[int], list[dict]]]:
+    strings = sidecar["string_table"]
+    tables = {}
+    for lib in sidecar["data"]:
+        entries = sorted(lib["symbol_table"], key=lambda e: e["rva"])
+        named = [{**e, "name": strings[e["symbol"]]} for e in entries]
+        tables[lib["debug_name"]] = ([e["rva"] for e in entries], named)
+    return tables
+
+
+def read_profile(path: Path) -> list[Sample]:
+    """Every sample in the profile, each stack named leaf first."""
+    # samply names it by replacing the profile's last suffix: prof.json.gz's is
+    # prof.json.syms.json, prof.json's prof.syms.json.
+    sidecar_path = path.with_suffix(".syms.json")
+    try:
+        opener = gzip.open if path.suffix == ".gz" else open
+        with opener(path, "rt") as source:
+            profile = json.load(source)
+        sidecar = json.loads(sidecar_path.read_text())
+    except (OSError, ValueError) as error:
+        raise UsageError(
+            f"can't read {path} and {sidecar_path.name}: {error}"
+        ) from error
+    tables = symbol_tables(sidecar)
+    samples = []
+    for index, thread in enumerate(profile["threads"]):
+        samples += thread_samples(index, thread, profile["libs"], tables)
+    return samples
+
+
+def thread_samples(
+    index: int, thread: dict, libs: list[dict], tables: dict
+) -> list[Sample]:
+    """One thread's samples, each stack named leaf first."""
+    frames, funcs = thread["frameTable"], thread["funcTable"]
+    stacks, resources = thread["stackTable"], thread["resourceTable"]
+    named: dict[int, str] = {}
+
+    def name(frame: int) -> str:
+        if frame not in named:
+            func = frames["func"][frame]
+            resource = funcs["resource"][func]
+            if resource is None or resource < 0:
+                named[frame] = thread["stringArray"][funcs["name"][func]]
+            else:
+                lib = libs[resources["lib"][resource]]
+                named[frame] = symbol(tables, lib, frames["address"][frame])
+        return named[frame]
+
+    samples = []
+    for stack in thread["samples"]["stack"]:
+        chain = []
+        while stack is not None:
+            chain.append(name(stacks["frame"][stack]))
+            stack = stacks["prefix"][stack]
+        if chain:
+            samples.append(Sample(thread["processName"], index, chain))
+    return samples
+
+
+def symbol(tables: dict, lib: dict, address: int) -> str:
+    """The symbol holding `address` in `lib`, or LIB+? when none does."""
+    starts, entries = tables.get(lib["debugName"], ([], []))
+    at = bisect.bisect_right(starts, address) - 1
+    if at >= 0 and address < entries[at]["rva"] + entries[at]["size"]:
+        name = RUST_HASH.sub("", entries[at]["name"])
+        return f"{lib['name']}:{name}" if UNNAMED.match(name) else name
+    return f"{lib['name']}+?"
+
+
+def share(count: int, total: int) -> str:
+    return f"{count / total:.1%}" if total else "0.0%"
+
+
+def table(counts: Counter, total: int, limit: int) -> list[str]:
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [f"  {share(n, total)}  {n}  {shown(name)}" for name, n in ranked[:limit]]
+
+
+def shown(name: str) -> str:
+    return name if len(name) <= WIDTH else name[: WIDTH - 1] + "…"
+
+
+def summary(samples: list[Sample], args: argparse.Namespace) -> list[str]:
+    total = len(samples)
+    if not total:
+        return ["0 samples"]
+    processes = Counter(sample.process for sample in samples)
+    selfs = Counter(sample.frames[0] for sample in samples)
+    threads = Counter(sample.thread for sample in samples)
+    by_thread: Counter = Counter()
+    for sample in samples:
+        by_thread.update((sample.thread, name) for name in set(sample.frames))
+    inclusive = inclusive_counts(by_thread, threads, selfs, total, args.all)
+    lines = [f"{total} samples", "--- by process"]
+    lines += table(processes, total, SHOWN_PROCESSES)
+    lines += ["--- by thread", *thread_roots(samples, threads, by_thread)]
+    lines += ["--- self", *table(selfs, total, args.n)]
+    lines += ["--- inclusive", *table(inclusive, total, args.n)]
+    if args.match:
+        lines += matching(samples, args.match, processes)
+    if args.callers:
+        lines += callers(samples, args.callers, args.n)
+    return lines
+
+
+@functools.cache
+def runtime(name: str) -> bool:
+    """Runtime plumbing (RUNTIME), asked once per name: a profile repeats each
+    name across many thousands of samples."""
+    return RUNTIME.search(name) is not None
+
+
+def inclusive_counts(
+    by_thread: Counter, threads: Counter, selfs: Counter, total: int, everything: bool
+) -> Counter:
+    """Each name's inclusive samples, less runtime plumbing and carried frames
+    (NEARLY_ALL) unless `everything`."""
+    inclusive: Counter = Counter()
+    on_carrying_threads: Counter = Counter()
+    for (thread, name), n in by_thread.items():
+        inclusive[name] += n
+        if threads[thread] >= BIG_THREAD and n >= NEARLY_ALL * threads[thread]:
+            on_carrying_threads[name] += n
+    if everything:
+        return inclusive
+    for name, n in list(inclusive.items()):
+        carried = selfs[name] < ALMOST_NEVER * n and (
+            on_carrying_threads[name] * 2 > n or n >= NEARLY_ALL * total
+        )
+        if carried or runtime(name):
+            del inclusive[name]
+    return inclusive
+
+
+def unnamed(name: str) -> bool:
+    """A frame with no symbol, or with only an address."""
+    return name.endswith("+?") or RAW_ADDRESS.match(name) is not None
+
+
+def thread_roots(
+    samples: list[Sample], threads: Counter, by_thread: Counter
+) -> list[str]:
+    """The biggest threads, each with its root: the frame nearest the leaf that is on
+    NEARLY_ALL of its samples, named and not runtime plumbing."""
+    first = {}
+    for sample in samples:
+        first.setdefault(sample.thread, sample)
+    lines = []
+    total = len(samples)
+    ranked = sorted(threads.items(), key=lambda item: (-item[1], item[0]))
+    for thread, n in ranked[:SHOWN_PROCESSES]:
+        sample = first[thread]
+        root = next(
+            (
+                name
+                for name in sample.frames
+                if by_thread[thread, name] >= NEARLY_ALL * n
+                and not unnamed(name)
+                and not runtime(name)
+            ),
+            "(no frame common to its samples)",
+        )
+        lines.append(f"  {share(n, total)}  {n}  {sample.process}: {shown(root)}")
+    return lines
+
+
+def pattern(text: str) -> re.Pattern[str]:
+    try:
+        return re.compile(text)
+    except re.error as error:
+        raise UsageError(f"{text!r} isn't a regular expression: {error}") from error
+
+
+def matching(samples: list[Sample], text: str, processes: Counter) -> list[str]:
+    found = pattern(text)
+    hits = Counter(
+        sample.process
+        for sample in samples
+        if any(found.search(name) for name in sample.frames)
+    )
+    total, matched = len(samples), sum(hits.values())
+    lines = [
+        f"--- matching {text}",
+        f"  {share(matched, total)}  {matched} of {total}  all",
+    ]
+    ranked = sorted(
+        processes.items(), key=lambda item: (-hits[item[0]], -item[1], item[0])
+    )
+    for process, n in ranked[:SHOWN_PROCESSES]:
+        lines.append(f"  {share(hits[process], n)}  {hits[process]} of {n}  {process}")
+    rest = ranked[SHOWN_PROCESSES:]
+    if rest:
+        hit = sum(hits[process] for process, _ in rest)
+        size = sum(n for _, n in rest)
+        lines.append(
+            f"  {share(hit, size)}  {hit} of {size}  {len(rest)} other processes"
+        )
+    return lines
+
+
+def callers(samples: list[Sample], text: str, limit: int) -> list[str]:
+    found = pattern(text)
+    above: Counter = Counter()
+    for sample in samples:
+        matches = [i for i, name in enumerate(sample.frames) if found.search(name)]
+        if not matches:
+            continue
+        outermost = max(matches)  # frames run leaf first, so the root is last
+        caller = next(
+            (
+                name
+                for name in sample.frames[outermost + 1 :]
+                if not unnamed(name) and not runtime(name)
+            ),
+            "(none named)",
+        )
+        above[caller] += 1
+    return [f"--- callers of {text}", *table(above, sum(above.values()), limit)]
+
+
+def record(args: argparse.Namespace) -> int:
+    paranoid_file = Path(os.environ.get("PROFILE_TOP_PARANOID", PARANOID))
+    try:
+        paranoid = int(paranoid_file.read_text().strip())
+    except (OSError, ValueError) as error:
+        raise UsageError(f"can't read {paranoid_file}: {error}") from error
+    if paranoid > 1:
+        raise UsageError(
+            f"perf events are closed (kernel.perf_event_paranoid is {paranoid}); open"
+            " them with: sudo sysctl kernel.perf_event_paranoid=1"
+        )
+    samply = shutil.which("samply")
+    if samply is None:
+        raise UsageError("samply isn't on PATH: sandbox-setup's setup.py installs it")
+    if not args.command:
+        raise UsageError("record needs a command after --")
+    if args.output:
+        out = Path(args.output)
+    else:
+        handle, name = tempfile.mkstemp(prefix="profile-top-", suffix=".json.gz")
+        os.close(handle)
+        out = Path(name)
+    command = [
+        samply,
+        "record",
+        "--save-only",
+        "--unstable-presymbolicate",
+        "--rate",
+        str(args.rate),
+        "-o",
+        str(out),
+        "--",
+        *args.command,
+    ]
+    status = subprocess.run(command, check=False).returncode
+    if not (out.exists() and out.stat().st_size):
+        # Most likely the command didn't start; samply has said why.
+        if not args.output:
+            out.unlink(missing_ok=True)
+        return 1
+    print(f"profile: {out}")
+    print("\n".join(summary(read_profile(out), args)))
+    return 0 if status == 0 else 1
+
+
+def parser_for(prog: str) -> argparse.ArgumentParser:
+    """A parser with the summary's options, and this file's docstring as its help."""
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-n", type=int, default=20, help="symbols in each list (20)")
+    parser.add_argument("--match", metavar="REGEX", help="the share holding a match")
+    parser.add_argument("--callers", metavar="REGEX", help="who calls the matches")
+    parser.add_argument("--all", action="store_true", help="keep frames on every stack")
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] == ["record"]:
+        parser = parser_for("profile-top record")
+        parser.add_argument(
+            "--rate", type=int, default=1000, help="samples a second (1000)"
+        )
+        parser.add_argument(
+            "-o", "--output", metavar="FILE", help="where the profile goes"
+        )
+        parser.add_argument("command", nargs=argparse.REMAINDER)
+        args = parser.parse_args(argv[1:])
+        if args.command[:1] == ["--"]:
+            args.command = args.command[1:]
+        return record(args)
+    parser = parser_for("profile-top")
+    parser.add_argument("profile", type=Path)
+    args = parser.parse_args(argv)
+    print("\n".join(summary(read_profile(args.profile), args)))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except UsageError as error:
+        print(f"profile-top: {error}", file=sys.stderr)
+        sys.exit(2)

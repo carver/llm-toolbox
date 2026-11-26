@@ -13,6 +13,18 @@ INSTALLED = OWN | {n for names in install.THIRD_PARTY_SKILLS.values() for n in n
 VENDORED = ("filedrawer-search", "filedrawer-submit")
 # Claude Code's own slash commands, which docs may name beside skills.
 BUILTIN = {"clear", "compact", "config", "help", "init", "memory", "resume"}
+# The skills that ship with Claude Code itself, as a session's skills listing shows
+# them, so no install.py installs them.
+BUNDLED = {
+    "claude-api",
+    "fewer-permission-prompts",
+    "keybindings-help",
+    "loop",
+    "schedule",
+    "security-review",
+    "simplify",
+    "update-config",
+}
 
 SLASH = re.compile(r"`/([a-z][a-z0-9-]*)`")
 NAMED = re.compile(r"the `([a-z][a-z0-9-]*)` skill")
@@ -23,7 +35,7 @@ def broken_refs(text: str) -> list[str]:
     broken = [
         f"/{name}"
         for name in SLASH.findall(text) + NAMED.findall(text)
-        if name not in INSTALLED | BUILTIN
+        if name not in INSTALLED | BUILTIN | BUNDLED
     ]
     for name, rest in PATH.findall(text):
         if name not in INSTALLED:
@@ -72,6 +84,13 @@ def test_finds_each_kind_of_broken_ref() -> None:
         "~/.agents/skills/coding/missing.md",
         "~/.agents/skills/gone",
     ]
+
+
+def test_claude_codes_bundled_skills_are_not_broken_refs() -> None:
+    text = (
+        "Start `/loop` in dynamic mode, then `/schedule` it, or the `simplify` skill."
+    )
+    assert broken_refs(text) == []
 
 
 def test_a_patch_s_removed_lines_are_not_refs() -> None:

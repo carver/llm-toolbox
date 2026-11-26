@@ -43,8 +43,11 @@ binary that crashed or has no libtest harness. The command is a cargo test run w
 holds `cargo`, then any `+toolchain` or `-flag` words, then `test`, `t` or `nextest`,
 also inside `sh -c '...'` or after a wrapper such as `heavy --`.
 
-Prints one line, with up to 3 of the command's pytest `E ` lines or Rust `error` lines
-when it failed, or its last line of output when there are none; never the whole output.
+Prints one line, then, when it failed, a few of its own: for a catch, the tests that
+failed (up to 3 names, from nextest's, libtest's or pytest's lines, and how many more)
+and the first Rust panic's message; then up to 3 of pytest's `E ` lines, or Rust
+`error` lines when no test ran, or the last line of output when nothing else was
+found; never the whole output.
 
 Stopped, or past --timeout, it stops the command's process group: SIGTERM, then
 SIGKILL after $MUTATE_CHECK_GRACE seconds (default 5; the tests shorten it).
@@ -147,6 +150,18 @@ PYTEST_FAILED = re.compile(r"\b[1-9]\d* failed\b.* in \d+(\.\d+)?s\b")
 # pytest's summary line, and the count in it that says a test passed.
 PYTEST_SUMMARY = re.compile(r"\b\d+ (passed|failed|skipped|deselected)\b.* in \d+")
 PYTEST_PASSED = re.compile(r"\b[1-9]\d* passed\b")
+# A test that failed, as each runner names it: nextest's status line (`FAIL`, a
+# signal, `TIMEOUT`) with its binary and test, libtest's `test NAME ... FAILED`
+# (a should_panic test's or a doctest's name holds spaces), and pytest's short
+# summary `FAILED NAME - why`, not unittest's closing `FAILED (failures=N)`.
+FAILED_TEST = re.compile(
+    r"^\s*(?:(?:FAIL|SIG[A-Z]+|TIMEOUT)\s+\[\s*[\d.]+s\]\s+(?:\(\d+/\d+\)\s+)?"
+    r"(?P<nextest>\S+\s+\S+)\s*$"
+    r"|test (?P<libtest>.+?) \.\.\. FAILED\s*$"
+    r"|FAILED (?P<pytest>[^(\s].*?)(?: - .*)?$)"
+)
+# Where a Rust test's panic message begins: the message is the next line.
+PANICKED = re.compile(r"\bpanicked at \S+:\d+:\d+:\s*$")
 BIN = Path(__file__).resolve().parent
 SHOWN_ERRORS = 3
 STOP_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
@@ -355,6 +370,47 @@ def summary(output: str) -> list[str]:
     return [last] if last is not None else []
 
 
+def failed_tests(lines: list[str]) -> list[str]:
+    """Each test the output says failed, once, in the order it first names them."""
+    names: dict[str, None] = {}
+    for line in lines:
+        found = FAILED_TEST.match(line)
+        if found:
+            name = found["nextest"] or found["libtest"] or found["pytest"]
+            names[" ".join(name.split())] = None
+    return list(names)
+
+
+def first_panic(lines: list[str]) -> str | None:
+    """The message of the first Rust panic in the output, or None."""
+    for at, line in enumerate(lines):
+        if PANICKED.search(line):
+            return next((m.strip() for m in lines[at + 1 :] if m.strip()), None)
+    return None
+
+
+def catch_report(output: str) -> list[str]:
+    """What a caught run shows: the tests that failed and the first panic's message,
+    then pytest's `E ` lines, or, when no failing test is named, the last line."""
+    lines = output.splitlines()
+    names = failed_tests(lines)
+    report = []
+    if names:
+        more = len(names) - SHOWN_ERRORS
+        named = ", ".join(names[:SHOWN_ERRORS]) + (
+            f" and {more} more" if more > 0 else ""
+        )
+        report.append(f"failed: {named}")
+    panic = first_panic(lines)
+    if panic is not None:
+        report.append(panic)
+    shown = summary(output)
+    # summary's fallback, the last line, says nothing once a test is named.
+    if not names or any(line.startswith("E ") for line in shown):
+        report.extend(shown)
+    return report
+
+
 @dataclass(frozen=True)
 class Verdict:
     """What a run with a mutation in place says: CAUGHT, MISSED or INCONCLUSIVE, the
@@ -400,7 +456,7 @@ def judge(code: int, output: str, command: list[str]) -> Verdict:
         CAUGHT,
         [
             f"mutate-check: caught: the command exited {code}",
-            *(f"  {line}" for line in summary(output)),
+            *(f"  {line}" for line in catch_report(output)),
         ],
         f"it exited {code}",
     )

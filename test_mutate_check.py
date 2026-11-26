@@ -600,6 +600,138 @@ def test_a_rust_test_that_fails_or_crashes_is_caught(
     assert f"caught: the command exited {status}" in result.stdout
 
 
+# Two failing tests and a passing one, as nextest prints them: each failure as it ends
+# and again in the closing list.
+NEXTEST_TWO_FAILED = (
+    "────────────\n"
+    "    Starting 3 tests across 1 binary\n"
+    "        PASS [   0.031s] (1/3) calc tests::doubles\n"
+    "        FAIL [   0.036s] (2/3) calc tests::halves\n"
+    "  stderr ───\n"
+    "\n"
+    "    thread 'tests::halves' (3993502) panicked at src/lib.rs:12:5:\n"
+    "    assertion `left == right` failed: 3 halves to 1\n"
+    "\n"
+    "        FAIL [   0.040s] (3/3) calc tests::triples\n"
+    "  stderr ───\n"
+    "\n"
+    "    thread 'tests::triples' (3993503) panicked at src/lib.rs:20:5:\n"
+    "    9 isn't 3 times 2\n"
+    "────────────\n"
+    "     Summary [   0.043s] 3 tests run: 1 passed, 2 failed, 0 skipped\n"
+    "        FAIL [   0.036s] (2/3) calc tests::halves\n"
+    "        FAIL [   0.040s] (3/3) calc tests::triples\n"
+    "error: test run failed\n"
+)
+LIBTEST_TWO_FAILED = (
+    "\nrunning 2 tests\n"
+    "test tests::halves ... FAILED\n"
+    "test tests::triples ... FAILED\n"
+    "\nfailures:\n\n---- tests::halves stdout ----\n\n"
+    "thread 'tests::halves' (1) panicked at src/lib.rs:12:5:\n"
+    "assertion `left == right` failed: 3 halves to 1\n"
+    "\nfailures:\n    tests::halves\n    tests::triples\n\n"
+    "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n"
+    "\nerror: test failed, to rerun pass `--lib`\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("command", "output", "named"),
+    [
+        (NEXTEST, NEXTEST_TWO_FAILED, "calc tests::halves, calc tests::triples"),
+        (("cargo", "test", "-q"), LIBTEST_TWO_FAILED, "tests::halves, tests::triples"),
+    ],
+    ids=["nextest", "libtest"],
+)
+def test_a_rust_catch_names_the_tests_that_failed_and_the_first_panic(
+    repo: Path,
+    cargo: dict[str, str],
+    command: tuple[str, ...],
+    output: str,
+    named: str,
+) -> None:
+    cargo_prints(repo, output, 100)
+
+    result = check(repo, BREAK, *command, env=cargo)
+
+    assert result.returncode == 0, result.stdout
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    assert lines[0] == "mutate-check: caught: the command exited 100"
+    assert f"failed: {named}" in lines
+    assert "assertion `left == right` failed: 3 halves to 1" in lines
+    assert "error: test run failed" not in lines
+    assert len(lines) <= 4
+
+
+def test_a_catch_names_at_most_three_tests_and_counts_the_rest(
+    repo: Path, cargo: dict[str, str]
+) -> None:
+    failures = "".join(
+        f"        FAIL [   0.010s] ({n}/5) calc tests::t{n}\n" for n in range(1, 6)
+    )
+    ran = "     Summary [   0.050s] 5 tests run: 0 passed, 5 failed, 0 skipped\n"
+    cargo_prints(repo, failures + ran + "error: test run failed\n", 100)
+
+    result = check(repo, BREAK, *NEXTEST, env=cargo)
+
+    assert (
+        "  failed: calc tests::t1, calc tests::t2, calc tests::t3 and 2 more"
+        in result.stdout.splitlines()
+    )
+
+
+def test_a_crashed_nextest_test_is_named_by_its_signal_line(
+    repo: Path, cargo: dict[str, str]
+) -> None:
+    cargo_prints(repo, NEXTEST_CRASHED, 100)
+
+    result = check(repo, BREAK, *NEXTEST, env=cargo)
+
+    assert "  failed: calc tests::deep" in result.stdout.splitlines()
+
+
+@pytest.mark.parametrize(
+    ("printed", "named"),
+    [
+        (
+            (
+                "test tests::refuses - should panic ... FAILED\n"
+                "test result: FAILED. 0 passed; 1 failed; 0 ignored\n"
+            ),
+            "tests::refuses - should panic",
+        ),
+        (
+            "FAILED test_x.py::test_y[a b] - assert 1 == 2\n1 failed in 0.10s\n",
+            "test_x.py::test_y[a b]",
+        ),
+    ],
+    ids=["libtest should_panic", "pytest id with a space"],
+)
+def test_a_name_with_spaces_is_named_whole(
+    repo: Path, printed: str, named: str
+) -> None:
+    result = check(repo, BREAK, "sh", "-c", f"printf '{printed}'; exit 1")
+
+    assert f"  failed: {named}" in result.stdout.splitlines()
+
+
+def test_unittests_closing_count_is_no_test_name(repo: Path) -> None:
+    printed = "FAIL: test_double (test_calc.Calc)\\n\\nFAILED (failures=1)\\n"
+
+    result = check(repo, BREAK, "sh", "-c", f"printf '{printed}'; exit 1")
+
+    assert not any("failed: (" in line for line in result.stdout.splitlines())
+
+
+def test_a_pytest_catch_names_the_test_beside_its_assertion(repo: Path) -> None:
+    result = check(repo, BREAK, *PYTEST)
+
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    assert "failed: test_calc.py::test_double" in lines
+    assert "E       assert 5 == 4" in lines
+
+
 def test_edits_from_a_file_break_the_code_with_stdin_closed(repo: Path) -> None:
     blocks = repo.parent / "break.edits"
     blocks.write_text(BREAK)

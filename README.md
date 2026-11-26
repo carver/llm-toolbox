@@ -200,7 +200,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   blocks from stdin (or from `--edits FILE`, for a run under bgrun, which
   gives its job no stdin), runs CMD (a test run), and puts every file back, also
   when stopped. It exits 0 when CMD failed (the tests catch the break) and 1 when it
-  passed, printing one line and at most 3 of pytest's `E ` lines. It exits 3,
+  passed, printing one line and, for a catch, the tests that failed (at most 3
+  names, from nextest, libtest or pytest), the first Rust panic's message and at
+  most 3 of pytest's `E ` lines. It exits 3,
   inconclusive, when no test judged the break: the build failed (a Rust compile
   error, such as unused code under `-D warnings`), pytest collected nothing (not
   pytest-xdist's exit 2 for `-x` after a failure, which is a catch), a

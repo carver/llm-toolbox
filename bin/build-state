@@ -38,7 +38,12 @@
                             When the repo has an agent-pre-commit, which wt-ship runs
                             on the tip of what it lands, the file tells the
                             reviewer to run only the tests a finding needs, not the
-                            whole suite
+                            whole suite. When the build holds fixup!, squash! or
+                            amend! commits, it first tries finish's fold in a
+                            temporary worktree it removes after, with no hooks and
+                            no branch moved, and when that conflicts warns on
+                            stderr, one line a conflicting file with the commit
+                            the fold stopped at, and still writes the prompt
     build-state fold [--upstream REV]
                             fold each commit that only refines an earlier commit
                             of the landing into it, in one rebase (see below)
@@ -67,7 +72,10 @@ ones. Every other commit
 stays as it is, in order. It refuses
 uncommitted changes and leftover conflict markers since the base. On a conflict it aborts
 the rebase, and when the folded tree differs from the tree before, it resets to that;
-either way the branch is as it was. A fix conflicts when a commit after the one it
+either way the branch is as it was. A conflict prints one line a conflicting file,
+`  FILE: conflicts at SHA SUBJECT`, naming the commit the fold stopped at, as
+review-prompt's trial fold does; only the first stop shows, since git stops there.
+A fix conflicts when a commit after the one it
 names changed the same lines, so finish then names the last commit before the fix to
 change its conflicting files, which the fix was made on top of, and how to point the
 fix at it with reword.
@@ -159,10 +167,13 @@ import json
 import os
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -257,8 +268,12 @@ NOT_SOURCE = [
 ]
 
 
-def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=check)
+def git(
+    *args: str, check: bool = True, cwd: Path | None = None
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=check
+    )
 
 
 def state_file() -> Path:
@@ -1092,29 +1107,54 @@ def fold_base(base: str) -> tuple[str, list[str]]:
         return base, [
             f"  a merge sits after {earliest[:12]}, and folding would flatten it"
         ]
-    print(
-        f"Folding from {fold_from[:12]}, before {earliest[:12]}, the earliest commit a"
-        " fix names: no branch, tag or remote holds it.",
-        flush=True,
-    )
     return fold_from, []
 
 
-def fold_fixups(base: str) -> bool:
-    """Autosquash onto the base; on failure, abort and say why."""
+# For a trial fold: no hook runs, no branch moves with the commits it rewrites, and
+# nothing is recorded or tidied in the repo the build shares with every worktree.
+TRIAL = (
+    *("-c", "core.hooksPath=/dev/null", "-c", "rerere.enabled=false"),
+    *("-c", "commit.gpgSign=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false"),
+)
+
+
+def autosquash(
+    base: str, cwd: Path | None = None, trial: bool = False
+) -> subprocess.CompletedProcess:
+    """Run finish's fold: an autosquash rebase onto the base, left stopped on a
+    conflict. A trial one runs with TRIAL's settings."""
     # ":" accepts the todo list as is, and a squash! commit's combined message.
     env = os.environ | {"GIT_SEQUENCE_EDITOR": ":", "GIT_EDITOR": ":"}
-    rebase = subprocess.run(
-        ["git", "rebase", "-q", "-i", "--autosquash", base],
+    return subprocess.run(
+        [
+            "git",
+            *(TRIAL if trial else ()),
+            *("rebase", "-q", "-i", "--autosquash"),
+            *(("--no-update-refs",) if trial else ()),
+            base,
+        ],
+        cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def fold_fixups(base: str) -> bool:
+    """Autosquash onto the base; on failure, abort and say why."""
+    rebase = autosquash(base)
     if rebase.returncode == 0:
         return True
-    hint = conflict_hint(base)
+    stop = fold_stop()
+    hint = conflict_hint(base, stop, "and run finish again") if stop else []
     git("rebase", "--abort", check=False)
+    if stop:
+        return not fail(
+            "Folding the fixups conflicts, so the branch is as it was:",
+            *stop.lines(),
+            *hint,
+        )
     fail(
         # git's hints say to resolve the conflict and continue, but the rebase is over.
         *(
@@ -1123,22 +1163,119 @@ def fold_fixups(base: str) -> bool:
             if not line.startswith("hint: ")
         ),
         "Folding the fixups failed; the branch is as it was.",
-        *hint,
     )
     return False
 
 
-def conflict_hint(base: str) -> list[str]:
-    """For a fold stopped at a fix that conflicts: the later commit it was made on top
-    of, and how to point the fix at that commit. Empty when it stopped elsewhere or the
-    commit the fix names is the last before it to change those files."""
-    stopped = git("rev-parse", "--verify", "--quiet", "REBASE_HEAD", check=False)
-    unmerged = git("diff", "--no-relative", "--name-only", "-z", "--diff-filter=U")
+@dataclass
+class FoldStop:
+    """Where a fold stopped on a conflict: the commit it was applying, and the files
+    that conflict, from the top of the work tree."""
+
+    commit: str
+    subject: str
+    files: list[str]
+
+    def lines(self) -> list[str]:
+        return [
+            f"  {file}: conflicts at {self.commit[:12]} {self.subject}"
+            for file in self.files
+        ]
+
+
+def fold_stop(cwd: Path | None = None) -> FoldStop | None:
+    """Where the fold under way in `cwd` stopped, or None when it stopped for no
+    conflict."""
+    stopped = git(
+        "rev-parse", "--verify", "--quiet", "REBASE_HEAD", check=False, cwd=cwd
+    )
+    unmerged = git(
+        "diff", "--no-relative", "--name-only", "-z", "--diff-filter=U", cwd=cwd
+    )
     files = [name for name in unmerged.stdout.split("\0") if name]
     if stopped.returncode != 0 or not files:
+        return None
+    commit = stopped.stdout.strip()
+    subject = git("log", "-1", "--format=%s", commit).stdout.strip()
+    return FoldStop(commit, subject, files)
+
+
+@contextmanager
+def exit_on_signals():
+    """While it lasts, SIGTERM, SIGHUP and SIGINT exit with 128 + the signal, without
+    a traceback, so the `finally` blocks inside it still run."""
+    stops = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    before = {stop: signal.getsignal(stop) for stop in stops}
+    for stop in stops:
+        signal.signal(stop, lambda signum, _frame: sys.exit(128 + signum))
+    try:
+        yield
+    finally:
+        for stop, handler in before.items():
+            signal.signal(stop, handler)
+
+
+def trial_fold(base: str) -> list[str]:
+    """Whether the build's fixups fold, found by finish's own fold in a temporary
+    worktree it removes after, also when stopped by a signal, so the build's tree,
+    its branch and the repo's config stay as they were: where it stopped, one line a
+    file, and how to fix it, or that the fold changed the tree, which finish
+    refuses. Empty when they fold, or there are none, or the base has left HEAD's
+    history, which finish sorts out first."""
+    if not ancestor(base, "HEAD") or not any(
+        subject.startswith(FIXES) for _, subject in commits(f"{base}..HEAD")
+    ):
         return []
-    fix = stopped.stdout.strip()
-    subject = git("log", "-1", "--format=%s", fix).stdout.strip()
+    fold_from, _ = fold_base(base)
+    with (
+        exit_on_signals(),
+        tempfile.TemporaryDirectory(prefix="build-state-fold-") as scratch,
+    ):
+        tree = Path(scratch) / "tree"
+        added = git(
+            *(*TRIAL, "worktree", "add", "-q", "--detach", str(tree), "HEAD"),
+            check=False,
+        )
+        if added.returncode != 0:
+            return [f"Couldn't try folding the fixups: {added.stderr.strip()}"]
+        admin = git("rev-parse", "--absolute-git-dir", cwd=tree).stdout.strip()
+        try:
+            rebase = autosquash(fold_from, tree, trial=True)
+            stop = None if rebase.returncode == 0 else fold_stop(tree)
+            folded = git("rev-parse", "HEAD^{tree}", cwd=tree).stdout
+        finally:
+            removed = git("worktree", "remove", "--force", str(tree), check=False)
+            if removed.returncode != 0:
+                # git's record of the trial worktree, whose folder goes with scratch.
+                shutil.rmtree(admin, ignore_errors=True)
+    if rebase.returncode == 0:
+        if folded == git("rev-parse", "HEAD^{tree}").stdout:
+            return []
+        return [
+            (
+                "Folding the fixups changes the tree, which `build-state finish`"
+                " refuses: fold them by hand and compare with `git diff HEAD`."
+            )
+        ]
+    if stop is None:
+        why = (rebase.stderr or rebase.stdout).strip().splitlines()[:1]
+        return [f"Trying to fold the fixups failed, with no conflict: {''.join(why)}"]
+    return [
+        (
+            f"Folding the fixups (`rebase --autosquash` from {fold_from[:12]}, as"
+            " `build-state finish` and wt-ship do) conflicts: fix it before landing."
+        ),
+        *stop.lines(),
+        *conflict_hint(fold_from, stop, "once the review is in"),
+    ]
+
+
+def conflict_hint(base: str, stop: FoldStop, when: str) -> list[str]:
+    """For a fold stopped at a fix that conflicts: the later commit it was made on top
+    of, and how to point the fix at that commit, ending with `when` to do it. Empty
+    when it stopped elsewhere or the commit the fix names is the last before it to
+    change those files."""
+    fix, subject, files = stop.commit, stop.subject, stop.files
     kind = next((kind for kind in FIXES if subject.startswith(kind)), None)
     if kind is None:
         return []
@@ -1171,8 +1308,8 @@ def conflict_hint(base: str) -> list[str]:
             f"{fix[:12]} {subject} conflicts in {', '.join(files)}, which {sha[:12]}"
             f" {later_subject}"
         ),
-        "changed after the commit the fix names. Point the fix at that commit and run",
-        "finish again:",
+        "changed after the commit the fix names. Point the fix at that commit",
+        f"{when}:",
         point,
         f"Or keep it as a commit of its own: reword it without `{kind.strip()}`.",
     ]
@@ -1393,6 +1530,12 @@ def finish(args: argparse.Namespace) -> int:
     after_sweep = unswept(state)
     before = head()
     fold_from, why = fold_base(base)
+    if fold_from != base:
+        print(
+            f"Folding from {fold_from[:12]}, the parent of the earliest commit a fix"
+            " names: no branch, tag or remote holds it.",
+            flush=True,
+        )
     if not fold_fixups(fold_from):
         return 1
     if (
@@ -1562,6 +1705,8 @@ def review_prompt(args: argparse.Namespace) -> int:
     if warning := unswept(state).warning():
         print(f"build-state: {warning}", file=sys.stderr)
     base, sha = state["base"], head()
+    if warning := trial_fold(base):
+        print(f"build-state: {warning[0]}", *warning[1:], sep="\n", file=sys.stderr)
     top = work_tree()
     if not (top / "CODING_STANDARDS.md").is_file():
         print(

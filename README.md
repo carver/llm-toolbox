@@ -813,7 +813,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   subagent; it says on stderr when the repo has no `CODING_STANDARDS.md`. When
   the repo has an `agent-pre-commit`, which `wt-ship` runs on the tip of what
   it lands, the prompt tells the reviewer to run only the tests a finding
-  needs rather than the whole suite.
+  needs rather than the whole suite. When the build holds fixups, it first
+  tries finish's fold in a temporary worktree it removes after (no hooks, no
+  branch moved), and when that conflicts it warns on stderr, one line a
+  conflicting file with the commit the fold stopped at, as `finish` does on a
+  conflict, and still writes the prompt.
   `fold` folds each commit whose changed lines came mostly (75%) from an
   earlier commit since the branch it lands on into that commit, in one rebase,
   leaving a commit that uses a name defined after its target, one with a

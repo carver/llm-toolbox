@@ -535,6 +535,41 @@ reviewed commit, which can't tell a drop from an accidental reset and misses mid
 drops; a `build-state drop` command, more code for the same check; a review of the
 drop's interactions every time, a subagent for what is usually nothing.
 
+### build-state review-prompt tries the fold before the review (#10, 2026-11-26)
+
+In a seven-commit build on 2026-11-23 a late fix was folded into an early commit of
+the series, twice, and each fold conflicted at later commits (filedrawer's
+`skills/versions.txt`, rewritten in every commit that touches a skill). Nothing said
+so until a reviewer tried `rebase --autosquash` in a throwaway clone. Now
+`review-prompt`, when the build holds fix commits, runs finish's own fold (the same
+`fold_base`, the same autosquash rebase) in a temporary worktree, and warns on stderr
+of each conflicting file with the commit the fold stopped at, then writes the prompt
+as before: a conflict is for fixing before landing, not a reason to hold the review
+(the issue's decision). finish prints the same lines when its own fold conflicts.
+
+- A worktree rather than a clone: it shares the object store, so it copies nothing
+  but the checkout, and `worktree remove` drops it. It runs with no hooks, no rerere,
+  no signing, no auto gc and `--no-update-refs`, so a `rebase.updateRefs` setting
+  can't move a branch and nothing lands in the shared repo but loose objects.
+  SIGTERM, SIGHUP and SIGINT exit through its cleanup, so a stopped review-prompt
+  leaves no worktree registered; when `worktree remove` fails it deletes only the
+  trial's own entry under the git dir, not a `worktree prune` of every stale one.
+  A clean fold that changes the tree, which finish refuses, is warned of too.
+- Only the first stop shows, as git stops there: resolving it by guess to go on
+  would make up conflicts the real fold may not have.
+- It sees what finish's fold sees, and wt-ship's while the branch it lands on hasn't
+  moved: wt-ship rebases from the fork point, an ancestor of `fold_base`'s start,
+  and the commits between are replayed unchanged. Checked on a ten-commit series
+  with a fix of commit 2 conflicting in a file every commit rewrites: the trial and
+  `rebase -i --autosquash --fork-point main` stopped at the same fix, in the same
+  file. A main that moved can add conflicts of its own, which neither finish nor the
+  trial looks for.
+- Cost: about half a second. On a ten-commit series with two fixups, in a clone of
+  this repo (224 files), review-prompt took 0.60 s against 0.14 s without the trial
+  (hyperfine, 15 runs each, twice, both under heavy's outside-load warning, about
+  one core). A bigger checkout costs more, as the worktree checks out every file. A
+  build with no fix commits skips it.
+
 ### wt-ship --remove keeps a worktree that processes still run in (2026-11-25)
 
 In a filedrawer session the agent stopped `bin/live-preview`, which it had started in

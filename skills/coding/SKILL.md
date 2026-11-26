@@ -22,7 +22,7 @@ Make it work, then make it good. While implementing, the quality you own is the 
 - Fast tests, so the whole suite runs on every commit:
   - Run them in parallel from the start (pytest: `pytest-xdist` with `-n auto --maxprocesses=8` in `addopts`; `-n0` for one file).
   - Avoid spawning an interpreter when another option works: each one pays its imports again, often most of a second. When a test needs one, have it import only the light module it uses.
-  - Wait for a condition by polling it: a fixed sleep costs its full length on every run.
+  - Before writing a fixed sleep, look for any other way to get what it's for, such as polling a condition: a fixed sleep costs its full length on every run.
   - Build an expensive fixture (a git repo, a rendered figure) once per module, and copy it into each test.
 
 Review holds the code to [standards.md](standards.md), in the same order, and a refactor pass applies what it finds. `/build` runs that sequence.

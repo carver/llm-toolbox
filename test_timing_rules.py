@@ -2,9 +2,11 @@
 
 A fixed sleep costs its whole length on every run, and on a loaded machine it can end
 before what it waits for. A call to time.sleep with a number of SHORTEST seconds or
-more needs a `# fixed sleep: <why>` comment, on its line or on a comment line just
-above it, for a sleep that is the scenario itself: a window in which something must
-not happen. A process stopped with SIGSTOP may be holding a lock that every other
+more needs a `# fixed sleep: <why nothing but a sleep works>` comment, on its line or
+on a comment line just above it. The failure asks for a rethink first rather than
+naming the ways around a sleep, since a list of cases invites matching a sleep
+against the list and taking the comment when none fits (2026-11-25: a sleep held
+heavy's lane where a short HEAVY_QUIET_SECONDS gave the same wait). A process stopped with SIGSTOP may be holding a lock that every other
 process in the test waits on, so each use of SIGSTOP needs a `# SIGSTOP: <why>`
 comment on its line. Once ruff format splits a long line, any line of the statement
 counts as its line. A sleep whose length is computed isn't checked, nor is code a
@@ -164,12 +166,12 @@ def located(find):
 def test_every_long_fixed_sleep_says_why():
     found = located(long_sleeps)
     assert not found, (
-        f"fixed sleeps of {SHORTEST:g} s or more at {', '.join(found)}. Poll the"
-        " condition with a deadline instead, as conftest's wait_until does: a"
-        " fixed sleep costs its whole length on every run, and under load it can end"
-        " before what it waits for. When the sleep is the scenario itself, a window in"
-        " which something must not happen, say so in a `# fixed sleep: <why>` comment"
-        " on its line or the line above."
+        f"fixed sleeps of {SHORTEST:g} s or more at {', '.join(found)}. A fixed sleep"
+        " costs its whole length on every run, and under load it can end before what"
+        " it waits for. Before keeping it, rethink the test: is there any other way to"
+        " get what the sleep is there for? Keep it only if there isn't, with a"
+        " `# fixed sleep: <why nothing but a sleep works>` comment on its line or the"
+        " line above."
     )
 
 

@@ -58,12 +58,14 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
       # path-refs searches with rg.
       - run: sudo apt-get install -y -q ripgrep
+      # --retention-days is mutants-covered's, below. test_mutants_base.py runs this
+      # step's line as GitHub would.
       - name: Find the base
         id: base
         env:
           GH_TOKEN: ${{ github.token }}
           OVERRIDE: ${{ inputs.base }}
-        run: bin/mutants-base ${OVERRIDE:+--override "$OVERRIDE"} >> "$GITHUB_OUTPUT"
+        run: bin/mutants-base --retention-days 90 ${OVERRIDE:+--override "$OVERRIDE"} >> "$GITHUB_OUTPUT"
       - name: Mutate the lines landed since
         if: steps.base.outputs.skip == 'false'
         id: mutate

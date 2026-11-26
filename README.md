@@ -190,9 +190,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   that covered its range (it judged mutants and uploaded `mutants-covered`) and is
   still in HEAD's
   history; else the commit that added the workflow; `--override REV` instead.
-  Prints `base=SHA` and `skip=true|false` for `$GITHUB_OUTPUT`. It asks GitHub
+  `--retention-days N`, the marker's retention in the workflow, limits the runs it
+  asks for to the last N+1 days. Prints `base=SHA` and `skip=true|false` for
+  `$GITHUB_OUTPUT`, and where the base came from on stderr. It asks GitHub
   with `gh api`, each call bounded by `$MUTANTS_BASE_GH_SECONDS` (60), and fails
-  on any gh error rather than guess.
+  on any gh error rather than guess. filedrawer's `bin/mutants-base` is a copy.
 - **mutants-pending**: `mutants-pending [REPO_DIR...]` lists, for each repo whose
   `.github/workflows/mutants.yml` names a `# Tracking issue: #N`, the completed
   runs with results newer than the newest one a trusted comment on issue N marks

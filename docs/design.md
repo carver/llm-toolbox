@@ -1287,6 +1287,28 @@ the mutants it left out are not retried; only a run that judged none (the suite 
 unmutated on the runner) keeps the base, and fails. Raising MUTANT_MINUTES, as a
 public repo's free minutes would allow, leaves out fewer.
 
+### One mutants-base for llm-toolbox and filedrawer (2026-11-26)
+
+Two builders wrote a `bin/mutants-base` each on 2026-11-10, one per repo (#3).
+filedrawer now copies this one. Its rules differed in three places, and only one
+became an option:
+
+- Whether a full run covers: no option. Both tools took any successful scheduled or
+  dispatched run holding a live `mutants-covered`; what differed was when each
+  workflow uploads that artifact (filedrawer's full run does, llm-toolbox's run over
+  a base given by hand doesn't). The workflow keeps that rule.
+- How far back to look: `--retention-days N`, required, which each workflow passes
+  as its marker's retention-days (30 and 90). Older runs can't hold the marker, so
+  asking for them only costs calls.
+- Output: one form, `base=`/`skip=` lines plus a stderr line on where the base came
+  from. filedrawer's workflow appends them to `$GITHUB_OUTPUT` and ignores `skip`
+  (its daily run with nothing new still marks its range covered), so a bare-SHA
+  form would serve no caller.
+
+A run whose head HEAD lacks is passed over before its artifacts are asked for. Each
+repo's test runs its workflow's `Find the base` line as GitHub would, since a call
+that no longer fits shows otherwise only in the next scheduled run.
+
 ### The daily run gives each mutant's suite a PID namespace (2026-11-26)
 
 Six daily runs, 11-19 to 11-24, all at `bf78929`, passed the unmutated check, then

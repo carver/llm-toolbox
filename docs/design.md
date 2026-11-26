@@ -930,6 +930,16 @@ The agent sees a declined dialog, not answers, which a usability finding should 
 A session reads only its own transcript: before its first prompt the newest one is the last session's, and the simulated human answered that session's dialog again after a restart (jason86).
 Codex has no such dialog in default mode: `request_user_input` is for Plan mode, and `request_user_input_async` returns at once and shows its question as an agent message.
 
+### The simulated human's answer goes before the scripted text, and never alone (2026-11-26)
+
+The simulated human returns only an answer to a question the agent left open; drive-agent sends it, then a space, then the scripted text word for word, and turns.md logs the answer on its own line.
+A conditional turn whose condition doesn't hold sends its `else`, after the answer, or nothing: the answer is then withheld, and turns.md logs it as such.
+Only scripted text counts as "scripted so far" for the gated rule, so the human's own answer approves nothing later.
+Reason: in filedrawer's usability runs of 2026-11-13 the human's words arrived where the script wanted silence or its own words.
+In jason96 turn 4 ("Yes, post it.", only if the agent asks for the go-ahead) didn't hold, yet "Don't attach any code… the token is already set up" went out, an answer to the agent's question about code, and the agent took it as the go-ahead and posted; a persona fact on a detail of a gated action reads as approval.
+In jason100 a sentence went before scripted turn 2, and turns.md showed it only inside what was sent, since the human wrote the whole message and could change the scripted part too.
+Withholding costs a scenario whose agent asks something open beside the gated ask: the question goes unanswered until the next turn that is sent, as it would with a person who answers only when they mean to go on. A scenario that wants it answered there gives the turn an `else`.
+
 ### Rejected: a separate user without bwrap (2026-11-10)
 
 It blocks writes but not reads of the workspace, which is world-readable, and leaves `/proc` and `/var/tmp` shared between runs.

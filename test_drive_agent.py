@@ -289,9 +289,9 @@ for line in sys.stdin:
     print("❯ ", end="", flush=True)
 """
 
-# The simulated human: echoes the scripted message, or, when the prompt holds a
-# condition, says it holds only when the agent's last message asks to post. Every
-# prompt is appended to $FAKE_HUMAN_LOG. FAKE_HUMAN=fail makes it fail.
+# The simulated human: answers $FAKE_HUMAN_ANSWER (default none) and, when the prompt
+# holds a condition, says it holds only when the agent's last message asks to post.
+# Every prompt is appended to $FAKE_HUMAN_LOG. FAKE_HUMAN=fail makes it fail.
 FAKE_HUMAN = r"""#!/usr/bin/env python3
 import json, os, sys
 prompt = sys.stdin.read()
@@ -300,16 +300,10 @@ with open(os.environ["FAKE_HUMAN_LOG"], "a") as f:
 if os.environ.get("FAKE_HUMAN") == "fail":
     print("overloaded", file=sys.stderr)
     sys.exit(1)
-if os.environ.get("FAKE_HUMAN") == "empty":
-    print(json.dumps({"condition_met": True, "message": ""}))
-    sys.exit()
-scripted = prompt.rsplit("The scripted next message:\n<<<\n", 1)[1].split("\n>>>", 1)[0]
 last = prompt.rsplit("The agent's last message:\n<<<\n", 1)[1].split("\n>>>", 1)[0]
-if "judge this condition" in prompt:
-    met = "Shall I post" in last
-    print(json.dumps({"condition_met": met, "message": scripted if met else ""}))
-else:
-    print(json.dumps({"condition_met": True, "message": scripted}))
+met = "Shall I post" in last if "judge this condition" in prompt else True
+print(json.dumps({"condition_met": met,
+                  "answer": os.environ.get("FAKE_HUMAN_ANSWER", "")}))
 """
 
 
@@ -611,21 +605,69 @@ def test_a_conditional_first_turn_sends_its_else(tmp_path, env):
     assert "Sent: Hi there." in log and "Sent: Yes, post it." not in log
 
 
-def test_an_empty_answer_sends_an_unconditional_turn_as_scripted(tmp_path, env):
-    path = scenario(tmp_path, turns=["hello", "again"])
+def test_an_answer_goes_before_the_scripted_text_and_is_logged_apart(tmp_path, env):
+    # jason100: the simulated human prepended a sentence to scripted turn 2, which
+    # turns.md showed only inside what was sent.
+    path = scenario(tmp_path, turns=["hello", "again", "more"])
     out = tmp_path / "out"
     drive(
-        {**env, "FAKE_HUMAN": "empty"},
-        "run",
-        path,
-        "--harness",
-        "claude",
-        "--name",
-        "jason18",
-        "--out",
-        out,
+        {**env, "FAKE_HUMAN_ANSWER": "I'd rather not say."},
+        *("run", path, "--harness", "claude", "--name", "jason18", "--out", out),
     )
-    assert "Sent: again" in (out / "turns.md").read_text()
+    log = (out / "turns.md").read_text()
+    turn2 = log.split("## Turn 2")[1].split("## Turn 3")[0]
+    assert "Answer (simulated human): I'd rather not say." in turn2
+    assert "Sent: I'd rather not say. again" in turn2
+    (records,) = transcript_records(out).values()
+    assert typed(records)[1] == "I'd rather not say. again"
+    # The answer is no scripted message, so it approves nothing later.
+    history = (
+        human_prompts(env)[-1].split("Scripted messages so far: ")[1].split("\n")[0]
+    )
+    assert json.loads(history) == ["hello", "again"]
+
+
+def test_a_conditional_turn_that_doesnt_hold_sends_no_answer_alone(tmp_path, env):
+    # jason96: turn 4's only_if was false, yet the simulated human's answer to the
+    # agent's open question went out, and the agent took it as the go-ahead to post.
+    path = scenario(
+        tmp_path,
+        turns=[
+            "hello",
+            {"text": "Yes, post it.", "only_if": "the agent asks to post"},
+            "after",
+        ],
+    )
+    out = tmp_path / "out"
+    drive(
+        {**env, "FAKE_HUMAN_ANSWER": "Don't attach any code."},
+        *("run", path, "--harness", "claude", "--name", "jason72", "--out", out),
+    )
+    (records,) = transcript_records(out).values()
+    assert typed(records) == ["hello", "Don't attach any code. after"]
+    log = (out / "turns.md").read_text()
+    turn2 = log.split("## Turn 2")[1].split("## Turn 3")[0]
+    assert ": skipped, condition_met: False" in turn2
+    assert "Withheld answer (simulated human): Don't attach any code." in turn2
+
+
+def test_a_conditional_turn_that_doesnt_hold_sends_its_else_after_the_answer(
+    tmp_path, env
+):
+    path = scenario(
+        tmp_path,
+        turns=[
+            "hello",
+            {"text": "Yes, post it.", "only_if": "it asks to post", "else": "Wait."},
+        ],
+    )
+    out = tmp_path / "out"
+    drive(
+        {**env, "FAKE_HUMAN_ANSWER": "Blue."},
+        *("run", path, "--harness", "claude", "--name", "jason73", "--out", out),
+    )
+    (records,) = transcript_records(out).values()
+    assert typed(records) == ["hello", "Blue. Wait."]
 
 
 def test_restart_starts_a_new_session_in_the_same_home(tmp_path, env):

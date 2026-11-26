@@ -1856,9 +1856,11 @@ def sudo_and_bwrap():
 
 @pytest.mark.skipif(not sudo_and_bwrap(), reason="needs passwordless sudo and bwrap")
 def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
-    # tmp_path is under /home here, which the box hides: the fake gets bound into
-    # the run's ~/.local/bin, as Claude Code's own binary is.
     name = f"datest{os.getpid() % 100000}"
+    # The fake in a folder only the driver can enter, outside the roots the box
+    # hides, as tmp_path is under /mnt/pytest-tmp: drive-agent has to give it to the
+    # run's ~/.local/bin, as it gives Claude Code's own binary under /home.
+    private = Path(f"/opt/drive-agent-test-{name}-bin")
     upstream = FakeUpstream()
     path = scenario(
         tmp_path,
@@ -1873,16 +1875,36 @@ def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
     out = tmp_path / "out"
     # A file outside /home, as the sandbox's shell setup in /etc is.
     secret = f"/opt/drive-agent-test-{name}.sh"
-    subprocess.run(
-        ["sudo", "-n", "tee", secret],
-        input="export WORKSPACE_ONLY=1\n",
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    e = {**env, "HTTPS_PROXY": upstream.url, "FAKE_HIDDEN": secret}
+    e = {
+        **env,
+        "HTTPS_PROXY": upstream.url,
+        "FAKE_HIDDEN": secret,
+        "PATH": f"{private}:{env['PATH']}",
+    }
     del e["DRIVE_AGENT_ISOLATION"], e["DRIVE_AGENT_HOME_ROOT"]
     try:
+        subprocess.run(
+            [
+                "sudo",
+                "-n",
+                "install",
+                "-d",
+                "-m",
+                "700",
+                "-o",
+                str(os.getuid()),
+                private,
+            ],
+            check=True,
+        )
+        shutil.copy(Path(env["PATH"].split(":")[0]) / "claude", private / "claude")
+        subprocess.run(
+            ["sudo", "-n", "tee", secret],
+            input="export WORKSPACE_ONLY=1\n",
+            text=True,
+            capture_output=True,
+            check=True,
+        )
         drive(
             e,
             "run",
@@ -1899,7 +1921,7 @@ def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
             "FAKE_HIDDEN",
         )
     finally:
-        subprocess.run(["sudo", "-n", "rm", "-f", secret], check=False)
+        subprocess.run(["sudo", "-n", "rm", "-rf", secret, private], check=False)
     seen = json.loads((out / "files" / "seen.json").read_text())
     assert seen["user"] == name
     assert seen["homes"] == [name]

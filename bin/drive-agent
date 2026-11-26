@@ -81,7 +81,8 @@ run options:
   --deny-host HOST     also refuse HOST at the proxy (repeatable)
   --bind-tool PATH     also give the agent this program in ~/.local/bin (repeatable);
                        the harness, uv and uvx are given when they live where
-                       the box hides (/home, /tmp, /var/tmp, /dev/shm)
+                       the box hides (/home, /tmp, /var/tmp, /dev/shm) or where
+                       the box's user can't run them
   --hide PATH          also show the agent PATH as an empty file (repeatable); the
                        box already hides /etc/sandbox-persistent.sh and
                        /etc/sandbox-secrets.sh, which set this sandbox's own
@@ -728,6 +729,11 @@ class Box:
         tar.stdout.close()
         if tar.wait():
             raise Failed(f"couldn't copy {source}")
+
+    def can_run(self, path: str) -> bool:
+        """Whether the box's user can run `path` where it is, as from a folder only
+        the driver can enter it can't."""
+        return run(*self.as_user(), "test", "-x", path, check=False).returncode == 0
 
     def give_tool(self, path: str) -> None:
         """Makes `path` runnable as ~/.local/bin/<its name> inside the box: bound
@@ -2077,10 +2083,11 @@ def prepare_home(
 ) -> tuple[Path, dict]:
     """Gives the box its tools, git identity, projects and setup; returns the folder
     the agent starts in and the environment every command in the box gets."""
-    # The agent's PATH leaves out every folder the box hides.
+    # The agent's PATH leaves out every folder the box hides, and a tool in a folder
+    # the box's user can't enter is no use to it on PATH.
     tools = [harness_bin, *filter(None, map(shutil.which, ("uv", "uvx")))]
     for tool in tools:
-        if hidden(tool) or hidden(os.path.realpath(tool)):
+        if hidden(tool) or hidden(os.path.realpath(tool)) or not box.can_run(tool):
             box.give_tool(tool)
     for tool in args.bind_tool:
         box.give_tool(tool)

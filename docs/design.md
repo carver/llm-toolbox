@@ -806,6 +806,52 @@ the id, neither is picked, and the current folder's newest is read as before. Th
 and when no project holds it, a line on stderr names the log that was read, since it
 may be another session's; session-scan passes the line on.
 
+### session-grep prints commands only, and masks secret-shaped values (#13, 2026-11-26)
+
+An agent looking for the session that ran `git reset --hard HEAD~1` in a main
+tree grepped the raw JSONL about eight times. JSON escaping hid matches, and each
+try printed 1 to 2k characters of log. session-grep decodes each assistant
+record's tool calls and matches the command as typed. Every tool_use record checked
+(about 3,900 in the 30 newest main logs, 1,100 in the 30 newest subagent logs,
+2026-11-26) carries `timestamp`, `cwd` and `sessionId`. A subagent's log has
+`agentId` and sits in its session's folder, and no main log held a sidechain record
+with a call. So the session and agent come from the log's path, and the time and cwd
+from the record.
+
+It reads only calls' inputs. Outputs and message text are never searched, since
+an output can hold anything a command printed. A command can hold a secret too,
+typed inline (`GH_TOKEN=... gh api`, a curl Authorization header), so values of
+the common shapes print as `***`. The pattern matches before masking, so searching
+for a token finds the call without printing the token. There is no flag to turn
+the mask off. A regex mask misses shapes it doesn't know, so `-h` calls it best
+effort and says to treat the output as private. Names that end in a secret word
+are masked (`GH_TOKEN`, `--client-secret`) and names that only contain one are
+not (`--token-file PATH`). `$references` are left as typed, since they name the
+secret rather than hold it. A value after a space is masked only after an
+option's dashes (`--password x`). The first version also masked a bare word's
+next word, and on 7 days of real logs 473 of its 538 masked commands were that
+form, mostly ordinary words such as `grep -rn password src/` and `gh secret set
+FOO`. YAML-style `password: x` stays unmasked for the same reason: code holds it
+far more often than a secret does.
+
+A call is logged before it runs, so every search found its own call and exit 1
+never happened inside a session. A call that runs session-grep is held back until
+its result appears in the log, and left out when none does. That skips the
+running search wherever it runs (a subagent's log, a parallel batch) without
+guessing which call is newest. A session-grep call that was cut off before its
+result is left out too.
+
+The default line is short: the session's and a subagent's first 8 id characters,
+the cwd with `~` for home, and the project folder only when the log has no cwd.
+The first version printed the full ids and the project, a median of 194
+characters before the command. `--full` keeps that long form, since
+session-digest takes the whole session id.
+
+The log listing and record time are in `lib/sessionlogs.py`, which session-digest
+now uses too. session-digest reads each log whole. session-grep streams it and
+parses only lines that contain `"tool_use"`, and skips a log last written before
+`--since`. A search over all 1.8G of logs took 8.7 s, unmeasured under load.
+
 ### Rejected: a rebuild only after 40 idle minutes (2026-11-09)
 
 The first rule. It caught all four of the main session's rebuilds, but only one

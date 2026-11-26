@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Search the commands every Claude Code session and subagent ran, never their outputs.
+
+    session-grep 'reset --hard'                      # every session, every project
+    session-grep -F 'git push' --since 2h            # the last two hours
+    session-grep rm --since '2026-11-25 14:00' --until '2026-11-25 14:10'
+    session-grep pytest --project '*llm-toolbox*' --cwd ~/code/claudedev/llm-toolbox
+    session-grep --tool Read 'secrets\\.toml'         # another tool's inputs
+    session-grep --full 'wt-ship' --max 5            # whole commands, the newest five
+
+PATTERN is a Python regular expression (-F: a fixed string; -i: either case),
+matched against each tool call's input as the agent typed it, decoded from the
+log's JSON, so quotes, backslashes and newlines match as typed. A Bash call's input
+is its command. With --tool NAME (a glob, such as 'mcp__*'; default Bash) the
+calls searched are that tool's, and a call's input is its fields as
+`key=value`, after the tool's name. Those inputs include what Write and Edit
+put in files, and they print like a command. Tool outputs and message text
+are never searched or printed: outputs can hold secrets. A call that runs
+session-grep and has no result logged yet, such as the one running this
+search, is left out, so a search that finds nothing else exits 1.
+
+Each match prints one line: the time (local), the session ID's first 8
+characters, the agent (main, agent-<first 8 of its id> (description) for a
+subagent, <run>:<label> for a workflow agent), the call's cwd as the log records
+it (~ for your home), or the project folder when the log has no cwd, and the
+command, newlines shown as ⏎, cut to 160 characters around the first match.
+--full prints the long form instead: the project folder, the whole session ID
+(which session-digest takes), the agent's whole name and the cwd, with the whole
+command indented under the line. Matches print in time order; past --max
+(default 50) the newest are kept, and a line on stderr says how many older ones
+were left out.
+
+Values shaped like secrets are printed as ***: an env-style assignment whose
+name ends in token, secret, password, passwd, api key, access key, private key,
+credentials or _KEY (GH_TOKEN=..., AWS_SECRET_KEY=...), and an option of those
+names with its value after = or a space (--password ..., --client-secret=...),
+unless the value is a $reference; an Authorization, X-Api-Key or Cookie
+header's value, in a curl -H or in JSON; a URL's password; GitHub, GitLab,
+Anthropic or OpenAI, Stripe, Hugging Face, Google API, Slack and AWS key
+shapes; a JWT; a private key block. A secret word on its own, as in `grep
+password src/`, is not a name, and what follows it prints as typed. The pattern
+is matched before masking, so a search for a secret finds the call without
+printing it. The mask is best effort: a secret in another shape prints as
+typed, so treat the output as private.
+
+--since and --until take a local time (2026-11-25 14:00, 2026-11-25T14:00:30,
+2026-11-25, or 14:00 or 9:00:00 for today) or a duration back from now (90s,
+30m, 2h, 3d). --until with a date alone means the end of that day. A log last
+written before --since isn't read.
+--project GLOB matches the project folder's name (such as -home-me-code-repo);
+--cwd PATH keeps calls whose cwd is PATH or a folder under it.
+
+Logs are read from $CLAUDE_CONFIG_DIR (default ~/.claude): projects/<project>/
+<session>.jsonl, and the session's subagents/ and workflow agents beside it.
+
+Exit status: 0 printed a match; 1 no match; 2 usage error, such as a bad pattern
+or time.
+"""
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import sys
+from collections.abc import Iterator
+from datetime import datetime, time, timedelta
+from pathlib import Path
+from typing import NamedTuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from sessionlogs import agent_logs, config_dir, timestamp
+
+WIDTH = 160
+CONTEXT = 40  # characters kept before a match that lies past WIDTH
+DESCRIPTION = 30  # a subagent's description is cut to this
+SHORT_ID = 8  # a session's or subagent's id is cut to this, except under --full
+# A command that runs session-grep: its own call is logged before it runs.
+RUNS_SELF = re.compile(r"(?:^|[\s;&|(`/])session-grep(?=\s|$)")
+MAX = 50
+NEWLINE = " ⏎ "
+MASK = "***"
+DURATION = re.compile(r"(\d+)([smhd])")
+UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
+
+# A name whose value is a secret: GH_TOKEN, API_KEY, --client-secret, --password.
+SECRET_NAME = (
+    r"[A-Za-z0-9_.-]*?(?:token|secret|password|passwd|api[_-]?key|access[_-]?key"
+    r"|private[_-]?key|credentials?)"
+)
+# A literal value: single-quoted, double-quoted without a $, or a bare word; never a
+# $reference, which names the secret rather than holding it.
+LITERAL = r"""'[^']*'|"[^"$]*"|[^\s"'$;&|)-][^\s;&|)]*"""
+MASKS = [
+    (
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            re.DOTALL,
+        ),
+        MASK,
+    ),
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,})"), MASK),
+    (re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"), MASK),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), MASK),
+    (re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}"), MASK),
+    (re.compile(r"\bhf_[A-Za-z0-9]{20,}"), MASK),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}"), MASK),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), MASK),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), MASK),
+    (re.compile(r"\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}"), MASK),
+    (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), rf"\1{MASK}@"),
+    (
+        re.compile(
+            r"\b((?:proxy-)?authorization|x-api-key|api-key|x-auth-token|cookie)"
+            r"(\"?\s*:\s*\"?)((?:bearer|basic|token)\s+)?[^\s\"']+",
+            re.IGNORECASE,
+        ),
+        rf"\1\2\3{MASK}",
+    ),
+    # NAME=value, for an env name or an option.
+    (
+        re.compile(rf"(?<![\w-])(-{{0,2}}{SECRET_NAME})=(?:{LITERAL})", re.IGNORECASE),
+        rf"\1={MASK}",
+    ),
+    (re.compile(rf"(?<![\w-])([A-Z0-9_]*_KEY)=(?:{LITERAL})"), rf"\1={MASK}"),
+    # --name value: only after an option's dashes, since a bare word followed by
+    # another (grep password src/) is no assignment.
+    (
+        re.compile(rf"(?<![\w-])(--?{SECRET_NAME})(\s+)(?:{LITERAL})", re.IGNORECASE),
+        rf"\1\2{MASK}",
+    ),
+]
+
+
+class BadTime(ValueError):
+    pass
+
+
+class Match(NamedTuple):
+    when: datetime
+    project: str
+    session: str
+    agent: str  # main, a workflow agent's name, or agent-<id>
+    about: str  # a subagent's description, else ""
+    cwd: str
+    command: str
+
+
+class Search(NamedTuple):
+    pattern: re.Pattern
+    tool: str
+    since: datetime | None
+    until: datetime | None
+    cwd: Path | None
+
+
+def mask(command: str) -> str:
+    for secret, replacement in MASKS:
+        command = secret.sub(replacement, command)
+    return command
+
+
+def when(text: str, flag: str) -> datetime:
+    """A --since or --until value as a local time, aware of its zone."""
+    now = datetime.now().astimezone()
+    if duration := DURATION.fullmatch(text):
+        return now - timedelta(**{UNITS[duration[2]]: int(duration[1])})
+    if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", text):
+        try:
+            clock = time.fromisoformat(text if text.index(":") == 2 else "0" + text)
+            return datetime.combine(now.date(), clock, now.tzinfo)
+        except ValueError:
+            pass
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        raise BadTime(
+            f"session-grep: {flag} {text!r} is neither a time (2026-11-25 14:00, "
+            "14:00) nor a duration (30m, 2h, 3d)"
+        ) from None
+    if flag == "--until" and re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        moment += timedelta(days=1, microseconds=-1)  # the day's end
+    return moment if moment.tzinfo else moment.astimezone()
+
+
+def tool_text(name: str, tool_input: dict) -> str:
+    if name == "Bash":
+        return str(tool_input.get("command", ""))
+    fields = (
+        f"{key}={value if isinstance(value, str) else json.dumps(value)}"
+        for key, value in tool_input.items()
+    )
+    return f"{name}: {' '.join(fields)}"
+
+
+def under(cwd: str, folder: Path) -> bool:
+    path = Path(os.path.normpath(cwd))
+    return path == folder or folder in path.parents
+
+
+def calls(log: Path, search: Search) -> Iterator[tuple[datetime, str, str]]:
+    """Each matching call in the log: its time, its cwd and its input's text. A call
+    that runs session-grep is held back until its result is logged, and left out
+    when none is, since the search running now is one."""
+    # Each held-back call's id, as the log writes it, and what it would yield.
+    held: dict[bytes, tuple[datetime, str, str]] = {}
+    with log.open("rb") as lines:
+        for line in lines:
+            for call_id in [i for i in held if i in line]:
+                yield held.pop(call_id)
+            # Only an assistant record holds a call; skip the rest unparsed.
+            if b'"tool_use"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("type") != "assistant":
+                continue
+            moment = timestamp(record)
+            if moment is None:
+                continue
+            if (search.since and moment < search.since) or (
+                search.until and moment > search.until
+            ):
+                continue
+            cwd = record.get("cwd")
+            if search.cwd and not (isinstance(cwd, str) and under(cwd, search.cwd)):
+                continue
+            content = (record.get("message") or {}).get("content")
+            for block in content if isinstance(content, list) else []:
+                if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                    continue
+                name = str(block.get("name", ""))
+                if not fnmatch.fnmatchcase(name, search.tool):
+                    continue
+                tool_input = block.get("input")
+                text = tool_text(
+                    name, tool_input if isinstance(tool_input, dict) else {}
+                )
+                if not search.pattern.search(text):
+                    continue
+                found = (moment, cwd if isinstance(cwd, str) else "-", text)
+                if name == "Bash" and RUNS_SELF.search(text):
+                    held[json.dumps(str(block.get("id", ""))).encode()] = found
+                else:
+                    yield found
+
+
+def sessions(project: Path) -> list[Path]:
+    """Each session's main log path, whether or not it exists: a subagent's log can
+    outlive it."""
+    names = {p.stem for p in project.glob("*.jsonl")}
+    names |= {p.parent.name for p in project.glob("*/subagents")}
+    return [project / f"{name}.jsonl" for name in sorted(names)]
+
+
+def search_all(projects: Path, project_glob: str, search: Search) -> list[Match]:
+    found = []
+    for project in sorted(p for p in projects.iterdir() if p.is_dir()):
+        if not fnmatch.fnmatchcase(project.name, project_glob):
+            continue
+        for session in sessions(project):
+            agents = [("main", "", session)] if session.is_file() else []
+            for log in agent_logs(session):
+                about = "" if log.workflow else str(log.meta.get("description", ""))
+                agents.append((log.name, about, log.path))
+            for agent, about, path in agents:
+                try:
+                    if search.since and path.stat().st_mtime < search.since.timestamp():
+                        continue
+                    hits = list(calls(path, search))
+                except FileNotFoundError:  # deleted since it was listed
+                    continue
+                for moment, cwd, text in hits:
+                    found.append(
+                        Match(
+                            moment, project.name, session.stem, agent, about, cwd, text
+                        )
+                    )
+    return sorted(found, key=lambda m: m.when)
+
+
+def home_short(cwd: str) -> str:
+    home = str(Path.home())
+    if cwd == home or cwd.startswith(home + "/"):
+        return "~" + cwd[len(home) :]
+    return cwd
+
+
+def cut(command: str, pattern: re.Pattern) -> str:
+    """The command on one line, at most WIDTH characters, around its first match."""
+    flat = command.replace("\n", NEWLINE)
+    if len(flat) <= WIDTH:
+        return flat
+    hit = pattern.search(flat)
+    if hit is None or hit.end() <= WIDTH - 1:
+        return flat[: WIDTH - 1] + "…"
+    window = flat[max(0, hit.start() - CONTEXT) :]
+    if len(window) <= WIDTH - 1:
+        return "…" + window
+    return "…" + window[: WIDTH - 2] + "…"
+
+
+def show(match: Match, pattern: re.Pattern, full: bool) -> str:
+    local = match.when.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    command = mask(match.command)
+    if full:
+        agent = f"{match.agent} ({match.about})" if match.about else match.agent
+        head = f"{local}  {match.project}  {match.session}  {agent}  {match.cwd}"
+        return "\n".join([head, *("    " + line for line in command.split("\n"))])
+    agent = match.agent
+    if agent.startswith("agent-"):
+        agent = agent[: len("agent-") + SHORT_ID]
+    if match.about:
+        agent = f"{agent} ({match.about[:DESCRIPTION]})"
+    where = home_short(match.cwd) if match.cwd != "-" else match.project
+    head = f"{local}  {match.session[:SHORT_ID]}  {agent}  {where}"
+    return f"{head}  {cut(command, pattern)}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="session-grep",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("pattern", help="a regular expression (-F: a fixed string)")
+    parser.add_argument(
+        "-F", "--fixed", action="store_true", help="PATTERN is a fixed string"
+    )
+    parser.add_argument(
+        "-i", "--ignore-case", action="store_true", help="match either case"
+    )
+    parser.add_argument(
+        "--tool",
+        default="Bash",
+        help="the tool whose calls to search, a glob (default: Bash)",
+    )
+    parser.add_argument("--since", help="a local time or a duration back from now")
+    parser.add_argument("--until", help="a local time or a duration back from now")
+    parser.add_argument(
+        "--project", default="*", help="a glob on the project folder's name"
+    )
+    parser.add_argument("--cwd", help="only calls run in this folder or under it")
+    parser.add_argument("--full", action="store_true", help="print each command whole")
+    parser.add_argument(
+        "--max",
+        type=int,
+        default=MAX,
+        help=f"print the newest N matches (default: {MAX})",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        pattern = re.compile(
+            re.escape(args.pattern) if args.fixed else args.pattern,
+            re.IGNORECASE if args.ignore_case else 0,
+        )
+    except re.error as error:
+        print(
+            f"session-grep: bad pattern {args.pattern!r}: {error}; -F takes it as a fixed string",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        since = when(args.since, "--since") if args.since else None
+        until = when(args.until, "--until") if args.until else None
+    except BadTime as error:
+        print(error, file=sys.stderr)
+        return 2
+    if args.max < 1:
+        print("session-grep: --max takes 1 or more", file=sys.stderr)
+        return 2
+    cwd = Path(os.path.abspath(os.path.expanduser(args.cwd))) if args.cwd else None
+    search = Search(pattern, args.tool, since, until, cwd)
+
+    projects = config_dir() / "projects"
+    if not projects.is_dir():
+        print(f"session-grep: no session logs under {projects}", file=sys.stderr)
+        return 1
+    found = search_all(projects, args.project, search)
+    if not found:
+        return 1
+    if len(found) > args.max:
+        print(
+            f"session-grep: {len(found) - args.max} older matches left out; "
+            "--max N prints more, --since narrows",
+            file=sys.stderr,
+        )
+        found = found[-args.max :]
+    for match in found:
+        print(show(match, pattern, args.full))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

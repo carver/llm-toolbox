@@ -78,7 +78,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   subagent checks it on `/code-review`'s two axes, against
   `coding/standards.md`, and the agent
   triages the findings and refactors. It asks before handing a large change to
-  an implementer subagent.
+  an implementer subagent, which only implements: a fresh subagent reviews it.
 - **unslop**: cut AI tells from writing.
 - **upskill**: run by hand (`/upskill`) near the end of a session, or on an
   earlier one. Reviews it for mistakes, waste, repeated work and missing

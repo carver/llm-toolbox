@@ -7,7 +7,7 @@ description: Carry a code change through implement, review and refactor. You wri
 
 You hold the request, the conversation and the decisions, so you write the code yourself. Review runs in a subagent, so fresh eyes judge it. Make it work, then make it good: implementation carries no coding standards beyond the brief, and review carries them all.
 
-If a change looks too big to hold in your context (many files, or an already long session), stop and ask the user whether to hand implementation to a subagent. Expect this to be rare. The user makes that call, not you.
+If a change looks too big to hold in your context (many files, or an already long session), stop and ask the user whether to hand implementation to a subagent. Expect this to be rare. The user makes that call, not you. That subagent runs step 2 only and reports its commits, and you run step 3 on, with a fresh review subagent. Reason: a subagent told to run all of `/build` often has no Agent tool, so it reviews its own diff, which a fresh reviewer is there to avoid.
 
 ## 1. Brief
 

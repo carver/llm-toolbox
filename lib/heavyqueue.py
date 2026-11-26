@@ -39,6 +39,9 @@ HEAVY_SCCACHE_CPU (the tests' stand-ins for /proc/meminfo, /proc/vmstat, /proc/s
 and sccache's CPU time), as bin/heavy's
 -h describes them; HEAVY_SLOT, which a job's environment carries so a heavy inside it
 runs at once; and RUSTC_WRAPPER, to start sccache's server before pinning.
+
+Every job that takes a slot or runs outside the queue goes on lib/heavyjobs.py's
+record, with its own CPU time and that of other work on its cores (Tally).
 """
 
 import math
@@ -56,6 +59,7 @@ from typing import NamedTuple
 import cores
 import fifo
 import heavyhistory
+import heavyjobs
 from fifo import Holder
 
 LANES = ("normal", "long")
@@ -166,41 +170,78 @@ def sccache_seconds():
     return ticks / os.sysconf("SC_CLK_TCK")
 
 
-class Outside:
-    """What other work an --alone job's cores did while it ran: their busy time minus
-    the job's own (CMD and what it waited for, so a process CMD left running counts as
-    other work) and the sccache server's, which runs a cargo job's compiles but isn't
-    its child. The server is the VM's, so another session's compiles then count as
-    the job's own. A measure that can't be taken is a note, never a failure: the job
-    has run."""
+class Use(NamedTuple):
+    """A job's run: its seconds, the cores it kept busy on average, and the
+    CPU-seconds it used, other work used on its cores, and sccache's server used."""
+
+    seconds: float
+    cores: float
+    own: float
+    other: float
+    compiles: float
+
+
+class Tally:
+    """A job's measure, from when it starts to when it ends: its own CPU time (CMD
+    and what it waited for, so a process CMD left running counts as other work), and
+    the busy time of its cores less that and the sccache server's, which runs a cargo
+    job's compiles but isn't its child. The server is the VM's, so another session's
+    compiles then count as the job's own. A busy time that can't be read leaves
+    `error` set and the Use's other and compiles None."""
 
     def __init__(self, cpus):
-        self.cpus = cpus
+        self.cpus, self.error, self.used = cpus, None, None
+        self.run = heavyhistory.Run()
+        try:
+            self.before = busy_seconds(cpus), sccache_seconds()
+        except (OSError, ValueError, IndexError) as error:
+            self.before, self.error = None, error
+
+    def end(self):
+        """The Use, measured the first time it's asked for, as the job ends."""
+        if self.used is None:
+            cores_used, seconds = self.run.cores()
+            other = compiles = None
+            if self.before is not None:
+                try:
+                    busy, compiles = busy_seconds(self.cpus), sccache_seconds()
+                    compiles -= self.before[1]
+                    other = busy - self.before[0] - cores_used * seconds - compiles
+                    other = max(0.0, other)
+                except (OSError, ValueError, IndexError) as error:
+                    self.error, compiles = error, None
+            self.used = Use(seconds, cores_used, cores_used * seconds, other, compiles)
+        return self.used
+
+
+class Outside:
+    """What other work an --alone job's cores did while it ran, as its Tally measured
+    it. A measure that can't be taken is a note, never a failure: the job has run."""
+
+    def __init__(self, tally):
+        self.tally = tally
         try:
             self.limit = knob("HEAVY_ALONE_OUTSIDE", ALONE_OUTSIDE)
-            self.before = busy_seconds(cpus), sccache_seconds()
+            if tally.error is not None:
+                raise tally.error
         except (OSError, ValueError) as error:
-            self.before = None
+            self.limit = None
             note(
                 f"heavy: can't tell what other work shares this --alone job ({error})."
             )
 
-    def report(self, run):
+    def report(self):
         """Say it on stderr, with a warning past HEAVY_ALONE_OUTSIDE cores, and write
         `seconds own other` to the HEAVY_ALONE_REPORT file when one is named."""
-        if self.before is None:
+        if self.limit is None:
             return
-        used, seconds = run.cores()
-        try:
-            busy, compiles = busy_seconds(self.cpus), sccache_seconds()
-        except (OSError, ValueError) as error:
+        seconds, _, own, other, compiles = self.tally.end()
+        if other is None:
             note(
-                f"heavy: can't tell what other work shared this --alone job ({error})."
+                "heavy: can't tell what other work shared this --alone job"
+                f" ({self.tally.error})."
             )
             return
-        compiles -= self.before[1]
-        own = used * seconds
-        other = max(0.0, busy - self.before[0] - own - compiles)
         average = other / seconds if seconds > 0 else 0.0
         line = (
             f"heavy: while this --alone job ran ({seconds:.1f} s), other work used"
@@ -343,6 +384,7 @@ class Job:
     expendable: bool = False
     status: int | None = None
     oom_kills_at_start: int | None = field(default_factory=oom_kills)
+    command_pid: int | None = None  # CMD's, for the record, once its caller starts it
 
     def pin(self):
         """Pin this process to the job's cores, and nice it for a sharer; what it
@@ -470,19 +512,27 @@ def turn(
             note("heavy: --alone does nothing inside a job, which runs at once.")
         yield Job(sorted(os.sched_getaffinity(0)), dict(os.environ), nested=True)
         return
+    joined = time.time()
     cpus = sorted(os.sched_getaffinity(0))
     lane = "long" if long and split(cpus) else "normal"
+    here = folder_now()
+    known_as = None if here is None else heavyhistory.key(here, command)
+    asked = {"command": command, "key": known_as, "lane": lane, "joined": joined}
+    asked |= {"cwd": here}
+    asked |= {"long": long, "alone": alone, "share": share, "front": front}
+    asked |= {"quick": quick}
     lull = Lull(lane, cpus) if quick else None
     if lull is not None:
         why = lull.why_not(lull.first_look())
         if why is None:
-            yield lull.job()
+            job = lull.job()
+            with recorded(job, asked, "outside", beside=slot_text(lane)):
+                yield job
             return
         if slot_text(lane) is not None:  # else nothing it waits on needs a word
             note(f"heavy: {why}, so this --few-seconds job waits at the queue's front.")
     folder = lane_folder(lane)
     me = Holder.mine()
-    known_as = heavyhistory.key(os.getcwd(), command)
     # One line, or a command's own lines would read as the entry's fields.
     one_line = command.replace("\n", "\\n")
     about = f"cwd={os.getcwd()}\ncmd={one_line}\nkey={known_as}\n"
@@ -514,24 +564,76 @@ def turn(
         ).wait()
         if started is None:  # a --few-seconds job whose cores went quiet
             entry.unlink(missing_ok=True)
-            yield lull.job()
+            job = lull.job()
+            with recorded(job, asked, "outside", beside=slot_text(lane)):
+                yield job
             return
         env = dict(os.environ) | {
             "HEAVY_SLOT": first_line(started.text),
             "CARGO_BUILD_JOBS": str(started.jobs),
         }
         job = Job(started.cpus, env, nice=started.nice)
-        run = heavyhistory.Run()
-        outside = Outside(started.cpus) if alone else None
-        yield job
+        how = started.slot.name if started.slot.name == "share" else "slot"
+        beside = slot_text(lane) if how == "share" else None
+        with recorded(job, asked, how, beside) as tally:
+            outside = Outside(tally) if alone else None
+            yield job
         if outside is not None:
-            outside.report(run)
+            outside.report()
         if job.status == 0:
-            heavyhistory.record(base(), known_as, *run.cores())
+            used = tally.end()
+            heavyhistory.record(base(), known_as, used.cores, used.seconds)
     finally:
         entry.unlink(missing_ok=True)
         if started is not None:
             fifo.release(started.slot, started.text)
+
+
+def folder_now():
+    """This process's folder, or None when it has been removed: a --few-seconds job
+    run outside the queue still runs there."""
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        return None
+
+
+@contextmanager
+def recorded(job, asked, how, beside=None):
+    """Record the job in heavyjobs' file while the body runs it, yielding its Tally:
+    asked is what turn() was asked for, how where the job runs (`slot`, `share` or
+    `outside`), and beside the slot text of the holder a sharer or an outside job
+    started beside. Nothing here fails the job."""
+    tally = Tally(job.cpus)
+    command, cut = heavyjobs.shown(asked["command"])
+    fields = {name: value for name, value in asked.items() if name != "command"}
+    fields |= {"cmd": command, "cut": cut, "how": how}
+    fields |= {"cores": span(job.cpus), "nice": job.nice}
+    if beside:
+        holder = Holder.parse(beside)
+        pid = int(holder.pid) if (holder.pid or "").isdigit() else None
+        fields["beside"] = {"session": holder.session, "pid": pid}
+    ident = heavyjobs.started(base(), fields)
+    stopped_by = None
+    try:
+        yield tally
+    except BaseException as error:
+        stopped_by = getattr(error, "signum", None)
+        raise
+    finally:
+
+        def end():
+            used = tally.end()
+            return {"exit": job.status, "signal": stopped_by} | {
+                "cmd_pid": job.command_pid,
+                "cpu": round(used.own, 3),
+                "other_cpu": None if used.other is None else round(used.other, 3),
+                "sccache_cpu": None
+                if used.compiles is None
+                else round(used.compiles, 3),
+            }
+
+        heavyjobs.ended(base(), ident, end)
 
 
 class Snapshot(NamedTuple):

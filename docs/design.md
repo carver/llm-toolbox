@@ -58,6 +58,25 @@ landings are fewer full checks per landing and cheaper ones, not more at once.
 The script and its raw results (hyperfine JSON, vmstat logs) are in
 `/home/carver/code/claudedev/keep/heavy-lane-exp/` on the host disk, outside git.
 
+### Every job goes on a record; its command is cut, not redacted (2026-11-26)
+
+On 2026-11-24 a filedrawer landing's tests ran ten times slower than usual, beside a 12-minute pytest that the sandbox's processes.log showed by its PID alone; by then it had exited, and nothing said what it ran, for whom, or how it got in (#9, #8).
+history.json, keyed by a hash, couldn't say either.
+So every job a heavy runs in a slot or outside the queue writes a JSON line to `HEAVY_DIR/jobs.jsonl` as it starts and one as it ends, and `heavy history --overlapping PID|TIME|START..END` answers "what ran beside my landing?" in one command.
+
+- The start line is written before CMD runs, so a job still running, or one whose heavy was killed, shows (as `running` or `no end recorded`).
+- Overlaps are found when the record is read, from each job's start and end, rather than stored with a job: one still running when another ends is found the same way as one that ended first.
+- Each job's end line holds the CPU-seconds other work used on its cores while it ran, as `--alone`'s report measures it, so load from work outside the queue shows too, not only heavy's jobs.
+- A heavy inside a job adds no record: its work is the job's, and a commit check inside wt-ship's job would list each landing twice.
+- Lines are appended in one write without the queue's lock, and the file is cut to its newest 2000 lines past 2 MiB, by a rename. A line appended during that rename can be lost; taking the lock at each line would add a wait to every job's start and end for a record that only explains.
+- Nothing in it fails a job: any error is a one-line note, and heavy's stop signals wait while a line is written, since heavy stops CMD by raising from its signal handler.
+- It lives with the queue in /tmp, so a reboot clears it. A crash's post-mortem then has only the sandbox's processes.log.
+
+A command line can hold a secret (`--token X`, `TOKEN=X`, `-pX`, a URL's credentials), and the record outlives the job, so it keeps the command's first words only, up to the first that may be a value (a word holding `=` or `@`, one after an option, or an option other than a bare `-X` or `--word`, which may hold its value glued on) and at most 120 characters, with `cut` set when it dropped any.
+It doesn't keep every secret out: a bare positional token, as in `./deploy prod TOKEN`, looks like a subcommand and is kept.
+The other option the issue named, redacting what looks like a secret and keeping the rest, fails open: every shape it doesn't know (a header after `-H`, a positional token, a new tool's flag) is kept in full. Cutting fails closed: what it drops can't leak, and the first words still name the tool, its subcommand and its folder, enough to say which job overlapped.
+The cost is detail: `sh -c 'pytest -n 8'` shows as `sh -c`, and `pytest -k name` as `pytest -k`. The record's `key`, history.json's hash of the repo and the whole command, still tells two runs of one command from runs of another.
+
 ### heavy-bench: a benchmark is many short --alone jobs, interleaved (2026-11-25)
 
 In filedrawer #137's benchmark (2026-11-25), `heavy --alone -- hyperfine` over three variants of a 2-minute suite held heavy's queue for about 25 minutes, so every session's commit checks waited behind it; the owner asked for it split.

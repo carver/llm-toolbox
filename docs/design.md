@@ -1341,7 +1341,71 @@ permission rules, is undocumented.
 lib/paperkit/git.py keeps its own copy of the main-tree test, since paperkit is
 vendored into projects without lib/; test_maintree.py holds the two to one answer.
 Issue #12 (destructive git after a bare `cd X;`) reuses the walk: each step names the
-latest earlier `cd` in its scope that ends with `;` or a newline.
+earlier cds in its scope whose failure wouldn't stop it, with the folder each would
+leave the shell in.
+
+### Destructive git after a loose cd, or in a main tree, is refused (#12, 2026-11-26)
+
+On 2026-11-23 a review agent's `cd filedrawer; ...; d=<scratch>/r; cd $d; ...; git
+reset -q --hard HEAD~1` met a folder that didn't exist: the cd failed, the shell stayed
+in filedrawer's main tree, and the reset dropped main's newest commit, unnoticed for
+two hours. On 2026-11-26, `cd WT && sleep 900 & by=$!; heavy -- bin/mutate-check ...`
+sent the cd to the background with the sleep, mutate-check put a mutant into
+llm-toolbox's main tree, whose bin/ every session runs, and it killed every process
+on the VM. bin/wrong-tree-gate refuses both shapes for git before anything runs: a
+destructive git command (`reset --hard`, `checkout -f`, `switch -f`, `clean -f`,
+`restore` of the work tree, `stash drop`/`clear`, a `rebase` that starts one) after a
+cd whose failure wouldn't stop it, and one in the main tree of a repo with an agent
+check, judged by lib/maintree.py's walk as #4's commit refusal is. mutate-check,
+which the first draft gated too, refuses a main tree itself since 07771c1.
+
+- Scope of the main-tree rule: repos with an agent check, as #4's, rather than every
+  repo under the workspace root the issue named. That leaves out what has no rule to
+  break: the shallow clones in `cache/`, review scratch repos, and the workspace
+  repos with no agent check (blog, research, dot-files and others), which #4's
+  commit refusal leaves free too.
+- A loose cd is one whose failure doesn't stop the command: it ends with `;` or a
+  newline, or it starts an `&&` list that does, as in `cd X && git fetch; git reset
+  --hard`, where a failed cd skips only the fetch. `cd X || exit` was never loose;
+  `cd X || echo` isn't caught.
+- It is judged by the folder the shell would stay in if it failed, and refused only
+  when that folder isn't certain or is a main tree the rule below refuses. A scratch
+  experiment that cds about under /tmp, or `cd ..; git reset --hard` from there,
+  has no main tree to hit; the incident's shell stayed in filedrawer's. With several
+  loose cds, each one's folder counts, back to the latest that names an absolute
+  folder that is there when the hook runs.
+- `set -e` makes a later cd safe only where bash heeds it. Bash ignores it in an if,
+  while or until condition, in a non-final part of an `&&` or `||` list, and in every
+  command inside a group, subshell or compound command sitting in one of those places
+  (`set -e; { cd $d; git reset --hard; } || echo failed` resets wherever the shell
+  was), so shellparse marks those commands `unchecked`, and the walk counts no `set
+  -e` at all once the command defines a function, which may be called as `f || true`.
+  It is tracked per subshell, `set +e` undoing it.
+- The honest case, an agent resolving its own rebase in the main tree of a repo with
+  no worktrees. Finishing one under way (`--continue`, `--abort`, `--skip`, `--quit`,
+  `--edit-todo`) passes anywhere. The owner's call (2026-11-26, on #12): in a main tree
+  mid-merge, mid-rebase, mid-cherry-pick or mid-revert, only that and a path's fix
+  pass, `restore` and `checkout -f` naming paths (after `--`, or with `--ours`,
+  `--theirs`, `-m` or `--conflict`); `reset --hard`, `clean -f`, `stash drop`/`clear`
+  and a branch's `checkout -f` stay refused, with the opt-out prefix for what the
+  user asked for. An unborn HEAD, a submodule and a bare repo still let all of it
+  through, as #4's commit does.
+- Cost: the gate runs on every Bash call. It exits before importing the parser when
+  the command names none of the subcommands it judges: about 45 ms a call against
+  90 ms (hyperfine, 20 runs each, 2026-11-26), and 28 against 45 ms on another run;
+  the rest is the interpreter starting.
+
+A dry run over the transcripts (2026-10-30 to 11-26, against the filesystem of 11-26;
+keep/llm-toolbox/wrong-tree-gate/replay2.json) found 241 Bash calls with destructive
+git, and the gate refused 101. 8 ran in a main tree, all from before agents moved to
+worktrees (11-10) or undated. 93 followed a loose cd, 57 of them through the `&&`-list
+rule. 53 of the 93 name an absolute worktree folder since removed: when they ran it
+was there (only 4 results in all 93 show a cd failing, the 11-23 incident's among
+them), so the gate would have passed them. The other 40 cd to a variable (`cd $S;
+...`) or a relative folder in review scratch experiments started from a main-tree cwd,
+the incident's shape: 21 of them since 11-10, under one a day. The first draft's run
+(replay.json) counted mutate-check too, 1,245 calls and 237 refused. The one-shot
+`AGENT_MAIN_TREE_OK=1` prefix is #4's, unnamed in the refusal.
 
 ### skill-patch save -C writes the patch into a worktree (#23, 2026-11-26)
 

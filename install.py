@@ -93,6 +93,12 @@ HOOKS = [
         {"timeout": 10},
     ),
     (
+        "PreToolUse",
+        "Bash",
+        "wrong-tree-gate",
+        {"timeout": 10},
+    ),
+    (
         "PostToolUse",
         "Bash",
         "issue-view-hint",

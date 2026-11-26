@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""A Claude Code PreToolUse hook that refuses destructive git where it may hit the
+wrong tree.
+
+On 2026-11-23 a review agent ran `cd filedrawer; ...; cd $d; ...; git reset -q --hard
+HEAD~1`. The folder in $d didn't exist, so the second cd failed, the shell stayed in
+filedrawer's main tree, and the reset dropped main's newest commit there. On
+2026-11-26, in `cd WT && sleep 900 & by=$!; heavy -- bin/mutate-check ...`, the `&`
+sent the cd to the background with the sleep, so mutate-check put its mutants into
+llm-toolbox's main tree, whose bin/ every session runs, and one killed every process
+on the VM (since then, mutate-check refuses a main tree itself). So this gate refuses
+a Bash command that would run destructive git:
+
+- after a `cd` (or pushd) whose failure wouldn't stop it, so it would run wherever
+  the shell already was: one that ends with `;` or a newline, or one chained with
+  `&&` to a list that then ends with `;` or a newline, as in `cd X && git fetch; git
+  reset --hard`. It is judged by the folder the shell would stay in: the command
+  passes when that folder is certain and isn't a main tree as below, so `cd ..; git
+  reset --hard` from /tmp passes. The refusal names the cd and says to chain it with
+  `&&`, to name the folder with `git -C DIR`, or to put `set -e` first. A cd to an
+  absolute folder that is there, a later `cd /abs &&` chained to the command, a `git
+  -C` an absolute folder, or a `set -e` before the cd takes the risk away. `set -e`
+  doesn't count where bash ignores it: for a cd in an if, while or until condition,
+  or in a group, subshell or compound command that a non-final part of an `&&` or
+  `||` list is (`{ cd $d; ...; } || echo`), or anywhere once the command defines a
+  function, which may be called that way.
+- in a repo's main tree, not a linked worktree, when the repo has an agent check (an
+  executable agent-pre-commit among its hooks, as agent-commit-gate's refusal of a
+  commit there reads it): the owner's rule is that a main tree only receives
+  landings. The folder is the one lib/maintree.py's walk gives: the hook's cwd, moved
+  by the command's cds and pushds (not one in a list sent to the background), `git
+  -C` and bgrun's -C. Scratch repos, which have no agent check, pass.
+
+Destructive is `git reset --hard`, `checkout -f`/`--force`, `switch -f`/`--force`/
+`--discard-changes`, `clean -f` (not with `-n`), `restore` of the work tree (anything
+but `--staged` alone), `stash drop`/`clear` and a `rebase` that starts one. Finishing
+a rebase already under way (`--continue`, `--abort`, `--skip`, `--quit`,
+`--edit-todo`, `--show-current-patch`) is never destructive. In a main tree mid-merge,
+mid-rebase, mid-cherry-pick or mid-revert, a path's `restore` and `checkout -f` (one
+naming its paths after `--`, or with `--ours`, `--theirs`, `-m` or `--conflict`)
+pass too, so an agent resolving its own operation there is never left halfway;
+`reset --hard`, `clean -f` and the rest stay refused. With an unborn HEAD, in a
+submodule or a bare repo, all of it passes, as agent-commit-gate's commit does. Help
+(`-h`, `--help`) passes.
+
+It lets a command through whenever it can't tell: a main-tree folder that isn't certain
+(a cd to a variable or `~`, a sourced file, GIT_DIR; lib/maintree.py lists them), git
+that can't answer for it, a command it can't parse, input that isn't JSON. wt-ship,
+conflicts and the other tools that run git as subprocesses aren't Bash commands and are
+never seen; nor are `git branch -f`, `update-ref`, `push --force`, `pull` or `cd X ||
+echo`, which this gate doesn't catch. A command that names none of the subcommands above
+passes before the gate loads its parser, which keeps it cheap on every call. The
+one-shot prefix `AGENT_MAIN_TREE_OK=1` in front of the command lets it through, for what
+the user asked for; the refusal doesn't name it, since that is the user's call. Like
+every gate's, the refusal says nothing ran and saves the command for reuse. install.py
+registers it in ~/.claude/settings.json.
+
+    wrong-tree-gate < hook-input.json    # as Claude Code calls it
+
+Exit status: 0 the command may run; 2 refused, with the reason on stderr.
+"""
+
+import json
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+from typing import NamedTuple
+
+LIB = Path(__file__).resolve().parent.parent / "lib"
+
+# The subcommands it judges: a command naming none of them passes unparsed.
+SUBCOMMANDS = ("reset", "checkout", "switch", "clean", "restore", "stash", "rebase")
+# The one-shot prefix that lets a command through, shared with agent-commit-gate.
+OPT_OUT = "AGENT_MAIN_TREE_OK"
+# The hook whose presence marks a repo whose main tree only receives landings.
+HOOK_NAME = "agent-pre-commit"
+NEW_WORKTREE = "bin/new-worktree"
+# The rebase options that carry on or end a rebase under way rather than start one.
+REBASE_UNDER_WAY = {
+    "--continue",
+    "--abort",
+    "--skip",
+    "--quit",
+    "--edit-todo",
+    "--show-current-patch",
+}
+# How lib/maintree.py's Place.exempt ends for a merge, rebase, cherry-pick or revert
+# under way.
+IN_PROGRESS = "in progress"
+# The checkout options that name paths rather than a branch.
+CHECKOUT_PATHS = {"--", "--ours", "--theirs", "-m", "--merge"}
+# A cluster of short options, as in `-fdx`.
+SHORT = re.compile(r"-[A-Za-z]+")
+
+
+def options(args: list[str]) -> list[str]:
+    """The options among a command's arguments, before any `--`."""
+    found = []
+    for arg in args:
+        if arg == "--":
+            break
+        if arg.startswith("-"):
+            found.append(arg)
+    return found
+
+
+def has_short(opts: list[str], letter: str, takes_value: str = "") -> bool:
+    """Whether a short option cluster holds `letter` before any letter in
+    `takes_value`, whose value the rest of the cluster would be."""
+    for opt in opts:
+        if SHORT.fullmatch(opt):
+            for char in opt[1:]:
+                if char == letter:
+                    return True
+                if char in takes_value:
+                    break
+    return False
+
+
+class Destructive(NamedTuple):
+    """What a git command destroys, as words naming it, and whether it works on
+    named paths alone, as resolving a conflict does."""
+
+    what: str
+    paths: bool = False
+
+
+def destructive(subcommand: str, args: list[str]) -> Destructive | None:
+    """What a git subcommand with `args` destroys, or None."""
+    opts = options(args)
+    if any(shellparse.is_help(opt) for opt in opts):
+        return None
+    if subcommand == "reset" and "--hard" in opts:
+        return Destructive("git reset --hard")
+    if subcommand == "checkout" and ("--force" in opts or has_short(opts, "f", "bBU")):
+        named = "--" in args or any(
+            opt.split("=", 1)[0] in (*CHECKOUT_PATHS, "--conflict") for opt in opts
+        )
+        return Destructive("git checkout --force", named)
+    if subcommand == "switch" and (
+        {"--force", "--discard-changes"} & set(opts) or has_short(opts, "f", "cC")
+    ):
+        return Destructive("git switch --force")
+    if subcommand == "clean" and (
+        ("--force" in opts or has_short(opts, "f", "e"))
+        and not ("--dry-run" in opts or has_short(opts, "n", "e"))
+    ):
+        return Destructive("git clean -f")
+    if subcommand == "restore":
+        staged = "--staged" in opts or has_short(opts, "S", "s")
+        worktree = "--worktree" in opts or has_short(opts, "W", "s")
+        if worktree or not staged:
+            return Destructive("git restore", True)
+    action = next((arg for arg in args if not arg.startswith("-")), None)
+    if subcommand == "stash" and action in ("drop", "clear"):
+        return Destructive(f"git stash {action}")
+    if subcommand == "rebase" and not REBASE_UNDER_WAY & set(opts):
+        return Destructive("git rebase")
+    return None
+
+
+def pinned(words: list[str], subcommand: str) -> bool:
+    """Whether a git command's own options give -C an absolute folder, so a cd
+    before it that failed wouldn't change where it works."""
+    words = words[1:]
+    for i, word in enumerate(words[:-1]):
+        if word == subcommand:
+            break
+        if word == "-C" and words[i + 1].startswith("/"):
+            return True
+    return False
+
+
+class Target(NamedTuple):
+    """A destructive git command: what it destroys, its step, the folder it works
+    in, and whether its own `-C /abs` keeps a failed cd from moving it."""
+
+    destroys: Destructive
+    step: "maintree.Step"
+    directory: Path | None
+    pinned: bool
+
+
+def targets(command: str, cwd: Path | None):
+    """Each destructive git command in `command` run from `cwd`, as a Target."""
+    for call in maintree.git_calls(command, cwd):
+        if destroys := destructive(call.subcommand, call.args):
+            is_pinned = pinned(call.step.words, call.subcommand)
+            yield Target(destroys, call.step, call.directory, is_pinned)
+
+
+def has_agent_check(hooks: Path) -> bool:
+    agent = hooks / HOOK_NAME
+    return agent.is_file() and os.access(agent, os.X_OK)
+
+
+def will_succeed(cd: list[str]) -> bool:
+    """Whether a cd names an absolute folder, plainly, that is there now."""
+    _, target = maintree.cd_target(cd)
+    return bool(
+        target and target.startswith("/") and maintree.certain(target)
+    ) and os.path.isdir(target)
+
+
+def loose_cd_refusal(target: Target) -> str | None:
+    """Why a cd before the target, should it fail, leaves it to run where it may do
+    harm: in a folder that isn't certain, or in a main tree as main_tree_refusal
+    judges it. The latest cd first: one to an absolute folder that is there settles
+    where the shell is, whatever the cds before it did."""
+    if target.pinned:
+        return None
+    for cd in reversed(target.step.loose_cd):
+        if will_succeed(cd.words):
+            return None
+        if cd.fallback is None or main_tree(target.destroys, cd.fallback):
+            return (
+                f"Refused: `{target.destroys.what}` runs after"
+                f" `{shlex.join(cd.words)}`, and the cd, or the `&&` list it starts,"
+                " ends with `;` or a newline, so if the cd fails the shell stays"
+                " where it was and this runs there. Chain the cd with `&&` all the"
+                " way to this (`cd DIR && ... && git ...`), name the folder with"
+                " `git -C DIR`, or put `set -e` first."
+            )
+    return None
+
+
+def main_tree(destroys: Destructive, directory: Path | None):
+    """The Place of the main tree `directory` is in, when the repo has an agent
+    check and the command may not run there; else None."""
+    try:
+        where = maintree.place(directory)
+        if where is None or not where.main:
+            return None
+        midway = where.exempt and where.exempt.endswith(IN_PROGRESS)
+        if where.exempt and not (midway and not destroys.paths):
+            return None
+        if not has_agent_check(where.hooks):
+            return None
+    except Exception:  # noqa: BLE001 - a gate that can't tell lets the command through
+        return None
+    return where
+
+
+def main_tree_refusal(destroys: Destructive, directory: Path | None) -> str | None:
+    where = main_tree(destroys, directory)
+    if where is None:
+        return None
+    what = destroys.what
+    repo = where.top.name
+    own = where.top / NEW_WORKTREE
+    if own.is_file() and os.access(own, os.X_OK):
+        worktree = f"{NEW_WORKTREE} <topic>"
+    else:
+        worktree = f"git worktree add --detach ../{repo}-wt-<topic>"
+    during = ""
+    if where.exempt:
+        during = (
+            f" With {where.exempt}, only finishing it (`--continue`, `--abort`, ...)"
+            " and a path's `git restore` or `git checkout -f -- PATH` pass."
+        )
+    return (
+        f"Refused: `{what}` would run in {where.top}, {repo}'s main tree, which only"
+        f" receives landings. Do it in a worktree beside it (`{worktree}`), reached"
+        " with `cd WT && ...` or an absolute path, never a cd sent to the background"
+        f" with `&`.{during} Leave the main tree's commits and changes as they are,"
+        " and tell the user if they look wrong; if this belongs in the main tree, ask"
+        " the user first."
+    )
+
+
+def refusal(command: str, cwd: Path | None) -> str | None:
+    """Why a Bash command run from `cwd` is refused, or None when it may run."""
+    for target in targets(command, cwd):
+        if target.step.assigned.get(OPT_OUT) == "1":
+            continue
+        why = loose_cd_refusal(target)
+        if why := why or main_tree_refusal(target.destroys, target.directory):
+            return why
+    return None
+
+
+def load_lib() -> None:
+    """Import the parser and its helpers, which cost more than most calls need."""
+    global maintree, refused, shellparse
+    sys.path.insert(0, str(LIB))
+    import maintree
+    import refused
+    import shellparse
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if any(arg in ("-h", "--help") for arg in argv):
+        print(__doc__)
+        return 0
+    try:
+        event = json.load(sys.stdin)
+        if event.get("tool_name") != "Bash":
+            return 0
+        command = event["tool_input"]["command"]
+        cwd = Path(event["cwd"]) if event.get("cwd") else None
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return 0  # input it can't read: let the command through, as when unparsed
+    if not isinstance(command, str) or not any(s in command for s in SUBCOMMANDS):
+        return 0
+    load_lib()
+    try:
+        why = refusal(command, cwd)
+    except Exception:  # noqa: BLE001 - a command the gate can't read runs unjudged
+        return 0
+    if why is None:
+        return 0
+    print(f"{why} {refused.ending(event)}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

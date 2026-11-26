@@ -111,15 +111,60 @@ def test_git_calls_give_the_subcommand_args_and_prefix_settings():
 @pytest.mark.parametrize(
     ("command", "loose"),
     [
-        ("cd /x && git reset --hard", None),
-        ("cd /x; git reset --hard", ["cd", "/x"]),
-        ("cd /x\ngit reset --hard", ["cd", "/x"]),
-        ("cd /x; cd y && git reset --hard", ["cd", "/x"]),
-        ("(cd /x; true); git reset --hard", None),
+        ("cd /x && git reset --hard", []),
+        ("cd /x; git reset --hard", ["cd /x"]),
+        ("cd /x\ngit reset --hard", ["cd /x"]),
+        ("cd /x; cd y && git reset --hard", ["cd /x"]),
+        ("(cd /x; true); git reset --hard", []),
+        ("cd x; cd /y && git reset --hard", []),
+        ("cd x; cd y && git reset --hard", ["cd x"]),
+        ('cd x; cd "$Y" && git reset --hard', ["cd x"]),
+        ("cd x; cd /y; git reset --hard", ["cd x", "cd /y"]),
+        ("set -e; cd x; git reset --hard", []),
+        ("set -euo pipefail\ncd x\ngit reset --hard", []),
+        ("set -o errexit; cd x; git reset --hard", []),
+        ("set -e; set +e; cd x; git reset --hard", ["cd x"]),
+        ("set -u; cd x; git reset --hard", ["cd x"]),
+        ("(set -e); cd x; git reset --hard", ["cd x"]),
+        ("cd x; set -e; git reset --hard", ["cd x"]),
+        ("cd /x && git fetch; git reset --hard", ["cd /x"]),
+        ("cd /x && git fetch & git reset --hard", []),
+        ("cd /x && { git fetch; git reset --hard; }", []),
+        ("cd /x && { git fetch; }; git reset --hard", ["cd /x"]),
+        ("cd /x && (git fetch; (true)); git reset --hard", ["cd /x"]),
+        ("cd x; cd /y && git fetch; git reset --hard", ["cd x", "cd /y"]),
+        ("cd x && cd y && true; git reset --hard", ["cd x", "cd y"]),
+        ("set -e; cd x && true; git reset --hard", ["cd x"]),
+        ("set -e; { cd x; git reset --hard; } || true", ["cd x"]),
+        ("set -e; (cd x; git reset --hard) && true", ["cd x"]),
+        ("set -e; if cd x; then git reset --hard; fi", ["cd x"]),
+        ("set -e; if true; then cd x; git reset --hard; fi || true", ["cd x"]),
+        ("set -e; true || { cd x; git reset --hard; }", []),
+        ("set -e; f() { cd x; git reset --hard; }; f || true", ["cd x"]),
     ],
 )
-def test_a_step_names_an_earlier_cd_whose_failure_would_not_stop_it(command, loose):
-    assert maintree.git_calls(command, CWD)[-1].step.loose_cd == loose
+def test_a_step_names_the_earlier_cds_whose_failure_would_not_stop_it(command, loose):
+    found = maintree.git_calls(command, CWD)[-1].step.loose_cd
+    assert [" ".join(cd.words) for cd in found] == loose
+
+
+def test_a_loose_cd_names_the_folder_its_failure_leaves_the_shell_in():
+    [first, second] = maintree.git_calls("cd x; cd $Y; git reset --hard", CWD)[
+        0
+    ].step.loose_cd
+    assert (first.fallback, second.fallback) == (CWD, CWD / "x")
+
+
+def test_a_cd_sent_to_the_background_moves_only_its_own_list():
+    # 2026-11-26: the `&` took the cd with the sleep, so mutate-check put its
+    # mutants into the main tree and one killed every process on the VM.
+    command = (
+        "cd /w/r-wt && sleep 900 & by=$!; heavy --few-seconds -- bin/mutate-check"
+        " --edits e.edits -- pytest -q test_x.py; kill $by"
+    )
+    steps = {step.words[0]: step.directory for step in maintree.walk(command, CWD)}
+    assert steps["sleep"] == Path("/w/r-wt")
+    assert steps["bin/mutate-check"] == CWD
 
 
 def git(repo, *args):

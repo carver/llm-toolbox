@@ -224,6 +224,7 @@ def test_hooks_register_once_beside_existing_settings(settings):
         str(install.BIN_DST / "heavy-gate"),
         str(install.BIN_DST / "pipe-status-gate"),
         str(install.BIN_DST / "gh-body-gate"),
+        str(install.BIN_DST / "wrong-tree-gate"),
         str(install.BIN_DST / "skill-change-hint"),
     ]
     assert groups[-1]["matcher"] == "Bash|Agent"

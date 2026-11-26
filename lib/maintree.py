@@ -5,18 +5,23 @@ receives landings. A hook that holds agents to it needs two answers, and each mu
 when it can't tell, so the hook can let the command through:
 
 walk(command, cwd) lists each simple command in a Bash command with the directory it
-runs in: the hook's cwd, moved by each `cd DIR` or `pushd DIR` before it in its scope
-(a `cd` inside `( ... )`, a pipeline or a list sent to the background with `&` ends with it), by
-`git -C DIR`, and by bgrun's `-C DIR`. The directory is None whenever it isn't certain:
-a `cd` to a word with an expansion (`"$WT"`, `~/x`, `$(...)`), `cd -`, `popd`, a plain
-`cd`, a sourced file or an eval before it, a function defined anywhere in the command,
-an `env -C` or `sudo -D` in front, a `GIT_DIR` or `GIT_WORK_TREE` set before the
-command or exported earlier, or `git --git-dir`/`--work-tree`. A directory that doesn't
-exist yet, as when `git worktree add` runs earlier in the same command, is given as
-written, and place() then says it can't tell. Each step also names the most recent
-earlier `cd` in its scope that ends with `;` or a newline, so its failure wouldn't
-have stopped the step. The script a shell runs with -c is walked from the directory
-the shell starts in, and a $(...) substitution's body from an unknown one.
+runs in: the hook's cwd, moved by each `cd DIR` or `pushd DIR` before it in its scope (a
+`cd` inside `( ... )`, a pipeline or a list sent to the background with `&` ends with
+it), by `git -C DIR`, and by bgrun's `-C DIR`. The directory is None whenever it isn't
+certain: a `cd` to a word with an expansion (`"$WT"`, `~/x`, `$(...)`), `cd -`, `popd`,
+a plain `cd`, a sourced file or an eval before it, a function defined anywhere in the
+command, an `env -C` or `sudo -D` in front, a `GIT_DIR` or `GIT_WORK_TREE` set before
+the command or exported earlier, or `git --git-dir`/`--work-tree`. A directory that
+doesn't exist yet, as when `git worktree add` runs earlier in the same command, is given
+as written, and place() then says it can't tell. Each step also names the earlier cds
+in its scope whose failure wouldn't have stopped it, each with the folder the shell
+would have stayed in: one that ends with `;` or a newline, unless `set -e` held for it
+(not in a condition, nor in a compound command that a non-final part of an `&&` or
+`||` list is, nor anywhere once the command defines a function), and one chained with
+`&&` to a list that then ended with `;` or a newline; less those before a cd to an
+absolute folder that the step is chained to. The script a shell runs with -c is walked
+from the directory the shell starts in, and a $(...) substitution's body from an
+unknown one.
 
 place(directory) asks git what the directory is: its work tree's top level, whether
 that is the main tree (its git dir is the common one), the hooks folder, the branch,
@@ -32,7 +37,7 @@ projects without this folder; test_maintree.py holds the two to the same answers
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from shellparse import (
@@ -43,6 +48,7 @@ from shellparse import (
     command_of,
     commands,
     prepare,
+    set_errexit,
     shell_script,
 )
 
@@ -67,6 +73,9 @@ QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
 FUNCTION = re.compile(r"(^|[\s;&|(])(function\s+\S|[\w.:-]+\s*\(\s*\))")
 # The operators after a `cd` that don't wait for it to succeed.
 LOOSE = (";", "\n")
+# The operators that end an && or || list, so a chained cd's failure no longer stops
+# what comes next.
+LIST_ENDS = (";", "\n", "&", "")
 GIT_SECONDS = 5
 # The files and folders in a git dir that mark an operation in progress.
 IN_PROGRESS = (
@@ -79,24 +88,73 @@ IN_PROGRESS = (
 )
 
 
+@dataclass(frozen=True)
+class LooseCd:
+    """A cd whose failure wouldn't stop a later step: its `words`, the folder the
+    shell stays in if it fails (`fallback`, None when that isn't certain), and its
+    place among the command's simple commands (`index`)."""
+
+    words: list[str]
+    fallback: Path | None
+    index: int
+
+
 @dataclass
 class Step:
     """A simple command: `words`, the command it runs (past variable settings,
     wrappers, bgrun and heavy); `directory`, where it runs, or None when that isn't
     certain; `assigned`, the variables set in front of it, with their values as
-    written; its redirections, as
-    shellparse.Command gives them; `loose_cd`, the words of the latest earlier `cd`
-    in its scope that ends with `;` or a newline, else None; `guess`, the directory
-    from its plain `cd`s and -C options alone, which a sourced file, a function,
-    GIT_DIR, `env -C` or a piped group's cd don't undo: for a check that reads an
-    unknown directory as a reason to act rather than to pass."""
+    written; its redirections, as shellparse.Command gives them; `loose_cd`, the
+    earlier cds in its scope whose failure wouldn't stop it, in order: each one that
+    ends with `;` or a newline while `set -e` holds for it, or that a `&&` chains to
+    commands whose list then ends with `;` or a newline, less those before a cd to an
+    absolute folder chained to the step itself; `guess`, the directory from its plain
+    `cd`s and -C options alone, which a sourced file, a function, GIT_DIR, `env -C`
+    or a piped group's cd don't undo: for a check that reads an unknown directory as
+    a reason to act rather than to pass."""
 
     words: list[str]
     directory: Path | None
     assigned: dict[str, str] = field(default_factory=dict)
     redirects: list[tuple[str, str]] = field(default_factory=list)
-    loose_cd: list[str] | None = None
+    loose_cd: list[LooseCd] = field(default_factory=list)
     guess: Path | None = None
+
+
+@dataclass(frozen=True)
+class _Chained:
+    """A cd that `&&` chains to the rest of its list: while the list goes on, its
+    failure stops what comes next. `depth`: how many compound commands it sits in;
+    `covers`: whether it names a certain absolute folder, so the steps chained to it
+    run there whatever earlier cds did."""
+
+    cd: LooseCd
+    depth: int
+    covers: bool
+
+
+@dataclass(frozen=True)
+class _Scope:
+    """Where a scope's shell stands: its directory, the guess, its loose cds and its
+    chained cds."""
+
+    directory: Path | None
+    guess: Path | None
+    loose: tuple[LooseCd, ...] = ()
+    chained: tuple[_Chained, ...] = ()
+
+    def loose_for_step(self) -> list[LooseCd]:
+        cover = max((c.cd.index for c in self.chained if c.covers), default=-1)
+        return [cd for cd in self.loose if cd.index > cover]
+
+    def ended(self, depth: int) -> "_Scope":
+        """This scope once a list ends at `depth`: the cds chained in it are loose."""
+        done = [c.cd for c in self.chained if c.depth >= depth]
+        if not done:
+            return self
+        kept = tuple(c for c in self.chained if c.depth < depth)
+        loose = tuple(sorted((*self.loose, *done), key=lambda cd: cd.index))
+        return replace(self, loose=loose, chained=kept)
 
 
 @dataclass
@@ -184,8 +242,9 @@ def walk(command: str, cwd: Path | None) -> list[Step]:
     """Each simple command in `command`, run from `cwd`, with the directory it runs
     in, in order; then those of each $(...) substitution, from an unknown directory."""
     cleaned, substitutions, _ = prepare(command, first_mark=0)
-    steps = _walk(cleaned, cwd)
-    if FUNCTION.search(QUOTED.sub("''", cleaned)):
+    has_function = bool(FUNCTION.search(QUOTED.sub("''", cleaned)))
+    steps = _walk(cleaned, cwd, has_function)
+    if has_function:
         # A function's body runs where it's called, not where it's defined.
         for step in steps:
             step.directory = None
@@ -207,14 +266,15 @@ def background_lists(simples) -> list[tuple[int, int]]:
     return found
 
 
-def _walk(cleaned: str, cwd: Path | None) -> list[Step]:
-    # The directory and latest loose cd in each scope: the subshells a command sits
-    # in, as shellparse numbers them. A scope seen first starts from the nearest one
-    # around it, which is where the shell stood when the subshell opened.
-    places: dict[tuple[int, ...], tuple[Path | None, Path | None, list[str] | None]] = {
-        (): (cwd, cwd, None)
-    }
+def _walk(cleaned: str, cwd: Path | None, has_function: bool) -> list[Step]:
+    # Where the shell stands in each scope: the subshells a command sits in, as
+    # shellparse numbers them. A scope seen first starts from the nearest one around
+    # it, which is where the shell stood when the subshell opened.
+    places: dict[tuple[int, ...], _Scope] = {(): _Scope(cwd, cwd)}
     steps: list[Step] = []
+    # Whether `set -e` is on in each scope, so a cd that fails ends it. A function
+    # may be called where bash ignores it, as in `f || true`, so then it never counts.
+    errexit: dict[tuple[int, ...], bool] = {(): False}
     elsewhere = False  # GIT_DIR or GIT_WORK_TREE exported, or set for the shell
     simples = commands(cleaned)
     # A list sent to the background, as in `cd WT && sleep 900 &`, runs in a
@@ -233,7 +293,11 @@ def _walk(cleaned: str, cwd: Path | None) -> list[Step]:
             if scope[:size] in places:
                 places.setdefault(scope, places[scope[:size]])
                 break
-        directory, guess, loose = places[scope]
+        for size in range(len(scope), -1, -1):
+            if scope[:size] in errexit:
+                errexit.setdefault(scope, errexit[scope[:size]])
+                break
+        directory, guess = places[scope].directory, places[scope].guess
         words, _ = command_of(simple.words)
         prefix = simple.words[: len(simple.words) - len(words)]
         if any(CHDIR_OPTIONS.fullmatch(word) for word in prefix):
@@ -252,6 +316,7 @@ def _walk(cleaned: str, cwd: Path | None) -> list[Step]:
         if not words:
             if GIT_PLACE_VARIABLES & assigned.keys():
                 elsewhere = True
+            _end_lists(places, simple)
             continue
         name = Path(words[0]).name
         if name in ("export", "declare", "typeset") and any(
@@ -260,9 +325,18 @@ def _walk(cleaned: str, cwd: Path | None) -> list[Step]:
             elsewhere = True
         if elsewhere or GIT_PLACE_VARIABLES & assigned.keys():
             here = None
-        step = Step(words, here, assigned, simple.redirects, loose, guessed)
+        step = Step(
+            words,
+            here,
+            assigned,
+            simple.redirects,
+            places[scope].loose_for_step(),
+            guessed,
+        )
         steps.append(step)
-        if name in ("cd", "pushd", "popd"):
+        if name == "set":
+            errexit[scope] = set_errexit(words[1:], errexit[scope])
+        elif name in ("cd", "pushd", "popd"):
             changes, target = cd_target(words)
             # A cd in a pipeline, or sent to the background, runs in a subshell:
             # alone it moves nothing, but in a group, as in `(cd x && git commit) |
@@ -271,17 +345,41 @@ def _walk(cleaned: str, cwd: Path | None) -> list[Step]:
             apart = simple.piped or simple.fed or simple.after == "&"
             if changes and not (apart and not simple.grouped):
                 after = None if target is None else moved(directory, target)
-                places[scope] = (
-                    None if apart else after,
-                    None if target is None else moved(guess, target),
-                    words if simple.after in LOOSE else loose,
+                now = places[scope]
+                cd = LooseCd(words, directory, index)
+                stops = errexit[scope] and not simple.unchecked and not has_function
+                if simple.after in LOOSE and not stops:
+                    now = replace(now, loose=(*now.loose, cd))
+                elif simple.after == "&&":
+                    covers = target is not None and certain(target)
+                    covers = covers and target[:1] == "/"
+                    chained = _Chained(cd, simple.depth, covers)
+                    now = replace(now, chained=(*now.chained, chained))
+                places[scope] = replace(
+                    now,
+                    directory=None if apart else after,
+                    guess=None if target is None else moved(guess, target),
                 )
         elif words[0] in SOURCES:
             # A sourced file or an eval may cd anywhere.
-            places[scope] = (None, guess, loose)
+            places[scope] = replace(places[scope], directory=None)
         elif (script := shell_script(words)) is not None:
             steps += walk(script, here)
+        _end_lists(places, simple)
     return steps
+
+
+def _end_lists(places: dict[tuple[int, ...], _Scope], simple) -> None:
+    """Make loose the cds chained in each list that `simple` ends: its own, by the
+    operator after it, and those around each subshell it closes."""
+    ends = [(simple.depth, simple.after)]
+    ends += [(simple.depth - 1 - k, op) for k, op in enumerate(simple.closes)]
+    for depth, op in ends:
+        if op not in LIST_ENDS:
+            continue
+        for size in range(len(simple.subshells), -1, -1):
+            if (scope := simple.subshells[:size]) in places:
+                places[scope] = places[scope].ended(depth)
 
 
 def git_calls(command: str, cwd: Path | None) -> list[GitCall]:

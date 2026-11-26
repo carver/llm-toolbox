@@ -53,6 +53,8 @@ KEYWORDS = {"if", "then", "elif", "else", "do", "while", "until", "!", "{"}
 # The words that open and close a compound command whose output a pipe can take whole.
 OPENERS = {"{", "if", "for", "while", "until", "select", "case"}
 CLOSERS = {"}", "fi", "done", "esac"}
+# The openers whose condition, up to `then` or `do`, bash runs with `set -e` ignored.
+CONDITIONS = {"if", "while", "until"}
 # A quoted word of these alone, such as '|', which shlex returns unquoted, as an operator.
 OPERATOR_WORD = re.compile(r"[;&|()<>]+")
 # Commands that run the command after them: (their options that take a value, how many
@@ -97,7 +99,12 @@ class Command:
     before it, as in `{ ...; } | CMD`. `subshells`: the `( ... )` subshells it sits
     in, each a number of its own, outermost first, so a `cd` inside one can be told
     to end with it. `after`: the operator that ends it (`&&`, `||`, `|`, `;`, `&`,
-    a newline, `(` or `)`), or "" at the end of the command."""
+    a newline, `(` or `)`), or "" at the end of the command. `depth`: how many
+    compound commands it sits in. `closes`: when `after` is a `)`, the operator
+    after each subshell it closes, innermost first, as in `;` for `(a; b); c`.
+    `unchecked`: bash ignores `set -e` for it, since it sits in an if, while or until
+    condition, after `!`, or in a compound command that a non-final part of an `&&`
+    or `||` list is, as in `{ ...; } || echo`."""
 
     words: list[str]
     piped: bool
@@ -106,17 +113,24 @@ class Command:
     fed: bool = False
     subshells: tuple[int, ...] = ()
     after: str = ""
+    depth: int = 0
+    closes: list[str] = field(default_factory=list)
+    unchecked: bool = False
 
 
 @dataclass
 class _Output:
     """Whether the output of a simple or compound command goes into a pipe, whether
     the compound command is a case, whose patterns end in a `)` that closes nothing,
-    and the number of the `( ... )` subshell it is, if it is one."""
+    the number of the `( ... )` subshell it is, if it is one, whether its condition
+    (an if's, while's or until's) is being read, and whether it is a non-final part
+    of an && or || list."""
 
     piped: bool = False
     case: bool = False
     subshell: int | None = None
+    condition: bool = False
+    nonfinal: bool = False
 
 
 def _lexer(cleaned: str) -> shlex.shlex:
@@ -144,42 +158,66 @@ def commands(cleaned: str) -> list[Command]:
     # Each command's words, with its own output and those of the compound commands
     # around it, and its redirections; the compound commands open now, innermost last;
     # the output a `|` would take now; the words of the command being read, and its
-    # redirections so far.
-    found: list[tuple[list[str], list[_Output], list[tuple[str, str]], bool, str]] = []
+    # redirections so far, the operators after the subshells it closes, and whether
+    # it sits in a condition.
+    found: list[
+        tuple[
+            list[str], list[_Output], list[tuple[str, str]], bool, str, list[str], bool
+        ]
+    ] = []
     groups: list[_Output] = []
     pipe_source: _Output | None = None
     words: list[str] = []
     redirects: list[tuple[str, str]] = []
     fed = False  # a `|` came since the last command ended
     subshells = 0  # how many ( ... ) subshells have opened so far
+    shut: _Output | None = None  # the subshell a `)` just closed
 
     def end(after: str = "") -> None:
-        nonlocal words, pipe_source, redirects, fed
+        nonlocal words, pipe_source, redirects, fed, shut
+        if shut is not None and found:
+            if not words:
+                found[-1][5].append(after)
+            shut.nonfinal = after in ("&&", "||")
+        shut = None
         if not words:
             if redirects and found:  # after a compound command's close
                 found[-1][2].extend(redirects)
                 redirects = []
             return
         closed = None
+        negated = False
         for word in words:
             if word in OPENERS:
-                groups.append(_Output(case=word == "case"))
+                groups.append(
+                    _Output(case=word == "case", condition=word in CONDITIONS)
+                )
             elif word in CLOSERS:
                 closed = groups.pop() if groups else None
-            elif word not in KEYWORDS:
+                if closed is not None:
+                    closed.nonfinal = after in ("&&", "||")
+            elif word in KEYWORDS:
+                if word == "elif" and groups:
+                    groups[-1].condition = True
+                elif word in ("then", "do") and groups:
+                    groups[-1].condition = False
+                negated = negated or word == "!"
+            else:
                 break
         own = _Output()
-        found.append((words, [own, *groups], redirects, fed, after))
+        condition = negated or any(group.condition for group in groups)
+        found.append((words, [own, *groups], redirects, fed, after, [], condition))
         pipe_source, words, redirects, fed = closed or own, [], [], False
 
     def close() -> None:
         """A `)`: it ends a subshell, or a case's pattern."""
-        nonlocal pipe_source
+        nonlocal pipe_source, shut
         end(")")
         if groups and groups[-1].case:
             pipe_source = None
         else:
             pipe_source = groups.pop() if groups else None
+            shut = pipe_source
 
     redirection = None  # the operator whose target the next token is
     for token in tokens:
@@ -225,8 +263,11 @@ def commands(cleaned: str) -> list[Command]:
             fed,
             tuple(o.subshell for o in outputs[1:] if o.subshell is not None),
             after,
+            len(outputs) - 1,
+            closes,
+            condition or any(o.nonfinal for o in outputs[1:]),
         )
-        for words, outputs, redirects, fed, after in found
+        for words, outputs, redirects, fed, after, closes, condition in found
     ]
 
 
@@ -550,6 +591,17 @@ def set_pipefail(args: list[str], pipefail: bool) -> bool:
         if "o" in option and "pipefail" in values:
             pipefail = option[0] == "-"
     return pipefail
+
+
+def set_errexit(args: list[str], errexit: bool) -> bool:
+    """``errexit`` after set's options ``args``: -e (alone or in a cluster such as
+    -euo pipefail) or -o errexit turns it on, +e or +o errexit off."""
+    for option, values in shell_options(args)[0]:
+        if option.startswith("--"):
+            continue
+        if "e" in option or "o" in option and "errexit" in values:
+            errexit = option[0] == "-"
+    return errexit
 
 
 def shell_flags(words: list[str]) -> tuple[str, list[str]] | None:

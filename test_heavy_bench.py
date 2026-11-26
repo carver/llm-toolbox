@@ -25,6 +25,8 @@ FIELDS = [
     "outside",
     "exit",
     "flagged",
+    "start_speed",
+    "end_speed",
     "parts",
 ]
 
@@ -307,6 +309,40 @@ def test_a_run_quicker_than_the_tables_places_still_counts(tmp_path):
     assert "gave no measure" not in done.stderr
     assert (tmp_path / "out" / "a-1.log").read_text() == "A\n"
     assert table_line(done, "a")[1] == "3"  # runs counted
+
+
+def test_each_row_keeps_the_machines_speed_at_the_runs_start_and_end(tmp_path):
+    # A stand-in heavy whose report adds the speed factors, as heavy's does once it
+    # knows the machine's usual speed, or `-` for each it doesn't.
+    tool = tmp_path / "bin"
+    tool.mkdir()
+    (tool / "heavy-bench").write_text(SCRIPT.read_text())
+    (tool / "heavy-bench").chmod(0o755)
+    (tool / "heavy").write_text(
+        '#!/bin/sh\nshift 2\n"$@"\n'
+        'echo "1.500 0.001 0.000 0.40 -" > "$HEAVY_ALONE_REPORT"\n'
+    )
+    (tool / "heavy").chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k != "HEAVY_SLOT"}
+    out = tmp_path / "out"
+
+    done = subprocess.run(
+        [str(tool / "heavy-bench"), "--out", str(out), "--rounds", "1", "a=true"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    header, row = (out / "results.tsv").read_text().splitlines()
+    found = dict(zip(header.split("\t"), row.split("\t"), strict=True))
+    assert (found["wall"], found["start_speed"], found["end_speed"]) == (
+        "1.500",
+        "0.40",
+        "-",
+    )
 
 
 # A run's parts: lines `NAME SECONDS` it writes to $BENCH_TIMINGS.

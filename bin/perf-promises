@@ -33,15 +33,30 @@ counts or a signal stopped it; one that shared a lane (--share), or beside other
 that used over half its cores, is logged but left out, and its note says so. A file
 or entry that can't be read is that note instead, and never fails the job.
 
+The host can throttle the VM's CPU where the sandbox can't see it (cgroup cpu.stat,
+cpuinfo and cpufreq showed nothing on 2026-11-26, when the owner said "The CPU was
+throttled really low, so I wouldn't trust that 262 s number right now"), so heavy
+probes the machine's speed after each job exits (`heavy -h`): a factor of 1.0 is its
+usual speed on that vCPU under that load, 0.4 is 2.5 times slower, and `heavy speed`
+prints the usual times. A run counts at its seconds times the factor of the newest
+probe of the last 5 minutes whose speed is known (an --alone job's, its own as it
+ended), at most 1, and its note shows both and the probe's age, `heavy: NAME ran 3425 s
+(1370 s at the machine's 0.40x speed, measured 2 min ago), 11.4x its promised 120 s
+(...)`. A run that took twice its promise or more only because the machine was slow,
+under twice it at the usual speed, is logged but left out, and its note says so. While
+the usual speed is unknown, a run counts at its seconds.
+
 status prints each promise of DIR's repo (default: the current folder) and
 llm-toolbox's: its promised seconds, the runs logged, the median of its newest 5
-counted runs of the last 14 days and the p90 of them all, and BROKEN when that median
-is twice the promise or more; below 5 runs, `n=3, not judged`. Only log lines with the
-promise's current seconds and command count, so a worktree's edited promise doesn't
-skew main's. A promise is flagged when its seconds are over 3 times its
-measured_seconds, or when it matched jobs once but none in 7 days, and so are the
-problems reading each file. One that never matched a job, as a tripwire for a dropped
-command is meant to, isn't flagged: status ends its line `never matched`.
+counted runs of the last 14 days and the p90 of them all, each run at the machine's
+usual speed, and BROKEN when that median is twice the promise or more; below 5 runs,
+`n=3, not judged`. Only log lines with the promise's current seconds and command
+count, so a worktree's edited promise doesn't skew main's. A promise is flagged when
+its seconds are over 3 times its measured_seconds, when it matched jobs once but none
+in 7 days, or when most of its last 10 runs (6 or more, or most of fewer) were left
+out, for the machine's speed or other work's load, and so are the problems reading
+each file. One that never matched a job, as a tripwire for a dropped command is meant
+to, isn't flagged: status ends its line `never matched`.
 
 --session-start is Claude Code's SessionStart hook, which install.py registers: it
 reads the event on stdin, checks the promises of its cwd's repo and llm-toolbox's, and
@@ -52,7 +67,9 @@ promised (SOURCE); perf-promises status`. It prints nothing when all hold.
 
 Each repo's runs are logged in its git common dir, perf-promises/NAME.tsv, shared by
 its worktrees, a tab-separated line a run (its end in UTC, seconds, exit or sigN, load,
-the promised seconds, the command's hash, session, folder), the newest 200 kept.
+the promised seconds, the command's hash, session, folder, and the machine's speed
+factor, `-` when unknown), the newest 200 kept. The speed probes go beside them, in
+llm-toolbox's git common dir (`heavy -h`).
 
 Environment:
   PERF_PROMISES_DIR     a folder for the logs, REPO/NAME.tsv, in place of each repo's

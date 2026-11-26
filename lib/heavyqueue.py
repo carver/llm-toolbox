@@ -41,8 +41,10 @@ and sccache's CPU time), as bin/heavy's
 runs at once; and RUSTC_WRAPPER, to start sccache's server before pinning.
 
 Every job that takes a slot or runs outside the queue goes on lib/heavyjobs.py's
-record, with its own CPU time and that of other work on its cores (Tally), and is
-measured against its repo's perf promises (lib/perfpromises.py) as it ends.
+record, with its own CPU time and that of other work on its cores (Tally), is
+measured against its repo's perf promises (lib/perfpromises.py) at the machine's
+speed from its newest probe, and has the machine's speed probed once its slot is free
+(lib/machinespeed.py, which reads HEAVY_SPEED_PROBE and HEAVY_SPEED_AFTER_EXIT).
 """
 
 import math
@@ -61,7 +63,9 @@ import cores
 import fifo
 import heavyhistory
 import heavyjobs
+import machinespeed
 import perfpromises
+from cores import span
 from fifo import Holder
 
 LANES = ("normal", "long")
@@ -105,13 +109,6 @@ def note(line):
     print(line, file=sys.stderr, flush=True)
 
 
-def span(cpus):
-    """Cores as `0-11`, or a list when they aren't one run."""
-    if len(cpus) > 1 and cpus == list(range(cpus[0], cpus[-1] + 1)):
-        return f"{cpus[0]}-{cpus[-1]}"
-    return ",".join(map(str, cpus))
-
-
 def unspan(text):
     """The cores span() wrote."""
     found = []
@@ -139,20 +136,20 @@ def busy_now(cpus):
     if fake:
         time.sleep(poll)
         return float(Path(fake).read_text())
-    before = cores.snapshot()
-    time.sleep(poll)
-    return cores.busy(before, cores.snapshot(), cpus)
+    window = cores.sample("/proc/stat", poll)  # which machinespeed may reuse
+    return cores.busy(window.before, window.after, cpus)
 
 
 ALONE_OUTSIDE = 0.5  # cores of outside work, on average, past which a timing may be off
 
 
 def busy_seconds(cpus):
-    """The CPU-seconds cpus have spent busy since boot, from /proc/stat (or the
-    HEAVY_STAT file, the tests' stand-in)."""
+    """(busy, steal): the seconds cpus have spent busy since boot, and the host's
+    steal among them, from /proc/stat (or the HEAVY_STAT file, the tests' stand-in)."""
     text = cores.snapshot(os.environ.get("HEAVY_STAT") or "/proc/stat")
-    found = cores.counters(text)
-    return sum(found[cpu][0] for cpu in cpus if cpu in found) / os.sysconf("SC_CLK_TCK")
+    found = [ticks for cpu, ticks in cores.counters(text).items() if cpu in cpus]
+    tick = os.sysconf("SC_CLK_TCK")
+    return sum(t.busy for t in found) / tick, sum(t.steal for t in found) / tick
 
 
 def sccache_seconds():
@@ -173,14 +170,18 @@ def sccache_seconds():
 
 
 class Use(NamedTuple):
-    """A job's run: its seconds, the cores it kept busy on average, and the
-    CPU-seconds it used, other work used on its cores, and sccache's server used."""
+    """A job's run: its seconds, the cores it kept busy on average, the CPU-seconds
+    it used, other work used on its cores, and sccache's server used, the host's
+    steal on its cores, and the machine's speed as it ended (a machinespeed
+    Reading)."""
 
     seconds: float
     cores: float
     own: float
     other: float
     compiles: float
+    steal: float | None
+    speed: machinespeed.Reading
 
 
 class Tally:
@@ -189,10 +190,18 @@ class Tally:
     the busy time of its cores less that and the sccache server's, which runs a cargo
     job's compiles but isn't its child. The server is the VM's, so another session's
     compiles then count as the job's own. A busy time that can't be read leaves
-    `error` set and the Use's other and compiles None."""
+    `error` set and the Use's other, compiles and steal None. The machine's speed is
+    the newest probe's as the job ends, and probe_later starts the job's own once
+    its slot is free; an --alone job (alone) probes as it ends, after its seconds are
+    taken, and before they start, as `speed_at_start`, where a stop signal stops
+    heavy, as it would before any probe."""
 
-    def __init__(self, cpus):
-        self.cpus, self.error, self.used = cpus, None, None
+    def __init__(self, cpus, alone=False):
+        self.cpus, self.alone, self.error, self.used = cpus, alone, None, None
+        self.steal_share = None
+        self.speed_at_start = (
+            machinespeed.measure(cpus, stoppable=True) if alone else None
+        )
         self.run = heavyhistory.Run()
         try:
             self.before = busy_seconds(cpus), sccache_seconds()
@@ -203,17 +212,34 @@ class Tally:
         """The Use, measured the first time it's asked for, as the job ends."""
         if self.used is None:
             cores_used, seconds = self.run.cores()
-            other = compiles = None
+            other = compiles = steal = None
             if self.before is not None:
                 try:
-                    busy, compiles = busy_seconds(self.cpus), sccache_seconds()
+                    (busy, stolen), compiles = (
+                        busy_seconds(self.cpus),
+                        sccache_seconds(),
+                    )
                     compiles -= self.before[1]
-                    other = busy - self.before[0] - cores_used * seconds - compiles
+                    other = busy - self.before[0][0] - cores_used * seconds - compiles
                     other = max(0.0, other)
+                    steal = max(0.0, stolen - self.before[0][1])
                 except (OSError, ValueError, IndexError) as error:
                     self.error, compiles = error, None
-            self.used = Use(seconds, cores_used, cores_used * seconds, other, compiles)
+            if steal is not None and seconds > 0:
+                self.steal_share = steal / (seconds * max(1, len(self.cpus)))
+            if self.alone:
+                speed = machinespeed.measure(self.cpus, self.steal_share)
+            else:
+                speed = machinespeed.latest()
+            own = cores_used * seconds
+            self.used = Use(seconds, cores_used, own, other, compiles, steal, speed)
         return self.used
+
+    def probe_later(self):
+        """Once the job has ended and freed its slot, start its probe of the
+        machine's speed, which heavy doesn't wait for; an --alone job took its own."""
+        if not self.alone and self.used is not None:
+            machinespeed.probe_after_exit(self.cpus, self.steal_share)
 
 
 class Outside:
@@ -233,11 +259,18 @@ class Outside:
             )
 
     def report(self):
-        """Say it on stderr, with a warning past HEAVY_ALONE_OUTSIDE cores, and write
-        `seconds own other` to the HEAVY_ALONE_REPORT file when one is named."""
+        """Say it on stderr, with a warning past HEAVY_ALONE_OUTSIDE cores, the host's
+        steal and the machine's speed, and write `seconds own other start_speed
+        end_speed` to the HEAVY_ALONE_REPORT file when one is named."""
         if self.limit is None:
             return
-        seconds, _, own, other, compiles = self.tally.end()
+        used = self.tally.end()
+        seconds, own, other, compiles = (
+            used.seconds,
+            used.own,
+            used.other,
+            used.compiles,
+        )
         if other is None:
             note(
                 "heavy: can't tell what other work shared this --alone job"
@@ -254,20 +287,52 @@ class Outside:
                 f" {compiles:.1f} more went to the sccache server, counted as the"
                 " job's, though other sessions' compiles go there too."
             )
+        if used.steal:
+            line += f" Meanwhile the host stole {used.steal:.1f} s of its cores' time."
         if average > self.limit:
             line += (
                 f" That's more than {self.limit:g} cores: the timing may be off;"
                 " run it again."
             )
+        start = self.tally.speed_at_start
+        factors = [None if r is None else r.factor for r in (start, used.speed)]
+        line += speed_words(*factors)
         note(line)
         target = os.environ.get("HEAVY_ALONE_REPORT")
         if target:
+            shown = " ".join("-" if f is None else f"{f:.2f}" for f in factors)
             try:
-                Path(target).write_text(f"{seconds:.3f} {own:.3f} {other:.3f}\n")
+                Path(target).write_text(
+                    f"{seconds:.3f} {own:.3f} {other:.3f} {shown}\n"
+                )
             except OSError as error:
                 note(
                     f"heavy: can't write HEAVY_ALONE_REPORT {target}: {error.strerror}."
                 )
+
+
+TRUSTED_SPEED = 0.8  # the speed factor below which, at both ends, a timing is no timing
+
+
+def speed_words(start, end):
+    """What an --alone job's closing line says of the machine's speed at its start
+    and end (factors, or None where unknown)."""
+    if start is None and end is None:
+        return ""
+    if end is None:
+        return f" The machine ran at {start:.2f}x its usual speed at the start."
+    if start is None:
+        return f" The machine ran at {end:.2f}x its usual speed at the end."
+    words = (
+        f" The machine ran at {start:.2f}x its usual speed at the start and"
+        f" {end:.2f}x at the end."
+    )
+    if max(start, end) < TRUSTED_SPEED:
+        words += (
+            f" Below {TRUSTED_SPEED:g}x at both, so this timing isn't one to trust;"
+            " run it again later."
+        )
+    return words
 
 
 def free_memory():
@@ -531,8 +596,9 @@ def turn(
         why = lull.why_not(lull.first_look())
         if why is None:
             job = lull.job()
-            with recorded(job, asked, "outside", beside=slot_text(lane)):
+            with recorded(job, asked, "outside", beside=slot_text(lane)) as tally:
                 yield job
+            tally.probe_later()
             return
         if slot_text(lane) is not None:  # else nothing it waits on needs a word
             note(f"heavy: {why}, so this --few-seconds job waits at the queue's front.")
@@ -570,8 +636,9 @@ def turn(
         if started is None:  # a --few-seconds job whose cores went quiet
             entry.unlink(missing_ok=True)
             job = lull.job()
-            with recorded(job, asked, "outside", beside=slot_text(lane)):
+            with recorded(job, asked, "outside", beside=slot_text(lane)) as tally:
                 yield job
+            tally.probe_later()
             return
         env = dict(os.environ) | {
             "HEAVY_SLOT": first_line(started.text),
@@ -592,6 +659,7 @@ def turn(
         entry.unlink(missing_ok=True)
         if started is not None:
             fifo.release(started.slot, started.text)
+    tally.probe_later()  # with the slot free
 
 
 def folder_now():
@@ -609,7 +677,7 @@ def recorded(job, asked, how, beside=None):
     asked is what turn() was asked for, how where the job runs (`slot`, `share` or
     `outside`), and beside the slot text of the holder a sharer or an outside job
     started beside. Nothing here fails the job."""
-    tally = Tally(job.cpus)
+    tally = Tally(job.cpus, alone=asked.get("alone", False))
     command, cut = heavyjobs.shown(asked["command"])
     fields = {name: value for name, value in asked.items() if name != "command"}
     fields |= {"cmd": command, "cut": cut, "how": how}

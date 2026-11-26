@@ -13,7 +13,7 @@
 name = "mutate-check-diff"
 command = '^mutate-check --diff'
 seconds = 120
-measured = "median 861 s of the 6 runs in heavy's record on 2026-11-26 that exited 0 or 1 or were stopped by a signal (15.6, 317, 641, 1082, 1261, 3425 s); a seventh exited 143 after 412 s"
+measured = "median 861 s of the 6 runs in heavy's record on 2026-11-26 that exited 0 or 1 or were stopped by a signal (15.6, 317, 641, 1082, 1261, 3425 s); a seventh exited 143 after 412 s. Taken while the host throttled the CPU that afternoon, and not measured again since"
 measured_seconds = 861
 source = "030df63; docs/design.md, /build's --diff run is dropped again (2026-11-26)"
 counts = [0, 1]

@@ -600,9 +600,27 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   giving the CPU-seconds other work used on its cores while it ran, warning
   past `$HEAVY_ALONE_OUTSIDE` (0.5)
   cores on average that the timing may be off; sccache's server's CPU counts
-  as the job's own, and the line names it. `$HEAVY_ALONE_REPORT` names a file
-  that gets the numbers. A job that ran twice a perf promise's time or more
-  hears so as it ends (`perf-promises`). A third job in a lane, or a head stalled for
+  as the job's own, and the line names it, as it names the host's steal and the
+  machine's speed at the job's start and end, warning at under 0.8x at both that
+  the timing isn't one to trust. `$HEAVY_ALONE_REPORT` names a file
+  that gets the numbers. After every job frees its place, heavy exits and
+  leaves a child of its own session to measure the load for a second, then time
+  a fixed CPU loop (about 8 ms on a quiet machine, 4 runs) pinned to the least
+  busy of the job's cores (the load being the busier of that second and the
+  loop's run), one such child at a time, each done within 10 s;
+  a job is judged by the newest probe of the last 5 minutes whose speed is
+  known, and an `--alone` job probes inline at its start and end. The probe
+  gives the machine's speed
+  factor, its usual time over its time now, since the host can throttle the
+  VM's CPU where the sandbox can't see it: the usual time is the fastest tenth of the
+  last 3 days' probes on this machine, this vCPU and this load bucket (under 1,
+  1-3, 3-6 or 6+ busy vCPUs, since load alone halves the loop's speed on this
+  power-bound VM), from 20 at least, kept beside the perf promises' logs.
+  `heavy speed` prints them; `$HEAVY_SPEED_PROBE` stands in for the loop's time
+  and the load in the tests, and `$HEAVY_SPEED_AFTER_EXIT=0` turns the child
+  off there. A job
+  that ran twice a perf promise's time or more hears so as it ends
+  (`perf-promises`). A third job in a lane, or a head stalled for
   `$HEAVY_STALL_SECONDS` (600), gets a hint to push a topic branch and open a PR for CI's results
   instead. A heavy inside a job (`$HEAVY_SLOT`), or inside a `--few-seconds` run
   outside the queue, runs at once. The queue and
@@ -625,7 +643,8 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `--prepare CMD` resets state before each run, with `$BENCH_VARIANT` set. A run
   whose cores did more than `$HEAVY_ALONE_OUTSIDE` (0.5) cores of other work is
   flagged and run once more, unless `--no-rerun`. Rows go to `DIR/results.tsv`
-  as each run ends, output to a log per run, and a table sums up each variant
+  as each run ends, with the machine's speed at its start and end (never
+  flagged), output to a log per run, and a table sums up each variant
   over its clean runs, with each part's mean when runs write `name seconds`
   lines to `$BENCH_TIMINGS`. A variant named `NAME@REV` runs in a worktree
   detached at REV, made beside the main tree and removed at the end, so
@@ -882,11 +901,17 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   it ends, without its queue wait, logs it in the repo's git common dir
   (`perf-promises/NAME.tsv`, or under `$PERF_PROMISES_DIR`), and gives a run of
   twice its promise or more a one-line note (in a commit check's pass line).
+  A run counts at its seconds times the machine's speed factor from the newest
+  probe of the last 5 minutes whose speed is known, at most 1 (`heavy`), since
+  the host can throttle the CPU where the sandbox can't see it; the note gives
+  both times.
   `perf-promises status [-C DIR]` lists each promise with its runs, the median
   of its last 5 counted runs and the p90, and BROKEN at twice the promise or
-  more; runs beside other work or sharing a lane are logged but not counted. It
-  flags a promise over 3 times its `measured_seconds`, or one that matched jobs
-  once but none in 7 days; one that never matched shows only in `status`.
+  more; runs beside other work, sharing a lane, or over twice it only because
+  the machine was slow are logged but not counted. It
+  flags a promise over 3 times its `measured_seconds`, one that matched jobs
+  once but none in 7 days, or one most of whose last 10 runs (or of fewer, all
+  it has) were left out; one that never matched shows only in `status`.
   `install.py` registers `perf-promises --session-start` as a SessionStart hook,
   which shows those lines to the owner and the agent. `$PERF_PROMISES_GLOBAL`
   stands in for llm-toolbox's file in the tests.

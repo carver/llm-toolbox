@@ -14,7 +14,7 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 import cores
 import fifo
 import heavyjobs
+import machinespeed
 
 
 def set_busy(busy, share):
@@ -431,6 +432,56 @@ def test_busy_counts_the_named_cores_from_two_snapshots():
     assert cores.busy(before, after, [0]) == pytest.approx(0.8)
     assert cores.busy(before, after, [1]) == pytest.approx(0.0)
     assert cores.busy(before, after, [0, 1]) == pytest.approx(40 / 150)
+
+
+def test_load_is_busy_cores_less_the_hosts_steal_and_the_measurer():
+    before = "cpu  1 1 1 1\ncpu0 0 0 0 0 0 0 0 0\ncpu1 0 0 0 0 0 0 0 0\n"
+    before += "cpu2 0 0 0 0 0 0 0 0\n"
+    # 100 ticks a core: cpu0 all busy, 20 of them stolen; cpu1 half busy, 10 of it
+    # iowait, which is idle; cpu2 idle.
+    after = "cpu  1 1 1 1\ncpu0 60 0 20 0 0 0 0 20\ncpu1 40 0 0 50 10 0 0 0\n"
+    after += "cpu2 0 0 0 100 0 0 0 0\n"
+
+    busy_cores, shares = cores.load(before, after, own_ticks=10)
+
+    # 80 + 40 busy ticks less 10 of the measurer's, over 100 ticks a core.
+    assert busy_cores == pytest.approx(1.1)
+    assert shares == pytest.approx({0: 0.8, 1: 0.4, 2: 0.0})
+
+
+def test_load_with_no_time_passed_is_none():
+    text = "cpu  1 1 1 1\ncpu0 10 0 0 90 0 0 0 0\n"
+    assert cores.load(text, text) is None
+
+
+def test_a_sample_is_reused_only_while_it_covers_the_last_moment(tmp_path):
+    stat = tmp_path / "stat"
+    stat.write_text("cpu  1 1 1 1\ncpu0 0 0 0 0 0 0 0 0\n")
+
+    taken = cores.sample(str(stat), 0.05)
+
+    assert (taken.before, taken.seconds >= 0.05) == (stat.read_text(), True)
+    assert cores.recent(str(stat), 0.05) is taken
+    assert cores.recent(str(tmp_path / "other"), 0.05) is None  # another file's
+    assert cores.recent(str(stat), 1) is None  # too short for a second's window
+    wait_until(lambda: cores.recent(str(stat), 0.05) is None, "the sample to age")
+
+
+def test_a_probe_takes_the_quietest_vcpu_from_heavys_own_sample(monkeypatch):
+    # Two seconds at 100 ticks a core: cpu0 fully busy, cpu1 half, cpu2 a quarter;
+    # cpu3, outside the job's cores, idle.
+    before = "cpu  1 1 1 1\n" + "".join(f"cpu{n} 0 0 0 0 0 0 0 0\n" for n in range(4))
+    after = "cpu  1 1 1 1\ncpu0 200 0 0 0 0 0 0 0\ncpu1 100 0 0 100 0 0 0 0\n"
+    after += "cpu2 50 0 0 150 0 0 0 0\ncpu3 0 0 0 200 0 0 0 0\n"
+    monkeypatch.setenv("HEAVY_STAT", "/heavy/stat")  # never read: the sample is reused
+    monkeypatch.setenv("HEAVY_POLL", "2")
+    monkeypatch.setattr(
+        cores,
+        "newest",
+        cores.Sample("/heavy/stat", before, after, 2.0, 0.0, time.monotonic()),
+    )
+
+    assert machinespeed.moment([0, 1, 2]) == (2, pytest.approx(1.75))
 
 
 @pytest.mark.parametrize("text", ["", "s-old 2026-11-07T01:02:03+00:00\ncmd=make\n"])
@@ -2104,7 +2155,7 @@ def test_an_alone_job_says_how_much_outside_work_shared_its_cores(outside):
     assert done.returncode == 0, done.stderr
     assert "other work used 42.0 CPU-seconds of its cores" in done.stderr
     assert "the timing may be off; run it again." in done.stderr
-    seconds, own, other = outside.report.read_text().split()
+    seconds, own, other, *_ = outside.report.read_text().split()
     assert (float(own), float(other)) == (0.0, 42.0)
     assert float(seconds) > 0
 
@@ -2159,6 +2210,128 @@ def test_a_measure_it_cannot_take_is_a_note_not_a_failure(outside):
     assert done.returncode == 0, done.stderr
     assert "Traceback" not in done.stderr
     assert "can't tell what other work" in done.stderr
+
+
+@pytest.fixture
+def usual_speed(box):
+    """An env whose probe (HEAVY_SPEED_PROBE) takes the file's 10 ms, and a speed file
+    of 20 such probes on this job's cores: the machine's usual speed."""
+    tmp_path, _, env = box
+    probe = tmp_path / "probe"
+    probe.write_text("0.01\n")
+    env = env | {"HEAVY_SPEED_PROBE": str(probe)}
+    cpus = sorted(os.sched_getaffinity(0))
+    when = datetime.now(UTC).isoformat(timespec="seconds")
+    line = f"{when}\t0.01\t0.01\t-\t{cores.span(cpus)}\t{cpus[0]}\t0.00\tfake\t-\n"
+    path = machinespeed.speed_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(line * 20)
+    return env, probe
+
+
+def test_an_alone_job_names_the_machines_speed_at_its_start_and_end(
+    usual_speed, tmp_path
+):
+    env, probe = usual_speed
+    report = tmp_path / "report"
+
+    done = heavy(
+        env,
+        "--alone",
+        "--",
+        "sh",
+        "-c",
+        'echo 0.02 > "$0"',
+        str(probe),
+        HEAVY_ALONE_REPORT=str(report),
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert (
+        "The machine ran at 1.00x its usual speed at the start and 0.50x at the end."
+        in done.stderr
+    )
+    assert "trust" not in done.stderr
+    assert report.read_text().split()[3:] == ["1.00", "0.50"]
+
+
+def test_an_alone_job_slow_at_its_start_and_end_is_no_timing(usual_speed):
+    env, probe = usual_speed
+    probe.write_text("0.02\n")
+
+    done = heavy(env, "--alone", "--", "true")
+
+    assert "0.50x its usual speed at the start and 0.50x at the end" in done.stderr
+    assert (
+        "Below 0.8x at both, so this timing isn't one to trust; run it again later."
+        in done.stderr
+    )
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_a_stop_during_an_alone_jobs_start_probe_stops_heavy(box, background, sig):
+    # The fake probe is a pipe the test holds open, so heavy is inside its start probe,
+    # reading it, when the signal comes.
+    tmp_path, _, _ = box
+    pipe, ran = tmp_path / "probe", tmp_path / "ran"
+    os.mkfifo(pipe)
+    h = background("--alone", "--", "touch", str(ran), HEAVY_SPEED_PROBE=str(pipe))
+    fd = None
+
+    def probe_reads():
+        nonlocal fd
+        try:
+            fd = os.open(pipe, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:  # ENXIO: heavy hasn't opened it yet
+            return False
+        return True
+
+    wait_until(probe_reads, "heavy to read its start probe")
+    try:
+        h.send_signal(sig)
+        h.wait(timeout=20)
+    finally:
+        os.close(fd)
+
+    assert h.returncode == 128 + sig
+    assert not ran.exists()
+    assert not held(tmp_path)
+
+
+def test_an_alone_job_with_no_usual_speed_yet_says_none(outside):
+    done = outside(0, "--alone")
+
+    assert "usual speed" not in done.stderr
+    assert outside.report.read_text().split()[3:] == ["-", "-"]
+
+
+def test_an_alone_job_names_the_time_the_host_stole(box):
+    tmp_path, _, env = box
+    stat, after = tmp_path / "stat", tmp_path / "stat.after"
+    stat.write_text(proc_stat(0))
+    first = min(os.sched_getaffinity(0))
+    after.write_text(
+        proc_stat(0).replace(
+            f"cpu{first} 0 0 0 1000 0 0 0 0", f"cpu{first} 0 0 0 1000 0 0 0 500"
+        )
+    )
+    sccache = tmp_path / "sccache"
+    sccache.write_text("0\n")
+
+    done = heavy(
+        env,
+        "--alone",
+        "--",
+        "sh",
+        "-c",
+        'cp "$0" "$HEAVY_STAT"',
+        str(after),
+        HEAVY_STAT=str(stat),
+        HEAVY_SCCACHE_CPU=str(sccache),
+        HEAVY_CORES_USED="0",
+    )
+
+    assert "the host stole 5.0 s of its cores' time." in done.stderr
 
 
 # The record of the jobs heavy ran, and `heavy history`.

@@ -17,22 +17,28 @@ returns a one-line note when the run took twice its promise or more. A run count
 toward the promise when its status is in `counts` or a signal stopped it (at least its
 elapsed time), it didn't run beside a holder (--share), and other work used at most
 LOAD_SHARE of its cores meanwhile; the rest are logged and left out. Its time is the
-monotonic time from the job's start to its end, never its wait in the queue.
+monotonic time from the job's start to its end, never its wait in the queue, and it
+counts at that time times the machine's speed factor as it ended (the newest probe
+of the last few minutes whose factor is known, lib/machinespeed.py), at most 1
+(unknown counts as 1): a run that took BROKEN_RATIO times its promise only because
+the machine was slow is logged and left out too.
 
 A promise is judged on its counted runs of the last COUNT_DAYS days whose log line
 carries its current `seconds` and its `command`'s hash, so a worktree's edited
 promise doesn't skew main's: below JUDGED_RUNS runs it isn't judged; it is broken
 when the median of its newest JUDGED_RUNS is BROKEN_RATIO times its seconds or more.
-A promise whose seconds are above DODGE_RATIO times its measured_seconds, or that
-matched jobs once but none in UNMATCHED_DAYS days, is flagged too. One that never
-matched a job isn't, since a tripwire for a dropped command is meant never to match;
-status says so.
+A promise whose seconds are above DODGE_RATIO times its measured_seconds, that
+matched jobs once but none in UNMATCHED_DAYS days, or most of whose last LEFT_OUT_OF
+runs (of those whose exit counts, or of all of them when it has fewer) were left
+out, is flagged too. One that never matched a job isn't, since a tripwire for a
+dropped command is meant never to match; status says so.
 
 The log is `<git common dir>/perf-promises/<name>.tsv` of the repo whose file holds
 the promise, shared by its worktrees, or `$PERF_PROMISES_DIR/<repo>/<name>.tsv` when
 that is set (the tests set it). Each run is one tab-separated line, appended in one
 write: its end (ISO, UTC), seconds, exit (a number, or `sigN`), load (`-`, `share`
-or `load=0.62`), the promised seconds, the command's hash, session and folder. Past
+or `load=0.62`), the promised seconds, the command's hash, session and folder, and the
+speed factor (`0.40`, or `-`; a line from before it has none). Past
 TRIM_AT lines it is cut to its newest KEEP lines, under a lock; a line appended while
 it's cut can be lost. A line that can't be read is skipped. PERF_PROMISES_GLOBAL names
 another file to stand in for llm-toolbox's (tests).
@@ -67,6 +73,7 @@ JUDGED_RUNS = 5
 BROKEN_RATIO = 2.0
 DODGE_RATIO = 3.0
 UNMATCHED_DAYS = 7
+LEFT_OUT_OF = 10  # flagged when most of its last this many runs were left out
 TRIM_AT, KEEP = 400, 200
 GIT_TIMEOUT = 5
 STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -262,6 +269,8 @@ class Ran:
     how: str
     load: float | None  # other work's share of the job's cores, when measured
     session: str | None
+    speed: float | None = None  # the machine's speed factor as it ended, when known
+    speed_age: float | None = None  # seconds since that probe; None: as it ended
 
     def exit_text(self):
         if self.signum is not None:
@@ -278,9 +287,23 @@ class Ran:
         return "-"
 
 
+def at_usual_speed(seconds, speed):
+    """A run's seconds as the machine's usual speed would have taken: its seconds
+    times its speed factor, at most 1 (unknown: the seconds)."""
+    return seconds if speed is None else seconds * min(speed, 1.0)
+
+
+def slowness_explains(promise, seconds, speed):
+    """Whether the machine's slowness alone takes the run to twice its promise or
+    more: it does, and at the usual speed it wouldn't."""
+    limit = BROKEN_RATIO * promise.seconds
+    return seconds >= limit > at_usual_speed(seconds, speed)
+
+
 def counted(promise, exit_text, load_text="-"):
-    """Whether a run, by its log fields, counts toward the promise's median; with no
-    load_text, whether its exit does, as a run's note asks."""
+    """Whether a run, by its exit and load fields, counts toward the promise's median
+    (slowness_explains may still leave it out); with no load_text, whether its exit
+    does, as a run's note asks."""
     if load_text != "-":
         return False
     if exit_text.startswith("sig"):
@@ -301,6 +324,11 @@ def after_job(job, folder, command, how, signum, tally):
     while a line is appended, so no log is left with half a line."""
     try:
         job.promise_note = judge_job(job, folder, command, how, signum, tally)
+        if job.promise_note is None:  # else a speed probe's problem goes untold
+            readings = (tally.speed_at_start, tally.end().speed)
+            job.promise_note = next(
+                (r.problem for r in readings if r is not None and r.problem), None
+            )
     except Exception as error:  # noqa: BLE001 - a promise must never fail a job
         stop = getattr(error, "signum", None)
         reason = (
@@ -356,6 +384,8 @@ def judge_job(job, folder, command, how, signum, tally):
         how,
         share,
         os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
+        used.speed.factor,
+        used.speed.age,
     )
     notes = []
     for toml, promise in matched:
@@ -372,10 +402,17 @@ def judge_job(job, folder, command, how, signum, tally):
             notes.append((ratio, toml, promise))
     if not notes:
         return None
-    ratio, toml, promise = max(notes, key=lambda item: item[0])
-    note = (
-        f"heavy: {promise.name} ran {short(ran.seconds)} s, {ratio:.1f}x its promised"
-        f" {short(promise.seconds)} s ({toml.repo().name}/{FILE})"
+    _, toml, promise = max(notes, key=lambda item: item[0])
+    usual = at_usual_speed(ran.seconds, ran.speed)
+    note = f"heavy: {promise.name} ran {short(ran.seconds)} s"
+    if usual < ran.seconds:
+        note += f" ({short(usual)} s at the machine's {ran.speed:.2f}x speed"
+        if ran.speed_age is not None:
+            note += f", measured {ago(ran.speed_age)}"
+        note += ")"
+    note += (
+        f", {usual / promise.seconds:.1f}x its promised {short(promise.seconds)} s"
+        f" ({toml.repo().name}/{FILE})"
     )
     load = ran.load_text()
     if load == "share":
@@ -384,7 +421,16 @@ def judge_job(job, folder, command, how, signum, tally):
         note += (
             f", but other work used {ran.load:.0%} of its cores, so it doesn't count"
         )
+    elif slowness_explains(promise, ran.seconds, ran.speed):
+        note += ", so it doesn't count"
     return note + ": perf-promises status"
+
+
+def ago(seconds):
+    """`40 s ago` or `2 min ago`."""
+    if round(seconds) < 60:
+        return f"{round(seconds)} s ago"
+    return f"{round(seconds / 60)} min ago"
 
 
 def line_of(ran, promise, now=None):
@@ -398,28 +444,29 @@ def line_of(ran, promise, now=None):
         promise.digest,
         ran.session or "-",
         ran.folder,
+        "-" if ran.speed is None else f"{ran.speed:.2f}",
     ]
     return "\t".join(text.replace("\t", " ").replace("\n", " ") for text in fields)
 
 
-def append(log, line):
-    """Append one line in one write; past TRIM_AT lines, cut to the newest KEEP."""
+def append(log, line, trim_at=TRIM_AT, keep=KEEP):
+    """Append one line in one write; past trim_at lines, cut to the newest keep."""
     log.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
         os.write(fd, (line + "\n").encode())
     finally:
         os.close(fd)
-    if log.read_bytes().count(b"\n") <= TRIM_AT:
+    if log.read_bytes().count(b"\n") <= trim_at:
         return
     lock = os.open(log.with_name(f".{log.name}.lock"), os.O_WRONLY | os.O_CREAT, 0o644)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         lines = log.read_bytes().splitlines(keepends=True)
-        if len(lines) > TRIM_AT:
+        if len(lines) > trim_at:
             part = log.with_name(f".{log.name}.{os.getpid()}.part")
             try:
-                part.write_bytes(b"".join(lines[-KEEP:]))
+                part.write_bytes(b"".join(lines[-keep:]))
                 part.rename(log)
             finally:
                 part.unlink(missing_ok=True)
@@ -435,6 +482,7 @@ class Logged:
     load: str
     promised: float
     digest: str
+    speed: float | None  # the machine's speed factor, None unknown or not logged
 
 
 def logged(log):
@@ -452,9 +500,16 @@ def logged(log):
             when = datetime.fromisoformat(parts[0])
             if when.tzinfo is None:
                 continue
+            speed = parts[8] if len(parts) > 8 else "-"
             found.append(
                 Logged(
-                    when, float(parts[1]), parts[2], parts[3], float(parts[4]), parts[5]
+                    when,
+                    float(parts[1]),
+                    parts[2],
+                    parts[3],
+                    float(parts[4]),
+                    parts[5],
+                    None if speed == "-" else float(speed),
                 )
             )
         except ValueError:
@@ -487,14 +542,21 @@ def judge(toml, promise, now=None):
     log = toml.log(promise)
     lines = [] if log is None else logged(log)
     same_command = [line for line in lines if line.digest == promise.digest]
-    recent = [
+    # The runs whose exit counts, and of them the ones left out for load or speed.
+    finished = [
         line
         for line in same_command
         if line.promised == promise.seconds
         and line.when >= now - timedelta(days=COUNT_DAYS)
-        and counted(promise, line.exit, line.load)
+        and counted(promise, line.exit)
     ]
-    times = [line.seconds for line in recent]
+    recent = [
+        line
+        for line in finished
+        if counted(promise, line.exit, line.load)
+        and not slowness_explains(promise, line.seconds, line.speed)
+    ]
+    times = [at_usual_speed(line.seconds, line.speed) for line in recent]
     middle = (
         statistics.median(times[-JUDGED_RUNS:]) if len(times) >= JUDGED_RUNS else None
     )
@@ -508,6 +570,14 @@ def judge(toml, promise, now=None):
         )
     if same_command and same_command[-1].when < now - timedelta(days=UNMATCHED_DAYS):
         flags.append(f"matched no job in {UNMATCHED_DAYS} days")
+    last = finished[-LEFT_OUT_OF:]
+    kept = {id(line) for line in recent}
+    left_out = sum(id(line) not in kept for line in last)
+    if 2 * left_out > len(last):
+        flags.append(
+            f"{left_out} of its last {len(last)} runs were left out, for the"
+            " machine's speed or load"
+        )
     matched = bool(same_command)
     return Verdict(len(lines), len(times), middle, p90, broken, flags, matched)
 

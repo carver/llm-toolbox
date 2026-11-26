@@ -43,7 +43,11 @@ row to DIR/results.tsv as it ends: variant, round, attempt, wall seconds (from
 heavy, so time spent in the queue doesn't count; `-` when heavy gave no measure,
 and the run counts for nothing), user and sys seconds (CMD's, plus
 heavy's own, which polls once a second while it waits its turn), outside
-CPU-seconds, exit status, flagged, parts. DIR must not hold results already, so
+CPU-seconds, exit status, flagged, the machine's speed at the run's start and end
+(heavy's speed factors, `-` before it knows the usual speed), parts. A run at a low
+speed is neither flagged nor rerun, since a throttled spell can outlast the whole
+bench and would flag every run; the columns show which runs it slowed. DIR must not
+hold results already, so
 a stopped bench's rows are never overwritten. At the end a table sums up each
 variant over its runs that were measured and neither flagged nor failed.
 
@@ -83,6 +87,8 @@ FIELDS = [
     "outside",
     "exit",
     "flagged",
+    "start_speed",
+    "end_speed",
     "parts",
 ]
 # A part's name holds neither `=` nor `,`, the parts column's own separators.
@@ -188,8 +194,10 @@ def limit(parser):
 
 def timed(command, log, cwd=None):
     """Run command as a heavy --alone job, in `cwd`: (exit, wall, user, sys, outside,
-    parts), wall None when heavy wrote no report. A stop signal meanwhile goes on to
-    heavy, which stops CMD and frees its place; the run then ends with heavy's 128+N."""
+    speeds, parts), wall None when heavy wrote no report, speeds the machine's speed
+    factors at its start and end as heavy wrote them (`-` unknown). A stop signal
+    meanwhile goes on to heavy, which stops CMD and frees its place; the run then ends
+    with heavy's 128+N."""
     with (
         tempfile.NamedTemporaryFile("r", prefix="heavy-bench-") as report,
         tempfile.NamedTemporaryFile("r", prefix="heavy-bench-parts-") as timings,
@@ -219,10 +227,10 @@ def timed(command, log, cwd=None):
         code = 128 - code if code < 0 else code
         words = Path(report.name).read_text().split()
         written = parts(Path(timings.name))
-    wall, _, outside = (
-        (float(w) for w in words) if len(words) == 3 else (None, 0.0, 0.0)
-    )
-    return code, wall, used.ru_utime, used.ru_stime, outside, written
+    measured = len(words) >= 3
+    wall, _, outside = (float(w) for w in words[:3]) if measured else (None, 0.0, 0.0)
+    speeds = (words[3:5] + ["-", "-"])[:2] if measured else ["-", "-"]
+    return code, wall, used.ru_utime, used.ru_stime, outside, speeds, written
 
 
 def counted(row):
@@ -261,7 +269,7 @@ class Bench:
                     return False
             suffix = "" if attempt == 1 else f"-{attempt}"
             log = self.out / f"{name}-{round_}{suffix}.log"
-            code, wall, user, sys_, outside, written = timed(command, log, cwd)
+            code, wall, user, sys_, outside, speeds, written = timed(command, log, cwd)
             if wall is None and code not in STOPPED_BY:
                 print(
                     f"heavy-bench: heavy gave no measure for {name} round {round_};"
@@ -281,6 +289,8 @@ class Bench:
                 "outside": f"{outside:.1f}",
                 "exit": str(code),
                 "flagged": str(int(flagged)),
+                "start_speed": speeds[0],
+                "end_speed": speeds[1],
                 "parts": written,
             }
             self.rows.append(row)

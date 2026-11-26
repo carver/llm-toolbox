@@ -159,6 +159,8 @@ def private_heavy_queue(tmp_path_factory, monkeypatch):
     # none, unless a test names a file of its own.
     monkeypatch.setenv("PERF_PROMISES_DIR", str(folder / "perf-promises"))
     monkeypatch.setenv("PERF_PROMISES_GLOBAL", str(folder / "no-global-promises.toml"))
+    # heavy's probe after a job exits, which a test turns on only to wait for it.
+    monkeypatch.setenv("HEAVY_SPEED_AFTER_EXIT", "0")
     for name in ("HEAVY_SLOT", "HEAVY_CORES_USED", "RUSTC_WRAPPER"):
         monkeypatch.delenv(name, raising=False)
 

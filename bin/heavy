@@ -9,6 +9,7 @@
     heavy --few-seconds -- CMD [ARGS...]  seconds of work, such as a few tests: at once
                                           on quiet cores, else next
     heavy status                          each lane's jobs and how busy its cores are
+    heavy speed                           the machine's usual speed, by vCPU and load
     heavy history [--since TIME] [--overlapping PID|TIME|START..END]
                                           the jobs it ran: when, for whom, how
     heavy waits [--since TIME] [--lane normal|long] [--min-jobs N] [--json]
@@ -77,10 +78,38 @@ on its cores while it ran, and how many cores that is on average: their busy tim
 counts as other work) and less what sccache's server used meanwhile, which the line
 names: the server runs a cargo job's compiles but isn't its child, and since every
 session shares it, another session's compiles then count as the job's. Past
-HEAVY_ALONE_OUTSIDE cores the line warns that the timing may be off. A measure that
-can't be taken is a note, and CMD's status stands. HEAVY_ALONE_REPORT names a file that
-gets the numbers as one line, `seconds own_cpu_seconds other_cpu_seconds`, for a tool
-that times runs.
+HEAVY_ALONE_OUTSIDE cores the line warns that the timing may be off. It names the
+host's steal on those cores meanwhile, when there was any, and the machine's speed at
+the job's start and end (below), once heavy knows its usual speed; at under 0.8x at
+both, it says the timing isn't one to trust. A measure that can't be taken is a note,
+and CMD's status stands. HEAVY_ALONE_REPORT names a file that gets the numbers as one
+line, `seconds own_cpu_seconds other_cpu_seconds start_speed end_speed` (each speed
+`-` when unknown), for a tool that times runs.
+
+The host can throttle this VM's CPU, and the sandbox can't see it otherwise: cgroup
+cpu.stat, /proc/cpuinfo and cpufreq showed nothing the afternoon it did (2026-11-26),
+when the owner said of a timing "The CPU was throttled really low, so I wouldn't trust
+that 262 s number right now". So after every job frees its place, heavy starts a probe
+of the machine's speed in a child of its own session and exits without waiting for it:
+the child measures the load over the next second (HEAVY_POLL), then times a fixed CPU
+loop, 4 runs of about 8 ms each on a quiet machine, pinned to the least busy of the
+job's cores, takes the load while the loop ran instead when that was busier, as when
+the next job has ramped up meanwhile, writes the result, and exits, within 10 s at most
+(its own alarm stops it then), so it needs no stopping. While one runs, a job that ends
+starts none. The job itself is judged by the newest probe of the last 5 minutes whose
+speed is known, any job's, and with none counts as at an unknown speed. No probe runs
+on a schedule yet, only as jobs end, so a job that runs past 5 minutes while no other
+job ends counts at its raw time, as a quiet machine's `mutate-check --diff` runs do. An
+--alone job probes inline instead, as it starts, reusing the last second of its wait
+for the load, and as it ends, before it frees its place. The machine's speed factor is
+the loop's usual process time over its time now: 1.0 is the usual speed, 0.4 is 2.5
+times slower. Load slows the loop too on this power-bound VM (16 ms at a load average
+of 1.5), so usual is per vCPU and load bucket, the load being the machine's busy vCPUs,
+steal left out: under 1, 1-3, 3-6 or 6+. It is the fastest tenth of the last 3 days'
+probes on this machine, this vCPU and this bucket, from at least 20 of them; with
+fewer, the speed is unknown. `heavy speed` prints them. The probes go on a file beside
+the perf promises' logs (lib/machinespeed.py says where and how), and a probe or file
+that fails is at most the job's one perf-promises note.
 
 A command's usual cores come from its last 5 runs that exited 0: the most CPU time
 any of them used per second of its run, counting CMD and the processes it waited for.
@@ -150,9 +179,11 @@ seconds, and frees its place; CMD also gets SIGTERM should heavy die.
 As a job ends, heavy measures its running time, without its wait in the queue,
 against the perf promises of its repo and llm-toolbox's (perf-promises -h): a run that
 took twice its promise or more hears so in one line on stderr, `heavy: NAME ran 312 s,
-2.6x its promised 120 s (REPO/perf-promises.toml): perf-promises status`, and every
-run a promise matches goes on its log. A promise file it can't read is that line
-instead; neither changes CMD's status.
+2.6x its promised 120 s (REPO/perf-promises.toml): perf-promises status`, or on a slow
+machine `heavy: NAME ran 3425 s (1370 s at the machine's 0.40x speed, measured 2 min
+ago), 11.4x its promised 120 s (...)`, and every run a promise matches goes on its
+log. A promise file
+it can't read is that line instead; neither changes CMD's status.
 
 heavy takes the queue's lock for a moment at each look, and a Ctrl-Z that comes while
 it holds it stops heavy only once it lets go. A heavy that has waited
@@ -175,8 +206,13 @@ Environment:
   HEAVY_GRACE          seconds CMD gets to stop before SIGKILL (default 5)
   HEAVY_ALONE_OUTSIDE  cores of other work, on average, past which an --alone job
                        hears its timing may be off (default 0.5)
-  HEAVY_ALONE_REPORT   a file an --alone job's seconds, own and other CPU-seconds go
-                       to, as one line
+  HEAVY_ALONE_REPORT   a file an --alone job's seconds, own and other CPU-seconds and
+                       speed at its start and end go to, as one line
+  HEAVY_SPEED_PROBE    a file whose `SECONDS [LOAD]` stand in for the speed probe's
+                       seconds and the load before it (tests; read only while
+                       PERF_PROMISES_DIR is set)
+  HEAVY_SPEED_AFTER_EXIT  0: start no speed probe after a job exits (tests; read
+                       only while PERF_PROMISES_DIR is set)
   HEAVY_WAITS_POLL     seconds between `heavy waits --until-open`'s readings
                        (default 30; the tests shorten it)
   FIFO_LOCK_SECONDS    seconds of waiting for the queue's lock before naming its
@@ -216,6 +252,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import heavyjobs
 import heavyqueue
+import machinespeed
 
 STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 # Why --few-seconds goes with none of these.
@@ -493,7 +530,7 @@ def main(argv=None):
     parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
-        help="status, history [OPTIONS], waits [OPTIONS], or -- CMD [ARGS...]",
+        help="status, speed, history [OPTIONS], waits [OPTIONS], or -- CMD [ARGS...]",
     )
     args = parser.parse_args(argv)
     if os.environ.get("OWN_PIDS") and heavyqueue.base().resolve() == SHARED_QUEUE:
@@ -511,12 +548,17 @@ def main(argv=None):
     if args.command == ["status"]:
         print(heavyqueue.status())
         return 0
+    if args.command == ["speed"]:
+        print(machinespeed.table())
+        return 0
     if args.command[:1] == ["history"]:
         return history(args.command[1:])
     if args.command[:1] == ["waits"]:
         return waits(args.command[1:])
     if args.command[:1] != ["--"] or len(args.command) < 2:
-        parser.error("expected `status`, `history`, `waits` or `-- CMD [ARGS...]`")
+        parser.error(
+            "expected `status`, `speed`, `history`, `waits` or `-- CMD [ARGS...]`"
+        )
     for sig in STOPS:
         signal.signal(sig, on_signal)
     try:

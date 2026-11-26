@@ -117,8 +117,9 @@ def diff(old_dir: Path, new_dir: Path) -> tuple[list[FileStat], str]:
     return stats, "".join(patch)
 
 
-def patch_file(name: str) -> Path | None:
-    path = PATCHES / f"{name}.patch"
+def patch_file(name: str, patches: Path | None = None) -> Path | None:
+    """NAME's patch in `patches` (by default this repo's skill-patches/), if any."""
+    path = (patches or PATCHES) / f"{name}.patch"
     return path if path.is_file() else None
 
 
@@ -132,11 +133,14 @@ def whys(patch: Path) -> list[str]:
     return found
 
 
-def write_patch(name: str, whys: list[str], patch: str) -> Path:
+def write_patch(
+    name: str, whys: list[str], patch: str, patches: Path | None = None
+) -> Path:
     if isinstance(whys, str):
         raise TypeError("write_patch takes a list of reasons, not one string")
-    PATCHES.mkdir(exist_ok=True)
-    path = PATCHES / f"{name}.patch"
+    patches = patches or PATCHES
+    patches.mkdir(exist_ok=True)
+    path = patches / f"{name}.patch"
     path.write_text("".join(f"{WHY} {why}\n" for why in whys) + patch)
     return path
 

@@ -149,7 +149,10 @@ def _compare(
             )
             if unpatched is None:
                 stats, text = tp.diff(installed, upstream)
-                note = f"doesn't hold {patch.name}: run install.py, or skill-patch save {name}"
+                note = (
+                    f"doesn't hold {patch.name}: run install.py, "
+                    f"or skill-patch save {name} -C WORKTREE"
+                )
                 return Change(name, source, stats, text, "local", note)
             base = unpatched
         stats, text = tp.diff(base, upstream)
@@ -165,7 +168,7 @@ def _compare(
                 else f"{patch.name} needs a rebase after the update"
             )
     elif kind == "local":
-        note = f"save it: skill-patch save {name} --why '...'"
+        note = f"save it: skill-patch save {name} -C WORKTREE --why '...'"
     return Change(name, source, stats, text, kind, note)
 
 

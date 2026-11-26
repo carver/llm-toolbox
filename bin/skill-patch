@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Keep hand edits to other authors' skills as patches that survive updates.
 
-    skill-patch save NAME [--why TEXT [--replace-why]]
+    skill-patch save NAME [-C WORKTREE] [--why TEXT [--replace-why]]
     skill-patch apply [NAME ...]
 
 save writes skill-patches/NAME.patch in llm-toolbox: the diff from the
@@ -13,6 +13,15 @@ its reason joins the earlier ones, which save prints. --replace-why drops the
 earlier reasons instead, for an edit that supersedes them. Saving without
 --why keeps every reason. A skill back to its upstream state loses its patch.
 
+-C WORKTREE writes the patch into that llm-toolbox worktree instead of the
+main tree, to commit there and land with wt-ship. It refuses a folder of any
+other repo, and a worktree whose base is behind a landed change to the same
+patch, since the reasons it would layer on are stale: rebase it first. When
+another worktree, or the main tree, holds an unlanded change to the patch, it
+saves and names them: the installed copy all sessions share holds that
+session's edits too, if it made them there, so this patch takes them in
+without their reasons, and whichever lands second merges the reasons.
+
 apply puts each patch (or the named ones) on its installed skill, skipping
 those already on. install.py runs it after installing or updating. A patch
 that no longer fits leaves the skill as upstream ships it: redo the change on
@@ -22,7 +31,7 @@ Exit status: 0 success; 1 a patch didn't apply, or save found nothing to
 compare against; 2 usage error.
 
 Examples:
-    skill-patch save show-me --why "Publish HTML views as Artifacts; open does nothing here."
+    skill-patch save show-me -C ../llm-toolbox-wt-show-me --why "Publish HTML views as Artifacts; open does nothing here."
     skill-patch apply
 """
 
@@ -33,6 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import thirdparty as tp
+from maintree import git
 
 
 class PatchError(Exception):
@@ -62,12 +72,86 @@ def installed_from(name: str) -> Path:
     return folder
 
 
-def save(name: str, why: str | None, replace_why: bool) -> str:
+def worktrees(directory: Path) -> list[Path]:
+    """The repo's work trees, the main one first, leaving out any whose folder is gone."""
+    listing = git(directory, "worktree", "list", "--porcelain") or ""
+    found = [
+        Path(line[9:]) for line in listing.splitlines() if line.startswith("worktree ")
+    ]
+    return [tree for tree in found if tree.is_dir()]
+
+
+def blob(tree: Path, rev: str, rel: str) -> str | None:
+    """The id of `rel` at `rev`, or None when it isn't there."""
+    found = git(tree, "rev-parse", "-q", "--verify", f"{rev}:{rel}")
+    return found.strip() if found else None
+
+
+def worktree_patches(directory: Path, name: str) -> Path:
+    """The skill-patches/ folder of `directory`, an llm-toolbox worktree, once its
+    base holds every landed change to NAME's patch. Warns of unlanded ones elsewhere."""
+    found = directory.is_dir() and git(
+        directory,
+        "rev-parse",
+        "--path-format=absolute",
+        "--show-toplevel",
+        "--git-common-dir",
+    )
+    if not found:
+        raise PatchError(f"{directory} isn't a git work tree")
+    top, common = map(Path, found.splitlines())
+    ours = git(tp.REPO, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not ours or Path(ours.strip()).resolve() != common.resolve():
+        raise PatchError(f"{directory} isn't a worktree of {tp.REPO}")
+    rel = f"{tp.PATCHES.name}/{name}.patch"
+    trees = worktrees(top)
+    main = trees[0] if trees else top
+    tip = (git(main, "rev-parse", "-q", "--verify", "HEAD") or "").strip()
+    if not tip:
+        return top / tp.PATCHES.name
+    branch = (git(main, "symbolic-ref", "-q", "--short", "HEAD") or "").strip()
+    onto = branch or tip[:12]
+    ours = f"the main tree's {branch}" if branch else f"the main tree's HEAD ({onto})"
+
+    def base(tree: Path) -> str | None:
+        found = git(tree, "merge-base", "HEAD", tip)
+        return found.strip() if found else None
+
+    start = base(top)
+    if start is None:
+        raise PatchError(f"couldn't find {top}'s base on {ours}")
+    if blob(top, start, rel) != blob(top, tip, rel):
+        dirty = git(top, "status", "--porcelain", "--untracked-files=no")
+        raise PatchError(
+            f"{ours} changed {rel} after {top}'s base, so the reasons there are "
+            f"stale: rebase it onto {onto} (git -C {top} rebase {onto})"
+            + (" (commit or stash first)" if dirty else "")
+            + ", then save again"
+        )
+    for tree in trees:
+        if tree.resolve() == top.resolve() or (since := base(tree)) is None:
+            continue
+        here = (tree / rel).is_file() and git(tree, "hash-object", rel)
+        if (here.strip() if here else None) != blob(tree, since, rel):
+            print(
+                f"skill-patch: {tree} holds an unlanded change to {rel}. The "
+                "installed copy holds that session's edits too, if it made them "
+                "there, so this patch takes them in without their reasons: the "
+                "second of the two to land merges the reasons in its rebase "
+                "conflict.",
+                file=sys.stderr,
+            )
+    return top / tp.PATCHES.name
+
+
+def save(
+    name: str, why: str | None, replace_why: bool, patches: Path | None = None
+) -> str:
     installed = tp.INSTALLED / name
     if not installed.is_dir():
         raise PatchError(f"{name} isn't installed in {tp.INSTALLED}")
     _, patch = tp.diff(installed_from(name), installed)
-    existing = tp.patch_file(name)
+    existing = tp.patch_file(name, patches)
     if not patch:
         if existing:
             existing.unlink()
@@ -80,7 +164,7 @@ def save(name: str, why: str | None, replace_why: bool) -> str:
         whys.append(why)
     if not whys:
         raise PatchError("a new patch needs --why")
-    path = tp.write_patch(name, whys, patch)
+    path = tp.write_patch(name, whys, patch, patches)
     report = [f"saved {path}; its reasons, one per layer of edits:"]
     report += [f"  {i}. {w}" for i, w in enumerate(whys, 1)]
     if dropped := [w for w in earlier if w not in whys]:
@@ -104,7 +188,7 @@ def apply(names: list[str]) -> int:
             conflicts += 1
             print(
                 f"  CONFLICT {name}: {patch.name} no longer fits; redo it on {skill}, "
-                f"then skill-patch save {name}"
+                f"then skill-patch save {name} -C WORKTREE"
             )
         elif status == "applied":
             print(f"  patched {name}")
@@ -121,6 +205,12 @@ def main(argv: list[str] | None = None) -> int:
         "save", help="write the installed skill's edits to its patch"
     )
     save_cmd.add_argument("name")
+    save_cmd.add_argument(
+        "-C",
+        dest="worktree",
+        type=Path,
+        help="an llm-toolbox worktree to write the patch into, instead of the main tree",
+    )
     save_cmd.add_argument(
         "--why",
         help="the reason for the edit; required for a new patch, and added as a "
@@ -140,7 +230,8 @@ def main(argv: list[str] | None = None) -> int:
         save_cmd.error("--replace-why needs --why")
     try:
         if args.command == "save":
-            print(save(args.name, args.why, args.replace_why))
+            patches = args.worktree and worktree_patches(args.worktree, args.name)
+            print(save(args.name, args.why, args.replace_why, patches))
             return 0
         return apply(args.names)
     except PatchError as e:

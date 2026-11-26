@@ -1198,6 +1198,35 @@ vendored into projects without lib/; test_maintree.py holds the two to one answe
 Issue #12 (destructive git after a bare `cd X;`) reuses the walk: each step names the
 latest earlier `cd` in its scope that ends with `;` or a newline.
 
+### skill-patch save -C writes the patch into a worktree (#23, 2026-11-26)
+
+Once #4 refused an agent's commit in a main tree, `skill-patch save` still wrote
+`skill-patches/NAME.patch` into llm-toolbox's main tree, so every skill patch needed
+the owner. The owner's answer: `save -C WORKTREE`, committed there and landed with
+wt-ship. Without -C, save writes into the main tree as before, for the owner.
+
+- -C refuses a folder that isn't a work tree of the tool's own repo (the same git
+  common dir as `lib/thirdparty.py`'s REPO), since a patch anywhere else is never
+  landed or applied. Any folder inside the worktree names it; the main tree passes
+  too, as the default does.
+- It refuses a worktree whose base is behind a landed change to that patch. The new
+  patch layers its reason on the reasons the worktree's copy holds, which would drop
+  the landed layer's, and the rebase at landing would then conflict. `git rebase
+  BRANCH` there settles it before save, where nothing is lost. A worktree with no
+  merge-base on the main tree's HEAD is refused too, rather than compared with
+  nothing.
+- An unlanded change to the patch in another worktree, or uncommitted in the main
+  tree, gets a note naming each, and save goes on. The diff runs against the installed
+  copy every session shares, so it takes in the other session's edit, if made there,
+  without its reason. The worktrees can't be ordered from here: the second to land
+  meets a rebase conflict and merges the reasons, and a main-tree change stops
+  wt-ship on its own.
+- `apply` takes no -C. It writes the installed copy every session shares, which should
+  hold the landed patches; install.py runs it from the main tree after a landing, and
+  a worktree's patch is already on the copy it was saved from.
+- THIRD_PARTY_SKILLS is still read from the tool's own install.py, the list the
+  installed skills came from.
+
 ## subagent-wait-gate
 
 ### A subagent blocks on its job; a SubagentStop hook refuses a stop to wait (2026-11-13)

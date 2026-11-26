@@ -877,7 +877,9 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
 
 - **skill-patch**: keeps hand edits to other authors' skills. Edit the
   installed copy in `~/.agents/skills/NAME`, then `skill-patch save NAME
-  --why "..."` writes `skill-patches/NAME.patch`, headed by its Why. A later
+  -C WORKTREE --why "..."` writes `skill-patches/NAME.patch` into that
+  llm-toolbox worktree, headed by its Why; commit it there and land it with
+  `wt-ship`. Without `-C` it writes into the main tree. A later
   edit with its own `--why` adds a layer and keeps the earlier reasons
   (`skill-patch -h`).
   `skill-patch apply` puts the patches back on; `install.py` runs it. When an

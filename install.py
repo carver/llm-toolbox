@@ -484,7 +484,8 @@ def apply_skill_patches() -> int:
         elif status == "conflict":
             say(
                 f"CONFLICT {patch.stem}: {patch.name} no longer fits the new version; "
-                f"redo the edit on {skill}, then `skill-patch save {patch.stem}`"
+                f"redo the edit on {skill}, then "
+                f"`skill-patch save {patch.stem} -C WORKTREE` in an llm-toolbox worktree"
             )
             conflicts += 1
     return conflicts

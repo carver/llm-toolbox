@@ -133,9 +133,11 @@ filedrawer's clippy on a build its check slot already holds. A check that exits 
 it, after printing why, runs again as heavy runs a `--few-seconds` job (`heavy -h`):
 at once outside the queue, at nice 10, while the normal lane's cores are quiet,
 whoever holds the lane, else from the queue's front, ahead of every ordinary waiter.
-Its pass line then says `a --few-seconds job`. One that ran past HEAVY_QUICK_MAX
-seconds (60) prints, after its pass line, that the check's seconds rule needs a look
-(the time counts any wait for a lock the check takes). This too is on trust. --no-queue exits 75 for it, as for the queue exit, and a
+Its pass line then says `a --few-seconds job`. One still running after HEAVY_QUICK_MAX
+seconds (60, and at most 60), as heavy stops a --few-seconds job, is stopped, its own
+process group sent SIGTERM and then SIGKILL after HEAVY_GRACE seconds, and runs again
+as an ordinary check in the queue, after a line saying that the check's seconds rule
+needs a look (the time counts any wait for a lock the check takes). This too is on trust. --no-queue exits 75 for it, as for the queue exit, and a
 check that finds the variable unset, under an older gate, asks with CHECK_QUEUE_EXIT.
 
 Each check also gets CHECK_TIMINGS, the path of an empty file it may write its parts'
@@ -821,31 +823,77 @@ class Run(NamedTuple):
     seconds: bool = False
     waited: float = 0.0
     promise: str | None = None  # the heavy job's perf promise note, if any
+    overran: bool = False  # stopped at the --few-seconds limit
 
     @property
     def code(self):
         return self.process.returncode
 
 
-def run_once(path, env):
+def run_once(path, env, limit=None):
     """The check's run, its output with stderr merged in, how long it took, and the
-    timings it wrote to the file TIMINGS_NAME names."""
+    timings it wrote to the file TIMINGS_NAME names. With a limit, in seconds, the
+    check runs in a process group of its own, which gets SIGTERM past it and SIGKILL
+    HEAVY_GRACE seconds later, and the Run says it overran. Its own group is out of
+    reach of a signal to the gate's, such as Ctrl-C's, so the check gets SIGTERM
+    should the gate die, and a gate stopped by SIGINT, SIGTERM or SIGHUP while the
+    check runs stops its group before it raises KeyboardInterrupt."""
     fd, timings = tempfile.mkstemp(prefix="check-timings-")
     os.close(fd)
     try:
         started = time.monotonic()
         # `path` as given: Path() would drop a leading ./ and send it to a PATH lookup.
-        run = subprocess.run(
+        proc = subprocess.Popen(
             [path],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            check=False,
             env=env | {TIMINGS_NAME: timings},
+            process_group=None if limit is None else 0,
+            # The gate runs no threads, so preexec_fn is safe here.
+            preexec_fn=None if limit is None else heavyqueue.die_with_parent,  # noqa: PLW1509
         )
+        overran = False
+        with ExitStack() as stack:
+            if limit is not None:
+                stack.enter_context(stops_its_group(proc))
+            try:
+                out, _ = proc.communicate(timeout=limit)
+            except subprocess.TimeoutExpired:
+                overran = True
+                out = heavyqueue.stop_group(
+                    proc, lambda t: proc.communicate(timeout=t)[0]
+                )
+        run = subprocess.CompletedProcess(proc.args, proc.returncode, out)
         took = time.monotonic() - started
-        return Run(run, took, read_timings(Path(timings)))
+        return Run(run, took, read_timings(Path(timings)), overran=overran)
     finally:
         Path(timings).unlink(missing_ok=True)
+
+
+STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def interrupted(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+@contextmanager
+def stops_its_group(proc):
+    """While the body waits on the check proc, in a group of its own: SIGTERM and
+    SIGHUP raise KeyboardInterrupt as SIGINT does, and on any exception the check's
+    group is stopped as heavy stops a job, with further signals ignored meanwhile so a
+    second Ctrl-C can't cut that short. Then the exception goes on."""
+    old = {sig: signal.signal(sig, interrupted) for sig in STOPS}
+    try:
+        yield
+    except BaseException:
+        for sig in STOPS:
+            signal.signal(sig, signal.SIG_IGN)
+        heavyqueue.stop_group(proc)
+        raise
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
 
 
 def read_timings(path):
@@ -1049,7 +1097,15 @@ def run_quiet(path, name, base, queue=True, seconds=False):
     the greps hid failed commits. With queue, it runs once it's its turn in heavy's
     queue, whose waiting lines print as they come; with seconds too, as heavy runs a
     --few-seconds job: at once outside the queue, niced, while the lane's cores are
-    quiet, else from the queue's front."""
+    quiet, else from the queue's front, and stopped past heavy's limit for one
+    (HEAVY_QUICK_MAX), to run again as an ordinary queued check."""
+    limit = None
+    if seconds and queue:
+        try:
+            limit = heavyqueue.quick_limit()
+        except ValueError as error:
+            limit = heavyqueue.QUICK_MOST
+            print(f"heavy: {error}; using {limit} s.", file=sys.stderr)
     with ExitStack() as stack:
         env, job = os.environ, None
         asked = time.monotonic()
@@ -1066,22 +1122,29 @@ def run_quiet(path, name, base, queue=True, seconds=False):
                 file=sys.stderr,
             )
         waited = time.monotonic() - asked + waited_before()
-        run = run_once(path, check_env(env, base))._replace(
-            waited=waited, seconds=job is not None and seconds
-        )
+        run = run_once(
+            path,
+            check_env(env, base),
+            # A check inside a job, as in wt-ship's landing, runs as part of it.
+            limit=limit if job is not None and not job.nested else None,
+        )._replace(waited=waited, seconds=job is not None and seconds)
         if job is not None:
-            job.exited(run.code)  # a passing check goes into heavy's history
-    if job is not None:
-        run = run._replace(promise=job.promise_note)
-    report(name, base, run)
-    limit = heavyqueue.knob("HEAVY_QUICK_MAX", 60)
-    if run.seconds and run.took > limit:
+            # A passing check goes into heavy's history; one stopped, as heavy's
+            # own --few-seconds jobs are, is recorded with timeout(1)'s 124.
+            job.overran = run.overran
+            job.exited(124 if run.overran else run.code)
+    if run.overran:
         print(
             f"{name}: said its queued work takes seconds ({SECONDS_EXIT_NAME}), but"
-            f" ran past {limit:g} s as a --few-seconds job: the rule it says so by"
+            f" ran past {limit:g} s as a --few-seconds job, so it was stopped and"
+            " runs again as an ordinary check in the queue: the rule it says so by"
             " needs a look.",
             file=sys.stderr,
         )
+        return run_quiet(path, name, base)
+    if job is not None:
+        run = run._replace(promise=job.promise_note)
+    report(name, base, run)
     return run
 
 

@@ -8,7 +8,8 @@ the hook refuses a Bash call that runs `heavy -- CMD` unless the call was made w
 run_in_background: true, and names the right form: `bgrun --wait -o LOG -- heavy --
 CMD` as a background call. `heavy --few-seconds -- CMD`, a run of seconds that waits for
 the running job and the queue's front, may run in the foreground, and the refusal
-names it too. That wait can pass the Bash tool's default limit of two minutes, so the
+names it too; heavy stops such a run past 60 s (HEAVY_QUICK_MAX), so anything longer
+goes through bgrun. That wait can pass the Bash tool's default limit of two minutes, so the
 hook refuses a foreground call that runs it unless the call's own timeout is the
 tool's longest, 600000 ms; a `timeout` command around heavy doesn't count.
 Background call or not, it refuses heavy around bgrun (`heavy -- bgrun ...`), and
@@ -69,7 +70,7 @@ FOREGROUND = (
     "Refused: heavy waits its turn with no time limit, and a Bash call that waits on it "
     f"is killed at the tool's limit. Run {RIGHT_FORM}. Only a run of seconds, such as "
     "a few tests, may run in the foreground, as heavy --few-seconds -- CMD with the "
-    "call's timeout at 600000.\n"
+    "call's timeout at 600000; heavy stops one past 60 s.\n"
     "Where a background call can't notify you, drop --wait, then wait with "
     "`waitone --pid PID -t 300` and read LOG."
 )
@@ -106,7 +107,8 @@ SUBAGENT = {
         "Refused: heavy waits its turn with no time limit, and a Bash call that waits on "
         f"it is killed at the tool's limit. In a subagent, run {SUBAGENT_FORM}. Only a "
         "run of seconds, such as a few tests, may run in the foreground, as heavy "
-        f"--few-seconds -- CMD with the call's timeout at {LONGEST_TIMEOUT_MS}."
+        f"--few-seconds -- CMD with the call's timeout at {LONGEST_TIMEOUT_MS}; heavy"
+        " stops one past 60 s."
     ),
     WRONG_ORDER: f"Refused: heavy goes inside bgrun, not around it: {SUBAGENT_FORM}.",
     MUTATE_LONG: (

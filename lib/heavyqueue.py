@@ -14,6 +14,9 @@ A `--few-seconds` job, seconds of work, runs at once outside the queue, taking n
 at nice SHARE_NICE, when its lane's cores have averaged under HEAVY_QUICK_BUSY busy for
 HEAVY_QUICK_SECONDS and SHARE_MEMORY is free (Lull); otherwise it joins the queue's
 front, keeps watching, and starts at its first quiet sample once it heads the lane.
+It may run HEAVY_QUICK_MAX seconds, at most QUICK_MOST (quick_limit); its runner
+stops it past that (bin/heavy, agent-commit-gate), with stop_group, and its record
+says so (Job.overran).
 
 A waiter that asks to (`--share`) starts beside the holder, as its lane's sharer,
 when the share slot is free, the holder doesn't run `--alone`, 4 GiB of memory are
@@ -32,9 +35,9 @@ under one lock for both lanes, so a long and a normal job starting together neve
 share cores.
 
 It reads HEAVY_DIR, HEAVY_SHARED_DIR (the tests' stand-in for /tmp/heavy, the shared
-queue), HEAVY_QUIET_SECONDS, HEAVY_POLL (seconds per sample),
-HEAVY_SHARE_SECONDS, HEAVY_STALL_SECONDS (before the PR hint), HEAVY_QUICK_SECONDS,
-HEAVY_QUICK_BUSY, HEAVY_ALONE_OUTSIDE, HEAVY_ALONE_REPORT, HEAVY_BUSY (the tests'
+queue), HEAVY_QUIET_SECONDS, HEAVY_POLL (seconds per sample), HEAVY_SHARE_SECONDS,
+HEAVY_STALL_SECONDS (before the PR hint), HEAVY_GRACE (stop_group's wait between
+SIGTERM and SIGKILL), HEAVY_QUICK_SECONDS, HEAVY_QUICK_BUSY, HEAVY_ALONE_OUTSIDE, HEAVY_ALONE_REPORT, HEAVY_BUSY (the tests'
 stand-in for measuring), HEAVY_MEMINFO, HEAVY_VMSTAT, HEAVY_STAT and
 HEAVY_SCCACHE_CPU (the tests' stand-ins for /proc/meminfo, /proc/vmstat, /proc/stat
 and sccache's CPU time), as bin/heavy's
@@ -48,9 +51,11 @@ speed from its newest probe, and has the machine's speed probed once its slot is
 (lib/machinespeed.py, which reads HEAVY_SPEED_PROBE and HEAVY_SPEED_AFTER_EXIT).
 """
 
+import ctypes
 import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -115,6 +120,60 @@ def is_shared(folder):
     """Whether `folder`, through any links, is the shared queue or the live one,
     whatever HEAVY_SHARED_DIR says."""
     return folder.resolve() in (shared().resolve(), LIVE.resolve())
+
+
+QUICK_MOST = 60  # seconds: the longest a --few-seconds job may run (HEAVY_QUICK_MAX)
+
+
+def quick_limit():
+    """The seconds a --few-seconds job may run before it is stopped: HEAVY_QUICK_MAX,
+    by default and at most QUICK_MOST. ValueError for a setting past that, or one
+    that isn't a number of seconds over 0."""
+    text = os.environ.get("HEAVY_QUICK_MAX", str(QUICK_MOST))
+    try:
+        limit = float(text)
+    except ValueError:
+        limit = math.nan
+    if not 0 < limit <= QUICK_MOST:  # nan fails both
+        raise ValueError(
+            f"HEAVY_QUICK_MAX must be a number of seconds over 0 and at most"
+            f" {QUICK_MOST}, not {text!r}: --few-seconds is for runs of seconds"
+        )
+    return limit
+
+
+PR_SET_PDEATHSIG = (
+    1  # prctl(2)'s option: a signal for this process when its parent dies
+)
+
+
+def die_with_parent():
+    """In a child, before it runs its command (Popen's preexec_fn): get SIGTERM should
+    the process that started it die, even by SIGKILL."""
+    ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+
+
+def stop_group(proc, wait=None):
+    """Stop the process group proc leads: SIGTERM and SIGCONT, since a stopped group
+    can't act on SIGTERM, then SIGKILL after HEAVY_GRACE seconds. What
+    wait(timeout) returned once proc ended: proc.wait by default, or a caller's
+    communicate, to keep proc's output."""
+    if wait is None:
+
+        def wait(timeout):
+            return proc.wait(timeout=timeout)
+
+    grace = knob("HEAVY_GRACE", 5)
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(proc.pid, signal.SIGCONT)
+        try:
+            return wait(grace)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # nothing left in the group, so proc has ended
+    return wait(None)
 
 
 def base():
@@ -471,6 +530,7 @@ class Job:
     # lib/perfpromises.py's note on the run, which it prints unless tell_promise is off
     promise_note: str | None = None
     tell_promise: bool = True
+    overran: bool = False  # its runner stopped it at the --few-seconds limit
 
     def pin(self):
         """Pin this process to the job's cores, and nice it for a sharer; what it
@@ -713,14 +773,19 @@ def recorded(job, asked, how, beside=None):
 
         def end():
             used = tally.end()
-            return {"exit": job.status, "signal": stopped_by} | {
-                "cmd_pid": job.command_pid,
-                "cpu": round(used.own, 3),
-                "other_cpu": None if used.other is None else round(used.other, 3),
-                "sccache_cpu": None
-                if used.compiles is None
-                else round(used.compiles, 3),
-            }
+            stopped = {"stopped": "limit"} if job.overran else {}
+            return (
+                {"exit": job.status, "signal": stopped_by}
+                | stopped
+                | {
+                    "cmd_pid": job.command_pid,
+                    "cpu": round(used.own, 3),
+                    "other_cpu": None if used.other is None else round(used.other, 3),
+                    "sccache_cpu": None
+                    if used.compiles is None
+                    else round(used.compiles, 3),
+                }
+            )
 
         heavyjobs.ended(base(), ident, end)
         perfpromises.after_job(job, asked["cwd"], command, how, stopped_by, tally)

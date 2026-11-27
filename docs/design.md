@@ -126,6 +126,18 @@ Such a run goes under heavy like any other command, with the foreground and
 - The script of a shell's `-c` under heavy (`heavy -- bash -c '...'`) is searched too.
 - `heavy -- mutate-check -h` passes this rule, since it returns at once.
 
+### A --few-seconds job is stopped at 60 s (2026-11-26)
+
+On 2026-11-26 agents ran jobs of 61 to 215 s under `--few-seconds` (heavy's record: whole test files such as `./t test_build_state.py`, 202 and 215 s; `./t test_gh_ci_wait.py`, 131 s), each jumping the queue's front and running beside the lane's holder, and heavy only warned as each ended (`HEAVY_QUICK_MAX`).
+The owner: "It should require a time limit of 60 s or less. That should only cover overloaded situations; they should usually be closer to 10 s or less."
+
+- A --few-seconds job still running `HEAVY_QUICK_MAX` seconds after CMD started (60 by default) is stopped as a stopped heavy stops one: SIGTERM to CMD's process group, SIGKILL after `HEAVY_GRACE`. heavy exits 124, timeout(1)'s status, and the record keeps 124. The line names `bgrun -o LOG -- heavy -- CMD`. The warning it replaces is gone: no job runs past the limit to hear it.
+- Only running time counts, not the wait at the queue's front, which a --few-seconds job doesn't choose.
+- `HEAVY_QUICK_MAX` may lower the limit, never raise it: a setting over 60, or one that isn't a number of seconds over 0, is a usage error (exit 2) for heavy. The tests lower it to fractions of a second.
+- A heavy inside a job has no limit of its own: the outer job's holds, and a check that calls heavy inside a landing's job must not be cut at 60 s.
+- Not from heavy's history: the owner doubts its fidelity, and a limit stops the run that overran whatever predicted it.
+- agent-commit-gate's seconds checks (`CHECK_SECONDS_EXIT`, filedrawer #155, since f54c3ac and filedrawer's 84af74b) run as --few-seconds jobs through heavyqueue, not bin/heavy, so the gate applies the same limit itself: the check runs in a process group of its own (with SIGTERM should the gate die, since a signal to the gate's group no longer reaches it; a gate stopped by SIGINT, SIGTERM or SIGHUP stops the check's group first, as heavy does, since PR_SET_PDEATHSIG reaches only the check's first process and a probe's `sleep` ran on outside the queue), and past the limit it is stopped the same way and runs again as an ordinary queued check, after a line saying the check's seconds rule needs a look. So a commit never fails for overrunning; it costs the time it ran plus the ordinary run. A bad `HEAVY_QUICK_MAX` there is a note and 60 s, not a refused commit. A check inside a job, as in wt-ship's landing, has no limit, as a heavy inside one has none. Both runners stop a group with heavyqueue's stop_group, and a stopped job's record says `"stopped": "limit"`, since its 124 alone is also what a command's own timeout(1) exits. filedrawer's record held no seconds run yet at landing; fd#148 measured the checks its rule calls short at under 40 s, so at the host's usual speed they fit, and under a throttle like that day's (about 0.15x) they would overrun and run again in the queue.
+
 ### heavy's `--quick` is named `--few-seconds` (2026-11-24)
 
 Agents ran `heavy --quick` for runs of minutes: in one session, a whole test file of
@@ -157,7 +169,7 @@ every session's full checks, sometimes tens of minutes.
   idles lets it through. Heading the lane, it starts at the first quiet sample: a 5 s
   job shouldn't wait 10 s of quiet.
 - One that runs past 60 s hears, as it ends, to drop `--quick` for runs like it; a
-  warning only.
+  warning only. Since 2026-11-26 it is stopped at 60 s (the entry above).
 - Since 2026-11-24, a run outside the queue is niced to 10, as a sharer is, even on a
   free lane, since a holder may take the lane while it runs and only root can undo a
   nice. That day a ten-worker pytest, most likely a `--quick` run admitted while a

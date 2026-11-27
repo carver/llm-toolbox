@@ -1994,28 +1994,92 @@ def test_help_names_few_seconds_and_not_the_old_quick(box):
     assert "--few-seconds" in done.stdout and "--quick" not in done.stdout
 
 
-def test_a_quick_job_that_runs_long_hears_once_at_its_end_to_drop_quick(
-    box, background, memory
+def alive(pid):
+    """Whether pid runs: a zombie, ended but not yet reaped, doesn't."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rpartition(")")[2].split()[0] != "Z"
+
+
+@pytest.mark.parametrize("ignores_term", [False, True], ids=["term", "kill"])
+def test_a_few_seconds_job_past_its_limit_is_stopped_with_its_group(
+    box, memory, ignores_term
 ):
-    tmp_path, _, _ = box
-    started, release = tmp_path / "started", tmp_path / "release"
-    command = (
-        f'touch "{started}"; while [ ! -e "{release}" ]; do sleep 0.05; done;'
-        " echo done >&2"
+    """2026-11-26: agents ran 61 to 214 s jobs as --few-seconds, and heavy only warned
+    as each ended. Past HEAVY_QUICK_MAX, CMD's whole group gets SIGTERM, then SIGKILL
+    after HEAVY_GRACE."""
+    tmp_path, _, env = box
+    pid_file = tmp_path / "grandchild"
+    trap = "trap '' TERM; " if ignores_term else ""
+    command = f'{trap}sleep 600 & echo $! > "{pid_file}"; wait; wait'
+    begun = time.monotonic()
+
+    done = heavy(
+        env,
+        "--few-seconds",
+        "--",
+        "sh",
+        "-c",
+        command,
+        HEAVY_QUICK_MAX="0.5",
+        HEAVY_GRACE="0.3",
     )
 
-    q = background("--few-seconds", "--", "sh", "-c", command, HEAVY_QUICK_MAX="0.2")
-    wait_until(started.exists, "the job to start")
-    # fixed sleep: the job must outlast HEAVY_QUICK_MAX, which heavy doesn't say
-    time.sleep(0.4)
-    release.touch()
-    status, _, err = finish(q)
+    took = time.monotonic() - begun
+    assert done.returncode == 124, done.stderr
+    assert took < 30, took
+    grandchild = int(pid_file.read_text())
+    wait_until(lambda: not alive(grandchild), "the job's grandchild to be stopped", 10)
+    (line,) = [ln for ln in done.stderr.splitlines() if ln.startswith("heavy:")]
+    assert "stopped this --few-seconds job at its 0.5 s limit" in line, line
+    assert "bgrun -o LOG -- heavy -- CMD" in line, line
+    (job,) = ended(tmp_path)
+    assert job["exit"] == 124 and job["stopped"] == "limit", job
+    shown = heavy(env, "history").stdout
+    assert "stopped at the --few-seconds limit" in shown, shown
 
-    assert status == 0, err
-    lines = err.splitlines()
-    assert len(lines) == 2 and lines[0] == "done", err
-    assert "past 0.2 s" in lines[1] and "--few-seconds" in lines[1], err
-    assert "--quick" not in lines[1], err
+
+def test_a_few_seconds_job_within_its_limit_runs_to_its_end(box, memory):
+    tmp_path, _, env = box
+
+    done = heavy(env, "--few-seconds", "--", "sh", "-c", "sleep 0.2; exit 124")
+
+    assert done.returncode == 124, done.stderr
+    assert "limit" not in done.stderr, done.stderr
+    (job,) = ended(tmp_path)
+    assert job["exit"] == 124 and "stopped" not in job, job
+
+
+def test_a_few_seconds_heavy_inside_a_job_has_no_limit(box):
+    """Inside a job, such as wt-ship's landing check, a --few-seconds heavy runs as
+    part of it: stopping it would cut the landing's check short."""
+    _, _, env = box
+    inner = [str(SCRIPT), "--few-seconds", "--", "sh", "-c", "sleep 0.5; exit 3"]
+
+    done = heavy(env, "--", *inner, HEAVY_QUICK_MAX="0.1", HEAVY_GRACE="0.1")
+
+    assert done.returncode == 3, done.stderr
+    assert "limit" not in done.stderr, done.stderr
+
+
+@pytest.mark.parametrize("setting", ["61", "0", "-5", "soon", "nan"])
+def test_a_few_seconds_limit_over_60_s_or_unreadable_is_a_usage_error(box, setting):
+    _, _, env = box
+
+    done = heavy(env, "--few-seconds", "--", "true", HEAVY_QUICK_MAX=setting)
+
+    assert done.returncode == 2, done.stderr
+    assert "HEAVY_QUICK_MAX" in done.stderr, done.stderr
+
+
+def test_the_limit_is_only_for_few_seconds_jobs(box):
+    _, _, env = box
+
+    done = heavy(env, "--", "sh", "-c", "sleep 0.3", HEAVY_QUICK_MAX="0.1")
+
+    assert done.returncode == 0, done.stderr
 
 
 @pytest.mark.parametrize("other", ["--long", "--alone", "--share"])

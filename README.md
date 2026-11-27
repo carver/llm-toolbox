@@ -577,8 +577,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   otherwise it waits at the queue's front, after earlier front entries such as
   a landing's check and ahead of every other waiter, until the
   cores go that quiet or it heads the lane, where it starts at the first quiet
-  sample. One that ran past `$HEAVY_QUICK_MAX` (60) seconds hears, as it ends,
-  to drop `--few-seconds` for runs like it. It goes with none of `--long`,
+  sample. One still running after `$HEAVY_QUICK_MAX` seconds (60, and at most
+  60; such a job usually takes 10 s or less) is stopped, its process group
+  sent SIGTERM and then SIGKILL after `$HEAVY_GRACE` seconds, and told to run
+  as `bgrun -o LOG -- heavy -- CMD`; heavy exits 124. It goes with none of `--long`,
   `--alone` and `--share`, and may run as a foreground Bash call, with a 600000 ms
   timeout; heavy-gate refuses the call without it. Stopped, it stops CMD's
   process group,
@@ -774,7 +776,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `run_in_background: true`, since heavy's queue has no time limit and the
   Bash tool kills a call at its own; the refusal names `bgrun --wait -o LOG --
   heavy -- CMD` as a background call, and `heavy --few-seconds -- CMD` for a run
-  of seconds, which passes in the foreground only when the call's own timeout is
+  of seconds (heavy stops one past 60 s), which passes in the foreground only when the call's own timeout is
   600000 ms (a `timeout` command doesn't count), since it may wait minutes for
   the running job. Background or not,
   it refuses heavy around bgrun, git commit or wt-ship, and heavy without

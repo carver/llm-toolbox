@@ -49,9 +49,13 @@ Otherwise it joins the queue's front, as wt-ship's job does, and keeps watching 
 poll: once the cores have averaged that quiet over the window, it leaves the queue and
 runs outside it. Heading the lane with the slot free, it starts at the first sample
 under half busy, not after HEAVY_QUIET_SECONDS of them, which would cost it more than
-its run, and it never hears the PR hint. A --few-seconds job that ran past
-HEAVY_QUICK_MAX seconds hears once, as it ends, to run ones like it, or the build before
-them, without --few-seconds; nothing is stopped. A --few-seconds call may run in the
+its run, and it never hears the PR hint. A --few-seconds job may run HEAVY_QUICK_MAX
+seconds (default 60, the most it may be set to; usually such a job takes 10 s or
+less): past that, heavy stops CMD's process group, SIGTERM and then SIGKILL after
+HEAVY_GRACE seconds, says to run it without --few-seconds and in the background,
+`bgrun -o LOG -- heavy -- CMD`, and exits 124. Its wait in the queue doesn't count. A
+setting over 60, or one that isn't a number of seconds over 0, is a usage error. A
+heavy inside a job has no limit of its own. A --few-seconds call may run in the
 foreground, but the running job can take minutes to end, so give the Bash call the
 tool's longest timeout (600000 ms); heavy-gate refuses the call without it.
 --few-seconds goes with none of --long, --alone and --share: each pair is a usage error
@@ -220,8 +224,8 @@ Environment:
                        (default 2)
   HEAVY_QUICK_BUSY     how busy, at most, they average for it to run outside the
                        queue (default 0.25)
-  HEAVY_QUICK_MAX      seconds a --few-seconds job runs before it hears to drop the
-                       flag (default 60)
+  HEAVY_QUICK_MAX      seconds a --few-seconds job may run before it is stopped
+                       (default 60, and at most 60)
   HEAVY_GRACE          seconds CMD gets to stop before SIGKILL (default 5)
   HEAVY_ALONE_OUTSIDE  cores of other work, on average, past which an --alone job
                        hears its timing may be off (default 0.5)
@@ -255,7 +259,8 @@ Environment:
                        HEAVY_DIR's default and one refused inside own-pids, beside
                        /tmp/heavy itself (tests)
 
-Exit status: CMD's own; 2 a usage error; 3 `heavy waits --until-open` or
+Exit status: CMD's own; 2 a usage error; 124 a --few-seconds job stopped at
+HEAVY_QUICK_MAX; 3 `heavy waits --until-open` or
 `--until-quiet` reached --max-wait with the queue still held; 125 heavy couldn't use
 its queue, or refused
 the shared one inside own-pids; 126 CMD
@@ -264,7 +269,6 @@ by signal N.
 """
 
 import argparse
-import ctypes
 import json
 import os
 import shlex
@@ -288,7 +292,6 @@ QUICK_WITHOUT = {
     "--share": "a --few-seconds job already runs beside the lane's holder when its"
     " cores are quiet, and --share is for work without time limits, such as a build.",
 }
-PR_SET_PDEATHSIG = 1
 
 
 class Stopped(Exception):
@@ -298,11 +301,6 @@ class Stopped(Exception):
 
 def on_signal(signum, _frame):
     raise Stopped(signum)
-
-
-def die_with_heavy():
-    """In CMD, before it starts: get SIGTERM should heavy die, even by SIGKILL."""
-    ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
 
 
 def hand_terminal(group):
@@ -326,31 +324,20 @@ def stop(proc):
     signals are ignored meanwhile, so a second Ctrl-C can't cut the KILL short."""
     for sig in STOPS:
         signal.signal(sig, signal.SIG_IGN)
-    grace = heavyqueue.knob("HEAVY_GRACE", 5)
-    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, None)):
-        try:
-            os.killpg(proc.pid, sig)
-            os.killpg(proc.pid, signal.SIGCONT)  # a stopped group can't act on TERM
-        except ProcessLookupError:
-            return
-        try:
-            proc.wait(timeout=wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+    heavyqueue.stop_group(proc)
 
 
-def warn_if_slow(ran):
-    """Tell a --few-seconds job that ran for more than HEAVY_QUICK_MAX seconds that
-    --few-seconds is for runs of seconds: once, as it ends, so the line is in the tail
-    of its output."""
-    limit = heavyqueue.knob("HEAVY_QUICK_MAX", 60)
-    if ran > limit:
-        heavyqueue.note(
-            f"heavy: this --few-seconds job ran past {limit:g} s. --few-seconds is for"
-            " runs of seconds, such as a few tests: run ones like this, or the build"
-            " before them, without it."
-        )
+OVERRAN = 124  # a --few-seconds job stopped at its limit, as timeout(1) exits
+
+
+def overran(limit):
+    """The line a --few-seconds job stopped at its limit hears."""
+    return (
+        f"heavy: stopped this --few-seconds job at its {limit:g} s limit"
+        " (HEAVY_QUICK_MAX). --few-seconds is for runs of seconds, usually 10 s or"
+        " less: run a longer one, or the build before it, without --few-seconds and"
+        " in the background, `bgrun -o LOG -- heavy -- CMD`."
+    )
 
 
 def run(command, long, alone, share, quick):
@@ -365,7 +352,7 @@ def run(command, long, alone, share, quick):
                 command,
                 env=job.env,
                 process_group=0,
-                preexec_fn=die_with_heavy,  # noqa: PLW1509
+                preexec_fn=heavyqueue.die_with_parent,  # noqa: PLW1509
             )
         except FileNotFoundError:
             print(f"heavy: no command {command[0]} to run.", file=sys.stderr)
@@ -378,17 +365,22 @@ def run(command, long, alone, share, quick):
         job.command_pid = proc.pid
         if terminal:
             hand_terminal(proc.pid)
-        begun = time.monotonic()
+        # A heavy inside a job runs at once, as part of it: the job's limit holds.
+        limit = heavyqueue.quick_limit() if quick and not job.nested else None
         try:
-            code = proc.wait()
+            code = proc.wait(timeout=limit)
+        except subprocess.TimeoutExpired:
+            stop(proc)
+            heavyqueue.note(overran(limit))
+            job.status = OVERRAN  # for its record; no run to remember
+            job.overran = True
+            return OVERRAN
         except Stopped:
             stop(proc)
             raise
         finally:
             if terminal:
                 hand_terminal(os.getpgrp())
-            if quick and not job.nested:
-                warn_if_slow(time.monotonic() - begun)
         job.exited(code)
         return 128 - code if code < 0 else code
 
@@ -655,6 +647,10 @@ def main(argv=None):
         for option, why in QUICK_WITHOUT.items():
             if getattr(args, option.removeprefix("--")):
                 parser.error(f"--few-seconds can't go with {option}: {why}")
+        try:
+            heavyqueue.quick_limit()
+        except ValueError as error:
+            parser.error(str(error))
     if args.command == ["status"]:
         slow = machinespeed.slow_warning()
         print(heavyqueue.status() if slow is None else f"{slow}\n{heavyqueue.status()}")

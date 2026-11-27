@@ -436,6 +436,23 @@ def test_busy_counts_the_named_cores_from_two_snapshots():
     assert cores.busy(before, after, [0, 1]) == pytest.approx(40 / 150)
 
 
+@pytest.mark.parametrize(
+    ("cpus", "text"),
+    [
+        ([0, 1, 2, 3], "0-3"),
+        ([0, 1], "0-1"),
+        ([0, 2, 3], "0,2,3"),
+        ([1, 5], "1,5"),
+        ([5], "5"),
+    ],
+)
+def test_span_writes_cores_that_unspan_reads_back(cpus, text):
+    # A holder's cores= field goes through both; a set that isn't one run must
+    # survive too, or a holder on it would look like it holds no cores.
+    assert cores.span(cpus) == text
+    assert heavyqueue.unspan(cores.span(cpus)) == cpus
+
+
 def test_load_is_busy_cores_less_the_hosts_steal_and_the_measurer():
     before = "cpu  1 1 1 1\ncpu0 0 0 0 0 0 0 0 0\ncpu1 0 0 0 0 0 0 0 0\n"
     before += "cpu2 0 0 0 0 0 0 0 0\n"

@@ -94,7 +94,7 @@ One with nothing for 60 minutes gets a status message, which it answers in its f
 
 When a finding applies to every agent (a shared file, a misread rule), fix the briefs in the run folder and message the agents in flight.
 
-**End-of-run timings**: implementers commit without timing and put each timing's exact command in their report and `log.md` line. Once no other agent of the run is in flight, run those commands one at a time, each only when `heavy status` shows both lanes empty, no job running or waiting from any session, and their cores mostly idle. Other sessions share the queue: while they keep it busy, check again a heartbeat later rather than start beside them. A timing that heavy warns about outside load is no timing. Measurement items run here too: run each, then spawn its build if the gain is beyond noise, each timed on top of the previous landing.
+**End-of-run timings**: implementers commit without timing and put each timing's exact command in their report and `log.md` line. Once no other agent of the run is in flight, run those commands one at a time, each only once `heavy waits --until-quiet --max-wait 1800` exits 0: both lanes empty, no job running or waiting from any session, and the load low. Other sessions share the queue: when it exits 3, wait a heartbeat and try again rather than start beside them. A timing that heavy warns about outside load is no timing. Measurement items run here too: run each, then spawn its build if the gain is beyond noise, each timed on top of the previous landing.
 
 Done when the queue is empty, no agent is running, and the timings, with the builds measurements earned, have run or are listed as not run.
 

@@ -297,8 +297,8 @@ The builder's and the brief review's choices, which the owner hasn't overruled:
 - Nothing in it fails a job: a file or entry it can't read, or a failure of its own, is the job's one note.
   A pathological `command` regex could still hang heavy while it holds a slot, since Python's `re` has no timeout; that is accepted, since promise files are written by the owner or through review.
 
-llm-toolbox's seed is a tripwire for `mutate-check --diff`, at 120 s, the whole run a /build use would need (40 mutants at about 3 s each), against the median of 861 s that heavy's record measured that day. Its own landing check, which the README says takes about half a minute and heavy's record shows at a median of 262 s over 7 runs that day, has no promise: llm-toolbox's file covers every repo's jobs, and that job's words, `wt-ship's checks`, are the same in each.
-Both numbers, the 262 s and the seed's 861 s, were taken on 2026-11-26 while the host throttled the CPU (the next entry), and neither has been measured again since.
+llm-toolbox's seed is a tripwire for `mutate-check --diff`, at 120 s, the whole run a /build use would need (40 mutants at about 3 s each), against the median of 861 s that heavy's record measured that day. Its own landing check, which the README said took about half a minute and heavy's record showed at a median of 262 s over 7 runs that day, got no promise then: llm-toolbox's file covers every repo's jobs, and that job's words, `wt-ship's checks`, are the same in each (since promised: A promise can cover only its own repo's jobs, below).
+Both numbers, the 262 s and the seed's 861 s, were taken on 2026-11-26 while the host throttled the CPU (the next entry); the seed's hasn't been measured again since.
 
 ### A run counts at the machine's usual speed (2026-11-26)
 
@@ -331,6 +331,18 @@ The builder's and the brief review's choices:
 - heavy-bench keeps the factors at each run's start and end in two columns of its results, and neither flags nor reruns a slow run: a throttled spell can outlast a bench, and would flag every run.
 
 A CFS quota makes short probes bimodal, which the steal over a whole job catches better; that is unverified for host kernels that throttle per task.
+
+### A promise can cover only its own repo's jobs (2026-11-26)
+
+README said `agent-pre-commit`, llm-toolbox's whole check, took "about half a minute". Measured unthrottled that night (#26), it takes 259.5 s: 3 heavy-bench rounds, each a `heavy --alone` job of `.githooks/agent-pre-commit` with no CHECK_BASE, at 2ac9872 with 8 xdist workers, 260.9, 257.7 and 259.9 s, none flagged for outside load.
+The promise to hold it to, in llm-toolbox's file, would judge every repo's landing, since that file covers every repo's jobs and the landing check's job is `wt-ship's checks` in each.
+
+- A promise may say `own_repo_only = true`: it then covers only jobs whose folder is in its file's repo, by git common dir, so the repo's worktrees count and another clone doesn't. A job it skips goes to the file's next matching promise.
+- Not a pattern only llm-toolbox's check has: a job's words are the gate's name for it, `wt-ship's checks` or `agent-pre-commit`, the same in every repo with the hook, so no regex over them tells the repos apart. Nor a `repo` key naming the repo: a name can drift from the folder or match another clone, and the only repo a shared promise needs to name is its own.
+- The promise matches `wt-ship's checks`, the landing's check in heavy's queue, which runs the whole suite whenever a landing changes a path outside agent-pre-commit's map (`tests_for`), any Python file among them.
+- It promises 270 s, the next half minute above the 259.5 s measured: perf-promises' only rule on a promise against its measurement is the flag over 3 times it.
+- The measurement departs from #26's rule to set aside runs whose speed factor is under 0.8: rounds 1 and 2 read 0.47 and 0.79 at their start (round 3 0.92 at its end). They are kept because the factor under-read the machine then. A direct 1M-step loop probe read full clock, 0.04 to 0.13 s on every vCPU probed, at 22:17 and 22:56 PST, while `machine-speed line` read `cpu 0.4x slow` both times (keep/llm-toolbox/overnight-2026-11-26b/timings/loop-probe.txt). The three walls agree to 1.2%, their user plus sys of about 991 s matches the evening's landings (about 976 s), and heavy's record has the last 5 landings at 255 to 272 s (median about 261 s).
+- Not acted on: a run that the probe reads as slow counts at its seconds times that factor, so while it under-reads, a slow landing could pass unseen.
 
 ## machine-speed
 

@@ -7,9 +7,12 @@ as heavy records them, the first word cut to its last path part), `seconds` (the
 promised running time of the whole run), `measured` (how the number was got),
 `measured_seconds` (what that measurement gave) and `source` (where the promise was
 made), and optionally `counts`, the exit statuses whose runs count toward the median
-(default [0]). llm-toolbox's own file, the one beside this module's folder, covers jobs
-in every repo, since its tools run everywhere; in llm-toolbox itself the tree's own
-copy is read instead, so a worktree's edited promise works there.
+(default [0]), and `own_repo_only` (default false). llm-toolbox's own file, the one
+beside this module's folder, covers jobs in every repo, since its tools run
+everywhere; in llm-toolbox itself the tree's own copy is read instead, so a
+worktree's edited promise works there. A promise with `own_repo_only = true` covers
+only jobs in its file's repo (the same git common dir), for a job whose words are
+the same in every repo, as `wt-ship's checks` is.
 
 When a heavy job ends (heavyqueue's `recorded`), after_job matches it against the job
 repo's file and llm-toolbox's, appends the run to each matching promise's log, and
@@ -88,6 +91,7 @@ class Promise:
     measured_seconds: float
     source: str
     counts: tuple = (0,)
+    own_repo_only: bool = False
 
     @property
     def digest(self):
@@ -172,6 +176,7 @@ def load(path):
             Promise(
                 **{key: entry[key] for key in KEYS},
                 counts=tuple(entry.get("counts", (0,))),
+                own_repo_only=entry.get("own_repo_only", False),
             )
         )
     return PromiseFile(Path(path), promises, problems)
@@ -184,7 +189,7 @@ def wrong(entry, names):
     missing = [key for key in KEYS if key not in entry]
     if missing:
         return "lacks " + ", ".join(missing)
-    extra = sorted(set(entry) - set(KEYS) - {"counts"})
+    extra = sorted(set(entry) - set(KEYS) - {"counts", "own_repo_only"})
     if extra:
         return "has unknown keys " + ", ".join(extra)
     if not isinstance(entry["name"], str) or not NAME.fullmatch(entry["name"]):
@@ -207,6 +212,8 @@ def wrong(entry, names):
         isinstance(code, int) and not isinstance(code, bool) for code in counts
     ):
         return "has counts that aren't a list of exit statuses"
+    if not isinstance(entry.get("own_repo_only", False), bool):
+        return "has own_repo_only that isn't true or false"
     return None
 
 
@@ -363,9 +370,21 @@ def judge_job(job, folder, command, how, signum, tally):
         return None
     words = words_of(command)
     files = promise_files(folder)
+    job_common = []  # the job's git common dir, found once a promise asks
+
+    def covers(toml, promise):
+        if not promise.matches(words):
+            return False
+        if not promise.own_repo_only:
+            return True
+        if not job_common:
+            job_common.append(common_dir(Path(folder)))
+        own, theirs = job_common[0], toml.repo().common
+        return None not in (own, theirs) and own.resolve() == theirs.resolve()
+
     matched = []  # the first match in each file
     for toml in files:
-        first = next((p for p in toml.promises if p.matches(words)), None)
+        first = next((p for p in toml.promises if covers(toml, p)), None)
         if first is not None:
             matched.append((toml, first))
     if not matched:

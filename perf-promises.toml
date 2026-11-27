@@ -17,3 +17,15 @@ measured = "median 861 s of the 6 runs in heavy's record on 2026-11-26 that exit
 measured_seconds = 861
 source = "030df63; docs/design.md, /build's --diff run is dropped again (2026-11-26)"
 counts = [0, 1]
+
+# llm-toolbox's landing check, the whole suite that wt-ship runs on a landing's tip
+# in heavy's queue. Every repo's landing check has this job name, so the promise
+# covers only llm-toolbox's own jobs (own_repo_only; docs/design.md, 2026-11-26).
+[[promise]]
+name = "landing-check"
+command = "^wt-ship's checks$"
+own_repo_only = true
+seconds = 270
+measured = "mean 259.5 s of 3 heavy-bench rounds, each a heavy --alone job of .githooks/agent-pre-commit with no CHECK_BASE (260.9, 257.7, 259.9 s; user about 740 s, sys about 251 s, 52-56 s of outside CPU, none flagged), at 2ac9872, xdist 8 workers, on 2026-11-26 from 22:20 PST with the queue quiet. Departs from #26's rule to set aside runs with a speed factor under 0.8 (rounds 1-2 read 0.47 and 0.79 at start): a direct 1M-step loop read full clock, 0.04-0.13 s on every vCPU probed, while machine-speed read 0.4x slow (keep/llm-toolbox/overnight-2026-11-26b/timings/loop-probe.txt); the walls agree to 1.2%, user+sys of about 991 s matches the evening's landings (about 976 s), and heavy's record has the last 5 landings at 255-272 s (median about 261 s)"
+measured_seconds = 259.5
+source = "#26; keep/llm-toolbox/overnight-2026-11-26b/timings/b26-check/results.tsv"

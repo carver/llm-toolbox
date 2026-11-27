@@ -770,6 +770,48 @@ def test_a_repos_own_promise_and_llm_toolboxs_both_log_a_job(tmp_path):
     assert log_of("llm-toolbox", "any-nap").exists()
 
 
+def test_an_own_repo_only_promise_skips_another_repos_job(tmp_path):
+    # wt-ship's checks has that name in every repo, so llm-toolbox's landing promise
+    # mustn't judge filedrawer's landings.
+    toolbox = make_repo(
+        tmp_path / "llm-toolbox",
+        promise("own-nap", "^sleep", 30, own_repo_only="true"),
+        promise("any-nap", "^sleep", 30),
+    )
+    other = make_repo(tmp_path / "other")
+
+    heavy(other, "sleep", "0", PERF_PROMISES_GLOBAL=str(toolbox / "perf-promises.toml"))
+
+    assert not log_of("llm-toolbox", "own-nap").exists()
+    # The next promise in the file still takes the job.
+    assert log_of("llm-toolbox", "any-nap").exists()
+
+
+def test_an_own_repo_only_promise_logs_its_own_repos_job(tmp_path):
+    toolbox = make_repo(
+        tmp_path / "llm-toolbox",
+        promise("own-nap", "^sleep", 30, own_repo_only="true"),
+    )
+    git(toolbox, "add", "perf-promises.toml")
+    git(toolbox, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x")
+    tree = tmp_path / "llm-toolbox-wt-x"
+    git(toolbox, "worktree", "add", "-q", "--detach", str(tree))
+
+    heavy(tree, "sleep", "0", PERF_PROMISES_GLOBAL=str(toolbox / "perf-promises.toml"))
+
+    assert log_of("llm-toolbox", "own-nap").exists()
+
+
+def test_own_repo_only_must_be_true_or_false(tmp_path):
+    repo = make_repo(
+        tmp_path / "proj", promise("own", "^sleep", 30, own_repo_only='"yes"')
+    )
+
+    listed = tool("status", "-C", str(repo))
+
+    assert "'own' has own_repo_only that isn't true or false" in listed.stdout
+
+
 def test_in_a_worktree_of_llm_toolbox_its_own_copy_stands(tmp_path):
     toolbox = make_repo(tmp_path / "llm-toolbox", promise("old", "^sleep", 30))
     git(toolbox, "add", "perf-promises.toml")

@@ -922,9 +922,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   run through `heavy` takes, as `[[promise]]` tables of `name`, `command` (a
   regex over the job's command words, or a commit check's name), `seconds` (the
   whole run's), `measured`, `measured_seconds` and `source`, and optionally
-  `counts`, the exit statuses that count (`[0]`). llm-toolbox's own file covers
-  jobs in every repo. heavy measures each job's running time against them as
-  it ends, without its queue wait, logs it in the repo's git common dir
+  `counts`, the exit statuses that count (`[0]`), and `own_repo_only`.
+  llm-toolbox's own file covers jobs in every repo, except a promise with
+  `own_repo_only = true`, which covers only its own repo's, for a job named
+  the same everywhere (`wt-ship's checks`). heavy measures each job's running
+  time against them as it ends, without its queue wait, logs it in the repo's
+  git common dir
   (`perf-promises/NAME.tsv`, or under `$PERF_PROMISES_DIR`), and gives a run of
   twice its promise or more a one-line note (in a commit check's pass line).
   A run counts at its seconds times the machine's speed factor from the newest
@@ -1267,7 +1270,7 @@ without the few seconds of starting the workers) in a copy of the index outside 
 test that passes in the repo but reads its git state fails there. `install.py` points git at `.githooks`. Its
 `pre-commit` runs `pipefail-lint` on the staged files that name pipefail, then the two ruff checks on what's staged. When only formatting fails, it formats each staged file that has no unstaged changes,
 stages the result and names the file; any other unformatted file refuses the commit, as does every
-file of a `git commit PATH`. `agent-pre-commit` adds the tests (about half a minute, most of it build-paper's builds);
+file of a `git commit PATH`. `agent-pre-commit` adds the tests (about 4.5 minutes for the whole suite, measured inside `heavy --alone`; a promise in `perf-promises.toml`);
 `wt-ship` runs it on the tip of each landing. Both run the tools
 through `uv run`, so they need uv on `PATH`. `ruff.toml` brings the
 extensionless scripts in `bin/` into both ruff checks.

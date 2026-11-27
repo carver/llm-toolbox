@@ -21,7 +21,19 @@ call. It looks for --diff among mutate-check's options, the words before its `--
 counts an expansion there as --diff; inside heavy, a shell's -c script counts too. A
 mutate-check of edits, `--edits FILE` or blocks on stdin, runs once and goes under heavy
 like any other command. install.py
-registers it in ~/.claude/settings.json. A subagent's call (the event has an agent_id)
+registers it in ~/.claude/settings.json.
+
+It also refuses a hand-rolled timing without a bound, background call or not: `time`
+(the keyword or /usr/bin/time), hyperfine or `perf stat` under heavy without --alone,
+and hyperfine outside heavy. Such numbers carry whatever else runs on the cores, and a
+comparison of more than a minute or two belongs to heavy-bench, which the refusal
+names. A `timeout` around the timing or inside it bounds it, as do hyperfine's --runs
+and --max-runs and heavy's --few-seconds, which heavy stops at 60 s. A bounded timing
+outside --alone passes with a note beside the call saying timings belong under heavy
+--alone. A `time` outside heavy, such as `time gh api ...`, passes without one: agents
+time one-off commands that way often, and nothing queues behind them. Nor does it
+judge a heavy whose options hold an expansion, which could be --alone, or a timing
+inside a script file, which it can't see. A subagent's call (the event has an agent_id)
 gets the same verdict, but its refusal names the blocking form, plain bgrun in the
 foreground and then waitone, since a subagent doesn't end its turn to wait for a job
 (subagent-wait-gate).
@@ -40,11 +52,13 @@ regard to quotes, which errs toward refusing.
 
     heavy-gate < hook-input.json    # as Claude Code calls it
 
-Exit status: 0 allowed, 2 refused (the reason on stderr, ending with a sentence saying
-nothing in the command ran), 1 input that isn't JSON.
+Exit status: 0 allowed (a note, when there is one, on stdout as the hook's JSON), 2
+refused (the reason on stderr, ending with a sentence saying nothing in the command
+ran), 1 input that isn't JSON.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -60,6 +74,7 @@ from shellparse import (
     prepare,
     reads_stdin,
     shell_script,
+    unwrap,
 )
 
 RIGHT_FORM = (
@@ -92,8 +107,30 @@ QUICK_TIMEOUT = (
     f"{LONGEST_TIMEOUT_MS} (ms; a timeout command doesn't count), or run the call in the "
     "background (run_in_background: true)."
 )
+UNBOUNDED_TIMING = (
+    "Refused: a timing under plain heavy or outside heavy carries whatever else runs "
+    "on its cores, and this one has no bound. To compare commands, run bgrun --wait -o "
+    "<scratchpad>/LOG -- heavy-bench ... bare, never inside heavy, as a background call "
+    "(run_in_background: true; heavy-bench -h): each run is its own heavy --alone job, "
+    "the variants interleaved. A single short timing goes under heavy --alone, with a "
+    "`timeout N` around it or hyperfine's --runs N."
+)
+# Not a refusal: the note an allowed call gets beside it.
+PLAIN_TIMING = (
+    "heavy-gate: this call times a command outside heavy --alone, so its numbers carry "
+    "whatever else ran on its cores. Time it again under heavy --alone for a figure "
+    "worth quoting; a comparison that takes more than a minute or two in all goes to "
+    "heavy-bench, started bare with bgrun (heavy-bench -h)."
+)
 # Most specific first: the first that applies is the one printed.
-REFUSALS = (RUN_BARE, WRONG_ORDER, MUTATE_LONG, FOREGROUND, QUICK_TIMEOUT)
+REFUSALS = (
+    RUN_BARE,
+    WRONG_ORDER,
+    MUTATE_LONG,
+    UNBOUNDED_TIMING,
+    FOREGROUND,
+    QUICK_TIMEOUT,
+)
 # A subagent's prompt cache lasts five minutes, and its parent spends a turn on each of
 # its stops, so it blocks on the job rather than wait for a background call's
 # notification; its Bash calls go to the background after 180 s.
@@ -118,6 +155,15 @@ SUBAGENT = {
         "mutate-check --diff ... in the foreground, which prints the job's PID at once, "
         "then `waitone --pid PID -t 170`, again until it exits, and read LOG."
     ),
+    UNBOUNDED_TIMING: (
+        "Refused: a timing under plain heavy or outside heavy carries whatever else "
+        "runs on its cores, and this one has no bound. To compare commands, run bgrun "
+        "-o <scratchpad>/LOG -- heavy-bench ... bare, never inside heavy, in the "
+        "foreground, which prints the job's PID at once, then `waitone --pid PID -t "
+        "170`, again until it exits (heavy-bench -h): each run is its own heavy --alone "
+        "job, the variants interleaved. A single short timing goes under heavy --alone, "
+        "with a `timeout N` around it or hyperfine's --runs N."
+    ),
     QUICK_TIMEOUT: (
         "Refused: heavy --few-seconds can wait minutes at the queue's front, past this "
         "call's time limit (two minutes by default). Set the Bash tool's timeout "
@@ -129,6 +175,11 @@ SUBAGENT = {
 
 # Set in front of heavy, these give it a queue of its own or put it inside a job.
 OWN_QUEUE = {"HEAVY_DIR", "HEAVY_SLOT"}
+ALONE_FLAGS = ("--alone",)
+# hyperfine's options that cap its runs: -r 3, -r3, --runs 3, --runs=3, and -M for
+# --max-runs, also behind its short flags that take no value, as in -Nr3. --min-runs
+# and --warmup cap nothing.
+RUN_CAP = re.compile(r"-[Ni]*[rM]\d*|--(runs|max-runs)(=.*)?")
 
 
 def refusals(command: str, blocks: bool) -> set[str]:
@@ -146,11 +197,13 @@ def refusals(command: str, blocks: bool) -> set[str]:
     return found
 
 
-def judge(words: list[str], blocks: bool) -> set[str]:
-    """The refusals one simple command earns."""
-    words, assigned = command_of(words)
+def judge(words: list[str], blocks: bool, bounded: bool = False) -> set[str]:
+    """The refusals one simple command earns, and PLAIN_TIMING for the note.
+    ``bounded``: a `timeout` outside it limits its run."""
+    words, assigned, wrappers = unwrap(words)
     if not words:
         return set()
+    bounded = bounded or "timeout" in wrappers
     name, args = Path(words[0]).name, words[1:]
     if name in SHELLS:
         script = shell_script(words)
@@ -162,7 +215,9 @@ def judge(words: list[str], blocks: bool) -> set[str]:
         if parsed is None:
             return set()
         waits, rest = parsed
-        return judge(rest, blocks and waits)
+        return judge(rest, blocks and waits, bounded)
+    if name == "hyperfine":
+        return timing_verdict(timings(words, bounded))
     if name != "heavy" or assigned & OWN_QUEUE:
         return set()
     queued = heavy_command(args)
@@ -178,8 +233,55 @@ def judge(words: list[str], blocks: bool) -> set[str]:
     found = set()
     if not asks(args, LONG_FLAGS) and mutates_a_diff(queued):
         found.add(MUTATE_LONG)
+    if not asks(args, ALONE_FLAGS) and not expands(options_of(args)):
+        # heavy stops a --few-seconds run at 60 s.
+        quick = asks(args, QUICK_FLAGS)
+        found |= timing_verdict(timings(queued, bounded or quick))
     if blocks:
         found.add(QUICK_TIMEOUT if asks(args, QUICK_FLAGS) else FOREGROUND)
+    return found
+
+
+def timing_verdict(bounds: list[bool]) -> set[str]:
+    """What the timings a command runs, each given as whether its run is bounded, earn:
+    a refusal for any unbounded one, else the note."""
+    if not bounds:
+        return set()
+    return {PLAIN_TIMING} if all(bounds) else {UNBOUNDED_TIMING}
+
+
+def timings(words: list[str], bounded: bool) -> list[bool]:
+    """Each timing a simple command runs, as whether its run is bounded: `time` (the
+    keyword or /usr/bin/time), hyperfine and `perf stat`, itself or in a shell's -c
+    script. A `timeout` around a timing or inside it bounds it, as does a --runs or
+    --max-runs cap on hyperfine; ``bounded``, something outside the command."""
+    inner, _, wrappers = unwrap(words)
+    if not inner:
+        return []
+    bounded = bounded or "timeout" in wrappers
+    name, args = Path(inner[0]).name, inner[1:]
+    if name == "hyperfine":
+        if any(is_help(word) or word in ("-V", "--version") for word in args):
+            return []
+        return [bounded or any(RUN_CAP.fullmatch(word) for word in args)]
+    perf_stat = (name, args[:1]) == ("perf", ["stat"])
+    found = [bounded] if "time" in wrappers or perf_stat else []
+    if name in SHELLS:
+        script = shell_script(inner)
+        if script is not None:
+            found += script_timings(script, bounded)
+    return found
+
+
+def script_timings(script: str, bounded: bool) -> list[bool]:
+    """``timings`` for each command of a shell script, its command substitutions
+    included."""
+    cleaned, substitutions, _ = prepare(script)
+    found = []
+    for simple in commands(cleaned):
+        found += timings(simple.words, bounded)
+    for substitution in substitutions:
+        found += script_timings(substitution, bounded)
     return found
 
 
@@ -222,13 +324,22 @@ def heavy_command(args: list[str]) -> list[str] | None:
     return args if any("$" in word for word in args) else None
 
 
+def options_of(args: list[str]) -> list[str]:
+    """heavy's options: the words before its `--`."""
+    return args[: args.index("--")] if "--" in args else []
+
+
+def expands(words: list[str]) -> bool:
+    """Whether any word holds an expansion, which could be any option."""
+    return any("$" in word for word in words)
+
+
 def asks(args: list[str], flags: tuple[str, ...]) -> bool:
-    """Whether heavy's options, the words before its `--`, ask for one of flags, whole
-    or abbreviated as heavy's parser accepts."""
-    options = args[: args.index("--")] if "--" in args else []
+    """Whether heavy's options ask for one of flags, whole or abbreviated as heavy's
+    parser accepts."""
     return any(
         len(word) > 2 and any(flag.startswith(word) for flag in flags)
-        for word in options
+        for word in options_of(args)
     )
 
 
@@ -268,6 +379,9 @@ def main(argv=None) -> int:
                 refusal = SUBAGENT.get(refusal, refusal)
             print(f"{refusal} {refused.ending(event)}", file=sys.stderr)
             return 2
+    if PLAIN_TIMING in found:
+        output = {"hookEventName": "PreToolUse", "additionalContext": PLAIN_TIMING}
+        print(json.dumps({"hookSpecificOutput": output}))
     return 0
 
 

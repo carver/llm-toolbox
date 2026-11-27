@@ -491,7 +491,15 @@ def command_of(words: list[str]) -> tuple[list[str], set[str]]:
     """(the words of the command a simple command runs, past variable settings, keywords
     and wrappers; the variables set in front of it). No words when it runs none, as for
     `command -v`."""
-    assigned = set()
+    words, assigned, _ = unwrap(words)
+    return words, assigned
+
+
+def unwrap(words: list[str]) -> tuple[list[str], set[str], list[str]]:
+    """``command_of``'s two parts, then the names of the wrappers it passed, in order:
+    `/usr/bin/time` as `time`. A variable setting or an option's value names none, even
+    one such as `X=/tmp/time` or `flock /tmp/time`."""
+    assigned, wrappers = set(), []
     while words:
         word, name = words[0], Path(words[0]).name
         if ASSIGNMENT.match(word):
@@ -500,14 +508,15 @@ def command_of(words: list[str]) -> tuple[list[str], set[str]]:
         elif word in KEYWORDS:
             words = words[1:]
         elif name in WRAPPERS:
+            wrappers.append(name)
             values, between = WRAPPERS[name]
             options, words = split_options(words[1:], values)
             if name == "command" and {"-v", "-V"} & set(options):
-                return [], assigned
+                return [], assigned, wrappers
             words = words[between:]
         else:
             break
-    return words, assigned
+    return words, assigned, wrappers
 
 
 def exports(script: str) -> set[str]:

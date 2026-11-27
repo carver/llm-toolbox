@@ -15,11 +15,29 @@ SCRIPT = Path(__file__).resolve().parent / "bin" / "heavy-gate"
 NOTHING_RAN = "Nothing in this command ran, the parts before the refused one included."
 
 
-def run_hook(
+def run_hook(command, **call):
+    """The hook's exit status and stderr for one call (``call_hook``'s arguments)."""
+    result = call_hook(command, **call)
+    return result.returncode, result.stderr
+
+
+def note_of(command, **call):
+    """The note an allowed call gets beside it, None for none (``call_hook``'s
+    arguments)."""
+    result = call_hook(command, **call)
+    assert (result.returncode, result.stderr) == (0, "")
+    if not result.stdout:
+        return None
+    output = json.loads(result.stdout)["hookSpecificOutput"]
+    assert output["hookEventName"] == "PreToolUse"
+    return output["additionalContext"]
+
+
+def call_hook(
     command, background=None, tool="Bash", timeout=None, agent=None, session=None
 ):
-    """The hook's exit status and stderr for one call, its input shaped as Claude Code sends it.
-    ``timeout`` is the Bash call's own, in ms; ``agent`` a subagent's id, when it made the call."""
+    """The hook's run for one call, its input shaped as Claude Code sends it. ``timeout``
+    is the Bash call's own, in ms; ``agent`` a subagent's id, when it made the call."""
     tool_input = {"command": command, "description": "Run it"}
     if background is not None:
         tool_input["run_in_background"] = background
@@ -37,10 +55,9 @@ def run_hook(
     if agent:
         event |= {"agent_id": agent, "agent_type": "general-purpose"}
     event |= session or {}
-    result = subprocess.run(
+    return subprocess.run(
         [SCRIPT], input=json.dumps(event), capture_output=True, text=True, check=False
     )
-    return result.returncode, result.stderr
 
 
 WAITS_ON_HEAVY = [
@@ -348,6 +365,137 @@ def test_a_quick_mutate_check_of_edits_passes_in_the_foreground(agent):
 )
 def test_a_call_that_does_not_wait_on_heavy_passes(command):
     assert run_hook(command) == (0, "")
+
+
+UNBOUNDED_TIMINGS = [
+    "heavy -- /usr/bin/time -f '%e %U %S' -o t.1 bin/pytest bin/tests",
+    "heavy -- time make",
+    "heavy --long -- hyperfine 'make a' 'make b'",
+    "heavy --share -- perf stat -r 5 make",
+    "heavy -- hyperfine --warmup 3 --min-runs 5 'pytest -q'",
+    "heavy -- nice /usr/bin/time make",
+    "heavy -- env X=1 time -p make",
+    "heavy -- time hyperfine 'a'",
+    "heavy -- timeout 60 make && heavy -- time make",
+    "heavy -- env -C /src/timeout hyperfine 'a'",
+    "heavy -- flock /tmp/timeout time make",
+    "env X=timeout heavy -- time make",
+    "heavy -- sh -c 'cd x && for i in 1 2 3; do /usr/bin/time -o t.$i pytest; done'",
+    "heavy -- bash -c 'echo $(time make)'",
+    "heavy -- bash -c \"sh -c 'hyperfine a'\"",
+    "bgrun -o log -- heavy -- time make",
+    "bgrun --wait -o log -- heavy --long -- perf stat make",
+    "hyperfine 'a' 'b'",
+    "cd x && hyperfine -N --warmup 3 'bin/t'",
+    "bgrun -o log -- hyperfine -w 2 'a' 'b'",
+    "bash -c 'hyperfine a b'",
+    "time hyperfine 'a'",
+]
+
+
+@pytest.mark.parametrize("command", UNBOUNDED_TIMINGS)
+@pytest.mark.parametrize("background", [True, None])
+@pytest.mark.parametrize("agent", [None, "a1"])
+def test_an_unbounded_timing_outside_heavy_alone_is_refused(command, background, agent):
+    code, err = run_hook(command, background=background, timeout=600000, agent=agent)
+
+    assert code == 2
+    assert "heavy-bench" in err
+    assert "heavy --alone" in err
+    assert ("waitone" in err) == bool(agent)
+    assert len(err.splitlines()) == 1, err
+    assert err.rstrip().endswith(NOTHING_RAN)
+
+
+BOUNDED_TIMINGS = [
+    "heavy -- timeout 300 /usr/bin/time make",
+    "heavy -- /usr/bin/time -f %e timeout 300 make",
+    "timeout 600 heavy -- time make",
+    "heavy -- hyperfine --runs 3 'a' 'b'",
+    "heavy -- hyperfine -r3 'a'",
+    "heavy -- hyperfine -Nr3 'a'",
+    "heavy -- hyperfine -NiM 5 'a'",
+    "heavy -- hyperfine --runs=3 'a'",
+    "heavy -- hyperfine -w 1 -M 5 'a'",
+    "heavy -- hyperfine --max-runs 5 'a'",
+    "heavy -- sh -c \"/usr/bin/time -f 'WALL %e' timeout 300 bin/pytest -q\"",
+    "heavy --few-seconds -- hyperfine -N -w 3 'x'",
+    "heavy --few-seconds -- time ./t test_x.py -k one",
+    "heavy --few -- bash -c 'perf stat -r 80 -e task-clock -- bash -c :'",
+    "hyperfine -r 10 'a'",
+    "bgrun -o log -- hyperfine -N -w 2 -r 15 'a' 'b'",
+]
+
+
+@pytest.mark.parametrize("command", BOUNDED_TIMINGS)
+@pytest.mark.parametrize("agent", [None, "a1"])
+def test_a_bounded_timing_outside_heavy_alone_passes_with_a_note(command, agent):
+    note = note_of(command, background=True, agent=agent)
+
+    assert note
+    assert "heavy --alone" in note
+    assert "heavy-bench" in note
+
+
+def test_a_bounded_timing_that_waits_on_heavy_gets_the_foreground_refusal():
+    code, err = run_hook("heavy -- hyperfine --runs 3 'a'")
+
+    assert code == 2
+    assert "heavy-bench" not in err
+    assert "run_in_background" in err
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "heavy --alone -- hyperfine -w1 -r3 -N 'a' 'b'",
+        "heavy --alone -- hyperfine -N 'a'",
+        "heavy --al -- time make",
+        "heavy --alone -- sh -c 'perf stat -r 80 true'",
+        "bgrun --wait -o log -- heavy --alone -- hyperfine -N -w 2 -r 15 'a' 'b'",
+        'heavy $flag -- /usr/bin/time -f "%e" bin/pytest',
+        'heavy "$@"',
+        "bgrun -o log -- heavy-bench --runs 3 'a' 'b'",
+        "bgrun --wait -o log -- heavy-bench -- 'pytest -q'",
+        "heavy -- cargo build --release",
+        "heavy -- ./t test_x.py",
+        "heavy --long -- cargo mutants",
+        "heavy --share -- cargo build",
+        "heavy -- make time",
+        "heavy -- env OUTDIR=results/time cargo build",
+        "heavy -- env -C /src/time make",
+        "heavy -- flock /tmp/locks/time make",
+        "heavy -- sudo -u time make",
+        "heavy -- xargs -I time echo time",
+        "heavy -- pytest -k time",
+        "heavy -- sh -c 'echo time make'",
+        "heavy -- python3 -c 'import time; time.sleep(1)'",
+        "heavy -- hyperfine -h",
+        "heavy -- hyperfine --version",
+        "env HEAVY_SLOT=x heavy -- time make",
+        "HEAVY_DIR=/tmp/hd heavy -- time make",
+        "time make",
+        "/usr/bin/time -f %e gh api x",
+        "time (rg x | wc -l)",
+        "perf stat -e task-clock true",
+        "hyperfine --version",
+        "hyperfine --help | grep -E -- '--export-json'",
+        "echo 'heavy -- time make'",
+        "grep -n hyperfine notes.md",
+        "git commit -m 'heavy -- hyperfine a b'",
+        "cat > n.md <<'EOF'\nheavy -- time make\nEOF",
+    ],
+)
+def test_a_timing_under_heavy_alone_or_an_ordinary_command_passes_without_a_note(
+    command,
+):
+    assert note_of(command, background=True) is None
+
+
+def test_a_bare_time_of_a_quick_heavy_run_passes_without_a_note():
+    command = "time heavy --few-seconds -- pytest -q test_x.py"
+
+    assert note_of(command, timeout=600000) is None
 
 
 def test_other_tools_pass():

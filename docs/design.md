@@ -134,6 +134,39 @@ Such a run goes under heavy like any other command, with the foreground and
 - The script of a shell's `-c` under heavy (`heavy -- bash -c '...'`) is searched too.
 - `heavy -- mutate-check -h` passes this rule, since it returns at once.
 
+### heavy-gate refuses an unbounded timing outside `--alone` (#20, 2026-11-26)
+
+On 2026-11-26 an overnight agent compared two variants of filedrawer's suite, three
+runs a side, with `bench.sh`, a script it wrote with a heredoc and ran later, whose
+loop ran `heavy $flag -- /usr/bin/time -o FILE bin/pytest bin/tests`: under plain
+`heavy` the numbers carry whatever shares the lane, and each run held the queue.
+heavy-bench exists for that. heavy-gate now refuses, background call or not, a timing
+with no bound: `time` (keyword or /usr/bin/time), hyperfine or `perf stat` under heavy
+without `--alone` (in a shell's `-c` script and `$(...)` too), and hyperfine outside
+heavy. The refusal names `bgrun -o LOG -- heavy-bench ...` bare, and `heavy --alone`
+with a bound for a single short timing. A bounded timing outside `--alone` passes,
+with a note beside the call (the hook's `additionalContext`) that timings go under
+`heavy --alone` and comparisons of more than a minute or two to heavy-bench.
+
+- Bounds: a `timeout` around the timing or inside it (`time timeout 300 make`),
+  hyperfine's `--runs`/`-r` or `--max-runs`/`-M` (not `--min-runs`), and heavy's
+  `--few-seconds`, which heavy stops at 60 s. Any `timeout` counts, however long: the
+  gate errs toward letting a call through, since it runs in every session.
+- `time` outside heavy passes without a note. session-grep found about a hundred bare
+  `time` calls from 2026-11-09 to 11-26 (`time gh api ...`, `time rg ...`, a tool's
+  `-h`), one-off measurements with no queue behind them; refusing them would be wrong
+  refusals. hyperfine outside heavy is a benchmark by nature, so it is judged.
+- A heavy whose options hold an expansion (`heavy $flag -- ...`) isn't judged: the
+  expansion could be `--alone`. The incident's own call was of that shape, inside a
+  script written to a file and then run, which the gate never sees; only a check in
+  heavy, on the argv it runs, would catch it (left as a follow-up on #20, with
+  heavyhistory's estimate of runs times variants times a run's usual length).
+- Replayed over the 69,681 Bash calls in the session logs at landing, it refused 3,
+  each right: an unbounded `/usr/bin/time cargo nextest run` under plain heavy, and
+  two hyperfine runs outside heavy with no `--runs`. It noted 24, about half of them
+  hyperfine or `perf stat` under `heavy --few-seconds` (or `--quick`), most of the rest
+  hyperfine with `--runs` outside heavy.
+
 ### A --few-seconds job is stopped at 60 s (2026-11-26)
 
 On 2026-11-26 agents ran jobs of 61 to 215 s under `--few-seconds` (heavy's record: whole test files such as `./t test_build_state.py`, 202 and 215 s; `./t test_gh_ci_wait.py`, 131 s), each jumping the queue's front and running beside the lane's holder, and heavy only warned as each ended (`HEAVY_QUICK_MAX`).

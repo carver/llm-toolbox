@@ -785,7 +785,11 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   it refuses heavy around bgrun, git commit or wt-ship, and heavy without
   `--long` around `mutate-check --diff`, which would hold the normal lane, where
   the commit checks queue, for minutes; a mutate-check of edits runs once and
-  passes. It reads the command as
+  passes. It refuses a timing with no bound (`time`, hyperfine or `perf stat`
+  under heavy without `--alone`, or hyperfine outside heavy) and names
+  `heavy-bench`; a bounded one (a `timeout`, hyperfine's `--runs`, or
+  `--few-seconds`) passes with a note that timings go under `heavy --alone`.
+  It reads the command as
   shell words and looks only at what runs, through wrappers such as `timeout`
   and `nice`, `bash -c`, a heredoc fed to a shell and `$(...)`. A word that only
   mentions heavy passes, as do `heavy status`, `heavy -h`, `bgrun` without

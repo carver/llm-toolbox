@@ -92,6 +92,14 @@ A job per run lets other jobs in between, and interleaving the variants round by
 The cost is heavy's quiet-cores wait before each run, seconds on a quiet machine.
 heavy-bench reads each run's wall and outside CPU from heavy's `HEAVY_ALONE_REPORT`, so time in the queue doesn't count, and reruns a run taken under outside load once, keeping both rows.
 
+### heavy-bench waits for a quiet machine before a rerun, and stops after two loaded runs (2026-11-26)
+
+On 2026-11-26 a `heavy-bench --warmup --rounds 3` over two variants of filedrawer's suite (about 9.6 min a run) had about 550 CPU-s of outside work in each run, and reran each flagged run at once, under the same load, holding the normal lane for over half an hour while `--few-seconds` jobs waited (#22).
+So before a rerun it runs `heavy waits --until-quiet --max-wait S` (`--quiet-wait`, default 900): no job running or waiting in either lane, so jobs that queued meanwhile go first, and the load average under 2. Still busy at S, it stops before the rerun; a rerun flagged too also stops it, since two loaded runs in a row say the load will last. Either stop prints the table so far and exits 3.
+The signal is the queue and the load average together, the ones `--until-quiet` already reads for the night's end-of-run timings; the loaded run's own outside CPU says only that it was loaded, not when the load ends.
+A stopped bench doesn't resume from its `--out`: it starts again with a new one. Resuming would mix runs from two spells of the machine in one table, and the stop is meant to be rare now that timings run last, alone; the bench that prompted this probably ran during that day's 10:11-12:50 host throttle.
+The 900 s is unmeasured, a guess at long enough for a commit's checks and short enough not to strand a bench for hours. A wait that fails for another reason is said and the rerun goes ahead, as before. `--no-rerun` waits for nothing, so a bench run on purpose beside another job, which keeps the machine from being quiet, takes it.
+
 ### An --alone job reports the other work its cores did (2026-11-25)
 
 `--alone` keeps other heavy jobs off a timing's cores, but not work outside the queue: agent-commit-gate's `checks-needed` runs before it asks for a place, and an agent can run a build bare.

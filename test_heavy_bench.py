@@ -3,7 +3,9 @@ round, and sums the runs up, flagging and rerunning one taken under outside load
 
 Each test runs heavy-bench against a queue of its own (HEAVY_DIR) whose cores read
 quiet (HEAVY_BUSY), as test_heavy.py does; outside load is staged the same way, by a
-command that rewrites the HEAVY_STAT file heavy reads in place of /proc/stat.
+command that rewrites the HEAVY_STAT file heavy reads in place of /proc/stat. The
+load average `heavy waits --until-quiet` reads before a rerun is a file too
+(HEAVY_LOADAVG), low unless a test raises it.
 """
 
 import os
@@ -31,6 +33,10 @@ FIELDS = [
 ]
 
 
+LOW_LOAD = "0.10 0.10 0.10 1/100 1\n"
+HIGH_LOAD = "5.00 5.00 5.00 9/100 1\n"
+
+
 def proc_stat(busy_on_first):
     cpus = sorted(os.sched_getaffinity(0))
     lines = ["cpu  0 0 0 0 0 0 0 0"]
@@ -51,6 +57,8 @@ def bench(tmp_path):
     stat.write_text(proc_stat(0))
     (tmp_path / "stat.quiet").write_text(proc_stat(0))
     (tmp_path / "stat.busy").write_text(proc_stat(10**6))
+    loadavg = tmp_path / "loadavg"
+    loadavg.write_text(LOW_LOAD)
     env = {
         k: v
         for k, v in os.environ.items()
@@ -64,6 +72,8 @@ def bench(tmp_path):
         "HEAVY_CORES_USED": "0",
         "HEAVY_QUIET_SECONDS": "0.1",
         "HEAVY_POLL": "0.02",
+        "HEAVY_LOADAVG": str(loadavg),
+        "HEAVY_WAITS_POLL": "0.05",
         "CLAUDE_CODE_SESSION_ID": "s-test",
     }
     out = tmp_path / "out"
@@ -91,7 +101,7 @@ def bench(tmp_path):
         assert lines[0].split("\t") == FIELDS
         return [dict(zip(FIELDS, line.split("\t"), strict=True)) for line in lines[1:]]
 
-    run.rows, run.out, run.tmp = rows, out, tmp_path
+    run.rows, run.out, run.tmp, run.loadavg = rows, out, tmp_path, loadavg
     run.busy_cmd = f'cp {tmp_path / "stat.busy"} "$HEAVY_STAT"; echo loud'
     run.quiet_cmd = f'cp {tmp_path / "stat.quiet"} "$HEAVY_STAT"; echo quiet'
     run.reset = f'cp {tmp_path / "stat.quiet"} "$HEAVY_STAT"'
@@ -113,8 +123,10 @@ def test_variants_run_interleaved_round_by_round_one_heavy_job_each(bench):
 
 
 def table_line(done, name):
-    """The summary table's line for variant `name`, split into words."""
-    (line,) = [line for line in done.stdout.splitlines() if line.split()[:1] == [name]]
+    """The summary table's line for variant `name`, split into words; `done` is a
+    finished run or its stdout."""
+    out = done if isinstance(done, str) else done.stdout
+    (line,) = [line for line in out.splitlines() if line.split()[:1] == [name]]
     return line.split()
 
 
@@ -160,16 +172,122 @@ def test_a_failed_prepare_stops_the_bench(bench):
     assert "results:" in done.stdout  # what it measured is still summed up
 
 
-def test_a_run_under_outside_load_is_flagged_and_run_again(bench):
+def test_two_loaded_runs_in_a_row_stop_the_bench(bench):
     # The prepare step makes each attempt start quiet, so the rerun sees the load too.
-    done = bench("--rounds", "1", "--prepare", bench.reset, f"a={bench.busy_cmd}")
+    done = bench(
+        "--rounds", "2", "--prepare", bench.reset, f"a={bench.busy_cmd}", "b=true"
+    )
     rows = bench.rows()
     assert [(r["round"], r["attempt"], r["flagged"]) for r in rows] == [
         ("1", "1", "1"),
         ("1", "2", "1"),
     ]
     assert float(rows[0]["outside"]) > 0
-    assert "flagged" in done.stdout
+    assert done.returncode == 3, done.stderr
+    assert "a round 1 ran under outside load twice in a row; stopping" in done.stderr
+    assert "with a new --out" in done.stderr
+    assert "flagged" in done.stdout  # the table of what it measured
+    assert "results:" in done.stdout
+
+
+def test_a_loaded_run_waits_for_a_quiet_machine_before_its_rerun(bench):
+    bench.loadavg.write_text(HIGH_LOAD)
+    flip = bench.tmp / "flip"
+    command = (
+        f"if [ -e {flip} ]; then {bench.quiet_cmd}; "
+        f"else touch {flip}; {bench.busy_cmd}; fi"
+    )
+    proc = subprocess.Popen(
+        [str(SCRIPT), "--out", str(bench.out), "--rounds", "1", f"a={command}"],
+        env=bench.env,
+        cwd=bench.tmp,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    before = until_busy_reading(proc)
+    assert len(bench.rows()) == 1  # heavy waits reads the load: no rerun yet
+    bench.loadavg.write_text(LOW_LOAD)
+    out, rest = proc.communicate(timeout=60)
+    err = before + rest
+
+    assert proc.returncode == 0, err
+    assert [(r["attempt"], r["flagged"]) for r in bench.rows()] == [
+        ("1", "1"),
+        ("2", "0"),
+    ]
+    assert "waiting for a quiet machine" in err
+    assert table_line(out, "a")[1] == "1"
+
+
+def until_busy_reading(proc):
+    """Read heavy-bench's stderr up to heavy waits' first `busy:` reading; return
+    what it read. pytest's timeout bounds a reading that never comes."""
+    read = []
+    for line in proc.stderr:
+        read.append(line)
+        if line.startswith("busy:"):
+            return "".join(read)
+    raise AssertionError(f"heavy waits never read busy:\n{''.join(read)}")
+
+
+def test_a_stop_during_the_quiet_wait_sums_up_and_leaves_no_heavy_waits(bench):
+    bench.loadavg.write_text(HIGH_LOAD)
+    proc = subprocess.Popen(
+        [str(SCRIPT), "--out", str(bench.out), "--rounds", "2", f"a={bench.busy_cmd}"],
+        env=bench.env,
+        cwd=bench.tmp,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    until_busy_reading(proc)
+    children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
+    (waits,) = [
+        pid
+        for pid in children
+        if b"waits" in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    ]
+    proc.send_signal(signal.SIGTERM)
+    out, _ = proc.communicate(timeout=30)
+
+    assert proc.returncode == 128 + signal.SIGTERM
+    assert "results:" in out
+    assert not Path(f"/proc/{waits}").exists()
+
+
+def test_a_failed_run_outranks_a_stop_for_outside_load(bench):
+    done = bench(
+        "--rounds", "1", "--prepare", bench.reset, "a=exit 4", f"b={bench.busy_cmd}"
+    )
+
+    assert "ran under outside load twice in a row" in done.stderr
+    assert done.returncode == 1, done.stderr
+
+
+def test_a_machine_still_busy_past_quiet_wait_stops_the_bench_before_the_rerun(bench):
+    bench.loadavg.write_text(HIGH_LOAD)
+    done = bench("--rounds", "1", "--quiet-wait", "0.2", f"a={bench.busy_cmd}")
+
+    assert done.returncode == 3, done.stderr
+    assert [r["attempt"] for r in bench.rows()] == ["1"]
+    assert "still busy" in done.stderr
+    assert "results:" in done.stdout
+
+
+def test_no_rerun_waits_for_nothing(bench):
+    bench.loadavg.write_text(HIGH_LOAD)
+    done = bench(
+        "--rounds", "2", "--no-rerun", "--prepare", bench.reset, f"a={bench.busy_cmd}"
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert [r["flagged"] for r in bench.rows()] == ["1", "1"]
+
+
+@pytest.mark.parametrize("seconds", ["-1", "soon"])
+def test_a_quiet_wait_that_isnt_a_number_of_seconds_is_a_usage_error(bench, seconds):
+    assert bench("--quiet-wait", seconds, "a=true").returncode == 2
 
 
 def test_no_rerun_keeps_a_flagged_run_as_it_is(bench):

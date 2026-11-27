@@ -2,7 +2,7 @@
 """Time commands against each other in short heavy --alone jobs, interleaved.
 
     heavy-bench --out DIR [--rounds N] [--warmup] [--prepare CMD] [--no-rerun] \\
-        NAME[@REV]=CMD [NAME[@REV]=CMD ...]
+        [--quiet-wait S] NAME[@REV]=CMD [NAME[@REV]=CMD ...]
 
 Each run of a variant's CMD (`sh -c CMD`, in this folder) is its own
 `heavy --alone` job, so heavy's queue holds one of this bench's jobs at a time and
@@ -35,8 +35,16 @@ file under a variable of its own can be pointed at it, as a commit check that wr
 CHECK_TIMINGS is with `CHECK_TIMINGS="$BENCH_TIMINGS" CMD`.
 
 heavy reports what other work used the job's cores while it ran (`heavy -h`). A run
-past HEAVY_ALONE_OUTSIDE cores of it on average (0.5) is flagged and run once more
-at once, unless --no-rerun; both rows are kept. A warmup run is never rerun.
+past HEAVY_ALONE_OUTSIDE cores of it on average (0.5) is flagged and run once more,
+unless --no-rerun; both rows are kept. Before the rerun it waits, with `heavy waits
+--until-quiet`, for no heavy job running or waiting in either lane and the load
+average under 2, so jobs that queued meanwhile go first and the rerun doesn't meet
+the same load; still busy after --quiet-wait seconds (default 900), it stops rather
+than spend the queue on a run it would throw away. A rerun flagged too stops it as
+well: two loaded runs in a row say the load will last. Either stop prints the table
+of what it measured and exits 3; run the bench again later, with a new --out. A
+bench run on purpose beside another job, which keeps the machine from ever being
+quiet, takes --no-rerun. A warmup run is never rerun.
 
 Each run's output goes to DIR/NAME-ROUND.log (-ATTEMPT added for a rerun), and its
 row to DIR/results.tsv as it ends: variant, round, attempt, wall seconds (from
@@ -63,7 +71,8 @@ Environment:
   HEAVY_SLOT           set inside a heavy job, where heavy-bench refuses to run
 
 Exit status: 0 every timed run exited 0; 1 a run or a prepare failed; 2 a usage
-error; 128+N stopped by signal N.
+error; 3 stopped for outside load, so run it again later with a new --out; 128+N
+stopped by signal N. A failed run wins over 3, and a signal over both.
 """
 
 import argparse
@@ -95,11 +104,17 @@ FIELDS = [
 PART = re.compile(r"([^\s=,]+)\s+(\d+(?:\.\d+)?)")
 STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 STOPPED_BY = {128 + sig for sig in STOPS}
+LOADED = 3  # the exit status of a bench stopped for outside load
+HELD = 3  # `heavy waits --until-quiet` still busy at --max-wait
 
 
 class Stopped(Exception):
     def __init__(self, signum):
         self.signum = signum
+
+
+class Loaded(Exception):
+    """The bench stops for outside load; the message says why."""
 
 
 def variants(specs, parser):
@@ -240,21 +255,25 @@ def counted(row):
 
 
 class Bench:
-    def __init__(self, out, prepare, rerun, limit, folders):
-        """`folders`: where each NAME@REV variant runs; the rest run here."""
+    def __init__(self, out, prepare, rerun, limit, folders, quiet_wait):
+        """`folders`: where each NAME@REV variant runs; the rest run here.
+        `quiet_wait`: the seconds a rerun waits for a quiet machine."""
         self.out, self.prepare, self.rerun, self.limit = out, prepare, rerun, limit
-        self.trees = folders
+        self.trees, self.quiet_wait = folders, quiet_wait
         self.rows = []
         out.mkdir(parents=True, exist_ok=True)
         self.tsv = out / "results.tsv"
         self.tsv.write_text("\t".join(FIELDS) + "\n")
 
     def run(self, name, command, round_):
-        """Run one variant's round, rerunning a flagged timed run once; False when a
-        prepare failed. Raises Stopped when the run was stopped by a signal."""
+        """Run one variant's round, rerunning a flagged timed run once the machine is
+        quiet; False when a prepare failed. Raises Stopped when the run was stopped by
+        a signal, and Loaded when the machine stayed busy or the rerun was flagged."""
         attempts = 2 if self.rerun and round_ != "warmup" else 1
         cwd = self.trees.get(name)
         for attempt in range(1, attempts + 1):
+            if attempt > 1:
+                self.settle(name, round_)
             if self.prepare:
                 env = os.environ | {"BENCH_VARIANT": name}
                 done = subprocess.run(
@@ -300,7 +319,40 @@ class Bench:
                 raise Stopped(code - 128)
             if not flagged:
                 break
+            if attempt > 1:
+                raise Loaded(
+                    f"{name} round {round_} ran under outside load twice in a row;"
+                    " stopping, since the load looks set to last."
+                )
         return True
+
+    def settle(self, name, round_):
+        """Wait for `heavy waits --until-quiet`, up to quiet_wait seconds, before a
+        flagged run's rerun; raise Loaded when the machine is still busy then. A wait
+        that fails otherwise is said, and the rerun goes ahead, as it did before."""
+        print(
+            f"heavy-bench: {name} round {round_} ran under outside load; waiting for a"
+            f" quiet machine (heavy waits --until-quiet, up to {self.quiet_wait:g} s)"
+            " before its rerun.",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Its readings go to stderr, so stdout keeps only the table.
+        done = subprocess.run(
+            [str(HEAVY), "waits", "--until-quiet", "--max-wait", str(self.quiet_wait)],
+            stdout=sys.stderr,
+            check=False,
+        )
+        if done.returncode == HELD:
+            raise Loaded(
+                f"the machine was still busy {self.quiet_wait:g} s after {name} round"
+                f" {round_} ran under outside load; stopping before its rerun."
+            )
+        if done.returncode != 0:
+            print(
+                f"heavy-bench: heavy waits exited {done.returncode}; rerunning at once.",
+                file=sys.stderr,
+            )
 
     def table(self, names):
         print(
@@ -373,11 +425,21 @@ def main(argv=None):
         action="store_true",
         help="keep a run flagged for outside load as it is",
     )
+    parser.add_argument(
+        "--quiet-wait",
+        type=float,
+        default=900.0,
+        metavar="S",
+        help="before a flagged run's rerun, wait up to S seconds for a quiet machine,"
+        " else stop (default 900)",
+    )
     parser.add_argument("variant", nargs="*", metavar="NAME=CMD")
     args = parser.parse_args(argv)
     found, revs = variants(args.variant, parser)
     if args.rounds < 1:
         parser.error("--rounds must be at least 1")
+    if not args.quiet_wait >= 0:  # NaN too
+        parser.error("--quiet-wait must be 0 or more seconds")
     if os.environ.get("HEAVY_SLOT"):
         parser.error(
             "it runs inside a heavy job, where heavy runs each run at once and measures"
@@ -394,6 +456,7 @@ def main(argv=None):
         rerun=not args.no_rerun,
         limit=limit(parser),
         folders={name: tree / prefix for name, tree in trees.items()},
+        quiet_wait=args.quiet_wait,
     )
 
     def stop(signum, _frame):
@@ -425,6 +488,14 @@ def run_bench(bench, found, args):
         print(f"heavy-bench: stopped by signal {stopped.signum}.", file=sys.stderr)
         bench.table(found)
         return 128 + stopped.signum
+    except Loaded as loaded:
+        print(
+            f"heavy-bench: {loaded} Run the bench again once the machine is quiet,"
+            " with a new --out.",
+            file=sys.stderr,
+        )
+        bench.table(found)
+        return 1 if bench.failed() else LOADED
     bench.table(found)
     return 1 if bench.failed() else 0
 

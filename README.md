@@ -659,7 +659,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   round by round (`--rounds`, 3), after an optional untimed `--warmup` run each.
   `--prepare CMD` resets state before each run, with `$BENCH_VARIANT` set. A run
   whose cores did more than `$HEAVY_ALONE_OUTSIDE` (0.5) cores of other work is
-  flagged and run once more, unless `--no-rerun`. Rows go to `DIR/results.tsv`
+  flagged and run once more, unless `--no-rerun`, after a wait of up to
+  `--quiet-wait` seconds (900) for `heavy waits --until-quiet`; a machine still
+  busy then, or a rerun flagged too, stops the bench with exit 3 and the table so
+  far (run it again later, with a new `--out`). Rows go to `DIR/results.tsv`
   as each run ends, with the machine's speed at its start and end (never
   flagged), output to a log per run, and a table sums up each variant
   over its clean runs, with each part's mean when runs write `name seconds`

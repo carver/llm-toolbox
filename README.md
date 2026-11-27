@@ -577,8 +577,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   otherwise it waits at the queue's front, after earlier front entries such as
   a landing's check and ahead of every other waiter, until the
   cores go that quiet or it heads the lane, where it starts at the first quiet
-  sample. One that ran past `$HEAVY_QUICK_MAX` (60) seconds hears, as it ends,
-  to drop `--few-seconds` for runs like it. It goes with none of `--long`,
+  sample. One still running after `$HEAVY_QUICK_MAX` seconds (60, and at most
+  60; such a job usually takes 10 s or less) is stopped, its process group
+  sent SIGTERM and then SIGKILL after `$HEAVY_GRACE` seconds, and told to run
+  as `bgrun -o LOG -- heavy -- CMD`; heavy exits 124. It goes with none of `--long`,
   `--alone` and `--share`, and may run as a foreground Bash call, with a 600000 ms
   timeout; heavy-gate refuses the call without it. Stopped, it stops CMD's
   process group,
@@ -605,6 +607,10 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   (`$HEAVY_WAITS_POLL`) until p90 is under `--p90` (180 s) with at most
   `--waiting` (1) jobs waiting, printing its first and last reading, and exits
   3 if `--max-wait` passes first, for an agent that can't keep time itself.
+  `heavy waits --until-quiet` waits the same way for no job running or waiting
+  in either lane, any session's, and the 1-minute load average under `--load`
+  (2), as before a timing run; `$HEAVY_LOADAVG` stands in for `/proc/loadavg`
+  in the tests.
   An `--alone` job ends with a line
   giving the CPU-seconds other work used on its cores while it ran, warning
   past `$HEAVY_ALONE_OUTSIDE` (0.5)
@@ -770,7 +776,7 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `run_in_background: true`, since heavy's queue has no time limit and the
   Bash tool kills a call at its own; the refusal names `bgrun --wait -o LOG --
   heavy -- CMD` as a background call, and `heavy --few-seconds -- CMD` for a run
-  of seconds, which passes in the foreground only when the call's own timeout is
+  of seconds (heavy stops one past 60 s), which passes in the foreground only when the call's own timeout is
   600000 ms (a `timeout` command doesn't count), since it may wait minutes for
   the running job. Background or not,
   it refuses heavy around bgrun, git commit or wt-ship, and heavy without
@@ -943,7 +949,12 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   line, which `install.py` sets in the sandbox when none is set: `cpu 0.9x`,
   `cpu 0.4x slow` under 0.5x, from the newest probe of the last 15 minutes whose
   speed is known, even when a newer one's isn't, `cpu ?` with none, and
-  `(mail failed)` while a mail it owes has failed. For the tests,
+  `(mail failed)` while a mail it owes has failed. While a slow spell is open
+  and cron's newest probe of known speed is at most 20 minutes old and under
+  1/3x (3x slower), `heavy status`, `heavy waits` (on stderr) and
+  `perf-promises --session-start` lead with one line:
+  `WARNING: host CPU running 7x slower than usual (0.14x its usual speed, slow
+  since 10:15 PST): check the host for throttling (PROCHOT).` For the tests,
   `$MACHINE_SPEED_SENDER` stands in for the sender and `$MACHINE_SPEED_NOW` for
   the clock; `$PERF_PROMISES_DIR`, `$HEAVY_SPEED_PROBE`, `$HEAVY_STAT` and
   `$HEAVY_DIR` are heavy's.

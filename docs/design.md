@@ -78,6 +78,13 @@ It doesn't keep every secret out: a bare positional token, as in `./deploy prod 
 The other option the issue named, redacting what looks like a secret and keeping the rest, fails open: every shape it doesn't know (a header after `-H`, a positional token, a new tool's flag) is kept in full. Cutting fails closed: what it drops can't leak, and the first words still name the tool, its subcommand and its folder, enough to say which job overlapped.
 The cost is detail: `sh -c 'pytest -n 8'` shows as `sh -c`, and `pytest -k name` as `pytest -k`. The record's `key`, history.json's hash of the repo and the whole command, still tells two runs of one command from runs of another.
 
+### `heavy waits --until-quiet` waits for empty lanes and a low load average (2026-11-26)
+
+The night's end-of-run timings waited for `heavy status` to show both lanes empty, as the protocol said, and started at a 1-minute load average of 4.4 to 6.5: the agents' own load (Claude Code sessions, their hooks, git and grep outside heavy, about 3 cores at 11:55 by #25's sample) shows in no lane.
+`--until-quiet` waits for both: no job running in either lane (holders, sharers, and --few-seconds jobs running outside the queue, which take no slot and are found in the record by a live PID), none waiting, and the load average under `--load`, default 2.
+The load average, not heavy's busy share: it counts runnable tasks over a minute, so it settles past a burst of hooks, and it is the number the night's runs were judged by. The default of 2 is the owner's ("about 2"), unmeasured; `--load` changes it.
+It is the queue's state once, not a promise: a job can start the moment it exits, so a timing still runs under `--alone`, whose closing line reports outside work.
+
 ### heavy-bench: a benchmark is many short --alone jobs, interleaved (2026-11-25)
 
 In filedrawer #137's benchmark (2026-11-25), `heavy --alone -- hyperfine` over three variants of a 2-minute suite held heavy's queue for about 25 minutes, so every session's commit checks waited behind it; the owner asked for it split.
@@ -119,6 +126,18 @@ Such a run goes under heavy like any other command, with the foreground and
 - The script of a shell's `-c` under heavy (`heavy -- bash -c '...'`) is searched too.
 - `heavy -- mutate-check -h` passes this rule, since it returns at once.
 
+### A --few-seconds job is stopped at 60 s (2026-11-26)
+
+On 2026-11-26 agents ran jobs of 61 to 215 s under `--few-seconds` (heavy's record: whole test files such as `./t test_build_state.py`, 202 and 215 s; `./t test_gh_ci_wait.py`, 131 s), each jumping the queue's front and running beside the lane's holder, and heavy only warned as each ended (`HEAVY_QUICK_MAX`).
+The owner: "It should require a time limit of 60 s or less. That should only cover overloaded situations; they should usually be closer to 10 s or less."
+
+- A --few-seconds job still running `HEAVY_QUICK_MAX` seconds after CMD started (60 by default) is stopped as a stopped heavy stops one: SIGTERM to CMD's process group, SIGKILL after `HEAVY_GRACE`. heavy exits 124, timeout(1)'s status, and the record keeps 124. The line names `bgrun -o LOG -- heavy -- CMD`. The warning it replaces is gone: no job runs past the limit to hear it.
+- Only running time counts, not the wait at the queue's front, which a --few-seconds job doesn't choose.
+- `HEAVY_QUICK_MAX` may lower the limit, never raise it: a setting over 60, or one that isn't a number of seconds over 0, is a usage error (exit 2) for heavy. The tests lower it to fractions of a second.
+- A heavy inside a job has no limit of its own: the outer job's holds, and a check that calls heavy inside a landing's job must not be cut at 60 s.
+- Not from heavy's history: the owner doubts its fidelity, and a limit stops the run that overran whatever predicted it.
+- agent-commit-gate's seconds checks (`CHECK_SECONDS_EXIT`, filedrawer #155, since f54c3ac and filedrawer's 84af74b) run as --few-seconds jobs through heavyqueue, not bin/heavy, so the gate applies the same limit itself: the check runs in a process group of its own (with SIGTERM should the gate die, since a signal to the gate's group no longer reaches it; a gate stopped by SIGINT, SIGTERM or SIGHUP stops the check's group first, as heavy does, since PR_SET_PDEATHSIG reaches only the check's first process and a probe's `sleep` ran on outside the queue), and past the limit it is stopped the same way and runs again as an ordinary queued check, after a line saying the check's seconds rule needs a look. So a commit never fails for overrunning; it costs the time it ran plus the ordinary run. A bad `HEAVY_QUICK_MAX` there is a note and 60 s, not a refused commit. A check inside a job, as in wt-ship's landing, has no limit, as a heavy inside one has none. Both runners stop a group with heavyqueue's stop_group, and a stopped job's record says `"stopped": "limit"`, since its 124 alone is also what a command's own timeout(1) exits. filedrawer's record held no seconds run yet at landing; fd#148 measured the checks its rule calls short at under 40 s, so at the host's usual speed they fit, and under a throttle like that day's (about 0.15x) they would overrun and run again in the queue.
+
 ### heavy's `--quick` is named `--few-seconds` (2026-11-24)
 
 Agents ran `heavy --quick` for runs of minutes: in one session, a whole test file of
@@ -150,7 +169,7 @@ every session's full checks, sometimes tens of minutes.
   idles lets it through. Heading the lane, it starts at the first quiet sample: a 5 s
   job shouldn't wait 10 s of quiet.
 - One that runs past 60 s hears, as it ends, to drop `--quick` for runs like it; a
-  warning only.
+  warning only. Since 2026-11-26 it is stopped at 60 s (the entry above).
 - Since 2026-11-24, a run outside the queue is niced to 10, as a sharer is, even on a
   free lane, since a holder may take the lane while it runs and only root can undo a
   nice. That day a ten-worker pytest, most likely a `--quick` run admitted while a
@@ -281,7 +300,7 @@ heavy's record put that throttling at roughly 0.1 to 0.2x from about 10:20 to 12
 It was a lower clock or a power cap, not steal: steal since boot came to about 3,900 CPU-seconds, about one core-hour, where descheduling to 0.1 to 0.2x on 16 vCPUs for 2 hours would be about 25. So a timed probe is the only signal.
 The owner's decisions:
 
-- Two channels: an email, which reaches the owner away from any session, and a Claude Code status line, live at a session. No session-start message.
+- Two channels: an email, which reaches the owner away from any session, and a Claude Code status line, live at a session. No session-start message (since reversed for one line: the next entry).
 - A cron job probes every 5 minutes, beside heavy's job-end probes, through the Purelymail account the email skill uses.
 - The thresholds, split after measuring that day: an email when three probes in a row, within about 20 minutes, read under 0.25x; a recovery email when three read 0.5x or above, only after a slow email went out. The status line says `slow` under 0.5x.
 - Load buckets, not quiet probes: "How would it even measure quiet machine probes? There are often long stretches where the machine is loaded without a break". Every cron probe counts, busy or not, at its load-adjusted factor (heavy's speed probe: against probes on the same vCPU under the same load), pinned to vCPU 0 so its cells fill fast. A cell with under 20 probes gives no judgment, so a machine loaded in a way it never was before is silent for about 100 minutes.
@@ -295,6 +314,19 @@ The builder's and the brief review's choices:
 - The status line shows the newest probe of the last 15 minutes whose speed is known, any probe's, rounded down to a tenth, so `0.4x` is never shown beside a factor of 0.5 or more. It always prints one line and exits 0, since Claude Code blanks the bar on a non-zero exit or no output, and refreshes every 60 s (`refreshInterval`), since its events stop while a session is idle.
 - `install.py` adds the cron line and the status line only in the sandbox (SANDBOX_VM_ID or /etc/sandbox-secrets.sh), where the credentials and cron live, and sets the status line only when none is set.
 - Limits, said in `-h`: throttling that lasts past the speed file's 3-day window becomes the usual speed; new hardware is a new machine, silent until its cells fill; a sandbox recreate loses the crontab and settings until install.py runs again.
+
+### A slow spell is one line in `heavy status`, `heavy waits` and the session start (2026-11-26)
+
+On 2026-11-26 the host held the VM's cores at 400 MHz (PROCHOT) from about 10:11 to 12:50, about 7 to 10 times slower, and agents read `heavy status` and `heavy waits` all that time without a word of it (#25's comment).
+In the night's retrospective the owner asked for one loud line in both and in the session-start hook, with a threshold above 3x, since 3x under load is plausible on this power-bound host, or judged within the probe's load bucket.
+That reverses the entry above's "no session-start message" for this one line: the owner's later word.
+
+- The line reuses machine-speed's judgment rather than a second one: it shows while the alert state holds a slow spell open, three cron probes in a row under 0.25x (4x slower), each against probes on its vCPU under its own load, until three at 0.5x or above. So it is both above 3x and judged within the load bucket, and it says what the mail says.
+- It shows only while cron's newest probe of known speed is at most 20 minutes old (`SPELL_FRESH`, the streak's span): a crontab lost to a sandbox recreate, or a probe that keeps failing, would otherwise leave a spell open for good. Where cron isn't installed there is no line, as there is no mail.
+- It shows only while that probe reads under 1/3x (`SLOW_SHOWN`, the owner's 3x). A spell closes only after three probes at 0.5x or above, so through its recovery tail the line said `running 1x slower` or `2x slower`, which is no warning (second review, 2026-11-26).
+- The factor is that probe's, shown as `Nx slower` (1 over it, rounded) and as the factor.
+- `heavy status` prints it as its first line. `heavy waits` prints it on stderr, since its stdout is one line, or JSON, that scripts and the overnight gate read; `--until-open` the same, once. The session start puts it first among perf-promises' lines, for the owner and the agent.
+- Reading it must never fail what prints it: a missing or broken state is no line.
 
 ## pipefail-lint
 

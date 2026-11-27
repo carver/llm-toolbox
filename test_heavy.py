@@ -1994,28 +1994,92 @@ def test_help_names_few_seconds_and_not_the_old_quick(box):
     assert "--few-seconds" in done.stdout and "--quick" not in done.stdout
 
 
-def test_a_quick_job_that_runs_long_hears_once_at_its_end_to_drop_quick(
-    box, background, memory
+def alive(pid):
+    """Whether pid runs: a zombie, ended but not yet reaped, doesn't."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rpartition(")")[2].split()[0] != "Z"
+
+
+@pytest.mark.parametrize("ignores_term", [False, True], ids=["term", "kill"])
+def test_a_few_seconds_job_past_its_limit_is_stopped_with_its_group(
+    box, memory, ignores_term
 ):
-    tmp_path, _, _ = box
-    started, release = tmp_path / "started", tmp_path / "release"
-    command = (
-        f'touch "{started}"; while [ ! -e "{release}" ]; do sleep 0.05; done;'
-        " echo done >&2"
+    """2026-11-26: agents ran 61 to 214 s jobs as --few-seconds, and heavy only warned
+    as each ended. Past HEAVY_QUICK_MAX, CMD's whole group gets SIGTERM, then SIGKILL
+    after HEAVY_GRACE."""
+    tmp_path, _, env = box
+    pid_file = tmp_path / "grandchild"
+    trap = "trap '' TERM; " if ignores_term else ""
+    command = f'{trap}sleep 600 & echo $! > "{pid_file}"; wait; wait'
+    begun = time.monotonic()
+
+    done = heavy(
+        env,
+        "--few-seconds",
+        "--",
+        "sh",
+        "-c",
+        command,
+        HEAVY_QUICK_MAX="0.5",
+        HEAVY_GRACE="0.3",
     )
 
-    q = background("--few-seconds", "--", "sh", "-c", command, HEAVY_QUICK_MAX="0.2")
-    wait_until(started.exists, "the job to start")
-    # fixed sleep: the job must outlast HEAVY_QUICK_MAX, which heavy doesn't say
-    time.sleep(0.4)
-    release.touch()
-    status, _, err = finish(q)
+    took = time.monotonic() - begun
+    assert done.returncode == 124, done.stderr
+    assert took < 30, took
+    grandchild = int(pid_file.read_text())
+    wait_until(lambda: not alive(grandchild), "the job's grandchild to be stopped", 10)
+    (line,) = [ln for ln in done.stderr.splitlines() if ln.startswith("heavy:")]
+    assert "stopped this --few-seconds job at its 0.5 s limit" in line, line
+    assert "bgrun -o LOG -- heavy -- CMD" in line, line
+    (job,) = ended(tmp_path)
+    assert job["exit"] == 124 and job["stopped"] == "limit", job
+    shown = heavy(env, "history").stdout
+    assert "stopped at the --few-seconds limit" in shown, shown
 
-    assert status == 0, err
-    lines = err.splitlines()
-    assert len(lines) == 2 and lines[0] == "done", err
-    assert "past 0.2 s" in lines[1] and "--few-seconds" in lines[1], err
-    assert "--quick" not in lines[1], err
+
+def test_a_few_seconds_job_within_its_limit_runs_to_its_end(box, memory):
+    tmp_path, _, env = box
+
+    done = heavy(env, "--few-seconds", "--", "sh", "-c", "sleep 0.2; exit 124")
+
+    assert done.returncode == 124, done.stderr
+    assert "limit" not in done.stderr, done.stderr
+    (job,) = ended(tmp_path)
+    assert job["exit"] == 124 and "stopped" not in job, job
+
+
+def test_a_few_seconds_heavy_inside_a_job_has_no_limit(box):
+    """Inside a job, such as wt-ship's landing check, a --few-seconds heavy runs as
+    part of it: stopping it would cut the landing's check short."""
+    _, _, env = box
+    inner = [str(SCRIPT), "--few-seconds", "--", "sh", "-c", "sleep 0.5; exit 3"]
+
+    done = heavy(env, "--", *inner, HEAVY_QUICK_MAX="0.1", HEAVY_GRACE="0.1")
+
+    assert done.returncode == 3, done.stderr
+    assert "limit" not in done.stderr, done.stderr
+
+
+@pytest.mark.parametrize("setting", ["61", "0", "-5", "soon", "nan"])
+def test_a_few_seconds_limit_over_60_s_or_unreadable_is_a_usage_error(box, setting):
+    _, _, env = box
+
+    done = heavy(env, "--few-seconds", "--", "true", HEAVY_QUICK_MAX=setting)
+
+    assert done.returncode == 2, done.stderr
+    assert "HEAVY_QUICK_MAX" in done.stderr, done.stderr
+
+
+def test_the_limit_is_only_for_few_seconds_jobs(box):
+    _, _, env = box
+
+    done = heavy(env, "--", "sh", "-c", "sleep 0.3", HEAVY_QUICK_MAX="0.1")
+
+    assert done.returncode == 0, done.stderr
 
 
 @pytest.mark.parametrize("other", ["--long", "--alone", "--share"])
@@ -3100,10 +3164,128 @@ def test_until_open_refuses_a_poll_interval_it_cant_read(box):
 def test_until_open_options_need_until_open(box):
     _, _, env = box
 
-    done = heavy(env, "waits", "--max-wait", "10")
+    done = heavy(env, "waits", "--p90", "10")
 
     assert done.returncode == 2, done.stdout
     assert "--until-open" in done.stderr, done.stderr
+
+
+# `heavy waits --until-quiet`: wait for an empty queue on a quiet machine, as the
+# end of a night's timing runs does.
+
+
+def until_quiet(box, *args, load="0.50"):
+    """Run `heavy waits --until-quiet` with its readings 0.05 s apart and the 1-minute
+    load average `load`."""
+    tmp_path, _, env = box
+    loadavg = tmp_path / "loadavg"
+    loadavg.write_text(f"{load} 3.00 2.00 1/300 1234\n")
+    return heavy(
+        env,
+        "waits",
+        "--until-quiet",
+        *args,
+        HEAVY_WAITS_POLL="0.05",
+        HEAVY_LOADAVG=str(loadavg),
+    )
+
+
+def test_until_quiet_on_an_empty_queue_and_a_quiet_machine_exits_0(box):
+    done = until_quiet(box)
+
+    assert done.returncode == 0, done.stderr
+    (line,) = done.stdout.splitlines()
+    assert line == "quiet: 0 running, 0 waiting, load 0.50 (under 2)", line
+
+
+def test_until_quiet_holds_for_a_waiter_in_either_lane(box):
+    tmp_path, _, _ = box
+    add_waiter(tmp_path, "long", 1)
+
+    done = until_quiet(box, "--max-wait", "0")
+
+    assert done.returncode == 3, done.stderr
+    (line,) = done.stdout.splitlines()
+    assert line == "busy: 0 running, 1 waiting, load 0.50 (under 2)", line
+
+
+def test_until_quiet_holds_for_a_high_load_average_unless_load_allows_it(box):
+    busy = until_quiet(box, "--max-wait", "0.2", load="4.40")
+    allowed = until_quiet(box, "--load", "5", load="4.40")
+
+    assert busy.returncode == 3, busy.stderr
+    assert all(line.startswith("busy: ") for line in busy.stdout.splitlines())
+    assert "load 4.40 (2 or more)" in busy.stdout, busy.stdout
+    assert allowed.returncode == 0, allowed.stderr
+    assert "load 4.40 (under 5)" in allowed.stdout, allowed.stdout
+
+
+def test_until_quiet_counts_a_few_seconds_job_running_outside_the_queue(box):
+    tmp_path, _, _ = box
+    folder = tmp_path / "heavy"
+    folder.mkdir()
+    pid = os.getpid()  # alive while the test runs
+    job = {"v": 1, "id": "q", "at_start": time.time(), "pid": pid, "how": "outside"}
+    job |= {"proc_start": fifo.started(str(pid)), "host": socket.gethostname()}
+    gone = job | {"id": "g", "pid": 999999}  # its heavy ended with no end line
+    (folder / "jobs.jsonl").write_text(json.dumps(job) + "\n" + json.dumps(gone) + "\n")
+
+    done = until_quiet(box, "--max-wait", "0", "--json")
+
+    assert done.returncode == 3, done.stderr
+    found = json.loads(done.stdout)
+    assert found == {
+        "quiet": False,
+        "running": 1,
+        "waiting": 0,
+        "load": 0.5,
+        "load_under": 2.0,
+    }, found
+
+
+def test_until_quiet_waits_for_the_running_job_to_end(box, background):
+    tmp_path, _, _ = box
+    loadavg = tmp_path / "loadavg"
+    loadavg.write_text("0.10 0.10 0.10 1/300 1234\n")
+    command, started, release = blocker(tmp_path, "a")
+    holder = background("--", *command)
+    wait_until(started.exists, "a to start")
+    waiter = background(
+        "waits",
+        "--until-quiet",
+        HEAVY_WAITS_POLL="0.05",
+        HEAVY_LOADAVG=str(loadavg),
+    )
+    first = waiter.stdout.readline()
+    release.touch()
+    finish(holder)
+
+    code, out, err = finish(waiter)
+
+    assert first == "busy: 1 running, 0 waiting, load 0.10 (under 2)\n", first
+    assert code == 0, err
+    assert out == "quiet: 0 running, 0 waiting, load 0.10 (under 2)\n", out
+
+
+@pytest.mark.parametrize(
+    ("args", "named"),
+    [
+        (["--until-quiet", "--until-open"], "--until-open"),
+        (["--until-quiet", "--p90", "10"], "--p90"),
+        (["--until-quiet", "--lane", "long"], "--lane"),
+        (["--until-quiet", "--since", "1h"], "--since"),
+        (["--until-quiet", "--min-jobs", "3"], "--min-jobs"),
+        (["--load", "3"], "--until-quiet"),
+        (["--max-wait", "10"], "--until-quiet"),
+    ],
+)
+def test_until_quiet_refuses_options_that_dont_go_with_it(box, args, named):
+    _, _, env = box
+
+    done = heavy(env, "waits", *args)
+
+    assert done.returncode == 2, done.stdout
+    assert named in done.stderr.splitlines()[-1], done.stderr  # not just the usage
 
 
 @pytest.mark.parametrize(

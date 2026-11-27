@@ -18,6 +18,9 @@
     heavy waits --until-open [--p90 S] [--waiting N] [--max-wait S] [--lane L]
                                           wait for the queue to be quiet enough to
                                           start work
+    heavy waits --until-quiet [--load N] [--max-wait S]
+                                          wait for an empty queue on a quiet
+                                          machine, as before a timing
 
 Every session on this VM shares two lanes, each running one job at a time at full
 priority, first come first served. A long job runs on the last quarter of the cores;
@@ -46,9 +49,13 @@ Otherwise it joins the queue's front, as wt-ship's job does, and keeps watching 
 poll: once the cores have averaged that quiet over the window, it leaves the queue and
 runs outside it. Heading the lane with the slot free, it starts at the first sample
 under half busy, not after HEAVY_QUIET_SECONDS of them, which would cost it more than
-its run, and it never hears the PR hint. A --few-seconds job that ran past
-HEAVY_QUICK_MAX seconds hears once, as it ends, to run ones like it, or the build before
-them, without --few-seconds; nothing is stopped. A --few-seconds call may run in the
+its run, and it never hears the PR hint. A --few-seconds job may run HEAVY_QUICK_MAX
+seconds (default 60, the most it may be set to; usually such a job takes 10 s or
+less): past that, heavy stops CMD's process group, SIGTERM and then SIGKILL after
+HEAVY_GRACE seconds, says to run it without --few-seconds and in the background,
+`bgrun -o LOG -- heavy -- CMD`, and exits 124. Its wait in the queue doesn't count. A
+setting over 60, or one that isn't a number of seconds over 0, is a usage error. A
+heavy inside a job has no limit of its own. A --few-seconds call may run in the
 foreground, but the running job can take minutes to end, so give the Bash call the
 tool's longest timeout (600000 ms); heavy-gate refuses the call without it.
 --few-seconds goes with none of --long, --alone and --share: each pair is a usage error
@@ -112,6 +119,11 @@ fewer, the speed is unknown. `heavy speed` prints them. The probes go on a file 
 the perf promises' logs (lib/machinespeed.py says where and how), and a probe or file
 that fails is at most the job's one perf-promises note.
 
+While machine-speed's cron probes hold a slow spell open (3 in a row under 0.25x),
+`heavy status` and `heavy waits` lead with one line saying how many times slower than
+usual the host CPU runs and to check the host for throttling (PROCHOT); `waits`
+prints it on stderr, so its stdout stays one line, or JSON.
+
 A command's usual cores come from its last 5 runs that exited 0: the most CPU time
 any of them used per second of its run, counting CMD and the processes it waited for.
 Every worktree of a repo shares one history, in HEAVY_DIR/history.json.
@@ -166,6 +178,16 @@ two lines, its first reading and its last, each `open: ` or `held: ` and then th
 can't wait on its own clock, such as an overnight workflow's spawn gate, runs it in
 the background and waits for it to exit.
 
+`heavy waits --until-quiet` waits, the same way, for no job running or waiting in
+either lane, from any session (holders, sharers, and --few-seconds jobs running
+outside the queue, which the record shows), with the 1-minute load average under
+--load (default 2), as before an end-of-night timing run: empty lanes alone said
+nothing of the agents' own load, and one such run started at a load of 4.4 to 6.5.
+Each reading is a line, `quiet: 0 running, 0 waiting, load 1.20 (under 2)` or `busy:
+...`, first and last as --until-open prints them; --json prints objects with `quiet`,
+`running`, `waiting`, `load` and `load_under`. It exits 0 once quiet, or 3 past
+--max-wait. It takes no --lane, --p90, --waiting, --since or --min-jobs.
+
 A command that fails while /proc/vmstat's oom_kill count rises hears on stderr that the
 out-of-memory killer may have taken one of its processes, and to run it again if the
 failure looks odd.
@@ -202,8 +224,8 @@ Environment:
                        (default 2)
   HEAVY_QUICK_BUSY     how busy, at most, they average for it to run outside the
                        queue (default 0.25)
-  HEAVY_QUICK_MAX      seconds a --few-seconds job runs before it hears to drop the
-                       flag (default 60)
+  HEAVY_QUICK_MAX      seconds a --few-seconds job may run before it is stopped
+                       (default 60, and at most 60)
   HEAVY_GRACE          seconds CMD gets to stop before SIGKILL (default 5)
   HEAVY_ALONE_OUTSIDE  cores of other work, on average, past which an --alone job
                        hears its timing may be off (default 0.5)
@@ -214,8 +236,9 @@ Environment:
                        PERF_PROMISES_DIR is set)
   HEAVY_SPEED_AFTER_EXIT  0: start no speed probe after a job exits (tests; read
                        only while PERF_PROMISES_DIR is set)
-  HEAVY_WAITS_POLL     seconds between `heavy waits --until-open`'s readings
-                       (default 30; the tests shorten it)
+  HEAVY_WAITS_POLL     seconds between `heavy waits --until-open`'s or
+                       `--until-quiet`'s readings (default 30; the tests shorten it)
+  HEAVY_LOADAVG        a file that stands in for /proc/loadavg (tests)
   FIFO_LOCK_SECONDS    seconds of waiting for the queue's lock before naming its
                        holder (default 5; the tests shorten it)
   HEAVY_BUSY           a file whose number stands in for how busy the cores are (tests)
@@ -236,15 +259,16 @@ Environment:
                        HEAVY_DIR's default and one refused inside own-pids, beside
                        /tmp/heavy itself (tests)
 
-Exit status: CMD's own; 2 a usage error; 3 `heavy waits --until-open` reached
---max-wait with the queue still held; 125 heavy couldn't use its queue, or refused
+Exit status: CMD's own; 2 a usage error; 124 a --few-seconds job stopped at
+HEAVY_QUICK_MAX; 3 `heavy waits --until-open` or
+`--until-quiet` reached --max-wait with the queue still held; 125 heavy couldn't use
+its queue, or refused
 the shared one inside own-pids; 126 CMD
 couldn't be run (a folder, or not executable); 127 CMD wasn't found; 128+N stopped
 by signal N.
 """
 
 import argparse
-import ctypes
 import json
 import os
 import shlex
@@ -268,7 +292,6 @@ QUICK_WITHOUT = {
     "--share": "a --few-seconds job already runs beside the lane's holder when its"
     " cores are quiet, and --share is for work without time limits, such as a build.",
 }
-PR_SET_PDEATHSIG = 1
 
 
 class Stopped(Exception):
@@ -278,11 +301,6 @@ class Stopped(Exception):
 
 def on_signal(signum, _frame):
     raise Stopped(signum)
-
-
-def die_with_heavy():
-    """In CMD, before it starts: get SIGTERM should heavy die, even by SIGKILL."""
-    ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
 
 
 def hand_terminal(group):
@@ -306,31 +324,20 @@ def stop(proc):
     signals are ignored meanwhile, so a second Ctrl-C can't cut the KILL short."""
     for sig in STOPS:
         signal.signal(sig, signal.SIG_IGN)
-    grace = heavyqueue.knob("HEAVY_GRACE", 5)
-    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, None)):
-        try:
-            os.killpg(proc.pid, sig)
-            os.killpg(proc.pid, signal.SIGCONT)  # a stopped group can't act on TERM
-        except ProcessLookupError:
-            return
-        try:
-            proc.wait(timeout=wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+    heavyqueue.stop_group(proc)
 
 
-def warn_if_slow(ran):
-    """Tell a --few-seconds job that ran for more than HEAVY_QUICK_MAX seconds that
-    --few-seconds is for runs of seconds: once, as it ends, so the line is in the tail
-    of its output."""
-    limit = heavyqueue.knob("HEAVY_QUICK_MAX", 60)
-    if ran > limit:
-        heavyqueue.note(
-            f"heavy: this --few-seconds job ran past {limit:g} s. --few-seconds is for"
-            " runs of seconds, such as a few tests: run ones like this, or the build"
-            " before them, without it."
-        )
+OVERRAN = 124  # a --few-seconds job stopped at its limit, as timeout(1) exits
+
+
+def overran(limit):
+    """The line a --few-seconds job stopped at its limit hears."""
+    return (
+        f"heavy: stopped this --few-seconds job at its {limit:g} s limit"
+        " (HEAVY_QUICK_MAX). --few-seconds is for runs of seconds, usually 10 s or"
+        " less: run a longer one, or the build before it, without --few-seconds and"
+        " in the background, `bgrun -o LOG -- heavy -- CMD`."
+    )
 
 
 def run(command, long, alone, share, quick):
@@ -345,7 +352,7 @@ def run(command, long, alone, share, quick):
                 command,
                 env=job.env,
                 process_group=0,
-                preexec_fn=die_with_heavy,  # noqa: PLW1509
+                preexec_fn=heavyqueue.die_with_parent,  # noqa: PLW1509
             )
         except FileNotFoundError:
             print(f"heavy: no command {command[0]} to run.", file=sys.stderr)
@@ -358,17 +365,22 @@ def run(command, long, alone, share, quick):
         job.command_pid = proc.pid
         if terminal:
             hand_terminal(proc.pid)
-        begun = time.monotonic()
+        # A heavy inside a job runs at once, as part of it: the job's limit holds.
+        limit = heavyqueue.quick_limit() if quick and not job.nested else None
         try:
-            code = proc.wait()
+            code = proc.wait(timeout=limit)
+        except subprocess.TimeoutExpired:
+            stop(proc)
+            heavyqueue.note(overran(limit))
+            job.status = OVERRAN  # for its record; no run to remember
+            job.overran = True
+            return OVERRAN
         except Stopped:
             stop(proc)
             raise
         finally:
             if terminal:
                 hand_terminal(os.getpgrp())
-            if quick and not job.nested:
-                warn_if_slow(time.monotonic() - begun)
         job.exited(code)
         return 128 - code if code < 0 else code
 
@@ -396,7 +408,43 @@ def history(argv):
     return 0
 
 
-HELD = 3  # `heavy waits --until-open` reached --max-wait with the queue held
+HELD = 3  # `heavy waits --until-open` or `--until-quiet` reached --max-wait
+QUIET_LOAD = 2.0  # `heavy waits --until-quiet`'s default 1-minute load average limit
+
+
+def load_average():
+    """The 1-minute load average, from /proc/loadavg (or the HEAVY_LOADAVG file, the
+    tests' stand-in)."""
+    path = os.environ.get("HEAVY_LOADAVG") or "/proc/loadavg"
+    return float(Path(path).read_text().split()[0])
+
+
+def quiet_reading(load_under):
+    """What `heavy waits --until-quiet` reads: the jobs running and waiting in every
+    lane, the 1-minute load average, and whether that is quiet."""
+    running, waiting = heavyqueue.jobs_now()
+    load = load_average()
+    quiet = running == 0 and waiting == 0 and load < load_under
+    return {
+        "quiet": quiet,
+        "running": running,
+        "waiting": waiting,
+        "load": load,
+        "load_under": load_under,
+    }
+
+
+def quiet_line(found):
+    """`heavy waits --until-quiet`'s line for one reading."""
+    limit = f"{found['load_under']:g}"
+    against = (
+        f"under {limit}" if found["load"] < found["load_under"] else f"{limit} or more"
+    )
+    verdict = "quiet" if found["quiet"] else "busy"
+    return (
+        f"{verdict}: {found['running']} running, {found['waiting']} waiting,"
+        f" load {found['load']:.2f} ({against})"
+    )
 
 
 def waits(argv):
@@ -406,9 +454,7 @@ def waits(argv):
         prog="heavy waits",
         description="How long jobs waited for their turn: see heavy -h.",
     )
-    reader.add_argument(
-        "--since", default="30m", help="jobs that started since TIME (default 30m)"
-    )
+    reader.add_argument("--since", help="jobs that started since TIME (default 30m)")
     reader.add_argument(
         "--lane",
         choices=heavyqueue.LANES,
@@ -417,38 +463,75 @@ def waits(argv):
     reader.add_argument(
         "--min-jobs",
         type=int,
-        default=heavyjobs.MIN_JOBS,
         help=f"give p50 and p90 only when this many jobs started"
         f" (default {heavyjobs.MIN_JOBS})",
     )
     reader.add_argument("--json", action="store_true", help="one JSON object")
-    reader.add_argument(
+    modes = reader.add_mutually_exclusive_group()
+    modes.add_argument(
         "--until-open",
         action="store_true",
         help="read every HEAVY_WAITS_POLL seconds (30) until the queue is open",
     )
+    modes.add_argument(
+        "--until-quiet",
+        action="store_true",
+        help="read every HEAVY_WAITS_POLL seconds (30) until no job runs or waits in"
+        " either lane and the load average is under --load",
+    )
     gate = {
         "--p90": (float, 180.0, "open below this p90, in seconds (default 180)"),
         "--waiting": (int, 1, "open with at most this many waiting (default 1)"),
-        "--max-wait": (float, None, "exit 3 when still held after this many seconds"),
     }
     for flag, (kind, _, text) in gate.items():
         reader.add_argument(flag, type=kind, help=f"with --until-open: {text}")
+    reader.add_argument(
+        "--load",
+        type=float,
+        help="with --until-quiet: quiet below this 1-minute load average"
+        f" (default {QUIET_LOAD:g})",
+    )
+    reader.add_argument(
+        "--max-wait",
+        type=float,
+        help="with --until-open or --until-quiet: exit 3 when still held after this"
+        " many seconds",
+    )
     args = reader.parse_args(argv)
-    if args.min_jobs < 0:
-        reader.error("--min-jobs must be 0 or more")
-    if not args.until_open:
+    if args.until_quiet:
         given = [
             flag
-            for flag in gate
+            for flag in ("--since", "--min-jobs")
             if getattr(args, flag[2:].replace("-", "_")) is not None
         ]
         if given:
+            reader.error(
+                f"{', '.join(given)} doesn't go with --until-quiet, which reads no"
+                " past jobs"
+            )
+    if args.since is None:
+        args.since = "30m"
+    if args.min_jobs is None:
+        args.min_jobs = heavyjobs.MIN_JOBS
+    if args.min_jobs < 0:
+        reader.error("--min-jobs must be 0 or more")
+    if not args.until_open:
+        given = [flag for flag in gate if getattr(args, flag[2:]) is not None]
+        if given:
             reader.error(f"{', '.join(given)} goes only with --until-open")
+    if not args.until_quiet and args.load is not None:
+        reader.error("--load goes only with --until-quiet")
+    if not (args.until_open or args.until_quiet) and args.max_wait is not None:
+        reader.error("--max-wait goes only with --until-open or --until-quiet")
+    if args.until_quiet and args.lane is not None:
+        reader.error("--lane doesn't go with --until-quiet, which waits on both lanes")
     try:
         heavyjobs.moment(args.since)
     except ValueError as error:
         reader.error(f"can't read that time: {error}")
+    slow = machinespeed.slow_warning()
+    if slow is not None:
+        heavyqueue.note(slow)  # on stderr: stdout stays one line, or JSON
 
     def reading():
         # An age (30m) slides with each reading; a moment stays put.
@@ -458,7 +541,7 @@ def waits(argv):
             heavyqueue.base(), since, waiters, args.lane, min_jobs=args.min_jobs
         )
 
-    if not args.until_open:
+    if not (args.until_open or args.until_quiet):
         found = reading()
         print(json.dumps(found) if args.json else heavyjobs.waits_line(found))
         return 0
@@ -466,38 +549,53 @@ def waits(argv):
         poll = float(os.environ.get("HEAVY_WAITS_POLL", "30"))
     except ValueError:
         reader.error("HEAVY_WAITS_POLL must be a number of seconds")
+    if args.until_quiet:
+        load_under = QUIET_LOAD if args.load is None else args.load
+
+        def show_quiet(found):
+            print(json.dumps(found) if args.json else quiet_line(found), flush=True)
+
+        def quiet():
+            found = quiet_reading(load_under)
+            return found, found["quiet"]
+
+        return until(quiet, show_quiet, args.max_wait, poll)
     p90 = args.p90 if args.p90 is not None else gate["--p90"][1]
     most = args.waiting if args.waiting is not None else gate["--waiting"][1]
-    return until_open(reading, p90, most, args.max_wait, poll, args.json)
 
-
-def until_open(reading, p90, most, max_wait, poll, as_json):
-    """Take a reading every `poll` seconds until heavyjobs.is_open; print the first
-    and the last. 0 when open, HELD past `max_wait` seconds (None: no limit)."""
-
-    def show(found, is_open):
-        if as_json:
-            print(json.dumps(found | {"open": is_open}), flush=True)
+    def show_open(found):
+        if args.json:
+            print(json.dumps(found), flush=True)
         else:
-            verdict = "open" if is_open else "held"
+            verdict = "open" if found["open"] else "held"
             print(f"{verdict}: {heavyjobs.waits_line(found)}", flush=True)
 
+    def opened():
+        found = reading()
+        found["open"] = heavyjobs.is_open(found, p90, most)
+        return found, found["open"]
+
+    return until(opened, show_open, args.max_wait, poll)
+
+
+def until(read, show, max_wait, poll):
+    """Take a reading, (found, ready) = read(), every `poll` seconds until it is
+    ready; show the first and the last. 0 when ready, HELD past `max_wait` seconds
+    (None: no limit)."""
     start = time.monotonic()
-    found = reading()
-    is_open = heavyjobs.is_open(found, p90, most)
-    show(found, is_open)
+    found, ready = read()
+    show(found)
     first = True
-    while not is_open:
+    while not ready:
         if max_wait is not None and time.monotonic() - start >= max_wait:
             if not first:
-                show(found, is_open)
+                show(found)
             return HELD
         time.sleep(poll)
-        found = reading()
-        is_open = heavyjobs.is_open(found, p90, most)
+        found, ready = read()
         first = False
     if not first:
-        show(found, is_open)
+        show(found)
     return 0
 
 
@@ -549,8 +647,13 @@ def main(argv=None):
         for option, why in QUICK_WITHOUT.items():
             if getattr(args, option.removeprefix("--")):
                 parser.error(f"--few-seconds can't go with {option}: {why}")
+        try:
+            heavyqueue.quick_limit()
+        except ValueError as error:
+            parser.error(str(error))
     if args.command == ["status"]:
-        print(heavyqueue.status())
+        slow = machinespeed.slow_warning()
+        print(heavyqueue.status() if slow is None else f"{slow}\n{heavyqueue.status()}")
         return 0
     if args.command == ["speed"]:
         print(machinespeed.table())

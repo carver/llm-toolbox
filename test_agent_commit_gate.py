@@ -13,6 +13,7 @@ import socket
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1898,18 +1899,150 @@ def test_a_check_whose_queued_work_takes_seconds_runs_beside_a_holder_on_quiet_c
     assert timings_record(installed)[-1][8] == "seconds"
 
 
-def test_a_seconds_check_that_runs_long_hears_so_after_its_pass_line(
+def alive(pid):
+    """Whether pid runs: a zombie, ended but not yet reaped, doesn't."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rpartition(")")[2].split()[0] != "Z"
+
+
+def test_a_seconds_check_past_the_limit_is_stopped_and_runs_again_in_the_queue(
     installed, monkeypatch
 ):
-    seconds_check(installed)
-    monkeypatch.setenv("HEAVY_QUICK_MAX", "0")
+    """Its first queued run, as a --few-seconds job, outlasts HEAVY_QUICK_MAX and is
+    stopped with what it started; the check then runs as an ordinary one."""
+    hook(
+        installed,
+        "agent-pre-commit",
+        '# names $CHECK_QUEUE_EXIT\nlog="$(git rev-parse --git-dir)/ran"\n'
+        'if [ -n "${CHECK_SECONDS_EXIT:-}" ]; then\n'
+        '  echo seconds >> "$log"; exit "$CHECK_SECONDS_EXIT"\n'
+        "fi\n"
+        'if [ ! -e "$log.slow" ]; then\n'
+        '  touch "$log.slow"; echo slow >> "$log"\n'
+        '  sleep 600 & echo $! > "$log.grandchild"; wait\n'
+        "fi\n"
+        'echo agent >> "$log"',
+    )
+    monkeypatch.setenv("HEAVY_QUICK_MAX", "0.5")
+    monkeypatch.setenv("HEAVY_GRACE", "0.3")
 
     run = commit(installed)
 
     assert run.returncode == 0, run.stderr
-    lines = run.stderr.splitlines()
-    assert lines[-2].startswith("agent-pre-commit: passed (")
-    assert lines[-1].startswith("agent-pre-commit: said its queued work takes seconds")
+    assert ran(installed) == ["fast", "seconds", "slow", "agent"], run.stderr
+    grandchild = int((installed / ".git" / "ran.grandchild").read_text())
+    assert wait_or_warn(
+        lambda: not alive(grandchild), "the stopped check's grandchild to end"
+    )
+    err = run.stderr
+    stopped = "said its queued work takes seconds (CHECK_SECONDS_EXIT), but ran past"
+    assert stopped in err and "runs again as an ordinary check" in err, err
+    assert err.index(stopped) < err.index("agent-pre-commit: passed ("), err
+    assert "a --few-seconds job" not in err.split("passed (", 1)[1], err
+    jobs = {}
+    for line in (Path(os.environ["HEAVY_DIR"]) / "jobs.jsonl").read_text().splitlines():
+        record = json.loads(line)
+        jobs.setdefault(record["id"], {}).update(record)
+    stops = [job.get("stopped") for job in jobs.values() if job.get("quick")]
+    assert stops == ["limit"], jobs
+
+
+def slow_seconds_check(repo, body):
+    """Make the repo's check say its queued work takes seconds, then run `body` as
+    that queued work."""
+    hook(
+        repo,
+        "agent-pre-commit",
+        '# names $CHECK_QUEUE_EXIT\nlog="$(git rev-parse --git-dir)/ran"\n'
+        'if [ -n "${CHECK_SECONDS_EXIT:-}" ]; then\n'
+        '  echo seconds >> "$log"; exit "$CHECK_SECONDS_EXIT"\n'
+        f"fi\n{body}",
+    )
+
+
+def test_a_seconds_check_in_a_nested_job_has_no_limit(tmp_path, monkeypatch, capsys):
+    """A job inside another runs as part of it, as heavy's own --few-seconds jobs do:
+    stopping it at the limit would cut the outer job's work short."""
+
+    @contextmanager
+    def nested(**_asked):
+        cpus = sorted(os.sched_getaffinity(0))
+        yield gate.heavyqueue.Job(cpus, dict(os.environ), nested=True)
+
+    monkeypatch.setattr(gate.heavyqueue, "turn", nested)
+    monkeypatch.setenv("HEAVY_QUICK_MAX", "0.3")
+    monkeypatch.setenv("HEAVY_GRACE", "0.1")
+    (tmp_path / ".githooks").mkdir()
+    runs = tmp_path / "runs"
+    check = hook(tmp_path, "check", f'echo began >> "{runs}"; sleep 1')
+
+    run = gate.run_quiet(str(check), "check", None, seconds=True)
+
+    err = capsys.readouterr().err
+    assert run.code == 0, err
+    assert runs.read_text() == "began\n", err  # not stopped and run again
+    assert "ran past" not in err, err
+
+
+def test_a_landings_seconds_check_runs_to_its_end(installed, monkeypatch):
+    """In wt-ship's landing the gate runs inside a heavy job, while wt-ship holds the
+    main tree: it runs the check there at once, as an ordinary one, so no limit stops
+    it."""
+    slow_seconds_check(installed, 'echo slow >> "$log"; sleep 1; echo agent >> "$log"')
+    monkeypatch.setenv("HEAVY_QUICK_MAX", "0.3")
+    monkeypatch.setenv("HEAVY_GRACE", "0.1")
+    env = without_repo_vars(os.environ) | {"AI_AGENT": "test-agent"}
+    env["PATH"] = os.pathsep.join(
+        [str(SCRIPT.parent), path_without(SCRIPT.name, env["PATH"])]
+    )
+    heavy = SCRIPT.parent / "heavy"
+
+    run = subprocess.run(
+        [str(heavy), "--", "git", "commit", "-q", "-m", "x"],
+        cwd=installed,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert run.returncode == 0, run.stderr
+    assert ran(installed) == ["fast", "slow", "agent"], run.stderr
+    assert "ran past" not in run.stderr, run.stderr
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_a_seconds_check_stops_with_its_group_when_the_commit_is_stopped(
+    installed, committing, sig
+):
+    """The check runs in a process group of its own, out of reach of Ctrl-C: once the
+    gate is stopped, nothing the check started may run on outside the queue."""
+    slow_seconds_check(
+        installed, 'sleep 600 & echo $! > "$log.grandchild"; wait; echo agent >> "$log"'
+    )
+    pid_file = installed / ".git" / "ran.grandchild"
+    commit_run = committing(installed)
+
+    def started():
+        return pid_file.exists() and pid_file.read_text().strip()
+
+    if not wait_or_warn(started, "the check to start its sleep"):
+        return
+    grandchild = int(pid_file.read_text())
+
+    os.killpg(commit_run.pid, sig)
+
+    if not finishes_or_warns(commit_run):
+        return
+    # git, in the same group, dies by the signal too, so the gate's 130 doesn't
+    # reach its status; its refusal line does reach the shared stderr.
+    assert commit_run.returncode != 0, commit_run.err()
+    assert "COMMIT REFUSED: the agent check was stopped." in commit_run.err()
+    assert wait_or_warn(lambda: not alive(grandchild), "the check's sleep to end")
+    assert "agent" not in ran(installed)
 
 
 def test_a_check_whose_queued_work_takes_seconds_waits_at_the_queues_front(

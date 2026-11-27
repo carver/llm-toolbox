@@ -11,20 +11,20 @@ the sandbox shows it but a timed loop (heavy -h; lib/machinespeed.py). The owner
 even if it's not a broken promise of the code. I want to be able to address it on the
 host machine."
 
-`probe` runs heavy's speed probe pinned to vCPU 0, judged against probes on vCPU 0
-under the same load, and appends it to heavy's speed file, so cron's probes also give
-heavy a recent speed for a long job's end. Then it judges the last three of its own
-probes. Three under 0.25x, all known and the first and last at most 20 minutes apart,
-start a slow spell, and it mails `HOST: machine at 0.20x its usual speed`; three at
-0.5x or above end the spell, and it mails `HOST: machine back to 0.90x`, only when a
-slow mail went out for that spell. A probe whose speed is unknown (fewer than 20
-probes in its vCPU and load bucket) breaks a streak. The caps: a slow mail at most
-once every 3 hours, which a new spell waits out while it lasts; at most 4 sends in
-any 24 hours, a failed one counted too once it reached the sender with a recipient
-and credentials, since a timeout or a dropped connection may come after delivery; a
-mail that failed is tried again at most hourly. So at most 4 mails a day. Each mail gives the probes with their factor, load and the host's steal since
-the probe before, when the slow spell began, heavy's queue (`heavy status`), and what
-it means.
+`probe` runs heavy's speed probe pinned to vCPU 0, judged against probes on vCPU 0 under
+the same load, and appends it to heavy's speed file, so cron's probes also give heavy a
+recent speed for a long job's end. Then it judges the last three of its own probes.
+Three under 0.25x, all known and the first and last at most 20 minutes apart, start a
+slow spell, and it mails `HOST: machine at 0.20x its usual speed`; three at 0.5x or
+above end the spell, and it mails `HOST: machine back to 0.90x`, only when a slow mail
+went out for that spell. A probe whose speed is unknown (fewer than 20 probes in its
+vCPU and load bucket) breaks a streak. The caps: a slow mail at most once every 3 hours,
+which a new spell waits out while it lasts; at most 4 sends in any 24 hours, a failed
+one counted too once it reached the sender with a recipient and credentials, since a
+timeout or a dropped connection may come after delivery; a mail that failed is tried
+again at most hourly. So at most 4 mails a day. Each mail gives the probes with their
+factor, load and the host's steal since the probe before, when the slow spell began,
+heavy's queue (`heavy status`), and what it means.
 
 It mails as the email skill does, through its send_email.py
 (~/.claude/skills/email/scripts/) with the credentials it reads from the
@@ -36,17 +36,22 @@ output is printed: a failure is logged as its error's class only, such as
 
 It prints one line on stdout for each thing that changed: a spell begun or ended, a
 mail sent or failed; nothing otherwise. Its state, the last probes and the mails, is
-`speed-<machine>.alert.json` beside the speed file, written whole each run.
+`speed-<machine>.alert.json` beside the speed file, written whole each run. While a
+spell is open and its newest probe of known speed is at most 20 minutes old and under
+1/3x (3x slower), `heavy status`, `heavy waits` (on stderr) and `perf-promises
+--session-start` lead with one line, `WARNING: host CPU running 7x slower than usual
+(0.14x its usual speed, slow since 10:15 PST): check the host for throttling
+(PROCHOT).`
 
-`line` prints the speed of the newest probe of the last 15 minutes whose speed is
-known, any probe's, heavy's or cron's: `cpu 0.9x` (rounded down to a tenth), `cpu
-0.4x slow` under 0.5x, `cpu ?` with none, and ` (mail failed)` after it while a mail
-it owes has failed. So when the newest probe's speed is unknown (its vCPU and load
-bucket has under 20 probes yet), it shows an older known one from those 15 minutes. It runs no probe and no git but the one call that finds the speed
-file, reads its stdin (Claude Code's session JSON) and ignores it, prints one line,
-and exits 0 whatever goes wrong, since Claude Code blanks the bar on a non-zero exit
-or no output. install.py sets it as Claude Code's statusLine, refreshed every 60 s,
-when none is set.
+`line` prints the speed of the newest probe of the last 15 minutes whose speed is known,
+any probe's, heavy's or cron's: `cpu 0.9x` (rounded down to a tenth), `cpu 0.4x slow`
+under 0.5x, `cpu ?` with none, and ` (mail failed)` after it while a mail it owes has
+failed. So when the newest probe's speed is unknown (its vCPU and load bucket has under
+20 probes yet), it shows an older known one from those 15 minutes. It runs no probe and
+no git but the one call that finds the speed file, reads its stdin (Claude Code's
+session JSON) and ignores it, prints one line, and exits 0 whatever goes wrong, since
+Claude Code blanks the bar on a non-zero exit or no output. install.py sets it as Claude
+Code's statusLine, refreshed every 60 s, when none is set.
 
 `install.py` installs the cron line (`*/5`, its log `~/.cache/machine-speed/cron.log`)
 in the sandbox only (SANDBOX_VM_ID set, or /etc/sandbox-secrets.sh there), and the
@@ -124,8 +129,7 @@ def now():
 def state_file():
     import machinespeed
 
-    path = machinespeed.speed_file()
-    return None if path is None else path.with_name(path.stem + ".alert.json")
+    return machinespeed.alert_file()
 
 
 def load_state(path):

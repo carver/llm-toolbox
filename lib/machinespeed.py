@@ -61,6 +61,7 @@ the job's one note."""
 
 import fcntl
 import functools
+import json
 import math
 import os
 import re
@@ -89,6 +90,8 @@ TRIM_AT, KEEP = 4000, 2000
 STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 RECENT_SECONDS = 300  # how old a probe may be to judge a job's end by
 CHILD_SECONDS = 10  # past which the after-exit probe is killed by its own alarm
+SPELL_FRESH = 20 * 60  # how old a slow spell's newest known probe may be to warn of it
+SLOW_SHOWN = 1 / 3  # the newest known factor under which a slow spell warns: 3x slower
 
 
 class Reading(NamedTuple):
@@ -317,6 +320,51 @@ def speed_file():
         return Path(root) / name
     folder = home()
     return None if folder is None else folder / name
+
+
+def alert_file():
+    """bin/machine-speed's state beside the speed file: its cron probes and whether
+    they hold a slow spell open; None when there is nowhere to keep it."""
+    path = speed_file()
+    return None if path is None else path.with_name(path.stem + ".alert.json")
+
+
+def slow_warning(now=None):
+    """One loud line while bin/machine-speed's cron probes hold a slow spell open (3
+    probes in a row under 0.25x, each judged under its own load, until 3 at 0.5x or
+    above) and the newest probe with a known factor is at most SPELL_FRESH seconds
+    old and under SLOW_SHOWN, so a spell's recovery tail stays quiet; else None: for
+    `heavy status`, `heavy waits` and perf-promises' session start. Never raises."""
+    try:
+        path = alert_file()
+        if path is None:
+            return None
+        state = json.loads(path.read_text())
+        readings = [r for r in state.get("readings", []) if isinstance(r, dict)]
+        if state.get("slow") is not True or not readings:
+            return None
+        known = [
+            r
+            for r in readings
+            if isinstance(r.get("factor"), (int, float))
+            and not isinstance(r["factor"], bool)
+        ]
+        if not known or not 0 < known[-1]["factor"] < SLOW_SHOWN:
+            return None
+        factor = known[-1]["factor"]
+        now = now or datetime.now(UTC)
+        if (
+            now - datetime.fromisoformat(known[-1]["at"])
+        ).total_seconds() > SPELL_FRESH:
+            return None  # no recent reading: an old spell says nothing about now
+        since = datetime.fromisoformat(state["since"]).astimezone()
+    except Exception:  # noqa: BLE001 - a warning must never fail what prints it
+        return None
+    return (
+        f"WARNING: host CPU running {1 / factor:.0f}x slower than usual"
+        f" ({factor:.2f}x its usual speed, slow since {since:%H:%M %Z}): check"
+        " the host for throttling (PROCHOT)."
+    )
 
 
 def probes(path, now):

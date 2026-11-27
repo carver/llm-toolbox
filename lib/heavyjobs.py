@@ -14,7 +14,8 @@ parents' PIDs and names); its folder (`cwd`) and command (`cmd`, cut as `shown` 
 `slot`, `share` beside the holder named in `beside`, or `outside` the queue as a
 --few-seconds job; the flags it asked for; its `cores` and `nice`). The end line holds
 `at_end`, `exit` (CMD's status, or None), `signal` (the signal that stopped heavy, or
-None), `cmd_pid` (CMD's PID, None when heavy's caller doesn't say), and the CPU-seconds
+None), `stopped` (`limit` when its runner stopped it at the --few-seconds limit, its
+`exit` then 124; absent otherwise), `cmd_pid` (CMD's PID, None when heavy's caller doesn't say), and the CPU-seconds
 the job used (`cpu`), other work used on its cores meanwhile (`other_cpu`) and sccache's
 server used (`sccache_cpu`), when they could be measured.
 
@@ -279,6 +280,8 @@ def outcome(job):
         return "running" if running(job) else "no end recorded"
     if isinstance(job.get("signal"), int):
         return f"stopped by signal {job['signal']}"
+    if job.get("stopped") == "limit":
+        return "stopped at the --few-seconds limit"
     status = job.get("exit")
     if isinstance(status, int) and status < 0:
         return f"killed by signal {-status}"

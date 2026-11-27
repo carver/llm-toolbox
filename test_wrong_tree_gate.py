@@ -145,6 +145,11 @@ def test_a_reset_in_a_scratch_repo_passes(scratch):
         "git stash clear",
         "git stash -q drop",
         "git stash -q drop stash@{1}",
+        "git checkout -- .",
+        "git checkout .",
+        "git checkout HEAD~1 -- a",
+        "x=$(git reset --hard 2>&1)",
+        "echo `git stash drop`",
         "git rebase main",
         "GIT_SEQUENCE_EDITOR=: git rebase -q -i --autosquash HEAD~1",
         "bgrun --wait -o log -- git rebase main",
@@ -168,6 +173,7 @@ def test_destructive_git_in_a_main_tree_is_refused(main, command):
         "git reset -h",
         "git checkout -b f",
         "git checkout main",
+        "git checkout main --",
         "git checkout -bf",
         "git switch -c f",
         "git clean -n",
@@ -239,6 +245,7 @@ def test_a_main_tree_mid_operation_lets_only_its_paths_and_finish_through(main, 
         "git restore a",
         "git checkout -f -- a",
         "git checkout --theirs -f a",
+        "git checkout -- a",
         "git rebase --continue",
         "git rebase --abort",
         "git merge --abort",
@@ -302,7 +309,6 @@ LOOSE_CDS = [
     "cd $X\ngit reset --hard",
     "cd /no/such/folder; git reset --hard",
     "cd sub; git clean -fdx",
-    "cd $X; cd $Y && git reset --hard",
     "cd $X; git -C sub reset --hard",
     "set -u; cd $X; git rebase main",
     "set -e; set +e; cd $X; git rebase main",
@@ -321,6 +327,17 @@ LOOSE_CDS = [
     "set -e; f() { cd $X; git reset --hard; }; f || true",
     "set -e; if cd $X; git reset --hard; then :; fi",
     "set -e; cd $X && true; git reset --hard",
+    # A cd that is an if's or loop's condition, where the shell goes on after it fails.
+    "if cd $X; then :; fi; git reset --hard",
+    "if cd $X; then :; else git reset --hard; fi",
+    "if ! cd $X; then echo no; fi; git reset --hard",
+    "until cd $X; do git reset --hard; done",
+    "until cd $X; do break; done; git reset --hard",
+    "while cd $X; do break; done; git reset --hard",
+    # A shell's script and a substitution run after the cd too.
+    "cd $X; bash -c 'git reset --hard'",
+    "cd $X; sh -c 'git status; git stash clear'",
+    "cd $X; x=$(git reset --hard 2>&1)",
 ]
 
 
@@ -369,16 +386,76 @@ def test_a_failed_cd_judges_every_folder_the_shell_may_be_left_in(main, tmp_path
         "cd $X; git status",
         "(cd $X; true); git reset --hard",
         "git reset --hard; cd $X",
+        # The body runs only when the cd succeeded, or the shell exits when it fails.
+        "if cd $X; then git reset --hard; fi",
+        "if ! cd $X; then exit 1; fi; git reset --hard",
+        "if ! cd $X\nthen\n  echo no >&2\n  exit 1\nfi\ngit reset --hard",
+        "if ! cd $X; then return 1; else echo; fi; git reset --hard",
+        "until cd $X; do sleep 1; done; git reset --hard",
+        "while ! cd $X; do sleep 1; done; git reset --hard",
+        # A function's body is where set -e may not hold, not the rest.
+        "set -e\nf() { echo; }\ncd $X\ngit rebase main",
+        "set -e; function f { echo; }; f || true; cd $X; git rebase main",
+        # An array assignment defines no function.
+        "arr=(a b); set -e; cd $X; git reset --hard",
+        "set -e; arr+=(c); cd $X; git reset --hard",
+        "cd $X; bash -c 'cd /abs && git reset --hard'",
     ],
 )
 def test_a_cd_whose_failure_doesnt_matter_passes(command):
     assert hook(None, command) == (0, "")
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "set -e; f() { cd $X; git reset --hard; }; f",
+        "set -e; function f { cd $X; git reset --hard; }; f",
+        "f() { set +e; }; set -e; f; cd $X; git reset --hard",
+        "set -e; { cd $X; git reset --hard; } || echo failed",
+        "set -e; cd $X && true; git reset --hard",
+    ],
+)
+def test_where_set_e_wouldnt_help_the_refusal_says_why(command):
+    code, err = hook(None, command)
+    assert code == 2
+    assert "`set -e` wouldn't stop it: " in err
+    assert "put `set -e` first" not in err
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'cd "$S" && git rebase main; cd "$T" && git rebase main',
+        "cd $S; cd $T && git rebase main",
+    ],
+)
+def test_a_step_chained_to_an_unsure_cd_hears_of_that_cd(main, worktree, command):
+    # The rebase waits for `cd "$T"`; what matters is whether that names a relative
+    # folder, which is then taken from wherever a failed `cd "$S"` left the shell.
+    code, err = hook(main, command)
+    assert code == 2
+    assert "`git rebase` runs after `cd '$T' &&`, whose folder isn't certain" in err
+    assert "the earlier `cd '$S'`" in err
+    assert "Give this cd an absolute folder" in err
+    assert hook(worktree, command) == (0, "")
+
+
 def test_a_cd_to_a_folder_that_is_there_passes(main, worktree):
     assert hook(main, f"cd {worktree}; git rebase main") == (0, "")
     assert hook(main, f"cd {worktree}/gone; git rebase main")[0] == 2
     assert hook(None, f"cd {worktree} && git fetch; git reset --hard") == (0, "")
+
+
+def test_a_relative_cd_to_a_folder_that_is_there_passes(main, worktree, tmp_path):
+    # The workspace's convention: `cd ../<repo>-wt-<topic>` from the main tree.
+    assert hook(main, "cd ../r-wt-x; git rebase main") == (0, "")
+    assert hook(main, "cd ../r-wt-x\ngit fetch\ngit reset --hard") == (0, "")
+    assert hook(main, "cd ../r-wt-gone; git rebase main")[0] == 2
+    assert hook(None, "cd ../r-wt-x; git rebase main")[0] == 2
+    # It is taken from the folder an earlier cd went to, which may have failed.
+    assert hook(main, f"cd {tmp_path}/gone; cd ../r-wt-x; git rebase main")[0] == 2
+    assert hook(main, f"cd {worktree}; cd ../r-wt-x; git rebase main") == (0, "")
 
 
 def test_a_refused_command_is_saved_for_the_next_call(main, refused_session):

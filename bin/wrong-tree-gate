@@ -17,28 +17,41 @@ a Bash command that would run destructive git:
   reset --hard`. It is judged by the folder the shell would stay in: the command
   passes when that folder is certain and isn't a main tree as below, so `cd ..; git
   reset --hard` from /tmp passes. The refusal names the cd and says to chain it with
-  `&&`, to name the folder with `git -C DIR`, or to put `set -e` first. A cd to an
-  absolute folder that is there, a later `cd /abs &&` chained to the command, a `git
-  -C` an absolute folder, or a `set -e` before the cd takes the risk away. `set -e`
-  doesn't count where bash ignores it: for a cd in an if, while or until condition,
-  or in a group, subshell or compound command that a non-final part of an `&&` or
-  `||` list is (`{ cd $d; ...; } || echo`), or anywhere once the command defines a
-  function, which may be called that way.
+  `&&`, to name the folder with `git -C DIR`, or to put `set -e` first, unless `set
+  -e` wouldn't help, when it says why. A cd to an absolute folder that is there, a
+  later `cd /abs &&` chained to the command, a `git -C` an absolute folder, or a
+  `set -e` before the cd takes the risk away. A cd to a relative folder that is
+  there, taken from where the shell was, as `cd ../<repo>-wt-<topic>` from a main
+  tree is, takes it away too when the cds before it can't fail or leave no harm.
+  `set -e` doesn't count where bash ignores it: for a cd in an if, while or until
+  condition, or in a group, subshell or compound command that a non-final part of
+  an `&&` or `||` list is (`{ cd $d; ...; } || echo`), in a function's body, which
+  may be called that way, or anywhere once a function sets or unsets it. A cd that
+  is the whole condition guards the branch that runs when it succeeded (`if cd $d;
+  then ...`), and what comes after when the other branch exits or the loop ends only
+  on success (`if ! cd $d; then exit 1; fi; ...`, `until cd $d; do ...; done;
+  ...`). The cd that matters may be one the command is chained to, as in `cd "$S" &&
+  ...; cd "$T" && git rebase`, where a relative "$T" is taken from where a failed
+  `cd "$S"` left the shell: then the refusal names that one, and asks for an
+  absolute folder. A loose cd before a `bash -c` or `sh -c` counts for its script,
+  as one before a $(...) substitution counts for its body.
 - in a repo's main tree, not a linked worktree, when the repo has an agent check (an
   executable agent-pre-commit among its hooks, as agent-commit-gate's refusal of a
   commit there reads it): the owner's rule is that a main tree only receives
   landings. The folder is the one lib/maintree.py's walk gives: the hook's cwd, moved
   by the command's cds and pushds (not one in a list sent to the background), `git
-  -C` and bgrun's -C. Scratch repos, which have no agent check, pass.
+  -C` and bgrun's -C, for a $(...) substitution's body too. Scratch repos, which
+  have no agent check, pass.
 
-Destructive is `git reset --hard`, `checkout -f`/`--force`, `switch -f`/`--force`/
-`--discard-changes`, `clean -f` (not with `-n`), `restore` of the work tree (anything
-but `--staged` alone), `stash drop`/`clear` and a `rebase` that starts one. Finishing
-a rebase already under way (`--continue`, `--abort`, `--skip`, `--quit`,
-`--edit-todo`, `--show-current-patch`) is never destructive. In a main tree mid-merge,
-mid-rebase, mid-cherry-pick or mid-revert, a path's `restore` and `checkout -f` (one
-naming its paths after `--`, or with `--ours`, `--theirs`, `-m` or `--conflict`)
-pass too, so an agent resolving its own operation there is never left halfway;
+Destructive is `git reset --hard`, `checkout -f`/`--force`, a `checkout` of paths
+(after `--`, or `.`), `switch -f`/`--force`/`--discard-changes`, `clean -f` (not with
+`-n`), `restore` of the work tree (anything but `--staged` alone), `stash drop`/
+`clear` and a `rebase` that starts one. Finishing a rebase already under way
+(`--continue`, `--abort`, `--skip`, `--quit`, `--edit-todo`, `--show-current-patch`)
+is never destructive. In a main tree mid-merge, mid-rebase, mid-cherry-pick or
+mid-revert, a path's `restore` and `checkout` (one naming its paths after `--`, or
+with `--ours`, `--theirs`, `-m` or `--conflict`) pass too, so an agent resolving its
+own operation there is never left halfway;
 `reset --hard`, `clean -f` and the rest stay refused. With an unborn HEAD, in a
 submodule or a bare repo, all of it passes, as agent-commit-gate's commit does. Help
 (`-h`, `--help`) passes.
@@ -139,6 +152,12 @@ def destructive(subcommand: str, args: list[str]) -> Destructive | None:
             opt.split("=", 1)[0] in (*CHECKOUT_PATHS, "--conflict") for opt in opts
         )
         return Destructive("git checkout --force", named)
+    if subcommand == "checkout" and (
+        args[args.index("--") + 1 :] if "--" in args else "." in args
+    ):
+        # Paths, which it overwrites from the index or a commit as `git restore`
+        # does: `git checkout -- PATH`, or `.` without the `--`.
+        return Destructive("git checkout -- PATH", True)
     if subcommand == "switch" and (
         {"--force", "--discard-changes"} & set(opts) or has_short(opts, "f", "cC")
     ):
@@ -196,34 +215,61 @@ def has_agent_check(hooks: Path) -> bool:
     return agent.is_file() and os.access(agent, os.X_OK)
 
 
-def will_succeed(cd: list[str]) -> bool:
-    """Whether a cd names an absolute folder, plainly, that is there now."""
-    _, target = maintree.cd_target(cd)
-    return bool(
-        target and target.startswith("/") and maintree.certain(target)
-    ) and os.path.isdir(target)
+def will_succeed(cd: "maintree.LooseCd") -> tuple[bool, bool]:
+    """(whether a cd names a folder, plainly, that is there now, whether that folder
+    is absolute). A relative one is taken from the folder the cd ran in, so it is
+    there only if the cds before it succeeded."""
+    _, target = maintree.cd_target(cd.words)
+    if not target or not maintree.certain(target):
+        return False, False
+    absolute = target.startswith("/")
+    folder = maintree.moved(None if absolute else cd.fallback, target)
+    return folder is not None and folder.is_dir(), absolute
 
 
 def loose_cd_refusal(target: Target) -> str | None:
     """Why a cd before the target, should it fail, leaves it to run where it may do
     harm: in a folder that isn't certain, or in a main tree as main_tree_refusal
     judges it. The latest cd first: one to an absolute folder that is there settles
-    where the shell is, whatever the cds before it did."""
+    where the shell is, whatever the cds before it did; one to a relative folder that
+    is there is passed over, the cds before it judged in turn."""
     if target.pinned:
         return None
     for cd in reversed(target.step.loose_cd):
-        if will_succeed(cd.words):
+        there, absolute = will_succeed(cd)
+        if there and absolute:
             return None
+        if there:
+            continue
         if cd.fallback is None or main_tree(target.destroys, cd.fallback):
-            return (
-                f"Refused: `{target.destroys.what}` runs after"
-                f" `{shlex.join(cd.words)}`, and the cd, or the `&&` list it starts,"
-                " ends with `;` or a newline, so if the cd fails the shell stays"
-                " where it was and this runs there. Chain the cd with `&&` all the"
-                " way to this (`cd DIR && ... && git ...`), name the folder with"
-                " `git -C DIR`, or put `set -e` first."
-            )
+            return loose_cd_message(target, cd)
     return None
+
+
+def loose_cd_message(target: Target, cd: "maintree.LooseCd") -> str:
+    what, words = target.destroys.what, shlex.join(cd.words)
+    later = [c for c in target.step.chained if c.index > cd.index]
+    if later:
+        # The step waits for the cd it is chained to, whose folder, if relative,
+        # is taken from where the earlier cd's failure left the shell.
+        return (
+            f"Refused: `{what}` runs after `{shlex.join(later[-1].words)} &&`,"
+            f" whose folder isn't certain, and the earlier `{words}`, or the `&&`"
+            " list it starts, ends with `;` or a newline: if that cd fails, a"
+            " relative folder here is taken from where the shell stayed. Give this"
+            " cd an absolute folder, or name it with `git -C /abs/DIR`."
+        )
+    if cd.ignored:
+        tail = f". `set -e` wouldn't stop it: {cd.ignored}."
+    else:
+        tail = ", or put `set -e` first."
+    return (
+        f"Refused: `{what}` runs after `{words}`, and the cd, or the `&&` list it"
+        " starts, ends with `;` or a newline, so if the cd fails the shell stays"
+        " where it was and this runs there. Chain the cd with `&&` all the way to"
+        " this (`cd DIR && ... && git ...`) or name the folder with `git -C DIR`"
+        f"{tail}"
+    )
 
 
 def main_tree(destroys: Destructive, directory: Path | None):
@@ -258,7 +304,7 @@ def main_tree_refusal(destroys: Destructive, directory: Path | None) -> str | No
     if where.exempt:
         during = (
             f" With {where.exempt}, only finishing it (`--continue`, `--abort`, ...)"
-            " and a path's `git restore` or `git checkout -f -- PATH` pass."
+            " and a path's `git restore` or `git checkout -- PATH` pass."
         )
     return (
         f"Refused: `{what}` would run in {where.top}, {repo}'s main tree, which only"

@@ -160,6 +160,7 @@ def test_a_detached_main_tree_is_refused_naming_no_branch(main):
         "git commit -m x",
         "git -C ../r commit -m x",
         "cd ../r && git commit -m x",
+        "cd ../r && echo $(git commit -m x)",
     ],
 )
 def test_the_directory_it_judges_is_the_commits_own(main, worktree, command):
@@ -200,7 +201,7 @@ def test_a_commit_moved_into_a_worktree_passes(main, worktree, command):
         "env -C /x git commit -m x",
         "git worktree add -q --detach ../r-wt-new && cd ../r-wt-new && git commit -m x",
         "cd ../r-wt-missing && git commit -m x",
-        "echo $(git commit -m x)",
+        'cd "$WT" && echo $(git commit -m x)',
     ],
 )
 def test_a_commit_whose_directory_is_uncertain_passes(main, command):

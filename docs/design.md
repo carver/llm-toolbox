@@ -1441,9 +1441,39 @@ which the first draft gated too, refuses a main tree itself since 07771c1.
   while or until condition, in a non-final part of an `&&` or `||` list, and in every
   command inside a group, subshell or compound command sitting in one of those places
   (`set -e; { cd $d; git reset --hard; } || echo failed` resets wherever the shell
-  was), so shellparse marks those commands `unchecked`, and the walk counts no `set
-  -e` at all once the command defines a function, which may be called as `f || true`.
+  was), so shellparse marks those commands `unchecked`. Nor does it count for a cd in
+  a function's body, which may be called as `f || true`, or anywhere once a function
+  sets or unsets it. The first version voided it everywhere once the command
+  defined any function, and its refusal still said to put `set -e` first (second
+  review, #12); where `set -e` wouldn't help, the refusal now says why instead.
   It is tracked per subshell, `set +e` undoing it.
+- A cd that is the whole condition of an if, elif, while or until guards what runs
+  only when it succeeded: `if cd $d; then ...`, and what follows `if ! cd $d; then
+  exit 1; fi` or `until cd $d; do ...; done` (unless the loop breaks). It stays
+  loose in the branch that runs on its failure and after an if whose failure branch
+  doesn't exit. A cd inside a longer condition (`if cd $d && x; then`) is still
+  judged as an `&&` list ending with `;`.
+- A relative cd counts as a cd to a folder that is there when the folder, taken from
+  where the shell stood, is there: the workspace's `cd ../<repo>-wt-<topic>` from a
+  main tree. Unlike an absolute one, it doesn't settle where the shell is: if a cd
+  before it failed, it is taken from elsewhere, so those earlier cds are still
+  judged.
+- When the step is chained to a cd that comes after the loose one, as in `cd "$S" &&
+  git rebase main; cd "$T" && git rebase main`, the second rebase waits for `cd
+  "$T"`; the risk is only that "$T" is relative and taken from wherever a failed
+  `cd "$S"` left the shell. The refusal names `cd "$T"` and asks for an absolute
+  folder, rather than naming `cd "$S"` and asking for the `&&` already there.
+- A loose cd before `bash -c '...'` or `sh -c '...'` counts for the script, which
+  starts where the shell is; one before a $(...) substitution counts for its body,
+  which runs in the folder the shell is in there. The main-tree rule judges a
+  substitution's body by that folder too, so `x=$(git reset --hard 2>&1)` in a main
+  tree is refused. agent-commit-gate and main-tree-hint share the walk, so they now
+  judge a substitution's body by that folder too: the commit gate refuses `echo
+  $(git commit ...)` in a main tree.
+- `git checkout -- PATH` and `git checkout .` overwrite the work tree as `git restore
+  PATH` does, so they count as it does, passing mid-operation. Left out, as a
+  question for the owner on #12: `checkout -B`, which moves a branch, and `reset
+  HEAD~1`, `--keep` and `--merge`, which move one and keep or refuse local changes.
 - The honest case, an agent resolving its own rebase in the main tree of a repo with
   no worktrees. Finishing one under way (`--continue`, `--abort`, `--skip`, `--quit`,
   `--edit-todo`) passes anywhere. The owner's call (2026-11-26, on #12): in a main tree
@@ -1469,6 +1499,14 @@ them), so the gate would have passed them. The other 40 cd to a variable (`cd $S
 the incident's shape: 21 of them since 11-10, under one a day. The first draft's run
 (replay.json) counted mutate-check too, 1,245 calls and 237 refused. The one-shot
 `AGENT_MAIN_TREE_OK=1` prefix is #4's, unnamed in the refusal.
+
+After the second review (replay3.json, the same transcripts and 61 more calls that
+`checkout` paths): of the 241, 99 are refused, the two fewer being a `set -e`
+command that defines a function; 4 of the loose-cd refusals now name the chained
+cd. Of the 61 checkouts of paths, 13 are refused, 5 of them in a main tree: agents
+putting back a main-tree file they had copied to a worktree, and once, after the
+11-26 crash, restoring the mutated bin/drive-agent there, which now takes the
+user's word or the opt-out prefix.
 
 ### skill-patch save -C writes the patch into a worktree (#23, 2026-11-26)
 

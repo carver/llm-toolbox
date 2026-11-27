@@ -17,11 +17,15 @@ as written, and place() then says it can't tell. Each step also names the earlie
 in its scope whose failure wouldn't have stopped it, each with the folder the shell
 would have stayed in: one that ends with `;` or a newline, unless `set -e` held for it
 (not in a condition, nor in a compound command that a non-final part of an `&&` or
-`||` list is, nor anywhere once the command defines a function), and one chained with
-`&&` to a list that then ended with `;` or a newline; less those before a cd to an
-absolute folder that the step is chained to. The script a shell runs with -c is walked
-from the directory the shell starts in, and a $(...) substitution's body from an
-unknown one.
+`||` list is, nor in a function's body, nor anywhere once a function sets or unsets
+it), and one chained with `&&` to a list that then ended with `;` or a newline; less
+those before a cd to an absolute folder that the step is chained to. A cd that is the
+whole condition of an if, elif, while or until is loose only where the shell runs on
+after it failed: in the branch that runs then, and after the compound command unless
+that branch exits (`if ! cd x; then exit 1; fi`) or the loop ends only once it
+succeeds (`until cd x`). Each step also names the cds it is chained to with `&&`. The
+script a shell runs with -c, and a $(...) substitution's body, are walked from the
+directory the shell is in there and after the loose cds before it.
 
 place(directory) asks git what the directory is: its work tree's top level, whether
 that is the main tree (its git dir is the common one), the hooks folder, the branch,
@@ -43,7 +47,9 @@ from pathlib import Path
 from shellparse import (
     ASSIGNMENT,
     BGRUN_VALUES,
+    KEYWORDS,
     MARK,
+    OPENERS,
     bgrun_command,
     command_of,
     commands,
@@ -73,6 +79,26 @@ QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
 FUNCTION = re.compile(r"(^|[\s;&|(])(function\s+\S|[\w.:-]+\s*\(\s*\))")
 # The operators after a `cd` that don't wait for it to succeed.
 LOOSE = (";", "\n")
+# The words a simple command can start with that make `word (` something other than
+# a function's definition, `f()`.
+RESERVED = KEYWORDS | OPENERS | {"fi", "done", "esac", "in", "time", "function"}
+# The compound commands whose condition a cd can be, and those of them that loop.
+GUARDS = {"if", "elif", "while", "until"}
+LOOPS = {"while", "until"}
+# Why `set -e`, on or not, wouldn't stop the shell when a cd fails: LooseCd.ignored.
+IN_FUNCTION = (
+    "the cd is in a function, which may be called where bash ignores it, as in"
+    " `f || true`"
+)
+FUNCTION_SETS = "a function in the command turns it on or off where it's called"
+UNCHECKED = (
+    "bash ignores it for a cd in an if, while or until condition, after `!`, or in"
+    " a group or subshell that a non-final part of an `&&` or `||` list is"
+)
+AND_LIST = (
+    "bash ignores it for a cd in a non-final part of an `&&` list, as one that"
+    " starts the list is"
+)
 # The operators that end an && or || list, so a chained cd's failure no longer stops
 # what comes next.
 LIST_ENDS = (";", "\n", "&", "")
@@ -93,12 +119,16 @@ IN_PROGRESS = (
 @dataclass(frozen=True)
 class LooseCd:
     """A cd whose failure wouldn't stop a later step: its `words`, the folder the
-    shell stays in if it fails (`fallback`, None when that isn't certain), and its
-    place among the command's simple commands (`index`)."""
+    shell stays in if it fails (`fallback`, None when that isn't certain), its place
+    among the command's simple commands (`index`; below 0 for one before the shell
+    script or substitution it was carried into), and, when `set -e` wouldn't stop
+    the shell if it failed, why not (`ignored`, one of IN_FUNCTION, FUNCTION_SETS,
+    UNCHECKED or AND_LIST)."""
 
     words: list[str]
     fallback: Path | None
     index: int
+    ignored: str = ""
 
 
 @dataclass
@@ -113,7 +143,8 @@ class Step:
     absolute folder chained to the step itself; `guess`, the directory from its plain
     `cd`s and -C options alone, which a sourced file, a function, GIT_DIR, `env -C`
     or a piped group's cd don't undo: for a check that reads an unknown directory as
-    a reason to act rather than to pass."""
+    a reason to act rather than to pass; `chained`, the cds that `&&` chains it to,
+    in order, so it runs only if they succeed."""
 
     words: list[str]
     directory: Path | None
@@ -121,6 +152,7 @@ class Step:
     redirects: list[tuple[str, str]] = field(default_factory=list)
     loose_cd: list[LooseCd] = field(default_factory=list)
     guess: Path | None = None
+    chained: list[LooseCd] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -146,8 +178,15 @@ class _Scope:
     chained: tuple[_Chained, ...] = ()
 
     def loose_for_step(self) -> list[LooseCd]:
-        cover = max((c.cd.index for c in self.chained if c.covers), default=-1)
-        return [cd for cd in self.loose if cd.index > cover]
+        cover = max((c.cd.index for c in self.chained if c.covers), default=None)
+        return [cd for cd in self.loose if cover is None or cd.index > cover]
+
+    def with_loose(self, cd: LooseCd, loose: bool) -> "_Scope":
+        """This scope with `cd` among its loose cds or not."""
+        kept = [c for c in self.loose if c.index != cd.index]
+        if loose:
+            kept = sorted((*kept, cd), key=lambda c: c.index)
+        return replace(self, loose=tuple(kept))
 
     def ended(self, depth: int) -> "_Scope":
         """This scope once a list ends at `depth`: the cds chained in it are loose."""
@@ -157,6 +196,69 @@ class _Scope:
         kept = tuple(c for c in self.chained if c.depth < depth)
         loose = tuple(sorted((*self.loose, *done), key=lambda cd: cd.index))
         return replace(self, loose=loose, chained=kept)
+
+
+@dataclass
+class _Guard:
+    """A cd that is the whole condition of an if, elif, while or until: `depth`, its
+    simple command's; `loop`, whether a while or until; `on_success`, whether the
+    body runs when the cd succeeded (`if cd`, `until ! cd`) rather than when it
+    failed (`if ! cd`, `until cd`); `in_else`, whether an if's else or elif is being
+    read; `exits`, whether the body's last command so far is exit or return;
+    `breaks`, whether the body breaks out of the loop."""
+
+    cd: LooseCd
+    scope: tuple[int, ...]
+    depth: int
+    loop: bool
+    on_success: bool
+    in_else: bool = False
+    exits: bool = False
+    breaks: bool = False
+
+    def loose_after(self) -> bool:
+        """Whether the cd is loose once the compound command ends: the shell goes on
+        past it when the cd failed, unless the branch it failed into exits, or the
+        loop ends only when the cd succeeds."""
+        if self.loop:
+            return self.on_success or self.breaks
+        return self.on_success or not self.exits
+
+
+def guard(simple, following: list, words: list[str]) -> tuple[bool, bool] | None:
+    """(loop, on_success) as _Guard has them when a cd's simple command, whose
+    command is `words`, is the whole condition of an if, elif, while or until:
+    `following` holds the simple command after it, which starts the body."""
+    raw = simple.words
+    if raw[0] not in GUARDS or simple.after not in LOOSE or not following:
+        return None
+    negated = raw[1:2] == ["!"]
+    if raw[1 + negated :] != words or following[0].words[:1] not in (["then"], ["do"]):
+        return None
+    return raw[0] in LOOPS, (raw[0] != "until") != negated
+
+
+def definition(raw: list[str], after: str) -> bool:
+    """Whether a simple command starts a function's definition: `f()` or `function
+    f`. An array assignment, `arr=(`, starts none."""
+    if raw[0] == "function":
+        return len(raw) > 1
+    return (
+        len(raw) == 1 and after == "(" and raw[0] not in RESERVED and "=" not in raw[0]
+    )
+
+
+def braces(raw: list[str]) -> int:
+    """How many `{` groups a simple command opens, less one when it is `}`."""
+    if raw[:1] == ["}"]:
+        return -1
+    count = 0
+    for word in raw:
+        if word == "{":
+            count += 1
+        elif word not in KEYWORDS:
+            break
+    return count
 
 
 @dataclass
@@ -240,18 +342,22 @@ def bgrun_cwd(args: list[str]) -> str | None:
     return cwd
 
 
-def walk(command: str, cwd: Path | None) -> list[Step]:
-    """Each simple command in `command`, run from `cwd`, with the directory it runs
-    in, in order; then those of each $(...) substitution, from an unknown directory."""
+def walk(command: str, cwd: Path | None, loose: tuple[LooseCd, ...] = ()) -> list[Step]:
+    """Each simple command in `command`, run from `cwd` after the cds in `loose`, with
+    the directory it runs in, in order; then those of each $(...) substitution, from
+    the directory and after the loose cds of the command it sits in."""
     cleaned, substitutions, _ = prepare(command, first_mark=0)
     has_function = bool(FUNCTION.search(QUOTED.sub("''", cleaned)))
-    steps = _walk(cleaned, cwd, has_function)
+    # Where each substitution, by its number, runs: (directory, loose cds).
+    substituted: dict[int, tuple[Path | None, tuple[LooseCd, ...]]] = {}
+    steps = _walk(cleaned, cwd, has_function, loose, substituted)
     if has_function:
         # A function's body runs where it's called, not where it's defined.
         for step in steps:
             step.directory = None
-    for body in substitutions:
-        steps += walk(body, None)
+    for number, body in enumerate(substitutions):
+        directory, outer = substituted.get(number, (None, ()))
+        steps += walk(body, None if has_function else directory, outer)
     return steps
 
 
@@ -268,15 +374,27 @@ def background_lists(simples) -> list[tuple[int, int]]:
     return found
 
 
-def _walk(cleaned: str, cwd: Path | None, has_function: bool) -> list[Step]:
+def _walk(
+    cleaned: str,
+    cwd: Path | None,
+    has_function: bool,
+    loose: tuple[LooseCd, ...],
+    substituted: dict[int, tuple[Path | None, tuple[LooseCd, ...]]],
+) -> list[Step]:
     # Where the shell stands in each scope: the subshells a command sits in, as
     # shellparse numbers them. A scope seen first starts from the nearest one around
-    # it, which is where the shell stood when the subshell opened.
-    places: dict[tuple[int, ...], _Scope] = {(): _Scope(cwd, cwd)}
+    # it, which is where the shell stood when the subshell opened. The loose cds
+    # carried in keep their order, numbered below this command's.
+    carried = tuple(replace(cd, index=i - len(loose)) for i, cd in enumerate(loose))
+    places: dict[tuple[int, ...], _Scope] = {(): _Scope(cwd, cwd, carried)}
     steps: list[Step] = []
-    # Whether `set -e` is on in each scope, so a cd that fails ends it. A function
-    # may be called where bash ignores it, as in `f || true`, so then it never counts.
+    # Whether `set -e` is on in each scope, so a cd that fails ends it. Inside a
+    # function's body it never counts, since the function may be called where bash
+    # ignores it, as in `f || true`; nor anywhere once a function sets or unsets it.
     errexit: dict[tuple[int, ...], bool] = {(): False}
+    function_braces: int | None = None  # the `{` groups open in a function's body
+    function_sets_errexit = False
+    guards: list[_Guard] = []  # the cds that are an if's or loop's condition
     elsewhere = False  # GIT_DIR or GIT_WORK_TREE exported, or set for the shell
     simples = commands(cleaned)
     # A list sent to the background, as in `cd WT && sleep 900 &`, runs in a
@@ -300,8 +418,23 @@ def _walk(cleaned: str, cwd: Path | None, has_function: bool) -> list[Step]:
                 errexit.setdefault(scope, errexit[scope[:size]])
                 break
         directory, guess = places[scope].directory, places[scope].guess
-        words, _ = command_of(simple.words)
-        prefix = simple.words[: len(simple.words) - len(words)]
+        for word in (*simple.words, *(target for _, target in simple.redirects)):
+            for mark in MARK.finditer(word):
+                outer = tuple(places[scope].loose_for_step())
+                substituted.setdefault(int(mark.group(1)), (directory, outer))
+        raw = simple.words
+        in_function = function_braces is not None
+        if in_function:
+            function_braces += braces(raw)
+            if function_braces <= 0 and raw[0] == "}":
+                function_braces = None
+        elif definition(raw, simple.after):
+            in_function, function_braces = True, braces(raw[2:])
+            if raw[0] == "function":
+                raw = raw[2:] or ["function"]
+        words, _ = command_of(raw)
+        _follow_guards(guards, places, simple, words)
+        prefix = raw[: len(raw) - len(words)]
         if any(CHDIR_OPTIONS.fullmatch(word) for word in prefix):
             here = None
         else:
@@ -334,9 +467,14 @@ def _walk(cleaned: str, cwd: Path | None, has_function: bool) -> list[Step]:
             simple.redirects,
             places[scope].loose_for_step(),
             guessed,
+            [c.cd for c in places[scope].chained],
         )
         steps.append(step)
-        if name == "set":
+        if name == "set" and in_function:
+            args = words[1:]
+            if not set_errexit(args, True) or set_errexit(args, False):
+                function_sets_errexit = True
+        elif name == "set":
             errexit[scope] = set_errexit(words[1:], errexit[scope])
         elif name in ("cd", "pushd", "popd"):
             changes, target = cd_target(words)
@@ -348,13 +486,28 @@ def _walk(cleaned: str, cwd: Path | None, has_function: bool) -> list[Step]:
             if changes and not (apart and not simple.grouped):
                 after = None if target is None else moved(directory, target)
                 now = places[scope]
-                cd = LooseCd(words, directory, index)
-                stops = errexit[scope] and not simple.unchecked and not has_function
-                if simple.after in LOOSE and not stops:
+                if in_function:
+                    ignored = IN_FUNCTION
+                elif function_sets_errexit:
+                    ignored = FUNCTION_SETS
+                elif simple.unchecked:
+                    ignored = UNCHECKED
+                else:
+                    ignored = ""
+                cd = LooseCd(words, directory, index, ignored)
+                stops = errexit[scope] and not ignored
+                guarded = guard(simple, simples[index + 1 : index + 2], words)
+                if guarded is not None:
+                    # Checked in the branch that runs when it succeeded, loose in
+                    # the other, and after the compound command as loose_after says.
+                    guards.append(_Guard(cd, scope, simple.depth, *guarded))
+                    now = now.with_loose(cd, not guarded[1])
+                elif simple.after in LOOSE and not stops:
                     now = replace(now, loose=(*now.loose, cd))
                 elif simple.after == "&&":
                     covers = target is not None and certain(target)
                     covers = covers and target[:1] == "/"
+                    cd = replace(cd, ignored=ignored or AND_LIST)
                     chained = _Chained(cd, simple.depth, covers)
                     now = replace(now, chained=(*now.chained, chained))
                 places[scope] = replace(
@@ -366,9 +519,37 @@ def _walk(cleaned: str, cwd: Path | None, has_function: bool) -> list[Step]:
             # A sourced file or an eval may cd anywhere.
             places[scope] = replace(places[scope], directory=None)
         elif (script := shell_script(words)) is not None:
-            steps += walk(script, here)
+            steps += walk(script, here, tuple(step.loose_cd))
         _end_lists(places, simple)
     return steps
+
+
+def _follow_guards(
+    guards: list[_Guard], places: dict[tuple[int, ...], _Scope], simple, words
+) -> None:
+    """Move each guard on by one simple command, `simple`, which runs `words`: in an
+    if's else the cd counts the other way, and once the compound command has ended
+    it is loose or not as loose_after says."""
+    name = Path(words[0]).name if words else ""
+    for pending in list(guards):
+        scope = places.get(pending.scope)
+        if simple.depth < pending.depth:
+            guards.remove(pending)
+            if scope is not None:
+                loose = pending.loose_after()
+                places[pending.scope] = scope.with_loose(pending.cd, loose)
+        elif (
+            simple.depth == pending.depth
+            and not pending.loop
+            and simple.words[0] in ("else", "elif")
+        ):
+            pending.in_else = True
+            if scope is not None:
+                places[pending.scope] = scope.with_loose(pending.cd, pending.on_success)
+        else:
+            if simple.depth == pending.depth and not pending.in_else:
+                pending.exits = name in ("exit", "return")
+            pending.breaks = pending.breaks or name == "break"
 
 
 def _end_lists(places: dict[tuple[int, ...], _Scope], simple) -> None:

@@ -835,17 +835,19 @@ The sbx sandbox runs this automatically: `sandbox-setup/setup.py` lists it in
   `$GH_BODY_GATE_DEADLINE` another deadline.
 - **wrong-tree-gate**: a Claude Code hook, which `install.py` registers, that
   refuses a Bash command running destructive git (`reset --hard`, `checkout -f`,
-  `switch -f`, `clean -f`, `restore` of the work tree, `stash drop`/`clear`, a
-  `rebase` that starts one) where it may hit the wrong tree: after a `cd` whose
-  failure would leave the shell where it was (as when `cd $d; ... git reset --hard
-  HEAD~1` dropped a main tree's newest commit), one ending with `;` or a newline or
-  an `&&` list that does, when that folder is a main tree or isn't certain, unless
-  `set -e` holds for the cd, the cd names an absolute folder that is there, or a
-  `cd /abs &&` chained to it or `git -C /abs` takes its place; and in the main tree
+  `checkout` of paths, `switch -f`, `clean -f`, `restore` of the work tree, `stash
+  drop`/`clear`, a `rebase` that starts one) where it may hit the wrong tree: after
+  a `cd` whose failure would leave the shell where it was (as when `cd $d; ... git
+  reset --hard HEAD~1` dropped a main tree's newest commit), one ending with `;` or
+  a newline or an `&&` list that does, when that folder is a main tree or isn't
+  certain, unless `set -e` holds for the cd, the cd names a folder that is there
+  (`cd ../<repo>-wt-<topic>` included), the cd is an `if` or `until` condition
+  that guards the command, or a `cd /abs &&` chained to it or `git -C /abs` takes
+  its place; and in the main tree
   of a repo with an agent check, as lib/maintree.py's walk finds it (a cd in a list
   sent to the background with `&` moves only that list). Finishing a rebase under
   way (`--continue`, `--abort`, `--skip`) passes; in a main tree mid-merge or
-  mid-rebase, so do a path's `restore` and `checkout -f -- PATH`, and with an
+  mid-rebase, so do a path's `restore` and `checkout -- PATH`, and with an
   unborn HEAD, in a submodule or a bare repo, all of it does; so does anything whose
   folder isn't certain. `AGENT_MAIN_TREE_OK=1` in front lets one command through.
 - **issue-view-hint**: a Claude Code hook, which `install.py` registers. After a

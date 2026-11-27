@@ -81,7 +81,8 @@ run options:
   --deny-host HOST     also refuse HOST at the proxy (repeatable)
   --bind-tool PATH     also give the agent this program in ~/.local/bin (repeatable);
                        the harness, uv and uvx are given when they live where
-                       the box hides (/home, /tmp, /var/tmp, /dev/shm)
+                       the box hides (/home, /tmp, /var/tmp, /dev/shm) or where
+                       the box's user can't run them
   --hide PATH          also show the agent PATH as an empty file (repeatable); the
                        box already hides /etc/sandbox-persistent.sh and
                        /etc/sandbox-secrets.sh, which set this sandbox's own
@@ -256,23 +257,36 @@ class Usage(Exception):
     """A usage error: exit 2."""
 
 
+def tree(pid: int) -> list[int]:
+    """`pid` and every process under it, parents first, read from each one's
+    /proc/PID/task/*/children: only that tree, never all of /proc, so no broken
+    test can widen it to every process."""
+    found = [pid]
+    for parent in found:
+        for children in Path(f"/proc/{parent}/task").glob("*/children"):
+            try:
+                kids = children.read_text().split()
+            except OSError:
+                continue
+            found += [int(kid) for kid in kids if int(kid) not in found]
+    return found
+
+
 def kill_tmux_server(pid: int | None) -> list[int]:
-    """SIGKILLs the tmux server `pid` and its panes' processes, its children, and
-    returns the pids killed. By pid, not socket name: a name repeats in every
-    TMUX_TMPDIR, another run's included."""
+    """SIGKILLs the tmux server `pid` and every process under it, its panes' and
+    theirs, and returns the pids killed. By pid, not socket name: a name repeats in
+    every TMUX_TMPDIR, another run's included. Nothing, when `pid` is no longer a
+    tmux server, as when it ended and the pid went to another process."""
     if pid is None:
         return []
-    victims = [pid]
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            # The parent pid is the field after the command, which may hold spaces.
-            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-        except (OSError, IndexError):
-            continue
-        if fields[1:2] == [str(pid)]:
-            victims.append(int(entry.name))
+    try:
+        if Path(f"/proc/{pid}/comm").read_text().strip() != "tmux: server":
+            return []
+    except OSError:
+        return []
+    # The whole tree before the first signal: a killed parent's children move to
+    # another parent.
+    victims = tree(pid)
     killed = []
     for victim in victims:
         try:
@@ -715,6 +729,11 @@ class Box:
         tar.stdout.close()
         if tar.wait():
             raise Failed(f"couldn't copy {source}")
+
+    def can_run(self, path: str) -> bool:
+        """Whether the box's user can run `path` where it is, as from a folder only
+        the driver can enter it can't."""
+        return run(*self.as_user(), "test", "-x", path, check=False).returncode == 0
 
     def give_tool(self, path: str) -> None:
         """Makes `path` runnable as ~/.local/bin/<its name> inside the box: bound
@@ -2064,10 +2083,11 @@ def prepare_home(
 ) -> tuple[Path, dict]:
     """Gives the box its tools, git identity, projects and setup; returns the folder
     the agent starts in and the environment every command in the box gets."""
-    # The agent's PATH leaves out every folder the box hides.
+    # The agent's PATH leaves out every folder the box hides, and a tool in a folder
+    # the box's user can't enter is no use to it on PATH.
     tools = [harness_bin, *filter(None, map(shutil.which, ("uv", "uvx")))]
     for tool in tools:
-        if hidden(tool) or hidden(os.path.realpath(tool)):
+        if hidden(tool) or hidden(os.path.realpath(tool)) or not box.can_run(tool):
             box.give_tool(tool)
     for tool in args.bind_tool:
         box.give_tool(tool)

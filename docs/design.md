@@ -1282,6 +1282,12 @@ DEST must not exist and is opened with `O_EXCL | O_NOFOLLOW`, so a run never ove
 `~/REL` is read as the box's user but outside bwrap, where a link the agent planted would reach a file the box hides from it, such as `/etc/sandbox-persistent.sh`, and the caller would then send that file on (filedrawer sends the kept header to its site). So the read opens one folder at a time with `O_NOFOLLOW` and takes only a regular file; a link anywhere on the way keeps nothing and says so.
 A wait turn's NAME is a bare file name, none drive-agent writes in the run folder (`turns.md` would end the wait at once) and no earlier wait turn's (the file is already there); print mode, which sends one turn, refuses one. turns.md logs the wait as it starts, so a run stopped mid-wait shows what it waited for.
 
+### A stuck tmux server is killed by its own tree, and only while it is one (#16, 2026-11-26)
+
+When `tmux kill-server` doesn't return, `kill_tmux_server` SIGKILLs the server's pid and every process under it, read from `/proc/PID/task/*/children` one level at a time, the whole tree before the first signal.
+Reason: the first version scanned every `/proc/*/stat` for the server's pid as parent, so a single negated comparison made every process the user owns a victim: the mutant that killed six daily mutants runs and, applied to the main tree's live file, the VM (see mutate-check's PID namespace entries). Read from the server's own tree, no inverted or dropped test can reach outside it. It also takes a pane's grandchildren, which the parent-pid scan left running.
+It signals nothing unless `/proc/PID/comm` still reads `tmux: server`, so a pid the ended server left to another process is spared.
+
 ### Rejected: a separate user without bwrap (2026-11-10)
 
 It blocks writes but not reads of the workspace, which is world-readable, and leaves `/proc` and `/var/tmp` shared between runs.
@@ -1885,6 +1891,28 @@ sudo's use_pty gives it a session of its own. bash runs with
 --posix, so it doesn't source the $BASH_ENV of the environment it restores. The
 environment goes through a 0600 file the init's first process deletes, as JSON, not
 `export -p`, since it is exec'd whole. Each run costs about 0.1 s.
+
+### safekill's tests can signal only what they started (#17, 2026-11-26)
+
+A mutant that drops `matches`' name test (lib/procmatch.py) matches every process but
+the caller's ancestors, and safekill is the only tool on `matches` that signals
+(safeps lists, waitone waits). Its tests then sent SIGTERM to everything in reach:
+in a PID namespace, the `sleep` started beside them and pytest. A local run outside
+one would reach every session on the machine.
+
+So test_safekill.py runs safekill through `signal_guard_testing.py`, which replaces `os.kill`
+and `os.killpg` with ones that refuse any target without the test's pid among its
+parents, and exits 86 at the first refusal, before the signal is sent. safekill
+signals in pid order, so a widened match stops at the first process outside the
+test's tree, kernel threads and other sessions included, and the tests' status
+checks fail. Checked with a stand-in mutant that adds one outside `sleep` to the
+matches (the real one was never run): 15 of the 24 tests failed on exit 86, and the
+`sleep` lived. Inside a namespace, where every process may be in the test's tree,
+`test_no_match_signals_nothing` still fails on its exit status and bystander.
+
+A fake /proc was the other way: procmatch would read it from a variable, which
+production code then carries for the tests, and safekill would still signal the
+real pids it lists.
 
 ## paper
 

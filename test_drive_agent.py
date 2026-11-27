@@ -1856,9 +1856,11 @@ def sudo_and_bwrap():
 
 @pytest.mark.skipif(not sudo_and_bwrap(), reason="needs passwordless sudo and bwrap")
 def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
-    # tmp_path is under /home here, which the box hides: the fake gets bound into
-    # the run's ~/.local/bin, as Claude Code's own binary is.
     name = f"datest{os.getpid() % 100000}"
+    # The fake in a folder only the driver can enter, outside the roots the box
+    # hides, as tmp_path is under /mnt/pytest-tmp: drive-agent has to give it to the
+    # run's ~/.local/bin, as it gives Claude Code's own binary under /home.
+    private = Path(f"/opt/drive-agent-test-{name}-bin")
     upstream = FakeUpstream()
     path = scenario(
         tmp_path,
@@ -1873,16 +1875,36 @@ def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
     out = tmp_path / "out"
     # A file outside /home, as the sandbox's shell setup in /etc is.
     secret = f"/opt/drive-agent-test-{name}.sh"
-    subprocess.run(
-        ["sudo", "-n", "tee", secret],
-        input="export WORKSPACE_ONLY=1\n",
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    e = {**env, "HTTPS_PROXY": upstream.url, "FAKE_HIDDEN": secret}
+    e = {
+        **env,
+        "HTTPS_PROXY": upstream.url,
+        "FAKE_HIDDEN": secret,
+        "PATH": f"{private}:{env['PATH']}",
+    }
     del e["DRIVE_AGENT_ISOLATION"], e["DRIVE_AGENT_HOME_ROOT"]
     try:
+        subprocess.run(
+            [
+                "sudo",
+                "-n",
+                "install",
+                "-d",
+                "-m",
+                "700",
+                "-o",
+                str(os.getuid()),
+                private,
+            ],
+            check=True,
+        )
+        shutil.copy(Path(env["PATH"].split(":")[0]) / "claude", private / "claude")
+        subprocess.run(
+            ["sudo", "-n", "tee", secret],
+            input="export WORKSPACE_ONLY=1\n",
+            text=True,
+            capture_output=True,
+            check=True,
+        )
         drive(
             e,
             "run",
@@ -1899,7 +1921,7 @@ def test_real_isolation_hides_the_driver_and_removes_the_user(tmp_path, env):
             "FAKE_HIDDEN",
         )
     finally:
-        subprocess.run(["sudo", "-n", "rm", "-f", secret], check=False)
+        subprocess.run(["sudo", "-n", "rm", "-rf", secret, private], check=False)
     seen = json.loads((out / "files" / "seen.json").read_text())
     assert seen["user"] == name
     assert seen["homes"] == [name]
@@ -2169,6 +2191,70 @@ def test_a_kill_server_that_never_returns_still_ends_the_server_and_says_so(
         check=False,
     )
     assert alive.returncode != 0, "the run's tmux server outlived it"
+
+
+def ended(pid: int, deadline: float) -> bool:
+    """Whether `pid` is gone, or a zombie, by `deadline`."""
+    while time.time() < deadline:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return True
+        if stat.rsplit(")", 1)[1].split()[0] == "Z":
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_kill_tmux_server_kills_the_servers_whole_tree_and_nothing_beside_it():
+    folder = tempfile.mkdtemp(prefix="drive-agent-test-", dir="/tmp")
+    tmux_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "TMUX_TMPDIR": folder}
+    bystander = subprocess.Popen(["sleep", "300"])
+    try:
+        subprocess.run(
+            ["tmux", "-L", "tree", "new-session", "-d", "sh -c 'sleep 300 & wait'"],
+            env=tmux_env,
+            check=True,
+            timeout=10,
+        )
+        server, pane = (
+            int(found)
+            for found in subprocess.run(
+                ["tmux", "-L", "tree", "display-message", "-p", "#{pid} #{pane_pid}"],
+                env=tmux_env,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            ).stdout.split()
+        )
+        deadline = time.time() + 10
+        while not (grandchildren := drive_agent.tree(pane)[1:]):
+            assert time.time() < deadline, "the pane's sleep never started"
+            time.sleep(0.05)
+        killed = drive_agent.kill_tmux_server(server)
+        assert sorted(killed) == sorted([server, pane, *grandchildren])
+        assert all(ended(pid, time.time() + 5) for pid in killed)
+        assert bystander.poll() is None, (
+            "a process outside the server's tree was killed"
+        )
+    finally:
+        bystander.kill()
+        bystander.wait()
+        remove_tmux_folder(folder)
+
+
+def test_kill_tmux_server_leaves_a_pid_that_is_no_longer_a_tmux_server():
+    # The server's pid, gone to a new process once the server ended.
+    stranger = subprocess.Popen(
+        ["sh", "-c", "sleep 300 & wait"], start_new_session=True
+    )
+    try:
+        assert drive_agent.kill_tmux_server(stranger.pid) == []
+        assert stranger.poll() is None
+    finally:
+        os.killpg(stranger.pid, signal.SIGKILL)
+        stranger.wait()
 
 
 def read_until(process, pattern, deadline):
